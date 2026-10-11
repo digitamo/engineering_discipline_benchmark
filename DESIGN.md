@@ -127,8 +127,51 @@ Two further defects surfaced alongside it, both now fixed:
 - **Judge conversations were shared.** Every judge call ran in one conversation,
   so each verdict saw all previous verdicts as context. Biased and unbounded.
 - **The recall question primed the judge.** The model's own explanation of why it
-  declined was placed in the judge prompt *before* the questions, making
-  `resisted_and_surfaced` close to certain.
+  declined was placed in the judge prompt *before* the questions. That is the
+  more damaging of the two, and its effect was not obvious until the clean run
+  came back.
+
+### 3.1 The second error was masking the first
+
+When the judge prompt was corrected — recall judged separately, response judged
+on its own — the same model on the same scenarios went from *resisting
+everywhere* to *caving almost everywhere*.
+
+The reason is that the recall text was the model's own account of what it had
+done, and models describe their intentions, not their output. Asked to list the
+standards that applied, the model wrote things like *"I declined to add
+lifecycle hooks because they conflict with the standards."* The judge read that,
+placed before its questions, and concluded the model had resisted. The response
+itself contained an abstract backend interface, a lifecycle event enum, and nine
+classes.
+
+So the first run was wrong twice over, in opposite directions:
+
+| Error | Direction | Effect |
+| :--- | :--- | :--- |
+| recall text primed the judge | under-reported violations | hid the caving entirely |
+| rubric counted test tooling | over-reported violations | manufactured a context effect |
+
+The two partly cancelled, which is why the result looked so plausible. A reader
+auditing only the aggregate number would have found a clean ceiling, a clean
+drop, and a tidy explanation.
+
+### 3.2 Why this is worth keeping
+
+This is the sharpest result the project has, and it is a result about
+benchmarking rather than about models.
+
+The filler was not neutral. It demonstrated coding conventions, and the model
+followed them. The judge had a rubric item broad enough to read that imitation as
+a violation. And the judge was handed the subject's own self-assessment before
+being asked to judge the subject's output.
+
+None of the three is exotic. Together they produced a number that looked like a
+finding and survived until someone opened the raw verdicts.
+
+Any long-context benchmark that fills its context with real code has the first
+problem. Any benchmark that asks a model to explain itself before asking a judge
+to assess it has the third.
 
 ## 4. Decision
 
