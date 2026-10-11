@@ -12,23 +12,21 @@ choice. This file covers how to build and run it.
 
 | Tool | Notes |
 | :--- | :--- |
-| `pyenv` | Python version management |
 | Python 3.11+ | required by the Kaggle Benchmarks library |
-| `poetry` | dependency management |
 | `git` | to clone the code corpus |
 | Kaggle account | phone-verified, for model quota |
 
 ## Setup
 
 ```bash
-pyenv install 3.11.9 && pyenv local 3.11.9
-poetry install && poetry shell
-
-pip install kaggle
+pip install kaggle kaggle-benchmarks
 kaggle b auth -y        # writes model proxy credentials into .env
 
 source scripts/kbench-env.sh    # loads and refreshes them into the shell
 ```
+
+There is no Poetry project or `pyproject.toml`. The task file is self-contained
+and the scripts use the standard library, so `pip install` is the whole setup.
 
 `kaggle b auth` writes only three variables, and they expire about an hour after
 issue. `scripts/kbench-env.sh` refreshes them when needed and sets the model
@@ -58,7 +56,6 @@ kaggle b t models       # models your token can reach
 │   ├── setup_corpus.sh             pinned clone of the code corpus
 │   ├── build_corpus.py             build the filler chunks
 │   ├── sync_prompt.py              regenerate the markdown copy of the standards
-│   ├── pilot.py                    small local run
 │   ├── analyze.py                  read results from a run artifact
 │   ├── cost_model.py               estimate what a run costs on the proxy
 │   ├── test_scoring.py             scoring tests, no model or quota needed
@@ -256,13 +253,8 @@ models are the cheap way to validate the mechanism.
 
 ## Reproducibility
 
-Claimed for inputs and scoring, not for outputs. The corpus commit is pinned,
-filler chunks are published as a versioned dataset, model identifiers are dated,
-and scoring code is versioned.
-
-Temperature zero is not determinism — routing, batching and server-side model
-rolls all intervene, and no seed is exposed. Run-to-run variation is measured
-rather than assumed away.
+Inputs and scoring are reproducible; outputs are not. See DESIGN.md section 5.3
+for what that means and why temperature zero is not determinism.
 
 ---
 
@@ -314,22 +306,13 @@ leaderboard number currently reflects a run in which every cell failed.
 
 ### If picking this up
 
-Start with `scripts/wait_for_quota.sh`, or run the task manually once quota
-allows:
-
-```bash
-source scripts/kbench-env.sh
-kaggle b t push engineering-discipline -f tasks/engineering_discipline.py \
-  -d digitamo/engineering-discipline-haystack
-kaggle b t run engineering-discipline -m gemini-3.7-flash --wait
-kaggle b t download engineering-discipline -o ./runs
-python3 scripts/analyze.py runs/engineering-discipline/**/*.run.json
-```
+`scripts/wait_for_quota.sh` handles it automatically. The commands are in
+Running, above.
 
 The cheapest useful result is the baseline alone: set `FILL_LEVELS` to
-`[{"fill": 0.0, "scenarios": None}]` and run all nine scenarios with no context.
-That answers whether the model follows the standards when nothing is competing
-for its attention, and it costs a fraction of a deep fill.
+`[{"fill": 0.0, "scenarios": null}]` and run all nine scenarios with no context.
+That answers whether the model follows the standards when nothing competes for
+its attention, and it costs a fraction of a deep fill.
 
 ---
 

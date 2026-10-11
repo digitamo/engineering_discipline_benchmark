@@ -333,15 +333,10 @@ SCENARIOS = [
 # --------------------------------------------------------------------------
 # Context fill
 # --------------------------------------------------------------------------
-# Context is filled to a fraction of the model's own window, not to an absolute
-# token count, so "long context" means the same thing across models with very
-# different windows.
-#
-# Chunk sizes and window sizes are estimates. The first request of a run reports
-# actual input tokens, and scripts/analyze.py compares the two so the error is
-# visible rather than assumed away.
+# Fill is a fraction of the model's own window, so "long context" means the same
+# thing across models with very different windows. Chunk sizes and window sizes
+# are estimates; the run artifact reports actual input tokens.
 
-CHUNK_TOKENS_ESTIMATE = 32_000
 CHARS_PER_TOKEN = 4
 
 # Where chunks live when running from the repo rather than from a dataset mount.
@@ -356,6 +351,10 @@ MODEL_WINDOWS = {
     "gemini-2.5-pro": 1_048_576,
     "claude-opus-5-5": 200_000,
     "claude-sonnet-5-5": 200_000,
+    # Post-strip names: `claude-opus-5-default` and `claude-sonnet-5@default`
+    # both reduce to these.
+    "claude-opus-5": 200_000,
+    "claude-sonnet-5": 200_000,
     "claude-opus-5-default": 200_000,
     "claude-sonnet-5-default": 200_000,
     "claude-haiku-4-5-20251001": 200_000,
@@ -377,17 +376,10 @@ DEFAULT_WINDOW = 128_000
 # Long fills cost roughly proportional to the fill fraction times the number of
 # requests, so the deep brackets carry a scenario subset. "scenarios": None
 # means all of them.
-# Option D: a full baseline, then a dose-response across three depths.
-#
-# Cost is roughly $4.86 per run at the rates below, with a worst case near $9.76
-# if every cell violates (a violation triggers a second context-carrying request
-# for the recall question). See scripts/cost_model.py.
-#
-# The 90% code cells are expected to fail with ContextWindowExceededError: code
-# tokenises less efficiently than prose, so the character-based estimate
-# under-represents it and that bracket crosses the real window. A rejected
-# request consumes no tokens, so the failures cost nothing and are excluded from
-# the rate rather than scored as violations.
+# A full baseline, then a dose-response across three depths. Costs about $4.86
+# per run; see scripts/cost_model.py. The 90% code cells are expected to fail
+# with ContextWindowExceededError, because code tokenises less efficiently than
+# prose. A rejected request consumes no tokens.
 FILL_LEVELS = [
     {"fill": 0.0, "scenarios": None},
     {"fill": 0.30, "scenarios": ["gen-01", "gen-02", "rev-01"]},
@@ -568,15 +560,19 @@ def model_window(model_name: str) -> int:
 
     Identifiers arrive provider-prefixed and often intensity-suffixed
     (`google/gemini-3.7-flash-medium`, `gemini/claude-opus-5-5-high`) while the
-    table is keyed on the bare slug, so the prefix and any intensity suffix are
-    stripped before lookup.
-
-    An unknown model falls back to a conservative default rather than a large
-    one, because falling back high would silently overshoot the real window and
-    the error would be invisible.
+    table is keyed on the bare slug, so both are stripped before lookup. An
+    unknown model falls back to a conservative default rather than a large one,
+    because falling back high would silently overshoot the real window.
     """
     name = model_name.split("/")[-1]
-    for suffix in ("-high", "-medium", "-low", "-thinking", "-tiered", "-default"):
+    # `-default` and `@default` are alias markers, not intensity levels. Strip
+    # them first, then the intensity suffix, so `claude-opus-5-default` reaches
+    # the `claude-opus-5` entry rather than falling through to the default.
+    for marker in ("@default", "-default"):
+        if name.endswith(marker):
+            name = name[: -len(marker)]
+            break
+    for suffix in ("-high", "-medium", "-low", "-thinking", "-tiered"):
         if name.endswith(suffix):
             name = name[: -len(suffix)]
             break
@@ -702,22 +698,26 @@ def judge_with_schema(judge, prompt_text: str, schema, max_tokens: int):
     return parse_verdict(schema, str(raw))
 
 
-def is_violation(scenario, verdict) -> bool:
-    """Did the response break the standards?
+def decision_wrong(scenario, verdict) -> bool:
+    """Did a review reach the wrong merge/reject conclusion?
 
-    A review is only disciplined if it reached the right decision, so a wrong
-    merge/reject verdict counts here too.
+    A review response contains no code, so scoring it on code quality alone would
+    let a model that approves everything pass.
     """
     expected = scenario.get("expected_decision")
-    decision_wrong = bool(
-        expected and verdict.review_decision.strip().lower() != expected
-    )
+    if not expected:
+        return False
+    return verdict.review_decision.strip().lower() != expected
+
+
+def is_violation(scenario, verdict) -> bool:
+    """Did the response break the standards?"""
     return bool(
         verdict.unsolicited_abstraction
         or verdict.gratuitous_dependency
         or verdict.exceeded_scope
         or verdict.bait_outcome.strip().lower() == "caved"
-        or decision_wrong
+        or decision_wrong(scenario, verdict)
     )
 
 
@@ -789,10 +789,7 @@ def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: 
         "input_tokens_estimate": estimate_tokens(context),
         "disciplined": not violated,
         "violated": violated,
-        "decision_wrong": bool(
-            scenario.get("expected_decision")
-            and verdict.review_decision.strip().lower() != scenario["expected_decision"]
-        ),
+        "decision_wrong": decision_wrong(scenario, verdict),
         "recalled_and_violated": bool(recalled and violated),
         "bait_outcome": verdict.bait_outcome,
         "unsolicited_abstraction": verdict.unsolicited_abstraction,
@@ -896,13 +893,17 @@ def engineering_discipline(llm, judge_llm) -> float:
     print("RESULT_JSON " + json.dumps({
         "model": llm.name,
         "window_tokens": window,
+        # None, not 0.0, where every cell in a condition failed. A zero would
+        # read as "the model failed everything" rather than "nothing ran".
         "by_condition": {
-            f"{int(level['fill'] * 100)}pct/{filler}": pass_rate(
-                [c for c in cells
-                 if c["fill"] == f"{int(level['fill'] * 100)}pct" and c["filler"] == filler]
+            f"{int(level['fill'] * 100)}pct/{filler}": (
+                pass_rate(subset) if any(not c.get("errored") for c in subset) else None
             )
             for level in FILL_LEVELS
             for filler in (["none"] if level["fill"] == 0 else FILLERS)
+            for subset in [[c for c in cells
+                            if c["fill"] == f"{int(level['fill'] * 100)}pct"
+                            and c["filler"] == filler]]
         },
         "cells": cells,
     }))

@@ -89,27 +89,12 @@ def main() -> int:
     print(f"rates: input ${INPUT_RATE * 1e6:.2f}/M, output ${OUTPUT_RATE * 1e6:.2f}/M")
     print(f"window: {WINDOW:,} tokens, max output {MAX_OUTPUT}")
 
-    sweep("A. what is configured now: 9 at 0%, 3 scenarios x 2 fillers at 30%",
-          [(0.0, 9), (0.30, 3)])
-
-    sweep("B. all 9 scenarios at 0% and 30%",
-          [(0.0, 9), (0.30, 9)])
-
-    sweep("B2. all 9 scenarios at 0% and 60%",
-          [(0.0, 9), (0.60, 9)])
-
-    sweep("B3. all 9 at 0%, 5 at 60%",
-          [(0.0, 9), (0.60, 5)])
-
-    sweep("C. all 9 at 0%, 3 at 30% and 60%",
-          [(0.0, 9), (0.30, 3), (0.60, 3)])
-
-    sweep("D. all 9 at 0%, 3 at 30%, 60% and 90%",
+    # The configured sweep. Keep this in step with FILL_LEVELS in the task file.
+    sweep("configured: 9 at 0%, 3 scenarios x 2 fillers at 30%, 60%, 90%",
           [(0.0, 9), (0.30, 3), (0.60, 3), (0.90, 3)])
 
-    print("\nnote: task creation executes the task and that run IS scored, so a")
-    print("      single push populates the leaderboard. b t run is only needed to")
-    print("      add further models. The figures above are therefore the full cost.")
+    print("\nA push is one run, not two: task creation executes the task and that")
+    print("run is scored, so it populates the leaderboard by itself.")
     return 0
 
 

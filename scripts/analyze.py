@@ -8,8 +8,7 @@ judged, which is how verdicts are mapped back.
     kaggle b t download engineering-discipline -o ./runs
     python3 scripts/analyze.py runs/**/*.run.json
 
-Also reports the gap between our chars/4 token estimate and the actual input
-tokens the platform charged, so the calibration error stays visible.
+Reports actual input tokens per cell, so a mis-sized fill is visible.
 """
 
 import glob
@@ -18,11 +17,9 @@ import re
 import sys
 from pathlib import Path
 
-CHARS_PER_TOKEN = 4
-
 JSON_OBJECT = re.compile(r"\{[^{}]*\"(?:bait_outcome|named_applicable_rule)\"[^{}]*\}", re.DOTALL)
 
-SCENARIO_IDS = [f"gen-{i:02d}" for i in range(1, 10)] + [f"rev-{i:02d}" for i in range(1, 10)]
+SCENARIO_IDS = [f"gen-{i:02d}" for i in range(1, 7)] + [f"rev-{i:02d}" for i in range(1, 4)]
 
 # Mirrors expected_decision in tasks/engineering_discipline.py. A review is only
 # disciplined if it reached the right decision, so a model that approves
@@ -86,7 +83,6 @@ def load(path: Path) -> dict:
     conversations = {c.get("id", ""): c for c in run.get("conversations", [])}
 
     cells: dict[tuple[str, str, str], dict] = {}
-    estimate_by_cell: dict[tuple[str, str, str], int] = {}
     actual_by_cell: dict[tuple[str, str, str], int] = {}
 
     for cid, conversation in conversations.items():
@@ -106,8 +102,6 @@ def load(path: Path) -> dict:
                 requests = conversation.get("requests", [])
                 if requests:
                     actual_by_cell[key] = requests[0].get("metrics", {}).get("inputTokens", 0)
-                    text = assistant_text(conversation)
-                    estimate_by_cell[key] = len(text) // CHARS_PER_TOKEN
 
     for key, cell in cells.items():
         verdict = cell.get("verdict", {})

@@ -109,14 +109,9 @@ every single time.
 The benchmark measured test-framework choice and reported it as discipline
 drift.
 
-Two further defects surfaced alongside it, both now fixed:
-
-- **Judge conversations were shared.** Every judge call ran in one conversation,
-  so each verdict saw all previous verdicts as context. Biased and unbounded.
-- **The recall question primed the judge.** The model's own explanation of why it
-  declined was placed in the judge prompt *before* the questions. That is the
-  more damaging of the two, and its effect was not obvious until the clean run
-  came back.
+Two further defects surfaced alongside it, both now fixed. Judge conversations
+were shared, so each verdict saw all previous verdicts as context. And the recall
+question primed the judge, which is the more damaging of the two.
 
 ### 3.1 The second error was masking the first
 

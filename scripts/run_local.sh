@@ -32,6 +32,8 @@ if ! curl -s --max-time 5 "${LITELLM}/models" >/dev/null 2>&1; then
   exit 1
 fi
 
+mkdir -p runs/local
+
 if ! curl -s --max-time 5 "http://127.0.0.1:${BRIDGE_PORT}/openapi/models" >/dev/null 2>&1; then
   echo "[run_local] starting bridge on ${BRIDGE_PORT}"
   nohup python3 scripts/litellm_bridge.py --port "$BRIDGE_PORT" --upstream "$LITELLM" \
@@ -44,8 +46,6 @@ export MODEL_PROXY_API_KEY="sk-local"
 export LLM_DEFAULT="$SUBJECT"
 export LLM_DEFAULT_JUDGE="$JUDGE"
 export LLMS_AVAILABLE="${SUBJECT},${JUDGE}"
-
-mkdir -p runs/local
 
 case "$MODE" in
   baseline) LEVELS='[{"fill": 0.0, "scenarios": null}]' ;;

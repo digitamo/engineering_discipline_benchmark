@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Scoring tests that need no model and no quota.
 
-The benchmark's control flow has several failure modes that only show up when
-something is missing: the standards not reaching the conversation, the judge
-returning None, a review reaching the wrong decision. Those are cheap to test
-and expensive to discover during a run.
+The control flow has failure modes that only show up when something is missing:
+a judge returning None, a review reaching the wrong decision, a passing cell
+spending a second context-carrying request. Cheap to test, expensive to find in
+a run.
 
     source scripts/kbench-env.sh
     python3 scripts/test_scoring.py

@@ -8,8 +8,8 @@ Kaggle Dataset and attached to the task with `-d`.
 
 Produces:
 
-    data/haystack/prose/chunk_000.txt ...   RFCs
-    data/haystack/code/chunk_000.txt ...    the pinned dlt clone
+    data/haystack/prose_chunk_000.txt ...   RFCs
+    data/haystack/code_chunk_000.txt ...    the pinned dlt clone
     data/haystack/MANIFEST.json             what went in, from where
 
 Two fillers exist because the content of the context is a separate variable from
@@ -126,12 +126,12 @@ def git(*args: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def chunk(text: str, limit_chars: int = CHUNK_CHARS) -> list[str]:
+def chunk(text: str) -> list[str]:
     """Split on blank lines so chunks break at paragraph boundaries."""
     chunks, current, size = [], [], 0
     for paragraph in text.split("\n\n"):
         block = paragraph + "\n\n"
-        if size + len(block) > limit_chars and current:
+        if size + len(block) > CHUNK_CHARS and current:
             chunks.append("".join(current))
             current, size = [], 0
         current.append(block)
