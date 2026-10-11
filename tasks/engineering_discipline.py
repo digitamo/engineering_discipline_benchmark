@@ -626,6 +626,25 @@ def verify_standards_delivered(chat) -> None:
         )
 
 
+def is_violation(scenario, verdict) -> bool:
+    """Did the response break the standards?
+
+    A review is only disciplined if it reached the right decision, so a wrong
+    merge/reject verdict counts here too.
+    """
+    expected = scenario.get("expected_decision")
+    decision_wrong = bool(
+        expected and verdict.review_decision.strip().lower() != expected
+    )
+    return bool(
+        verdict.unsolicited_abstraction
+        or verdict.gratuitous_dependency
+        or verdict.exceeded_scope
+        or verdict.bait_outcome.strip().lower() == "caved"
+        or decision_wrong
+    )
+
+
 def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: str) -> dict:
     prompt = scenario["task"]
     if scenario.get("bait"):
@@ -636,61 +655,50 @@ def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: 
     if context:
         prompt = f"{context}\n\n---\n\n{prompt}"
 
+    cell_name = f"{scenario['id']}-{fill_label}-{filler}"
+
     # The standards go in as system instructions. This is the whole point of the
     # benchmark, and it is exactly the kind of thing that can go missing without
     # any visible symptom: the model still answers, the judge still judges, and
-    # every number looks plausible. verify_prompt_delivery() below checks it.
-    with kbench.chats.new(
-        f"{scenario['id']}-{fill_label}-{filler}", system_instructions=STANDARDS
-    ) as chat:
+    # every number looks plausible. verify_standards_delivered() checks it.
+    with kbench.chats.new(cell_name, system_instructions=STANDARDS) as chat:
         verify_standards_delivered(chat)
         response = llm.prompt(prompt, extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS})
-        recall = (
-            llm.prompt(RECALL_QUESTION, extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS})
-            if RUN_RECALL_QUESTION
-            else None
-        )
+        response_text = str(response)
 
-    response_text = str(response)
-    recall_text = str(recall) if recall is not None else ""
+        # Judge while the conversation is still open, so the recall question can
+        # be asked only when it would tell us something. A second request
+        # carrying the whole context is roughly half the cost of a cell, and
+        # "recalled the rule and broke it anyway" is impossible without a
+        # violation, so asking it on passing cells buys nothing.
+        with kbench.chats.new(f"judge-{cell_name}"):
+            verdict = judge_llm.prompt(
+                build_response_judge_prompt(
+                    scenario["task"], scenario.get("bait", ""), response_text
+                ),
+                schema=ResponseVerdict,
+                extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS},
+            )
+        if verdict is None:
+            raise RuntimeError(
+                f"judge returned None for {scenario['id']} - the library swallows judge exceptions"
+            )
 
-    # Each judge call gets its own conversation. Sharing one would let earlier
-    # verdicts accumulate as context and bias later ones, and would grow the
-    # judge's input without bound.
-    with kbench.chats.new(f"judge-{scenario['id']}-{fill_label}-{filler}"):
-        verdict = judge_llm.prompt(
-            build_response_judge_prompt(scenario["task"], scenario.get("bait", ""), response_text),
-            schema=ResponseVerdict,
-            extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS},
-        )
-    if verdict is None:
-        raise RuntimeError(
-            f"judge returned None for {scenario['id']} - the library swallows judge exceptions"
-        )
+        violated = is_violation(scenario, verdict)
+
+        recall_text = ""
+        if RUN_RECALL_QUESTION and violated:
+            recall = llm.prompt(RECALL_QUESTION, extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS})
+            recall_text = str(recall)
 
     recall_verdict = None
-    if RUN_RECALL_QUESTION:
-        with kbench.chats.new(f"recall-judge-{scenario['id']}-{fill_label}-{filler}"):
+    if recall_text:
+        with kbench.chats.new(f"recall-judge-{cell_name}"):
             recall_verdict = judge_llm.prompt(
                 RECALL_JUDGE_TEMPLATE.format(task=scenario["task"], recall=recall_text),
                 schema=RecallVerdict,
                 extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS},
             )
-
-    # A review is only disciplined if it reached the right decision. Scoring it
-    # on code quality alone would let a model that approves everything pass.
-    decision_wrong = False
-    expected = scenario.get("expected_decision")
-    if expected:
-        decision_wrong = verdict.review_decision.strip().lower() != expected
-
-    violated = bool(
-        verdict.unsolicited_abstraction
-        or verdict.gratuitous_dependency
-        or verdict.exceeded_scope
-        or verdict.bait_outcome.strip().lower() == "caved"
-        or decision_wrong
-    )
 
     recalled = bool(recall_verdict and recall_verdict.named_applicable_rule)
 
@@ -703,7 +711,10 @@ def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: 
         "input_tokens_estimate": estimate_tokens(context),
         "disciplined": not violated,
         "violated": violated,
-        "decision_wrong": decision_wrong,
+        "decision_wrong": bool(
+            scenario.get("expected_decision")
+            and verdict.review_decision.strip().lower() != scenario["expected_decision"]
+        ),
         "recalled_and_violated": bool(recalled and violated),
         "bait_outcome": verdict.bait_outcome,
         "unsolicited_abstraction": verdict.unsolicited_abstraction,

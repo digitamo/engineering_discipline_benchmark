@@ -143,16 +143,28 @@ every judge verdict — is recovered from the run artifact.
 
 ### What a run costs
 
-Cost scales with fill fraction times the number of requests per cell, and each
-cell makes two requests carrying the full context (the task, then the recall
-question). A 30% fill of a million-token window is roughly 300,000 tokens per
-request; a 90% fill is roughly 900,000.
+Measured on a real deep cell (30% fill of a million-token window):
+
+| Component | Tokens | Share |
+| :--- | ---: | ---: |
+| The task request, carrying the context | ~316,000 | 50% |
+| The recall request, re-carrying the context | ~316,000 | 50% |
+| Judge call | ~5,000 | 1% |
+
+**The second context-carrying request is the cost, not the judging.** Dropping
+the judge would save about 1%. The recall question is asked only when a cell
+violated, because "recalled the rule and broke it anyway" is impossible
+otherwise — so a passing cell makes one request instead of two.
+
+Two other levers, in order of effect:
+
+- **Fill fraction.** Cost scales linearly with it. A 30% fill is ~300,000 tokens
+  per request; a 90% fill is ~900,000.
+- **Scenario subset at the deep fill.** Set in `FILL_LEVELS` in the task file.
 
 The model proxy reserves quota per request from input tokens plus maximum
 output, and refuses a request *before* sending it when the reservation exceeds
-the remaining balance. Output is capped in the task file for that reason. The
-deepest fill therefore also runs a scenario subset — widen it in `FILL_LEVELS`
-in the task file when quota allows.
+the remaining balance. Output is capped in the task file for that reason.
 
 A ~900,000-token request is accepted by the model proxy and answered in around
 twenty seconds, verified directly.
@@ -250,9 +262,11 @@ taken, and no number from it should be quoted.
 | **A no-bait control arm** | every generation scenario is always baited, so bait susceptibility is not computable | add unbaited twins; without the contrast, over-engineering cannot be attributed to the bait |
 | **The self-generated context arm** | the most faithful simulation of a real session, and the most expensive | seed the model, let it elaborate over turns until the window is full, then ask the task |
 | **Judge validation** | no hand-labelled set exists, so judge agreement is asserted rather than measured | label ~60 outputs and report agreement |
+| **Using the structural measures instead of the judge** | the judge is 1% of a cell's cost, so this saves almost nothing; the measures are also blind to registry dicts and decorator hooks | worth doing for robustness, not for cost. Report them alongside the judge rather than replacing it |
 | **Run-to-run variance** | every run so far was a single run | repeat a subset and report the flip rate at temperature zero |
 | **Paraphrase robustness** | one phrasing per scenario | paraphrase each scenario and check the result survives |
 | **A judge outside the tested model family** | the platform chooses the judge; it has been Gemini while Gemini was under test | request or configure a judge from a different family |
+| **Jev or Laya as the semantic judge** | both were the intended judges from the start; the platform supplies its own judge and the local proxy serves neither | wire either in as `judge_llm`, which also resolves the out-of-family problem above. They were designed for this role and would replace a general-purpose model doing a specialist job |
 
 ### The honest summary
 
