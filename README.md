@@ -61,6 +61,8 @@ kaggle b t models       # models your token can reach
 │   ├── pilot.py                    small local run
 │   ├── analyze.py                  read results from a run artifact
 │   ├── test_scoring.py             scoring tests, no model or quota needed
+│   ├── litellm_bridge.py           path bridge so the library can reach LiteLLM
+│   ├── run_local.sh                run against LiteLLM, bypassing the proxy
 │   └── wait_for_quota.sh           poll until quota returns, then run
 │
 ├── data/
@@ -126,11 +128,33 @@ tokens, and `scripts/analyze.py` prints both so the error stays visible.
 # scoring tests first: no model, no quota, catches control-flow bugs
 source scripts/kbench-env.sh
 python3 scripts/test_scoring.py
+```
 
-# iterate locally against a cheap model
-python3 scripts/pilot.py
+### Locally, against LiteLLM
 
-# push, with the filler dataset attached
+The platform proxy reserves quota per request and refuses a request before
+sending it when the reservation exceeds the balance. When that blocks you, run
+locally against a LiteLLM gateway instead — no quota applies.
+
+```bash
+./scripts/run_local.sh baseline     # all nine scenarios, no context
+./scripts/run_local.sh deep         # three scenarios at 30% of the window
+./scripts/run_local.sh full         # both
+SUBJECT=gemini/gemini-3.8-flash-medium ./scripts/run_local.sh baseline
+```
+
+LiteLLM must already be running. The library appends `/openapi` to its base URL
+while LiteLLM serves `/v1`, so `scripts/litellm_bridge.py` starts automatically
+and rewrites the prefix. Neither the library nor the running gateway is changed.
+
+Choose a judge from a different model family where one is available — the
+platform has been using Gemini to judge Gemini, which is the self-preference
+problem noted in the roadmap.
+
+### On Kaggle
+
+```bash
+source scripts/kbench-env.sh
 kaggle b t push engineering-discipline \
   -f tasks/engineering_discipline.py \
   -d digitamo/engineering-discipline-haystack
@@ -259,9 +283,9 @@ taken, and no number from it should be quoted.
 
 | Item | Why it is not done | What it would take |
 | :--- | :--- | :--- |
-| **The corrected measurement run** | model-proxy quota exhausted; a baseline cell needs ~$0.005 and the balance sits between $0.002 and $0.0038 | quota to return; `scripts/wait_for_quota.sh` pushes and runs automatically when it does |
-| **Fills deeper than 30%** | a 90% fill of a million-token window is ~900,000 tokens per request, which exceeds the remaining balance | quota, then widen `FILL_LEVELS` |
-| **More than one model** | only `gemini-3.7-flash` was ever run, and only against the broken versions | quota, then `kaggle b t run -m <model>` per model |
+| **A published Kaggle leaderboard entry** | the platform proxy refuses every request; the reservation for even a baseline cell exceeds the balance | quota to return; `scripts/wait_for_quota.sh` pushes and runs automatically when it does. Local runs via `scripts/run_local.sh` give the measurement meanwhile, but they cannot populate the leaderboard |
+| **Fills deeper than 30%** | a 90% fill of a million-token window is ~900,000 tokens per request | run locally with `FILL_LEVELS` widened — no quota applies there |
+| **More than one model** | only Gemini 3.7 Flash has been measured | run locally with `SUBJECT=` per model. `scripts/run_local.sh` takes it as an argument |
 | **The precedence ablation** | the variant was written, then removed as dead code during the rewrite | re-add `SYSTEM_PROMPT_PRECEDENCE` and run both; answers whether stating precedence explicitly helps |
 | **A no-bait control arm** | every generation scenario is always baited, so bait susceptibility is not computable | add unbaited twins; without the contrast, over-engineering cannot be attributed to the bait |
 | **The self-generated context arm** | the most faithful simulation of a real session, and the most expensive | seed the model, let it elaborate over turns until the window is full, then ask the task |
