@@ -361,6 +361,7 @@ is the floor of the problem rather than its ceiling.
 | The judge is a model, and shares a family with some tested models | disclosed; preference is for a judge outside the tested roster |
 | One phrasing per scenario | a paraphrase check is a possible extension |
 | No seed, so identical inputs can produce different outputs | run-to-run variation is measured rather than assumed away |
+| Model-proxy quota is reserved per request and is finite | deep fills run a scenario subset; a run cut short records failures per cell rather than discarding the whole run |
 
 ### 5.3 Reproducibility
 

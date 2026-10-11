@@ -116,7 +116,8 @@ The only defence I found that works is to inspect the raw artifacts — the conv
 
 ## What was actually happening
 
-TODO: fill from the corrected run.
+TODO: fill once the corrected run completes. The corrected task is built,
+validated end to end, and blocked only on model-proxy quota.
 
 ## Why this is worth more than the result I wanted
 
@@ -153,7 +154,26 @@ Two things get in the way, and both are handled rather than assumed away. Tokeni
 
 ## Results
 
-TODO: fill from the final run.
+**What is demonstrated.** The three methodological findings above, each with the raw artifact to back it:
+
+1. A filler of real code primes the model toward that code's conventions, and a judge rubric that does not distinguish production dependencies from test tooling will read the imitation as a standards violation. Verified: 24 pytest mentions and zero unittest mentions in the filler; four long-context failures citing pytest and no other cause.
+2. A judge handed the subject's own account of its behaviour, before being asked to assess that behaviour, will score the account rather than the behaviour. Verified: moving the recall question into a separate judgement flipped the same model on the same scenarios from resisting everywhere to caving almost everywhere.
+3. A benchmark whose subject never reaches the model produces plausible output rather than an error. Verified: the cell conversation contains no system message, and the recall answer states that no standards were provided.
+
+Those are real, reproducible, and each cost a run to find.
+
+**What is not demonstrated.** The measurement the benchmark was built to make. The corrected run is blocked: the model proxy reserves quota per request from input plus maximum output, and refuses a request before sending it when the reservation exceeds the remaining balance. At the time of writing the remaining balance sits between $0.002 and $0.0038, which is below the cost of a single baseline cell.
+
+| Reservation | Result |
+| ---: | :--- |
+| 925,000-token request | refused, $0.749 |
+| 314,000-token request | refused, $0.273 |
+| baseline cell (~4k input, 4096 output) | refused, $0.017 |
+| 512-token probe | accepted |
+
+So the honest summary is: three errors found and fixed, the mechanism verified end to end, and the corrected numbers pending quota.
+
+I would rather report that than publish the earlier number, which was wrong in three independent ways.
 
 ## What this can and cannot show
 
@@ -177,7 +197,28 @@ TODO: fill from the final run.
 
 ## Reproduce it
 
-TODO: task links, dataset, pinned commit.
+| | |
+| :--- | :--- |
+| Benchmark task | `kaggle.com/benchmarks/tasks/digitamo/engineering-discipline` |
+| Context fillers | `kaggle.com/datasets/digitamo/engineering-discipline-haystack` |
+| Code corpus | `github.com/dlt-hub/dlt` at `ff414a0a4abbae8413678ff0da6fc66533236cc9` |
+| Prose corpus | 90 IETF RFCs, listed in `data/haystack/MANIFEST.json` |
+
+Everything needed to rebuild is in the repository:
+
+```bash
+./scripts/setup_corpus.sh          # pinned clone of the code corpus
+python3 scripts/build_corpus.py    # downloads RFCs, chunks both fillers
+python3 scripts/sync_prompt.py     # regenerate the markdown copy of the standards
+python3 scripts/analyze.py runs/**/*.run.json
+```
+
+`MANIFEST.json` records the corpus commit, every chunk, and the exclusion rules
+applied, so the fillers can be regenerated and compared rather than trusted.
+
+The verification guard is worth reading if you take one thing from this:
+`verify_standards_delivered()` in the task file, and the comment above it
+explaining why it exists.
 
 ---
 
