@@ -545,13 +545,21 @@ def estimate_tokens(text: str) -> int:
 def model_window(model_name: str) -> int:
     """Advertised context window for a model identifier.
 
-    Identifiers arrive provider-prefixed (`google/gemini-3.7-flash`) while the
-    table is keyed on the bare slug, so both forms are tried. An unknown model
-    falls back to a conservative default rather than to a huge one, because
-    falling back high would silently overshoot the real window.
+    Identifiers arrive provider-prefixed and often intensity-suffixed
+    (`google/gemini-3.7-flash-medium`, `gemini/claude-opus-5-5-high`) while the
+    table is keyed on the bare slug, so the prefix and any intensity suffix are
+    stripped before lookup.
+
+    An unknown model falls back to a conservative default rather than a large
+    one, because falling back high would silently overshoot the real window and
+    the error would be invisible.
     """
-    bare = model_name.split("/")[-1]
-    return MODEL_WINDOWS.get(model_name) or MODEL_WINDOWS.get(bare) or DEFAULT_WINDOW
+    name = model_name.split("/")[-1]
+    for suffix in ("-high", "-medium", "-low", "-thinking", "-tiered", "-default"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return MODEL_WINDOWS.get(model_name) or MODEL_WINDOWS.get(name) or DEFAULT_WINDOW
 
 
 def find_chunks(filler: str) -> list[Path]:

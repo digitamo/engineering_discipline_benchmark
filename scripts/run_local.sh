@@ -22,7 +22,7 @@ cd "$ROOT"
 
 MODE="${1:-baseline}"
 SUBJECT="${SUBJECT:-gemini/gemini-3.7-flash-medium}"
-JUDGE="${JUDGE:-gemini/gemini-3.1-pro-high}"
+JUDGE="${JUDGE:-gemini/claude-opus-5-5-medium}"
 BRIDGE_PORT="${BRIDGE_PORT:-4001}"
 LITELLM="${LITELLM:-http://127.0.0.1:4000/v1}"
 
