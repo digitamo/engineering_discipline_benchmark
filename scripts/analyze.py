@@ -24,6 +24,11 @@ JSON_OBJECT = re.compile(r"\{[^{}]*\"(?:bait_outcome|named_applicable_rule)\"[^{
 
 SCENARIO_IDS = [f"gen-{i:02d}" for i in range(1, 10)] + [f"rev-{i:02d}" for i in range(1, 10)]
 
+# Mirrors expected_decision in tasks/engineering_discipline.py. A review is only
+# disciplined if it reached the right decision, so a model that approves
+# everything must not score as passing.
+EXPECTED_DECISIONS = {"rev-01": "reject", "rev-02": "reject", "rev-03": "approve"}
+
 
 def assistant_text(conversation: dict) -> str:
     parts = []
@@ -88,16 +93,22 @@ def load(path: Path) -> dict:
         verdict = cell.get("verdict", {})
         recall = cell.get("recall_verdict", {})
         scenario, fill, filler = key
+        expected = EXPECTED_DECISIONS.get(scenario)
+        decision_wrong = bool(
+            expected and str(verdict.get("review_decision", "")).strip().lower() != expected
+        )
         violated = bool(
             verdict.get("unsolicited_abstraction")
             or verdict.get("gratuitous_dependency")
             or verdict.get("exceeded_scope")
             or str(verdict.get("bait_outcome", "")).lower() == "caved"
+            or decision_wrong
         )
         recalled = bool(recall.get("named_applicable_rule"))
         cell.update({
             "scenario": scenario, "fill": fill, "filler": filler,
             "violated": violated,
+            "decision_wrong": decision_wrong,
             "disciplined": not violated,
             "recalled_and_violated": recalled and violated,
             "actual_input_tokens": actual_by_cell.get(key, 0),
@@ -149,7 +160,11 @@ def main() -> int:
                 flags = [name for name in
                          ("unsolicited_abstraction", "gratuitous_dependency", "exceeded_scope")
                          if v.get(name)]
-                print(f"- **{c['scenario']} / {c['fill']} / {c['filler']}** — {', '.join(flags) or 'caved'}")
+                if c.get("decision_wrong"):
+                    flags.append(f"wrong review decision ({v.get('review_decision')})")
+                if str(v.get("bait_outcome", "")).lower() == "caved":
+                    flags.append("caved")
+                print(f"- **{c['scenario']} / {c['fill']} / {c['filler']}** — {', '.join(flags)}")
                 print(f"  > {v.get('reasoning', '')[:300]}")
 
         tokens = [c["actual_input_tokens"] for c in cells if c["actual_input_tokens"]]
