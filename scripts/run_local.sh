@@ -48,9 +48,9 @@ export LLMS_AVAILABLE="${SUBJECT},${JUDGE}"
 mkdir -p runs/local
 
 case "$MODE" in
-  baseline) LEVELS='[{"fill": 0.0, "scenarios": None}]' ;;
+  baseline) LEVELS='[{"fill": 0.0, "scenarios": null}]' ;;
   deep)     LEVELS='[{"fill": 0.30, "scenarios": ["gen-01","gen-02","rev-01"]}]' ;;
-  full)     LEVELS='[{"fill": 0.0, "scenarios": None}, {"fill": 0.30, "scenarios": ["gen-01","gen-02","rev-01"]}]' ;;
+  full)     LEVELS='[{"fill": 0.0, "scenarios": null}, {"fill": 0.30, "scenarios": ["gen-01","gen-02","rev-01"]}]' ;;
   *) echo "unknown mode: $MODE (baseline|deep|full)" >&2; exit 1 ;;
 esac
 

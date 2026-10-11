@@ -12,6 +12,7 @@ See DESIGN.md for the methodology and the reasons behind each choice.
 """
 
 import ast
+import dataclasses
 import glob
 import json
 import re
@@ -641,6 +642,53 @@ def verify_standards_delivered(chat) -> None:
         )
 
 
+def parse_verdict(schema, text: str):
+    """Build a verdict dataclass from a model's plain-text JSON reply.
+
+    Used when a model cannot do schema-constrained output. Claude through the
+    Antigravity bridge rejects `tool_choice`, which is how structured output is
+    implemented, so the judge prompt asks for JSON directly instead.
+    """
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    allowed = {field.name for field in dataclasses.fields(schema)}
+    try:
+        return schema(**{k: v for k, v in data.items() if k in allowed})
+    except TypeError:
+        return None
+
+
+def judge_with_schema(judge, prompt_text: str, schema, max_tokens: int):
+    """Ask the judge for a verdict, tolerating models without structured output.
+
+    Preferred path is schema-constrained output. Some models reject the tool
+    call that implements it, so the fallback states the required fields in the
+    prompt and parses the reply.
+    """
+    try:
+        verdict = judge.prompt(
+            prompt_text, schema=schema, extra_api_params={"max_tokens": max_tokens}
+        )
+        if verdict is not None:
+            return verdict
+    except Exception:  # noqa: BLE001 - fall through to the plain-text path
+        pass
+
+    fields = ", ".join(field.name for field in dataclasses.fields(schema))
+    raw = judge.prompt(
+        f"{prompt_text}\n\nReturn ONLY a JSON object with exactly these fields: {fields}.",
+        extra_api_params={"max_tokens": max_tokens},
+    )
+    return parse_verdict(schema, str(raw))
+
+
 def is_violation(scenario, verdict) -> bool:
     """Did the response break the standards?
 
@@ -687,12 +735,13 @@ def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: 
         # "recalled the rule and broke it anyway" is impossible without a
         # violation, so asking it on passing cells buys nothing.
         with kbench.chats.new(f"judge-{cell_name}"):
-            verdict = judge_llm.prompt(
+            verdict = judge_with_schema(
+                judge_llm,
                 build_response_judge_prompt(
                     scenario["task"], scenario.get("bait", ""), response_text
                 ),
-                schema=ResponseVerdict,
-                extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS},
+                ResponseVerdict,
+                MAX_OUTPUT_TOKENS,
             )
         if verdict is None:
             raise RuntimeError(
@@ -709,10 +758,11 @@ def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: 
     recall_verdict = None
     if recall_text:
         with kbench.chats.new(f"recall-judge-{cell_name}"):
-            recall_verdict = judge_llm.prompt(
+            recall_verdict = judge_with_schema(
+                judge_llm,
                 RECALL_JUDGE_TEMPLATE.format(task=scenario["task"], recall=recall_text),
-                schema=RecallVerdict,
-                extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS},
+                RecallVerdict,
+                MAX_OUTPUT_TOKENS,
             )
 
     recalled = bool(recall_verdict and recall_verdict.named_applicable_rule)
