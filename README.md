@@ -59,7 +59,8 @@ kaggle b t models       # models your token can reach
 │   ├── build_corpus.py             build the filler chunks
 │   ├── sync_prompt.py              regenerate the markdown copy of the standards
 │   ├── pilot.py                    small local run
-│   └── analyze.py                  read results from a run artifact
+│   ├── analyze.py                  read results from a run artifact
+│   └── wait_for_quota.sh           poll until quota returns, then run
 │
 ├── data/
 │   ├── system_prompt.md            generated from the task file, do not edit
@@ -144,11 +145,14 @@ every judge verdict — is recovered from the run artifact.
 
 Cost scales with fill fraction times the number of requests per cell, and each
 cell makes two requests carrying the full context (the task, then the recall
-question). A 90% fill of a million-token window is roughly 900,000 tokens per
-request.
+question). A 30% fill of a million-token window is roughly 300,000 tokens per
+request; a 90% fill is roughly 900,000.
 
-The deepest fill therefore runs a scenario subset. Widen it in `FILL_LEVELS` in
-the task file when quota allows.
+The model proxy reserves quota per request from input tokens plus maximum
+output, and refuses a request *before* sending it when the reservation exceeds
+the remaining balance. Output is capped in the task file for that reason. The
+deepest fill therefore also runs a scenario subset — widen it in `FILL_LEVELS`
+in the task file when quota allows.
 
 A ~900,000-token request is accepted by the model proxy and answered in around
 twenty seconds, verified directly.
@@ -212,6 +216,74 @@ and scoring code is versioned.
 Temperature zero is not determinism — routing, batching and server-side model
 rolls all intervene, and no seed is exposed. Run-to-run variation is measured
 rather than assumed away.
+
+---
+
+## What is done, and what is not
+
+This section exists because the difference matters. The benchmark is built and
+its mechanism is verified end to end. The corrected measurement has not been
+taken, and no number from it should be quoted.
+
+### Done and verified
+
+| | Evidence |
+| :--- | :--- |
+| Standards delivered to the model, with a guard that fails loudly if they are not | guard verified in both directions |
+| Context fill expressed as a fraction of each model's window | `google/gemini-3.7-flash` resolves to 1,048,576 |
+| Fillers chunked, so a smaller window loses the tail cleanly | 102 prose chunks, 60 code chunks |
+| Filler free of agent instructions and coding-style guidance | every marker scans at zero |
+| Judge sees the response, not the model's own account of it | separate call, separate conversation |
+| Reviews scored on the decision reached, not on code quality | `rev-03` is the approve-control |
+| Dependency violations scoped to production code | the pytest artifact no longer reproduces |
+| A run cut short by quota records failures per cell | task version 5 completed with 15 recorded failures instead of crashing |
+| A ~900,000-token request is accepted by the proxy | answered in ~20s, verified directly |
+
+### Not done
+
+| Item | Why it is not done | What it would take |
+| :--- | :--- | :--- |
+| **The corrected measurement run** | model-proxy quota exhausted; a baseline cell needs ~$0.005 and the balance sits between $0.002 and $0.0038 | quota to return; `scripts/wait_for_quota.sh` pushes and runs automatically when it does |
+| **Fills deeper than 30%** | a 90% fill of a million-token window is ~900,000 tokens per request, which exceeds the remaining balance | quota, then widen `FILL_LEVELS` |
+| **More than one model** | only `gemini-3.7-flash` was ever run, and only against the broken versions | quota, then `kaggle b t run -m <model>` per model |
+| **The precedence ablation** | the variant was written, then removed as dead code during the rewrite | re-add `SYSTEM_PROMPT_PRECEDENCE` and run both; answers whether stating precedence explicitly helps |
+| **A no-bait control arm** | every generation scenario is always baited, so bait susceptibility is not computable | add unbaited twins; without the contrast, over-engineering cannot be attributed to the bait |
+| **The self-generated context arm** | the most faithful simulation of a real session, and the most expensive | seed the model, let it elaborate over turns until the window is full, then ask the task |
+| **Judge validation** | no hand-labelled set exists, so judge agreement is asserted rather than measured | label ~60 outputs and report agreement |
+| **Run-to-run variance** | every run so far was a single run | repeat a subset and report the flip rate at temperature zero |
+| **Paraphrase robustness** | one phrasing per scenario | paraphrase each scenario and check the result survives |
+| **A judge outside the tested model family** | the platform chooses the judge; it has been Gemini while Gemini was under test | request or configure a judge from a different family |
+
+### The honest summary
+
+Three methodological errors were found, each with the raw artifact to prove it:
+a filler that primed a convention, a rubric broad enough to read the imitation as
+a violation, and a standards prompt that never reached the model. Two of the
+three cancelled, which is why the first result looked clean.
+
+That story is complete. The measurement it was meant to produce is not, and the
+leaderboard number currently reflects a run in which every cell failed.
+
+### If picking this up
+
+Start with `scripts/wait_for_quota.sh`, or run the task manually once quota
+allows:
+
+```bash
+source scripts/kbench-env.sh
+kaggle b t push engineering-discipline -f tasks/engineering_discipline.py \
+  -d digitamo/engineering-discipline-haystack
+kaggle b t run engineering-discipline -m gemini-3.7-flash --wait
+kaggle b t download engineering-discipline -o ./runs
+python3 scripts/analyze.py runs/engineering-discipline/**/*.run.json
+```
+
+The cheapest useful result is the baseline alone: set `FILL_LEVELS` to
+`[{"fill": 0.0, "scenarios": None}]` and run all nine scenarios with no context.
+That answers whether the model follows the standards when nothing is competing
+for its attention, and it costs a fraction of a deep fill.
+
+---
 
 ## Licence
 
