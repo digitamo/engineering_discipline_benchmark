@@ -1,680 +1,3 @@
-diff --git a/.github/workflows/test_destinations_local.yml b/.github/workflows/test_destinations_local.yml
-index 93fa59593..1c45709e0 100644
---- a/.github/workflows/test_destinations_local.yml
-+++ b/.github/workflows/test_destinations_local.yml
-@@ -72,7 +72,7 @@ jobs:
-             filesystem_drivers: "[\"memory\", \"file\"]"
-             extras: "--extra sqlalchemy --extra filesystem --extra parquet --extra postgres --extra oracle --group adbc"
-             needs_mysql: true
--            post_install_commands: "uv run pip install pymysql && uv run pip install sqlalchemy==1.4 && uv run dbc install mysql && uv run dbc install sqlite"
-+            post_install_commands: "uv run pip install pymysql duckdb-engine && uv run pip install sqlalchemy==1.4 && uv run dbc install mysql && uv run dbc install sqlite"
- 
-           # SQLAlchemy 2.0 (same as above but with sqlalchemy 2.0)
-           - display_name: sqlalchemy-2.0
-@@ -80,7 +80,7 @@ jobs:
-             filesystem_drivers: "[\"memory\", \"file\"]"
-             extras: "--extra sqlalchemy --extra filesystem --extra parquet --extra postgres --extra oracle --group adbc"
-             needs_mysql: true
--            post_install_commands: "uv run pip install pymysql && uv run pip install sqlalchemy==2.0 && uv run dbc install mysql && uv run dbc install sqlite"
-+            post_install_commands: "uv run pip install pymysql duckdb-engine && uv run pip install sqlalchemy==2.0 && uv run dbc install mysql && uv run dbc install sqlite"
- 
-     env:
-       ACTIVE_DESTINATIONS: ${{ matrix.destinations }}
-diff --git a/dlt/destinations/impl/duckdb/configuration.py b/dlt/destinations/impl/duckdb/configuration.py
-index 14b4e71cd..686eb3203 100644
---- a/dlt/destinations/impl/duckdb/configuration.py
-+++ b/dlt/destinations/impl/duckdb/configuration.py
-@@ -55,7 +55,7 @@ class DuckDbBaseCredentials(CredentialsConfiguration):
- 
-             if isinstance(native_value, duckdb.DuckDBPyConnection):
-                 self._external_conn = native_value
--                self.database = ":external:"
-+                self.database = self._external_conn_database(native_value)
-                 return
-         except ImportError:
-             pass
-@@ -67,6 +67,25 @@ class DuckDbBaseCredentials(CredentialsConfiguration):
-             else:
-                 raise
- 
-+    @staticmethod
-+    def _external_conn_database(conn: DuckDBPyConnection) -> str:
-+        """Returns the file path of the connection's current database so physical_location()
-+        identifies it, ':external:' for in-memory databases or when the path cannot be read.
-+        """
-+        try:
-+            cur = conn.cursor()
-+            try:
-+                row = cur.execute(
-+                    "select path from duckdb_databases() where database_name = current_database()"
-+                ).fetchone()
-+            finally:
-+                cur.close()
-+            if row and row[0]:
-+                return str(row[0])
-+        except Exception:
-+            pass
-+        return ":external:"
-+
-     def _conn_str(self) -> str:
-         raise NotImplementedError()
- 
-diff --git a/dlt/destinations/impl/sqlalchemy/configuration.py b/dlt/destinations/impl/sqlalchemy/configuration.py
-index c8996a3a7..17d9fb736 100644
---- a/dlt/destinations/impl/sqlalchemy/configuration.py
-+++ b/dlt/destinations/impl/sqlalchemy/configuration.py
-@@ -167,6 +167,11 @@ class SqlalchemyCredentials(ConnectionStringCredentials):
-         self._external_engine = value
-         self.managed_engine = ManagedEngine(self, engine=value)
- 
-+    @property
-+    def is_external_engine(self) -> bool:
-+        """True when credentials wrap a user-provided engine that dlt does not own."""
-+        return self.managed_engine is not None and not self.managed_engine._conn_owner
-+
-     def get_dialect_class(self) -> Optional[Type["Dialect"]]:
-         if not self.drivername:
-             return None
-@@ -214,6 +219,7 @@ class SqlalchemyCredentials(ConnectionStringCredentials):
- 
- 
- SQLITE_DB_NAME_PAT = "%s.db"
-+DUCKDB_DB_NAME_PAT = "%s.duckdb"
- 
- 
- @configspec
-@@ -257,23 +263,34 @@ class SqlalchemyClientConfiguration(WithLocalFiles, DestinationClientDwhConfigur
-         if self.engine_kwargs and not self.credentials.engine_kwargs:
-             self.credentials.engine_kwargs = self.engine_kwargs
- 
--        # resolve local file path for sqlite backends
--        if self.credentials.drivername == "sqlite":
--            if not SqlalchemyCredentials.is_memory_database(
--                self.credentials.database, self.credentials.query
--            ):
--                db = self.credentials.database
--                if not db or not os.path.isabs(db):
-+        # resolve local file path for file-based backends
-+        if self.credentials.drivername in ("sqlite", "duckdb"):
-+            db = self.credentials.database
-+            # skip in-memory databases and special locations like motherduck (md:)
-+            if not SqlalchemyCredentials.is_memory_database(db, self.credentials.query) and not (
-+                db or ""
-+            ).startswith("md:"):
-+                if self.credentials.is_external_engine:
-+                    # external engines are never rebuilt from credentials: keep the engine's
-+                    # database so physical_location() reports the file actually written to
-+                    if db and not os.path.isabs(db):
-+                        self.credentials.database = os.path.abspath(db)
-+                elif not db or not os.path.isabs(db):
-+                    name_pat = (
-+                        SQLITE_DB_NAME_PAT
-+                        if self.credentials.drivername == "sqlite"
-+                        else DUCKDB_DB_NAME_PAT
-+                    )
-                     self.credentials.database = os.path.normpath(
--                        self.make_location(db or None, SQLITE_DB_NAME_PAT)
-+                        self.make_location(db or None, name_pat)
-                     )
- 
-     def physical_location(self) -> str:
--        """Returns sqlite database path for sqlite, otherwise host:port."""
-+        """Returns database file path for file-based backends, otherwise host:port."""
-         if not self.credentials:
-             return ""
- 
--        if self.get_backend_name() == "sqlite":
-+        if self.get_backend_name() in ("sqlite", "duckdb"):
-             # each in-memory database is a separate database
-             if SqlalchemyCredentials.is_memory_database(
-                 self.credentials.database, self.credentials.query
-diff --git a/dlt/destinations/impl/sqlalchemy/db_api_client.py b/dlt/destinations/impl/sqlalchemy/db_api_client.py
-index 515fc1630..ccb7a70e3 100644
---- a/dlt/destinations/impl/sqlalchemy/db_api_client.py
-+++ b/dlt/destinations/impl/sqlalchemy/db_api_client.py
-@@ -205,6 +205,10 @@ class SqlalchemyClient(SqlClientBase[Connection]):
- 
-     def has_dataset(self) -> bool:
-         with self._ensure_transaction():
-+            if self.dialect_name == "duckdb":
-+                # duckdb_engine returns catalog-qualified names from get_schema_names(),
-+                # has_schema resolves the dataset within the current catalog
-+                return self.dialect.has_schema(self._current_connection, self.dataset_name)  # type: ignore[attr-defined,no-any-return]
-             schema_names = self.engine.dialect.get_schema_names(self._current_connection)  # type: ignore[attr-defined]
-         return self.dataset_name in schema_names
- 
-@@ -339,6 +343,16 @@ class SqlalchemyClient(SqlClientBase[Connection]):
-         key = self.dataset_name + "." + table_name
-         return self.metadata.tables.get(key)  # type: ignore[no-any-return]
- 
-+    def to_dataset_table(self, table_obj: sa.Table, staging: bool = False) -> sa.Table:
-+        """Returns table_obj copied into the current or staging dataset in the shared metadata.
-+        Reuses a copy already registered there to avoid duplicate table warnings.
-+        """
-+        dataset_name = self.staging_dataset_name if staging else self.dataset_name
-+        existing: Optional[sa.Table] = self.metadata.tables.get(dataset_name + "." + table_obj.name)
-+        if existing is not None:
-+            return existing
-+        return table_obj.to_metadata(self.metadata, schema=dataset_name)  # type: ignore[no-any-return]
-+
-     def create_table(self, table_obj: sa.Table) -> None:
-         with self._ensure_transaction():
-             table_obj.create(self._current_connection)
-diff --git a/dlt/destinations/impl/sqlalchemy/dialect.py b/dlt/destinations/impl/sqlalchemy/dialect.py
-index 538cb7c35..d09a2afa8 100644
---- a/dlt/destinations/impl/sqlalchemy/dialect.py
-+++ b/dlt/destinations/impl/sqlalchemy/dialect.py
-@@ -224,6 +224,17 @@ class OracleDialectCapabilities(DialectCapabilities):
-         return super().is_undefined_relation(e)
- 
- 
-+class DuckdbDialectCapabilities(DialectCapabilities):
-+    """Capabilities for DuckDB via duckdb_engine."""
-+
-+    def is_undefined_relation(self, e: Exception) -> Optional[bool]:
-+        msg = str(e).lower()
-+        # binder errors (ie. unknown column) also contain "not found" but are terminal
-+        if "binder error" in msg:
-+            return False
-+        return super().is_undefined_relation(e)
-+
-+
- def _format_mysql_datetime_literal(v: Any, precision: int = 6, no_tz: bool = False) -> str:
-     from dlt.common.data_writers.escape import format_datetime_literal
- 
-@@ -235,3 +246,4 @@ register_dialect_capabilities("mariadb", MysqlDialectCapabilities)
- register_dialect_capabilities("trino", TrinoDialectCapabilities)
- register_dialect_capabilities("mssql", MssqlDialectCapabilities)
- register_dialect_capabilities("oracle", OracleDialectCapabilities)
-+register_dialect_capabilities("duckdb", DuckdbDialectCapabilities)
-diff --git a/dlt/destinations/impl/sqlalchemy/load_jobs.py b/dlt/destinations/impl/sqlalchemy/load_jobs.py
-index 4d8f290e3..bbaf2da63 100644
---- a/dlt/destinations/impl/sqlalchemy/load_jobs.py
-+++ b/dlt/destinations/impl/sqlalchemy/load_jobs.py
-@@ -121,11 +121,8 @@ class SqlalchemyJsonLInsertJob(RunnableLoadJob, HasFollowupJobs):
- 
-     def run(self) -> None:
-         _sql_client = self._job_client.sql_client
--        # Copy the table to the current dataset (i.e. staging) if needed
--        # This is a no-op if the table is already in the correct schema
--        table = self.table.to_metadata(
--            self.table.metadata, schema=_sql_client.dataset_name  # type: ignore[attr-defined]
--        )
-+        # copy the table to the current dataset (i.e. staging) if needed
-+        table = _sql_client.to_dataset_table(self.table)
- 
-         with _sql_client.begin_transaction():
-             for chunk in self._iter_data_item_chunks():
-@@ -248,9 +245,7 @@ class SqlalchemyReplaceJob(SqlFollowupJob):
-         for table in table_chain:
-             # Tables must have already been created in metadata
-             table_obj = sql_client.get_existing_table(table["name"])
--            staging_table_obj = table_obj.to_metadata(
--                sql_client.metadata, schema=sql_client.staging_dataset_name
--            )
-+            staging_table_obj = sql_client.to_dataset_table(table_obj, staging=True)
-             stmt = str(table_obj.delete().compile(dialect=sql_client.dialect))
-             statements.append(stmt)
- 
-diff --git a/dlt/destinations/impl/sqlalchemy/merge_job.py b/dlt/destinations/impl/sqlalchemy/merge_job.py
-index 583341a95..ded75eddb 100644
---- a/dlt/destinations/impl/sqlalchemy/merge_job.py
-+++ b/dlt/destinations/impl/sqlalchemy/merge_job.py
-@@ -41,9 +41,7 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
-         root_table = table_chain[0]
- 
-         root_table_obj = sql_client.get_existing_table(root_table["name"])
--        staging_root_table_obj = root_table_obj.to_metadata(
--            sql_client.metadata, schema=sql_client.staging_dataset_name
--        )
-+        staging_root_table_obj = sql_client.to_dataset_table(root_table_obj, staging=True)
- 
-         primary_key_names = get_columns_names_with_prop(root_table, "primary_key")
-         merge_key_names = get_columns_names_with_prop(root_table, "merge_key")
-@@ -214,9 +212,7 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
-         # Insert from staging to dataset
-         for table in table_chain:
-             table_obj = sql_client.get_existing_table(table["name"])
--            staging_table_obj = table_obj.to_metadata(
--                sql_client.metadata, schema=sql_client.staging_dataset_name
--            )
-+            staging_table_obj = sql_client.to_dataset_table(table_obj, staging=True)
-             select_sql = staging_table_obj.select()
- 
-             if (primary_key_names and len(table_chain) > 1) or (
-@@ -361,9 +357,7 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
-         sqla_statements = []
-         root_table = table_chain[0]
-         root_table_obj = sql_client.get_existing_table(root_table["name"])
--        staging_root_table_obj = root_table_obj.to_metadata(
--            sql_client.metadata, schema=sql_client.staging_dataset_name
--        )
-+        staging_root_table_obj = sql_client.to_dataset_table(root_table_obj, staging=True)
- 
-         from_, to = get_validity_column_names(root_table)
-         hash_ = get_first_column_name_with_prop(root_table, "x-row-version")
-@@ -454,9 +448,7 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
-             )
- 
-             table_obj = sql_client.get_existing_table(table["name"])
--            staging_table_obj = table_obj.to_metadata(
--                sql_client.metadata, schema=sql_client.staging_dataset_name
--            )
-+            staging_table_obj = sql_client.to_dataset_table(table_obj, staging=True)
- 
-             insert_statement = table_obj.insert().from_select(
-                 [col.name for col in table_obj.columns],
-diff --git a/dlt/destinations/impl/sqlalchemy/sqlalchemy_job_client.py b/dlt/destinations/impl/sqlalchemy/sqlalchemy_job_client.py
-index b458a8546..ab1b8378e 100644
---- a/dlt/destinations/impl/sqlalchemy/sqlalchemy_job_client.py
-+++ b/dlt/destinations/impl/sqlalchemy/sqlalchemy_job_client.py
-@@ -108,6 +108,9 @@ class SqlalchemyJobClient(SqlJobClientWithStagingDataset):
-             schema_column["name"],
-             self.type_mapper.to_destination_type(schema_column, table),
-             nullable=schema_column.get("nullable", True),
-+            # dlt always provides explicit values, never use db-side identity columns
-+            # ie. duckdb_engine compiles autoincrement primary keys to unsupported BIGSERIAL
-+            autoincrement=False,
-         )
-         if self.config.create_unique_indexes:
-             col_.unique = schema_column.get("unique", False)
-@@ -145,11 +148,12 @@ class SqlalchemyJobClient(SqlJobClientWithStagingDataset):
-         elif parsed_file.file_format == "parquet":
-             table_obj = self._to_table_object(table)
-             dialect_name = self.config.credentials.engine.dialect.name
--            # Skip ADBC for SQLite: Python's sqlite3 and adbc_driver_sqlite bundle different
--            # SQLite versions. In WAL mode, both libraries mmap the same -shm index file but
--            # have separate internal state, causing page-level corruption when writing.
-+            # ADBC copy job implements mysql and sqlite dialects only. SQLite is skipped:
-+            # Python's sqlite3 and adbc_driver_sqlite bundle different SQLite versions.
-+            # In WAL mode, both libraries mmap the same -shm index file but have separate
-+            # internal state, causing page-level corruption when writing.
-             # See: https://github.com/tensorflow/tensorboard/issues/1467
--            if dialect_name != "sqlite" and adbc_has_driver(dialect_name)[0]:
-+            if dialect_name == "mysql" and adbc_has_driver(dialect_name)[0]:
-                 return SqlalchemyParquetADBCJob(file_path, table_obj)
-             else:
-                 return SqlalchemyParquetInsertJob(file_path, table_obj)
-diff --git a/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md b/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md
-index cfa398d4a..765d36373 100644
---- a/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md
-+++ b/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md
-@@ -8,7 +8,7 @@ keywords: [sql, sqlalchemy, database, destination]
- 
- The SQLAlchemy destination allows you to use any database that has an [SQLAlchemy dialect](https://docs.sqlalchemy.org/en/20/dialects/) implemented as a destination.
- 
--Currently, MySQL and SQLite are considered to have full support and are tested as part of the `dlt` CI suite. Other dialects are not tested but should generally work.
-+Currently, MySQL, SQLite, and DuckDB are considered to have full support and are tested as part of the `dlt` CI suite. Other dialects are not tested but should generally work.
- 
- ## Install dlt with SQLAlchemy
- 
-@@ -258,8 +258,56 @@ To work around this issue, use one of the following approaches:
-    workers=1
-    ```
- 
-+## Notes on DuckDB
-+Install the [duckdb_engine](https://github.com/Mause/duckdb_engine) dialect to use DuckDB with the SQLAlchemy destination:
-+
-+```sh
-+pip install duckdb-engine
-+```
-+
-+```py
-+import dlt
-+
-+pipeline = dlt.pipeline(
-+    pipeline_name="my_pipeline",
-+    destination=dlt.destinations.sqlalchemy(credentials="duckdb:///my_data.duckdb"),
-+    dataset_name="my_dataset",
-+)
-+```
-+
-+Relative database paths are placed in the pipeline's local directory, same as for SQLite and the native DuckDB destination.
-+
-+**Note**: Prefer the native [DuckDB destination](duckdb.md). Use SQLAlchemy when you need full control over the engine, e.g., to `ATTACH` encrypted database files with connection setup SQL.
-+
-+### In-memory databases
-+An in-memory DuckDB database is private to each connection. Pass an `Engine` that shares a single connection and load sequentially:
-+
-+```py
-+import dlt
-+import sqlalchemy as sa
-+
-+engine = sa.create_engine("duckdb:///:memory:", poolclass=sa.pool.StaticPool)
-+
-+pipeline = dlt.pipeline(
-+    pipeline_name="my_pipeline",
-+    destination=dlt.destinations.sqlalchemy(engine),
-+    dataset_name="my_dataset",
-+)
-+```
-+
-+```toml
-+[load]
-+workers=1
-+```
-+
-+### DuckDB dialect limitations
-+* `duckdb_engine` does not reflect primary key and unique constraints nor indexes: they are created when `create_primary_keys` / `create_unique_indexes` are enabled but cannot be read back with SQLAlchemy tooling.
-+* JSON columns are reflected as VARCHAR.
-+* VARCHAR precision is accepted in DDL but not stored by DuckDB.
-+* Parquet files are loaded with batch INSERT statements: ADBC ingestion is not implemented for this dialect.
-+
- ## Notes on other dialects
--We tested this destination on **mysql**, **sqlite**, **oracledb** and **mssql** dialects. Below are a few notes that may help enabling other dialects:
-+We tested this destination on **mysql**, **sqlite**, **duckdb**, **oracledb** and **mssql** dialects. Below are a few notes that may help enabling other dialects:
- 1. `dlt` must be able to recognize if a database exception relates to non existing entity (like table or schema). We put
- some work to recognize those for most of the popular dialects (look for `db_api_client.py`)
- 2. Primary keys and unique constraints are not created by default to avoid problems with particular dialects.
-diff --git a/tests/load/duckdb/test_duckdb_configuration.py b/tests/load/duckdb/test_duckdb_configuration.py
-index 9056524e4..77cca2db3 100644
---- a/tests/load/duckdb/test_duckdb_configuration.py
-+++ b/tests/load/duckdb/test_duckdb_configuration.py
-@@ -1,7 +1,10 @@
-+from pathlib import Path
- from typing import Optional
- 
-+import duckdb
- import pytest
- 
-+from dlt.common.configuration import resolve_configuration
- from dlt.destinations.impl.duckdb.configuration import (
-     DuckDbClientConfiguration,
-     DuckDbCredentials,
-@@ -33,3 +36,35 @@ def test_duckdb_fingerprint(
-     config = DuckDbClientConfiguration(credentials=credentials)
- 
-     assert config.fingerprint() == expected_fingerprint
-+
-+
-+def test_external_connection_physical_location(tmp_path: Path) -> None:
-+    """Connection-passed credentials must identify the real database file so two
-+    different databases are not considered join-compatible.
-+    """
-+    conn_a = duckdb.connect(str(tmp_path / "a.duckdb"))
-+    conn_b = duckdb.connect(str(tmp_path / "b.duckdb"))
-+    conn_mem = duckdb.connect()
-+    try:
-+        config_a = resolve_configuration(
-+            DuckDbClientConfiguration(credentials=conn_a)._bind_dataset_name(dataset_name="ds")
-+        )
-+        config_a2 = DuckDbClientConfiguration(credentials=DuckDbCredentials(conn_a))
-+        config_b = DuckDbClientConfiguration(credentials=DuckDbCredentials(conn_b))
-+        config_mem = DuckDbClientConfiguration(credentials=DuckDbCredentials(conn_mem))
-+
-+        # real file path survives config resolution (make_location keeps absolute paths)
-+        assert config_a.physical_location() == str(tmp_path / "a.duckdb")
-+        # same database file: joinable, different files or memory: not
-+        assert config_a.can_read_from(config_a2)
-+        assert not config_a.can_read_from(config_b)
-+        assert not config_mem.can_read_from(config_a)
-+        # in-memory connections keep the external marker and stay compatible when shared
-+        assert config_mem.physical_location() == ":external:"
-+        assert config_mem.can_read_from(
-+            DuckDbClientConfiguration(credentials=DuckDbCredentials(conn_mem))
-+        )
-+    finally:
-+        conn_a.close()
-+        conn_b.close()
-+        conn_mem.close()
-diff --git a/tests/load/pipeline/test_adbc_loading.py b/tests/load/pipeline/test_adbc_loading.py
-index 0b88f8b6e..ca6708050 100644
---- a/tests/load/pipeline/test_adbc_loading.py
-+++ b/tests/load/pipeline/test_adbc_loading.py
-@@ -39,6 +39,8 @@ def test_adbc_detection(destination_config: DestinationTestConfiguration) -> Non
-         driver = "sqlite"
-     elif driver == "sqlalchemy_mysql":
-         driver = "mysql"
-+    elif driver == "sqlalchemy_duckdb":
-+        pytest.skip("ADBC ingestion not implemented for duckdb via sqlalchemy")
- 
-     assert has_adbc_driver(driver)[0] is True
- 
-diff --git a/tests/load/pipeline/test_sqlalchemy_pipeline.py b/tests/load/pipeline/test_sqlalchemy_pipeline.py
-index f0d75bd8c..9f07e68d6 100644
---- a/tests/load/pipeline/test_sqlalchemy_pipeline.py
-+++ b/tests/load/pipeline/test_sqlalchemy_pipeline.py
-@@ -48,6 +48,10 @@ def test_sqlalchemy_create_indexes(
- 
-     from sqlalchemy import inspect
- 
-+    if destination_config.destination_name == "sqlalchemy_duckdb":
-+        # duckdb_engine does not reflect primary key constraints nor indexes
-+        return
-+
-     with pipeline.sql_client() as client:
-         with_pk: Table = client.reflect_table("with_pk", metadata=MetaData())
-         assert (with_pk.c.id.primary_key or False) is create_primary_keys
-@@ -155,4 +159,8 @@ def test_custom_type_mapper(destination_config: DestinationTestConfiguration) ->
- 
-         # Check that the json field was mapped to String with length 345
-         assert isinstance(json_column.type, sa.String)
--        assert json_column.type.length == 345
-+        if destination_config.destination_name == "sqlalchemy_duckdb":
-+            # duckdb accepts varchar length in DDL but does not store it
-+            assert json_column.type.length is None
-+        else:
-+            assert json_column.type.length == 345
-diff --git a/tests/load/sqlalchemy/test_duckdb_engine_destination.py b/tests/load/sqlalchemy/test_duckdb_engine_destination.py
-new file mode 100644
-index 000000000..ed75e0be9
---- /dev/null
-+++ b/tests/load/sqlalchemy/test_duckdb_engine_destination.py
-@@ -0,0 +1,45 @@
-+import os
-+
-+import pytest
-+
-+import dlt
-+from dlt.common.utils import uniq_id
-+
-+from tests.pipeline.utils import assert_load_info
-+
-+sa = pytest.importorskip("sqlalchemy")
-+pytest.importorskip("duckdb_engine")
-+
-+
-+@pytest.mark.parametrize(
-+    "db_file",
-+    ["mydata.db", "my.data.duckdb", "weird name.db", "123abc.db", ":memory:"],
-+    ids=["simple", "dotted", "space", "leading-digit", "memory"],
-+)
-+def test_duckdb_engine_detects_existing_dataset(tmp_path, db_file: str) -> None:
-+    """Second run against the same duckdb database must detect the existing dataset:
-+    duckdb_engine returns catalog-qualified schema names so a bare name lookup fails
-+    and dlt attempts CREATE SCHEMA again.
-+    """
-+    if db_file == ":memory:":
-+        # in-memory duckdb is private per connection: share a single one and load serially
-+        engine = sa.create_engine("duckdb:///:memory:", poolclass=sa.pool.StaticPool)
-+        os.environ["LOAD__WORKERS"] = "1"
-+    else:
-+        engine = sa.create_engine(f"duckdb:///{tmp_path / db_file}")
-+    pipeline_name = "duckdb_engine_dataset_" + uniq_id()
-+
-+    try:
-+        for item_id in (1, 2):
-+            pipeline = dlt.pipeline(
-+                destination=dlt.destinations.sqlalchemy(engine),
-+                pipeline_name=pipeline_name,
-+                dataset_name="myschema",
-+                pipelines_dir=str(tmp_path),
-+            )
-+
-+            info = pipeline.run([{"id": item_id}], table_name="numbers")
-+
-+            assert_load_info(info)
-+    finally:
-+        engine.dispose()
-diff --git a/tests/load/sqlalchemy/test_sqlalchemy_configuration.py b/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
-index 7dd77f452..136ba5fc1 100644
---- a/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
-+++ b/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
-@@ -134,7 +134,10 @@ def test_sqlalchemy_credentials_from_engine() -> None:
-     assert creds.database == ":memory:"
- 
- 
--def test_sqlalchemy_sqlite_follows_local_dir() -> None:
-+@pytest.mark.parametrize(
-+    "driver,ext", [("sqlite", ".db"), ("duckdb", ".duckdb")], ids=["sqlite", "duckdb"]
-+)
-+def test_sqlalchemy_file_db_follows_local_dir(driver: str, ext: str) -> None:
-     local_dir = os.path.join(get_test_storage_root(), uniq_id())
-     os.makedirs(local_dir)
-     os.environ[DLT_LOCAL_DIR] = local_dir
-@@ -142,59 +145,96 @@ def test_sqlalchemy_sqlite_follows_local_dir() -> None:
-     # default case: no explicit database, uses destination_type as default name
-     c = resolve_configuration(
-         SqlalchemyClientConfiguration(
--            credentials=SqlalchemyCredentials("sqlite:///")
-+            credentials=SqlalchemyCredentials(f"{driver}:///")
-         )._bind_dataset_name(dataset_name="test_dataset")
-     )
--    db_path = os.path.join(local_dir, "sqlalchemy.db")
-+    db_path = os.path.join(local_dir, f"sqlalchemy{ext}")
-     assert c.credentials.database == os.path.abspath(db_path)
- 
-     # named destination: uses destination_name for the filename
-     c = resolve_configuration(
-         SqlalchemyClientConfiguration(
--            credentials=SqlalchemyCredentials("sqlite:///"),
-+            credentials=SqlalchemyCredentials(f"{driver}:///"),
-             destination_name="named",
-         )._bind_dataset_name(dataset_name="test_dataset")
-     )
--    db_path = os.path.join(local_dir, "named.db")
-+    db_path = os.path.join(local_dir, f"named{ext}")
-     assert c.credentials.database == os.path.abspath(db_path)
- 
-     # explicit relative location: relocated to local_dir
-     c = resolve_configuration(
-         SqlalchemyClientConfiguration(
--            credentials=SqlalchemyCredentials("sqlite:///./local.db"),
-+            credentials=SqlalchemyCredentials(f"{driver}:///./local{ext}"),
-         )._bind_dataset_name(dataset_name="test_dataset")
-     )
--    db_path = os.path.join(local_dir, "local.db")
-+    db_path = os.path.join(local_dir, f"local{ext}")
-     assert c.credentials.database.endswith(db_path)
- 
--    # pipeline context: uses <pipeline_name>.db for the filename
--    pipeline = dlt.pipeline("test_sqlalchemy_sqlite_follows_local_dir")
-+    # pipeline context: uses <pipeline_name>.<ext> for the filename
-+    pipeline = dlt.pipeline(f"test_sqlalchemy_follows_local_dir_{driver}")
-     c = resolve_configuration(
-         pipeline._bind_local_files(
-             SqlalchemyClientConfiguration(
--                credentials=SqlalchemyCredentials("sqlite:///"),
-+                credentials=SqlalchemyCredentials(f"{driver}:///"),
-             )._bind_dataset_name(dataset_name="test_dataset")
-         )
-     )
--    db_path = os.path.join(local_dir, "test_sqlalchemy_sqlite_follows_local_dir.db")
-+    db_path = os.path.join(local_dir, f"test_sqlalchemy_follows_local_dir_{driver}{ext}")
-     assert c.credentials.database.endswith(db_path)
- 
-     # absolute path: preserved as-is
-     c = resolve_configuration(
-         SqlalchemyClientConfiguration(
--            credentials=SqlalchemyCredentials("sqlite:////absolute/path/test.db"),
-+            credentials=SqlalchemyCredentials(f"{driver}:////absolute/path/test{ext}"),
-         )._bind_dataset_name(dataset_name="test_dataset")
-     )
--    assert c.credentials.database == "/absolute/path/test.db"
-+    assert c.credentials.database == f"/absolute/path/test{ext}"
- 
-     # memory database: preserved as-is
-     c = resolve_configuration(
-         SqlalchemyClientConfiguration(
--            credentials=SqlalchemyCredentials("sqlite:///:memory:"),
-+            credentials=SqlalchemyCredentials(f"{driver}:///:memory:"),
-         )._bind_dataset_name(dataset_name="test_dataset")
-     )
-     assert c.credentials.database == ":memory:"
- 
-+    if driver == "duckdb":
-+        # motherduck database: preserved as-is
-+        c = resolve_configuration(
-+            SqlalchemyClientConfiguration(
-+                credentials=SqlalchemyCredentials("duckdb:///md:my_db"),
-+            )._bind_dataset_name(dataset_name="test_dataset")
-+        )
-+        assert c.credentials.database == "md:my_db"
-+
-+
-+def test_external_engine_database_not_relocated() -> None:
-+    """A user-provided engine is never rebuilt from credentials: its relative database
-+    path must not be relocated to the local dir and physical_location() must report
-+    the file the engine actually writes to.
-+    """
-+    local_dir = os.path.join(get_test_storage_root(), uniq_id())
-+    os.makedirs(local_dir)
-+    os.environ[DLT_LOCAL_DIR] = local_dir
-+
-+    engine = sa.create_engine("sqlite:///relative_data.db")
-+    c = resolve_configuration(
-+        SqlalchemyClientConfiguration(credentials=SqlalchemyCredentials(engine))._bind_dataset_name(
-+            dataset_name="test_dataset"
-+        )
-+    )
-+    assert c.credentials.is_external_engine
-+    assert c.credentials.database == os.path.abspath("relative_data.db")
-+    assert c.physical_location() == os.path.abspath("relative_data.db")
-+
-+    # in-memory external engine has no physical identity
-+    c = resolve_configuration(
-+        SqlalchemyClientConfiguration(
-+            credentials=SqlalchemyCredentials(sa.create_engine("sqlite:///:memory:"))
-+        )._bind_dataset_name(dataset_name="test_dataset")
-+    )
-+    assert c.physical_location() == ""
-+
- 
- def test_engine_kwargs_forwarded_to_credentials() -> None:
-     """engine_kwargs set on the configuration should be forwarded to credentials."""
-diff --git a/tests/load/test_job_client.py b/tests/load/test_job_client.py
-index 10ac94523..250d3dcc6 100644
---- a/tests/load/test_job_client.py
-+++ b/tests/load/test_job_client.py
-@@ -542,6 +542,9 @@ def test_get_storage_table_with_all_types(
-                 continue
-         if client.config.destination_type == "dremio" and c["data_type"] == "json":
-             continue
-+        # duckdb_engine reflects JSON columns as VARCHAR
-+        if client.config.destination_name == "sqlalchemy_duckdb" and c["data_type"] == "json":
-+            continue
-         if not client.capabilities.supports_native_boolean and c["data_type"] == "bool":
-             # The reflected data type is probably either int or boolean depending on how the client is implemented
-             assert expected_c["data_type"] in ("bigint", "bool")
-diff --git a/tests/load/utils.py b/tests/load/utils.py
-index ead9134c7..7245c13ad 100644
---- a/tests/load/utils.py
-+++ b/tests/load/utils.py
-@@ -554,6 +554,13 @@ def destinations_configs(
-                 destination_name="sqlalchemy_sqlite",
-                 credentials="sqlite:///db.sqlite",
-             ),
-+            DestinationTestConfiguration(
-+                destination_type="sqlalchemy",
-+                supports_merge=True,
-+                supports_dbt=False,
-+                destination_name="sqlalchemy_duckdb",
-+                credentials="duckdb:///db.duckdb",
-+            ),
-             # TODO: enable in sql alchemy destination test, 99% of tests work
-             # DestinationTestConfiguration(
-             #     destination_type="sqlalchemy",
-
-
-===== COMMIT 80739621 =====
-
-
-commit 807396211
-Author: Alena Astrakhantseva
-Date: 2026-07-01
-
-    Docs: playground destination  (#4148)
-
 diff --git a/docs/website/docs/hub/getting-started/installation.md b/docs/website/docs/hub/getting-started/installation.md
 index 654ad6e7e..2248ea30b 100644
 --- a/docs/website/docs/hub/getting-started/installation.md
@@ -2900,4 +2223,653 @@ index 44dde5187..8b383536e 100644
 commit 14f4af5f8
 Author: Alberto
 Date: 2026-06-19
+
+    Add eu static ips for dlthub (#4085)
+
+diff --git a/docs/website/docs/hub/pipeline-operations/job-configuration.md b/docs/website/docs/hub/pipeline-operations/job-configuration.md
+index 6a61df8b3..dd9899b25 100644
+--- a/docs/website/docs/hub/pipeline-operations/job-configuration.md
++++ b/docs/website/docs/hub/pipeline-operations/job-configuration.md
+@@ -54,9 +54,16 @@ def sync_from_vendor():
+     ...
+ ```
+ 
+-Static egress routing forces job traffic through the US region. See [Regions and data residency](../platform-capabilities/regions.md) for how regional data planes relate to your organization.
++Which static egress IPs your jobs use depends on your organization's region and data residency settings. See [Regions and data residency](../platform-capabilities/regions.md) for how regional data planes relate to your organization.
+ 
+-The static egress IPs are:
++The static egress IPs for the **EU region** are:
++- 63.181.217.92
++- 18.156.57.4
++- 63.183.227.2
++- 63.182.151.74
++- 18.197.112.47
++
++The static egress IPs for the **US region** are:
+ - 34.205.113.62
+ - 44.221.24.144
+ - 34.193.87.36
+
+
+===== COMMIT 32ba71b2 =====
+
+
+commit 32ba71b2d
+Author: Alberto
+Date: 2026-06-19
+
+    Add eu proxy IPs (#4084)
+
+diff --git a/docs/website/docs/hub/pipeline-operations/job-configuration.md b/docs/website/docs/hub/pipeline-operations/job-configuration.md
+index 6a61df8b3..dd9899b25 100644
+--- a/docs/website/docs/hub/pipeline-operations/job-configuration.md
++++ b/docs/website/docs/hub/pipeline-operations/job-configuration.md
+@@ -54,9 +54,16 @@ def sync_from_vendor():
+     ...
+ ```
+ 
+-Static egress routing forces job traffic through the US region. See [Regions and data residency](../platform-capabilities/regions.md) for how regional data planes relate to your organization.
++Which static egress IPs your jobs use depends on your organization's region and data residency settings. See [Regions and data residency](../platform-capabilities/regions.md) for how regional data planes relate to your organization.
+ 
+-The static egress IPs are:
++The static egress IPs for the **EU region** are:
++- 63.181.217.92
++- 18.156.57.4
++- 63.183.227.2
++- 63.182.151.74
++- 18.197.112.47
++
++The static egress IPs for the **US region** are:
+ - 34.205.113.62
+ - 44.221.24.144
+ - 34.193.87.36
+
+
+===== COMMIT 128606d5 =====
+
+
+commit 128606d51
+Author: Joaquin Coromina
+Date: 2026-06-18
+
+    docs(hub): recommend dlthub-init vs dlthub-start consistently in onboarding docs (#4080)
+
+diff --git a/docs/website/docs/hub/getting-started/installation.md b/docs/website/docs/hub/getting-started/installation.md
+index 32fcea702..654ad6e7e 100644
+--- a/docs/website/docs/hub/getting-started/installation.md
++++ b/docs/website/docs/hub/getting-started/installation.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Installation
+ description: Install dlt[hub], create a workspace, and license paid features
+-keywords: [installation, dlthub, dlthub init, workspace mode, license]
++keywords: [installation, dlthub, dlthub-init, dlthub-start, workspace mode, license]
+ ---
+ 
+ :::info Supported Python versions
+@@ -42,7 +42,11 @@ If you don't have `uv` yet, either [install it first](#setting-up-your-environme
+ pipx run dlthub-start
+ ```
+ 
+-Either way, it prompts you to pick a coding agent (Claude, Cursor, or Codex), scaffolds a workspace with `.dlt/.workspace` already set, and runs `uv sync` so `dlt[hub]` and all workspace dependencies are installed.
++Either way, it prompts you to pick a coding agent (Claude / Cursor / Codex), then runs a guided first experience — it scaffolds the workspace, installs `dlt[hub]` and dependencies with `uv sync`, logs you in to the dltHub platform, runs a sample pipeline in a playground, and launches your agent ready to build your own source.
++
++:::tip
++Run `dlthub-start` yourself with no arguments — it's interactive and guides you through each step. It scaffolds into your current folder, so the AI skills land right where your coding agent is open.
++:::
+ 
+ ## Setting up your environment
+ 
+@@ -82,15 +86,15 @@ source .venv/bin/activate
+ 
+ ## Add dltHub to an existing project
+ 
+-To install `dlt[hub]` into an existing project, activate its virtual environment and run:
++To add dltHub to an existing project, run:
+ ```sh
+-uv pip install "dlt[hub]"
++uvx dlthub-init@latest
+ ```
+-This installs `dlt` plus two plugin packages pulled in by the `hub` extra:
+-* `dlthub`—enables the **dlthub** command and features like AI toolkits and transformations
+-* `dlthub-client`—enables access to the [managed dltHub Platform](../pipeline-operations/overview.md) (login, deploy, run, serve, etc.)
++This scaffolds a workspace, installs `dlt[hub]`, and sets up the AI skills your coding agent uses. The `dlt[hub]` extra pulls in two plugin packages:
++* `dlthub`—enables the `dlthub` command and features like AI toolkits and transformations
++* `dlthub-client`—enables access to the [managed dltHub platform](../pipeline-operations/overview.md) (login, deploy, run, serve, etc.)
+ 
+-Workspace-level dependencies (destinations like `duckdb`, plus tools like `marimo` or `fastmcp` used by notebooks and MCP jobs) are managed in your workspace's `pyproject.toml`, not via `dlt` extras. Run `dlthub init` (see [below](#enable-workspace-mode))—it scaffolds a `pyproject.toml` you can extend with `uv add <package>`.
++Workspace-level dependencies (destinations like `duckdb`, plus tools like `marimo` or `fastmcp` used by notebooks and MCP jobs) are managed in the generated `pyproject.toml`, not via `dlt` extras—extend it with `uv add <package>`.
+ 
+ ## Upgrade existing installation
+ 
+@@ -116,10 +120,10 @@ how to install a compatible plugin version).
+ The full dltHub feature surface—profiles, the `dlthub` CLI host, and [managed-platform commands](../pipeline-operations/overview.md)—is gated behind **Workspace mode**, signaled by a `.dlt/.workspace` marker file. The simplest way to turn it on is:
+ 
+ ```sh
+-dlthub init
++uvx dlthub-init@latest
+ ```
+ 
+-This scaffolds a fresh dltHub workspace—it creates the `.dlt/.workspace` marker plus `config.toml`, `secrets.toml`, `.gitignore`, and a `pyproject.toml` (or `requirements.txt` if `uv` isn't on `PATH`). See [Initialize a pipeline](../ingestion/init.md) for the next steps.
++This scaffolds a fresh, ready-to-run dltHub workspace—the `.dlt/.workspace` marker, local config and secrets, dependencies, and the dltHub AI skills your coding agent uses—and installs everything with `uv sync`. See [Initialize a pipeline](../ingestion/init.md) for the next steps.
+ 
+ If you'd rather flip the toggle by hand in an existing project, create the empty marker file yourself:
+ 
+diff --git a/docs/website/docs/hub/getting-started/introduction.md b/docs/website/docs/hub/getting-started/introduction.md
+index 9222c70a3..dfce90368 100644
+--- a/docs/website/docs/hub/getting-started/introduction.md
++++ b/docs/website/docs/hub/getting-started/introduction.md
+@@ -20,7 +20,7 @@ Use of the dltHub platform and toolkits is subject to a commercial [dltHub Licen
+ uvx dlthub-start@latest
+ ```
+ 
+-Scaffolds a local workspace with an example pipeline, and `dlt[hub]` installed. See [installation](installation.md) for prerequisites and alternative install paths.
++Runs a guided first experience: it scaffolds a local workspace (dltHub AI Workbench + `dlt[hub]`), installs dependencies, logs you in to the dltHub platform, runs a sample pipeline in a playground, and launches your coding agent ready to build your own source. See [installation](installation.md) for prerequisites and alternative install paths.
+ 
+ On the [dltHub platform](../pipeline-operations/overview.md), set `destination="playground"` for a zero-config destination that is ideal for testing and a quick first run.
+ 
+diff --git a/docs/website/docs/hub/getting-started/oss-and-dlthub.md b/docs/website/docs/hub/getting-started/oss-and-dlthub.md
+index 1462ab348..701d18854 100644
+--- a/docs/website/docs/hub/getting-started/oss-and-dlthub.md
++++ b/docs/website/docs/hub/getting-started/oss-and-dlthub.md
+@@ -44,12 +44,11 @@ dltHub is a managed cloud platform for running your dlt pipelines, transformatio
+ - **Web UI** at [app.dlthub.com](https://app.dlthub.com) — sign up to deploy, schedule, monitor pipelines, manage profiles, browse datasets.
+ - **Locally, from the CLI or Python** — bootstrap a new workspace in one command:
+   ```sh
+-  uvx dlthub-start@latest my-workspace
++  uvx dlthub-start@latest
+   ```
+   This creates a runnable workspace with the AI Workbench, example pipelines, and the [`dlt[hub]`](installation.md) extra installed. To add dltHub to an existing project instead, run:
+   ```sh
+-  pip install "dlt[hub]"
+-  dlthub init
++  uvx dlthub-init@latest
+   ```
+   Either way, you get the dltHub workspace and dashboard, the AI development tooling (`dlthub ai`, MCP server, AI Workbench), per-source contexts, and the `dlthub` library that adds data quality, transformations, and premium sources/destinations.
+ 
+diff --git a/docs/website/docs/hub/ingestion/delta.md b/docs/website/docs/hub/ingestion/delta.md
+index 9cc7c603f..80c724f13 100644
+--- a/docs/website/docs/hub/ingestion/delta.md
++++ b/docs/website/docs/hub/ingestion/delta.md
+@@ -19,7 +19,7 @@ Make sure you have installed the necessary dependencies:
+ pip install deltalake
+ ```
+ 
+-If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-start@latest` (see the [installation guide](../getting-started/installation.md)). Then, from inside the workspace, add a Delta pipeline:
++If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-init@latest` (see the [installation guide](../getting-started/installation.md)). Then, from inside the workspace, add a Delta pipeline:
+ 
+ ```sh
+ dlthub pipeline init sql_database delta
+diff --git a/docs/website/docs/hub/ingestion/iceberg.md b/docs/website/docs/hub/ingestion/iceberg.md
+index b5771f3cd..af6222cd7 100644
+--- a/docs/website/docs/hub/ingestion/iceberg.md
++++ b/docs/website/docs/hub/ingestion/iceberg.md
+@@ -28,7 +28,7 @@ The Iceberg destination in dlt allows you to load data into Iceberg tables using
+ If you don't have a dltHub workspace yet, scaffold one with:
+ 
+ ```sh
+-uvx dlthub-start@latest
++uvx dlthub-init@latest
+ ```
+ 
+ This installs `dlt[hub]` and sets up the workspace. Alternatively, install the required extras into an existing project:
+diff --git a/docs/website/docs/hub/ingestion/init.md b/docs/website/docs/hub/ingestion/init.md
+index 0f94ce6f7..3f48d5b67 100644
+--- a/docs/website/docs/hub/ingestion/init.md
++++ b/docs/website/docs/hub/ingestion/init.md
+@@ -27,7 +27,7 @@ Outside of a workspace (plain OSS `dlt`), the same scaffold is reachable as `dlt
+ Before you start, make sure you followed the [installation instructions](../getting-started/installation.md) and have a dltHub workspace initialized. The fastest way is:
+ 
+ ```sh
+-uvx dlthub-start@latest
++uvx dlthub-init@latest
+ ```
+ 
+ This scaffolds a workspace with `.dlt/.workspace` already set, the AI toolkits vendored, and `dlt[hub]` synced. See the [installation guide](../getting-started/installation.md) for the alternative paths (adding to an existing project, or enabling workspace mode by hand).
+diff --git a/docs/website/docs/hub/ingestion/ms-sql.md b/docs/website/docs/hub/ingestion/ms-sql.md
+index f261be87a..2dc08c660 100644
+--- a/docs/website/docs/hub/ingestion/ms-sql.md
++++ b/docs/website/docs/hub/ingestion/ms-sql.md
+@@ -45,7 +45,7 @@ WITH (TRACK_COLUMNS_UPDATED = ON);
+ 
+ ### Set up dlthub and drivers
+ 
+-* If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-start@latest` (see the [installation guide](../getting-started/installation.md) for prerequisites and alternative install paths).
++* If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-init@latest` (see the [installation guide](../getting-started/installation.md) for prerequisites and alternative install paths).
+ 
+ * Install the Microsoft ODBC Driver for SQL Server according to the official [instructions](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server?view=sql-server-ver16). If you prefer, there is also a [Python library alternative](https://www.pymssql.org/).
+ 
+diff --git a/docs/website/docs/hub/ingestion/rest-api-source.md b/docs/website/docs/hub/ingestion/rest-api-source.md
+index 5101daadb..d340c0aea 100644
+--- a/docs/website/docs/hub/ingestion/rest-api-source.md
++++ b/docs/website/docs/hub/ingestion/rest-api-source.md
+@@ -20,35 +20,17 @@ The dltHub AI workbench works with **Claude Code**, **Cursor**, and **Codex**.
+ 
+ ## Setup
+ 
+-### Python environment
++### Create the workspace
+ 
+-Install `uv` ([instructions](https://docs.astral.sh/uv/getting-started/installation/)) and create a virtual environment:
++Install `uv` ([instructions](https://docs.astral.sh/uv/getting-started/installation/)), then scaffold a dltHub workspace — this installs `dlt[hub]` and all dependencies and sets up the AI skills your coding assistant uses (see the [installation guide](../getting-started/installation.md)):
+ 
+ ```sh
+-uv venv && source .venv/bin/activate
+-```
+-
+-We recommend using uv. If you use uv, prefix all following commands with `uv run`. 
+-
+-### Install dlt
+-
+-Install the dlt workspace:
+-
+-```sh
+-pip install "dlt[hub]"
+-```
+-or upgrade to the latest version:
+-
+-```sh
+-pip install --upgrade "dlt[hub]"
++uvx dlthub-init@latest
+ ```
+ 
+ ### Initialize the AI assistant
+ 
+-First create the dlthub workspace and install dependencies (see the [installation guide](../getting-started/installation.md)):
+-```sh
+-uvx dlthub-start@latest
+-```
++Wire up your specific coding assistant:
+ 
+ <Tabs values={[{"label": "Claude Code", "value": "claude"}, {"label": "Cursor", "value": "cursor"}, {"label": "Codex", "value": "codex"}]} groupId="ai-agent" defaultValue="claude">
+ <TabItem value="claude">
+diff --git a/docs/website/docs/hub/ingestion/snowflake-plus.md b/docs/website/docs/hub/ingestion/snowflake-plus.md
+index 89a9dfda1..6298e77c3 100644
+--- a/docs/website/docs/hub/ingestion/snowflake-plus.md
++++ b/docs/website/docs/hub/ingestion/snowflake-plus.md
+@@ -54,7 +54,7 @@ Once the `snowflake` extra is installed, you can configure a pipeline to use `sn
+ GRANT USAGE ON EXTERNAL VOLUME <external_volume_name> TO ROLE <role_name>;
+ ```
+ 
+-5. If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-start@latest` (see the [installation guide](../getting-started/installation.md)). Then, from inside the workspace, add a Snowflake pipeline:
++5. If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-init@latest` (see the [installation guide](../getting-started/installation.md)). Then, from inside the workspace, add a Snowflake pipeline:
+ 
+ ```sh
+ dlthub pipeline init sql_database snowflake
+diff --git a/docs/website/docs/hub/pipeline-operations/overview.md b/docs/website/docs/hub/pipeline-operations/overview.md
+index f435b7b29..e66fcc5a6 100644
+--- a/docs/website/docs/hub/pipeline-operations/overview.md
++++ b/docs/website/docs/hub/pipeline-operations/overview.md
+@@ -152,5 +152,5 @@ For detailed CLI documentation, see [CLI](../command-line-interface.md).
+ - **UI operations**: new jobs must currently be created via the CLI; once a job exists, subsequent runs can be triggered from the Web UI (and schedules can be changed there too)
+ - **Pagination**: list views are paginated; the page size can be adjusted in the Web UI
+ - **Log latency**: logs typically lag a few seconds during execution and are guaranteed complete after the run finishes (completed or failed state)
+-- **One workspace per repo**: a single GitHub repository can only be connected to one remote workspace at a time; reconnecting deactivates jobs deployed under the previous binding — see [Workspace setup](workspace-setup.md#3-log-in-to-the-dlthub-platform)
++- **One workspace per repo**: a single GitHub repository can only be connected to one remote workspace at a time; reconnecting deactivates jobs deployed under the previous binding — see [Workspace setup](workspace-setup.md#2-log-in-to-the-dlthub-platform)
+ - **No drift detection**: the CLI does not yet detect whether local code differs from remote. Run `dlthub workspace deployment sync` (or any `run` / `serve` / `deploy`) to ensure your latest code is deployed
+diff --git a/docs/website/docs/hub/pipeline-operations/profiles.md b/docs/website/docs/hub/pipeline-operations/profiles.md
+index 74c92c053..f696552df 100644
+--- a/docs/website/docs/hub/pipeline-operations/profiles.md
++++ b/docs/website/docs/hub/pipeline-operations/profiles.md
+@@ -25,7 +25,7 @@ Before you start, make sure you have followed the [installation instructions](..
+ 
+ [More about dlt Workspace →](../getting-started/installation.md#what-is-a-dlthub-workspace)
+ 
+-[Scaffold](../ingestion/init.md) a workspace with `uvx dlthub-start@latest`, then add a pipeline to it from inside the workspace:
++[Scaffold](../ingestion/init.md) a workspace with `uvx dlthub-init@latest`, then add a pipeline to it from inside the workspace:
+ 
+ ```sh
+ dlthub pipeline init pokemon_api duckdb
+diff --git a/docs/website/docs/hub/pipeline-operations/workspace-setup.md b/docs/website/docs/hub/pipeline-operations/workspace-setup.md
+index 09fd569eb..00b12c72c 100644
+--- a/docs/website/docs/hub/pipeline-operations/workspace-setup.md
++++ b/docs/website/docs/hub/pipeline-operations/workspace-setup.md
+@@ -8,38 +8,19 @@ keywords: [dlthub platform, workspace, setup, login, profiles, credentials, conf
+ 
+ A workspace ready for the dltHub platform is a regular Python project with a few additions. You can easily convert any existing dlt project into a dltHub workspace.
+ 
+-## 1. Initialize a Python project
++## 1. Enable dltHub platform features
+ 
+-If your project doesn't have a `pyproject.toml` yet, create one:
++Initialize the workspace:
+ 
+ ```sh
+-uv init
++uvx dlthub-init@latest
+ ```
+ 
+-The dltHub platform uses `pyproject.toml` to install dependencies remotely.
++`uvx dlthub-init@latest` scaffolds a ready-to-run workspace—the `.dlt/.workspace` marker that turns on workspace mode, local config and secrets, a managed `pyproject.toml`, and the dltHub AI skills your coding agent uses—then installs dependencies with `uv sync`.
+ 
+-## 2. Enable dltHub platform features
++The `.dlt/.workspace` marker activates [profile support](./profiles.md) and enables the `dlthub` CLI command (including `dlthub profile` and `dlthub local`). Run `uvx dlthub-init@latest --help` for options like `--no-sync`. If you'd rather flip the toggle by hand, see [Enable workspace mode](../getting-started/installation.md#enable-workspace-mode).
+ 
+-Install `dlt[hub]` and initialize the workspace:
+-
+-```sh
+-uv add "dlt[hub]"
+-uv run dlthub init
+-```
+-
+-`dlthub init` scaffolds:
+-
+-```text
+-.dlt/
+-├── .workspace          # marker that enables the extended `dlthub` command surface
+-├── config.toml         # workspace-wide config
+-└── secrets.toml        # workspace-wide secrets (gitignored)
+-.gitignore
+-```
+-
+-The `.dlt/.workspace` marker activates [profile support](./profiles.md) and enables the `dlthub` CLI command (including `dlthub profile` and `dlthub local`). Pass `--name <workspace>` to override the default (the current directory's basename), or `--dry-run` to preview the file plan without writing. If you'd rather flip the toggle by hand, see [Enable workspace mode](../getting-started/installation.md#enable-workspace-mode).
+-
+-## 3. Log in to the dltHub platform
++## 2. Log in to the dltHub platform
+ 
+ ```sh
+ dlthub login
+@@ -65,7 +46,7 @@ A single GitHub repository can be connected to only one remote workspace at a ti
+ Connecting multiple local repositories to the same remote workspace is not yet supported.
+ :::
+ 
+-## 4. Add pipelines
++## 3. Add pipelines
+ 
+ ```sh
+ dlthub pipeline init <source> <destination>
+
+
+===== COMMIT c21cd8b8 =====
+
+
+commit c21cd8b80
+Author: Shreyas
+Date: 2026-06-18
+
+    Docs/hub getting started wording (#4070)
+
+diff --git a/docs/website/docs/hub/getting-started/installation.md b/docs/website/docs/hub/getting-started/installation.md
+index 464fb0d2a..32fcea702 100644
+--- a/docs/website/docs/hub/getting-started/installation.md
++++ b/docs/website/docs/hub/getting-started/installation.md
+@@ -42,13 +42,7 @@ If you don't have `uv` yet, either [install it first](#setting-up-your-environme
+ pipx run dlthub-start
+ ```
+ 
+-Either way, it prompts for a workspace name, scaffold, and which AI agents to wire up (Claude / Cursor / Codex), scaffolds a workspace with `.dlt/.workspace` already set, vendors the AI toolkits (`rest-api-pipeline`, `transformations`, `dlthub-platform`, `data-exploration`), and runs `uv sync` so `dlt[hub]` and all workspace dependencies are installed.
+-
+-For the recommended defaults non-interactively, pass a name explicitly:
+-
+-```sh
+-uvx dlthub-start@latest my-workspace --yes
+-```
++Either way, it prompts you to pick a coding agent (Claude, Cursor, or Codex), scaffolds a workspace with `.dlt/.workspace` already set, and runs `uv sync` so `dlt[hub]` and all workspace dependencies are installed.
+ 
+ ## Setting up your environment
+ 
+diff --git a/docs/website/docs/hub/getting-started/introduction.md b/docs/website/docs/hub/getting-started/introduction.md
+index 818db57b1..9222c70a3 100644
+--- a/docs/website/docs/hub/getting-started/introduction.md
++++ b/docs/website/docs/hub/getting-started/introduction.md
+@@ -20,7 +20,7 @@ Use of the dltHub platform and toolkits is subject to a commercial [dltHub Licen
+ uvx dlthub-start@latest
+ ```
+ 
+-Scaffolds a local workspace with the dltHub AI Workbench, example pipelines, and `dlt[hub]` installed. See [installation](installation.md) for prerequisites and alternative install paths.
++Scaffolds a local workspace with an example pipeline, and `dlt[hub]` installed. See [installation](installation.md) for prerequisites and alternative install paths.
+ 
+ On the [dltHub platform](../pipeline-operations/overview.md), set `destination="playground"` for a zero-config destination that is ideal for testing and a quick first run.
+ 
+diff --git a/docs/website/docusaurus.config.js b/docs/website/docusaurus.config.js
+index ed957a0c4..11018542c 100644
+--- a/docs/website/docusaurus.config.js
++++ b/docs/website/docusaurus.config.js
+@@ -156,16 +156,15 @@ const config = {
+           },
+           {
+             type: "docSidebar",
+-            sidebarId: "docsSidebar",
++            sidebarId: "hubSidebar",
+             position: "left",
+-            label: "dlt",
++            label: "dltHub",
+           },
+           {
+             type: "docSidebar",
+-            sidebarId: "hubSidebar",
++            sidebarId: "docsSidebar",
+             position: "left",
+-            label: "dltHub",
+-            className: "navbar-cta",
++            label: "dlt",
+           },
+           {
+             type: "docSidebar",
+diff --git a/docs/website/src/css/custom.css b/docs/website/src/css/custom.css
+index 86d81a2ac..7ae4f07ec 100644
+--- a/docs/website/src/css/custom.css
++++ b/docs/website/src/css/custom.css
+@@ -455,14 +455,6 @@ html[data-theme='dark'] .slack-navbar::after {
+   background-size: 32px 32px;
+ }
+ 
+-.navbar-cta.navbar__link {
+-  background: var(--ifm-color-primary);
+-  color: white;
+-  border-radius: 999px;
+-  padding: 0.5rem 1rem;
+-  font-weight: 600;
+-}
+-
+ /* siderbar-icons */
+ 
+ 
+
+
+===== COMMIT 87b4c321 =====
+
+
+commit 87b4c321b
+Author: Alberto
+Date: 2026-06-17
+
+    Update dlthub platform docs with playground destination. (#4075)
+
+diff --git a/docs/website/docs/hub/getting-started/installation.md b/docs/website/docs/hub/getting-started/installation.md
+index d242390a9..abcebbfb5 100644
+--- a/docs/website/docs/hub/getting-started/installation.md
++++ b/docs/website/docs/hub/getting-started/installation.md
+@@ -24,6 +24,10 @@ Every workspace contains:
+ 
+ For the wider feature surface that a workspace unlocks — [profiles](../pipeline-operations/profiles.md), [data quality](../data-quality/index.md), [transformations](../transformations/index.md), the [managed platform](../pipeline-operations/overview.md), the [dashboard](../ingestion/dashboard.md) — see the [introduction](introduction.md).
+ 
++### Playground destination
++
++When you deploy and run pipelines on the dltHub platform, you can use `destination="playground"` without configuring credentials or storage. The platform provisions isolated storage for each workspace and loads your pipeline data as [Delta tables](../ingestion/delta.md). Use it for testing and for a faster introduction to the platform — set `destination="playground"` in your pipeline and run.
++
+ ## Quickstart
+ 
+ If you already have `uv` installed:
+diff --git a/docs/website/docs/hub/getting-started/introduction.md b/docs/website/docs/hub/getting-started/introduction.md
+index efb86dd71..818db57b1 100644
+--- a/docs/website/docs/hub/getting-started/introduction.md
++++ b/docs/website/docs/hub/getting-started/introduction.md
+@@ -22,6 +22,8 @@ uvx dlthub-start@latest
+ 
+ Scaffolds a local workspace with the dltHub AI Workbench, example pipelines, and `dlt[hub]` installed. See [installation](installation.md) for prerequisites and alternative install paths.
+ 
++On the [dltHub platform](../pipeline-operations/overview.md), set `destination="playground"` for a zero-config destination that is ideal for testing and a quick first run.
++
+ ## What is dltHub?
+ 
+ dltHub is an agent-native data engineering platform for building, running, and operating production-grade data pipelines. The toolchain is designed to be driven from coding agents — Claude Code, Codex, and Cursor — through [scaffolding commands](../ingestion/init.md) and [per-source context files](../ingestion/rest-api-source.md). A developer or analyst comfortable with Python and a coding agent can build and operate ingestion, [transformations](../transformations/index.md), [quality checks](../data-quality/index.md), and data apps end-to-end without managing infrastructure.
+
+
+===== COMMIT ed06b33a =====
+
+
+commit ed06b33a0
+Author: Travior
+Date: 2026-06-16
+
+    (fix) install latest airflow dependencies with airflow constraints file declared (#4069)
+
+diff --git a/.github/workflows/test_tools_airflow.yml b/.github/workflows/test_tools_airflow.yml
+index 3b12bcccc..ff7fa8133 100644
+--- a/.github/workflows/test_tools_airflow.yml
++++ b/.github/workflows/test_tools_airflow.yml
+@@ -14,12 +14,12 @@ jobs:
+         include:
+           - airflow-version: "2"
+             python-version: "3.12"
+-            airflow-pin: ""
++            airflow-specifier: ">=2.8.0,<3"
+             run-unit-tests: true
+             run-smoke-test: false
+           - airflow-version: "3"
+             python-version: "3.12"
+-            airflow-pin: "apache-airflow>=3.1"
++            airflow-specifier: ">=3.1,<4"
+             run-unit-tests: false
+             run-smoke-test: true
+ 
+@@ -41,12 +41,8 @@ jobs:
+ 
+       - name: Install dependencies
+         run: |
+-          uv sync --group airflow --group pipeline --extra duckdb --extra parquet
+-          if [ -n "${{ matrix.airflow-pin }}" ]; then
+-            uv pip install '${{ matrix.airflow-pin }}'
+-            # overrife fastapi (airflow has special contstaints)
+-            uv pip install 'fastapi<0.137'
+-          fi
++          uv sync --group pipeline --extra duckdb --extra parquet
++          uv run python tools/install_airflow_ci.py '${{ matrix.airflow-specifier }}'
+ 
+       - name: Run unit tests
+         if: matrix.run-unit-tests
+diff --git a/tools/install_airflow_ci.py b/tools/install_airflow_ci.py
+new file mode 100755
+index 000000000..87900541f
+--- /dev/null
++++ b/tools/install_airflow_ci.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python
++# ruff: noqa: T201
++# flake8: noqa: T201
++
++import argparse
++import subprocess
++import sys
++
++import requests
++from packaging.specifiers import SpecifierSet
++from packaging.version import Version
++
++
++PYPI_AIRFLOW_URL = "https://pypi.org/pypi/apache-airflow/json"
++AIRFLOW_CONSTRAINTS_URL_TEMPLATE = (
++    "https://raw.githubusercontent.com/apache/airflow/"
++    "constraints-{airflow_version}/constraints-{python_version}.txt"
++)
++REQUEST_TIMEOUT_SECONDS = 30
++
++
++def is_supported_airflow_version(version: Version, specifier: SpecifierSet) -> bool:
++    return version in specifier and not version.is_prerelease and not version.is_devrelease
++
++
++def is_yanked_release(files: list[dict[str, object]]) -> bool:
++    return bool(files) and all(bool(file.get("yanked")) for file in files)
++
++
++def get_airflow_versions(specifier: SpecifierSet) -> list[Version]:
++    response = requests.get(PYPI_AIRFLOW_URL, timeout=REQUEST_TIMEOUT_SECONDS)
++    response.raise_for_status()
++
++    releases = response.json()["releases"]
++    versions = [
++        Version(version)
++        for version, files in releases.items()
++        if is_supported_airflow_version(Version(version), specifier)
++        and not is_yanked_release(files)
++    ]
++    versions.sort(reverse=True)
++    return versions
++
++
++def get_constraints_url(airflow_version: Version) -> str:
++    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
++    return AIRFLOW_CONSTRAINTS_URL_TEMPLATE.format(
++        airflow_version=airflow_version,
++        python_version=python_version,
++    )
++
++
++def constraints_exist(url: str) -> bool:
++    response = requests.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT_SECONDS)
++    if response.status_code == 404:
++        return False
++    response.raise_for_status()
++    return True
++
++
++def select_airflow_release(specifier: SpecifierSet) -> tuple[Version, str]:
++    for airflow_version in get_airflow_versions(specifier):
++        constraints_url = get_constraints_url(airflow_version)
++        if constraints_exist(constraints_url):
++            return airflow_version, constraints_url
++
++    raise RuntimeError(
++        f"No apache-airflow release matching {specifier} has constraints for "
++        f"Python {sys.version_info.major}.{sys.version_info.minor}"
++    )
++
++
++def install_airflow(airflow_version: Version, constraints_url: str) -> None:
++    subprocess.check_call(
++        [
++            "uv",
++            "pip",
++            "install",
++            f"apache-airflow=={airflow_version}",
++            "--constraint",
++            constraints_url,
++        ]
++    )
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "specifier",
++        help="Airflow version specifier, for example '>=2.8.0,<3' or '>=3.1,<4'",
++    )
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    specifier = SpecifierSet(args.specifier)
++    airflow_version, constraints_url = select_airflow_release(specifier)
++
++    print(f"Installing apache-airflow=={airflow_version}")
++    print(f"Using constraints {constraints_url}")
++
++    install_airflow(airflow_version, constraints_url)
++
++
++if __name__ == "__main__":
++    main()
+
+
+===== COMMIT 81c240c2 =====
+
+
+commit 81c240c2e
+Author: rudolfix
+Date: 2026-06-16
+
+    fixes metadata caching in sql_database (#4067)
 

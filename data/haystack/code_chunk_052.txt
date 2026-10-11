@@ -1,453 +1,3 @@
-This table tracks the history of all schema versions used by the pipeline. Every time dlt updates the schema. For example, when new columns or tables are added, a new entry is written to this table.
-
-| Column name      | Type           | Description                                 |
-| ---------------- | -------------- | ------------------------------------------- |
-| `version`        | INTEGER        | Numeric version of the schema               |
-| `engine_version` | INTEGER        | Version of the dlt engine used              |
-| `inserted_at`    | TIMESTAMP      | Time the schema version entry was created   |
-| `schema_name`    | STRING         | Name of the schema                          |
-| `version_hash`   | STRING         | Unique hash representing the schema content |
-| `schema`         | STRING or JSON | Full schema in JSON format                  |
-
-By keeping previous schema definitions, `_dlt_version` ensures that:
-
-- Older data remains readable
-- New data uses updated schema rules
-- Backward compatibility is maintained
-
-This table also supports troubleshooting and compatibility checks. It lets you track which schema and engine version were used for any load. This helps with debugging and ensures safe evolution of your data model.
-
-## Loading data into existing tables not created by dlt
-
-You can also load data from `dlt` into tables that already exist in the destination dataset and were not created by `dlt`.
-There are a few things to keep in mind when doing this:
-
-If you load data into a table that exists but does not contain any data, in most cases, your load will succeed without problems.
-`dlt` will create the needed columns and insert the incoming data. `dlt` will only be aware of columns that exist on the
-discovered or provided internal schema, so if you have columns in your destination that are not anticipated by `dlt`, they
-will remain in the destination but stay unknown to `dlt`. This generally will not be a problem.
-
-If your destination table already exists and contains columns that have the same name as columns discovered by `dlt` but
-do not have matching datatypes, your load will fail, and you will have to fix the column on the destination table first,
-or change the column name in your incoming data to something else to avoid a collision.
-
-If your destination table exists and already contains data, your load might also initially fail, since `dlt` creates
-special `non-nullable` columns that contain required mandatory metadata. Some databases will not allow you to create
-`non-nullable` columns on tables that have data, since the initial value for these columns of the existing rows cannot
-be inferred. You will have to manually create these columns with the correct type on your existing tables and
-make them `nullable`, then fill in values for the existing rows. Some databases may allow you to create a new column
-that is `non-nullable` and take a default value for existing rows in the same command. The columns you will need to
-create are:
-
-| name         | type                |
-| ------------ | ------------------- |
-| _dlt_load_id | text/string/varchar |
-| _dlt_id      | text/string/varchar |
-
-For nested tables, you may also need to create:
-
-| name           | type                |
-| -------------- | ------------------- |
-| _dlt_parent_id | text/string/varchar |
-| _dlt_root_id   | text/string/varchar |
-
-
-===== FILE: docs/website/docs/general-usage/destination.md =====
-
----
-title: Destination
-description: Declare and configure destinations to which to load data
-keywords: [destination, load data, configure destination, name destination]
----
-# Destination
-
-[Destination](glossary.md#destination) is a location in which `dlt` creates and maintains the current version of the schema and loads your data. Destinations come in various forms: databases, datalakes, vector stores, or files. `dlt` deals with this variety via destination type modules which you declare when creating a pipeline.
-
-We maintain a set of [built-in destinations](../dlt-ecosystem/destinations/) that you can use right away.
-
-## Declare the destination type
-
-We recommend that you declare the destination type when creating a pipeline instance with `dlt.pipeline`. This allows the `run` method to synchronize your local pipeline state with the destination and `extract` and `normalize` to create compatible load packages and schemas. You can also pass the destination to the `run` and `load` methods.
-
-* Use destination **shorthand type**
-
-```py
-import dlt
-
-pipeline = dlt.pipeline("pipeline", destination="filesystem")
-```
-
-Above, we want to use the **filesystem** built-in destination. You can use shorthand types only for built-ins.
-
-* Use a [**named destination**](#use-named-destinations) with a configured type
-
-```py
-import os
-import dlt
-
-os.environ["DESTINATION__MY_DESTINATION__DESTINATION_TYPE"] = "filesystem"
-
-pipeline = dlt.pipeline("pipeline", destination="my_destination")
-```
-
-Above, we use a custom destination name and configure the destination type to **filesystem** using an environment variable. This approach is especially useful when switching between destinations without modifying the actual pipeline code. See details in the [section on using named destinations](#use-named-destinations-to-switch-destinations-without-changing-code).
-
-* Use full **destination factory type**
-
-```py
-import dlt
-
-pipeline = dlt.pipeline("pipeline", destination="dlt.destinations.filesystem")
-```
-
-Above, we use the built-in **filesystem** destination by providing a factory type `filesystem` from the module `dlt.destinations`. You can implement [your own destination](../walkthroughs/create-new-destination.md) and pass this external module as well.
-
-* Import **destination factory**
-
-```py
-import dlt
-from dlt.destinations import filesystem
-
-pipeline = dlt.pipeline("pipeline", destination=filesystem)
-```
-
-Above, we import the destination factory for **filesystem** and pass it to the pipeline.
-
-All examples above will create the same destination class with default parameters and pull required config and secret values from [configuration](credentials/index.md) - they are equivalent.
-
-### Pass explicit parameters and a name to a destination factory
-
-You can instantiate the **destination factory** yourself to configure it explicitly. When doing this, you work with destinations the same way you work with [sources](source.md)
-
-```py
-import dlt
-from dlt.destinations import filesystem
-
-azure_bucket = filesystem(
-    "az://dlt-azure-bucket", destination_name="production_az_bucket"
-)
-pipeline = dlt.pipeline("pipeline", destination=azure_bucket)
-```
-
-Above, we import and instantiate the `filesystem` destination factory. We pass the explicit URL of the bucket and name the destination `production_az_bucket`.
-
-If a destination is not named, its shorthand type (the Python factory name) serves as the destination name. Name your destination explicitly if you need several separate configurations for destinations of the same type (i.e., when you wish to maintain credentials for development, staging, and production storage buckets in the same config file). The destination name is also stored in the [load info](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) and pipeline traces, so use explicit names when you need more descriptive identifiers (rather than generic names like `filesystem`).
-
-## Configure a destination
-
-We recommend passing the credentials and other required parameters to configuration via TOML files, environment variables, or other [config providers](credentials/setup). This allows you, for example, to easily switch to production destinations after deployment.
-
-Use the [default config section layout](credentials/advanced#organize-configuration-and-secrets-with-sections) as shown below:
-
-```toml
-[destination.filesystem]
-bucket_url="az://dlt-azure-bucket"
-[destination.filesystem.credentials]
-azure_storage_account_name="dltdata"
-azure_storage_account_key="storage key"
-```
-
-Alternatively, you can use environment variables:
-
-```sh
-DESTINATION__FILESYSTEM__BUCKET_URL=az://dlt-azure-bucket
-DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME=dltdata
-DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY="storage key"
-```
-
-When using destination factories, use the destination name in the config section:
-
-```toml
-[destination.production_az_bucket]
-bucket_url="az://dlt-azure-bucket"
-[destination.production_az_bucket.credentials]
-azure_storage_account_name="dltdata"
-azure_storage_account_key="storage key"
-```
-
-For custom destination names passed to your pipeline (e.g., `destination="my_destination"`), dlt resolves the destination type from configuration. Add `destination_type` to specify which destination type to use:
-
-```toml
-[destination.my_destination]
-destination_type="filesystem"
-bucket_url="az://dlt-azure-bucket"
-[destination.my_destination.credentials]
-azure_storage_account_name="dltdata"
-azure_storage_account_key="storage key"
-```
-
-Note that when you use the `dlt init` command to create or add a data source, `dlt` creates a sample configuration for the selected destination.
-
-### Pass explicit credentials
-
-You can pass credentials explicitly when creating a destination factory instance. This replaces the `credentials` argument in `dlt.pipeline` and `pipeline.load` methods, which is now deprecated. You can pass the required credentials object, its dictionary representation, or the supported native form like below:
-
-```py
-import dlt
-from dlt.destinations import postgres
-
-# pass full credentials - together with the password (not recommended)
-pipeline = dlt.pipeline(
-    "pipeline",
-    destination=postgres(
-        credentials="postgresql://loader:loader@localhost:5432/dlt_data"
-    ),
-)
-```
-
-:::tip
-You can create and pass partial credentials, and `dlt` will fill in the missing data. Below, we pass a PostgreSQL connection string but without a password and expect that it will be present in environment variables (or any other [config provider](credentials/setup))
-
-```py
-import dlt
-from dlt.destinations import postgres
-
-# pass credentials without password
-# dlt will retrieve the password from ie. DESTINATION__POSTGRES__CREDENTIALS__PASSWORD
-prod_postgres = postgres(credentials="postgresql://loader@localhost:5432/dlt_data")
-pipeline = dlt.pipeline("pipeline", destination=prod_postgres)
-```
-
-```py
-import dlt
-from dlt.destinations import filesystem
-from dlt.sources.credentials import AzureCredentials
-
-credentials = AzureCredentials()
-# fill only the account name, leave key to be taken from secrets
-credentials.azure_storage_account_name = "production_storage"
-pipeline = dlt.pipeline(
-    "pipeline",
-    destination=filesystem("az://dlt-azure-bucket", credentials=credentials),
-)
-```
-
-Please read how to use [various built-in credentials types](credentials/complex_types).
-:::
-
-### Inspect destination capabilities
-
-[Destination capabilities](../walkthroughs/create-new-destination.md#3-set-the-destination-capabilities) tell `dlt` what a given destination can and cannot do. For example, it tells which file formats it can load, what the maximum query or identifier length is. Inspect destination capabilities as follows:
-
-```py execute
-import dlt
-pipeline = dlt.pipeline("snowflake_test", destination="snowflake")
-capabilities = dict(pipeline.destination.capabilities())
-print(capabilities["supported_loader_file_formats"])
-#> ['jsonl', 'parquet', 'csv', 'model']
-print(capabilities["preferred_loader_file_format"])
-#> jsonl
-```
-
-### Pass additional parameters and change destination capabilities
-
-The destination factory accepts additional parameters that will be used to pre-configure it and change destination capabilities.
-
-```py execute
-import dlt
-destination = dlt.destinations.duckdb(naming_convention="duck_case", recommended_file_size=120000)
-capabilities = dict(destination.capabilities())
-
-assert capabilities["naming_convention"] == "duck_case"
-assert capabilities["recommended_file_size"] == 120000
-```
-
-The example above is overriding the `naming_convention` and `recommended_file_size` in the destination capabilities.
-
-## Use named destinations
-
-Named destinations are destinations with a custom name, the type of which can be explicitly provided or be resolved from the toml files or equivalent environment variables. There are multiple ways to use named destinations:
-
-- Use a named destination string reference with type configured via an environment variable
-
-```py
-import os
-import dlt
-
-os.environ["DESTINATION__MY_DESTINATION__DESTINATION_TYPE"] = "filesystem"
-
-pipeline = dlt.pipeline("pipeline", destination="my_destination")
-```
-
-- Use `dlt.destination()` with the type configured via an environment variable
-
-```py
-import os
-import dlt
-
-os.environ["DESTINATION__MY_DESTINATION__DESTINATION_TYPE"] = "filesystem"
-
-pipeline = dlt.pipeline("pipeline", destination=dlt.destination("my_destination"))
-```
-
-- Use `dlt.destination()` with the type explicitly configured
-
-```py
-import dlt
-
-pipeline = dlt.pipeline(
-    "pipeline",
-    destination=dlt.destination("my_destination", destination_type="filesystem"),
-)
-```
-
-For all of the above, the destination type can alternatively be configured in the `secrets.toml` file as follows:
-
-```toml
-[destination.my_destination]
-destination_type = "filesystem"
-```
-
-:::note
-When resolving non-module destination string references (e.g., `"bigquery"` or `"my_destination"`, not `"dlt.destinations.bigquery"`), dlt first attempts to resolve the reference as a named destination with a valid destination type configured, then falls back to shorthand type resolution.
-
-This means that, in the examples above, if the destination type was not properly configured or was not a valid destination type, dlt would have attempted to resolve `"my_destination"` as a shorthand for a built-in type and would have eventually failed.
-
-As another example, the following:
-
-```py
-import os
-import dlt
-
-os.environ["DESTINATION__BIGQUERY__DESTINATION_TYPE"] = "duckdb"
-
-pipeline = dlt.pipeline("pipeline", destination="bigquery")
-```
-
-will be resolved as a DuckDB destination that is named `"bigquery"`, because a valid destination type `"duckdb"` is configured and dlt does not attempt to resolve the name `"bigquery"` as a shorthand for a built-in type!
-
-**Exception:** If `dlt.destination()` is used and the `destination_type` is explicitly provided as an argument, dlt will skip the shorthand fallback and only attempt named destination resolution.
-
-:::
-
-### Configure multiple destinations of the same type
-
-One of the benefits of named destinations is the ability to configure multiple destinations of the same type for use across different pipelines in a single script. For example, if you have two BigQuery destinations, you could define the following in the `secrets.toml` file:
-
-```toml
-[destination.my_destination]
-location = "US"
-[destination.my_destination.credentials]
-project_id = "please set me up!"
-private_key = "please set me up!"
-client_email = "please set me up!"
-
-[destination.my_other_destination]
-location = "EU"
-[destination.my_other_destination.credentials]
-project_id = "please set me up!"
-private_key = "please set me up!"
-client_email = "please set me up!"
-```
-
-And use it in the pipeline code as follows:
-
-```py
-import dlt
-
-# Configure the pipeline to use the "my_destination" BigQuery destination
-my_pipeline = dlt.pipeline(
-    pipeline_name='my_pipeline',
-    destination=dlt.destination("my_destination", destination_type="bigquery"),
-    dataset_name='dataset_name'
-)
-
-# Configure the pipeline to use the "my_other_destination" BigQuery destination
-my_other_pipeline = dlt.pipeline(
-    pipeline_name='my_other_pipeline',
-    destination=dlt.destination("my_other_destination", destination_type="bigquery"),
-    dataset_name='dataset_name'
-)
-```
-
-### Use named destinations to switch destinations without changing code
-
-Another advantage of named destinations is environment-based switching. When you need to use different destinations across development, staging, and production environments, named destinations allow you to switch destinations by modifying only the toml configuration files without changing the pipeline code. For example, if you are developing with DuckDB, you would first have your `secrets.toml` file configured as follows:
-
-```toml
-[destination.my_destination]
-destination_type = "duckdb"
-```
-
-With the pipeline code being:
-
-```py
-import dlt
-
-pipeline = dlt.pipeline(
-    pipeline_name='my_pipeline',
-    destination='my_destination',
-    dataset_name='dataset_name'
-)
-```
-
-Then when you deploy the script, you would simply adjust your toml file with:
-
-```toml
-[destination.my_destination]
-destination_type = "bigquery"
-[destination.my_destination.credentials]
-project_id = "please set me up!"
-private_key = "please set me up!"
-client_email = "please set me up!"
-```
-
-And keep the pipeline code intact.
-
-## Access a destination
-
-When loading data, `dlt` will access the destination in two cases:
-
-1. At the beginning of the `run` method to sync the pipeline state with the destination (or if you call `pipeline.sync_destination` explicitly).
-2. In the `pipeline.load` method - to migrate the schema and load the load package.
-
-`dlt` will also access the destination when you instantiate [sql_client](../dlt-ecosystem/transformations/sql.md).
-
-:::note
-`dlt` will not import the destination dependencies or access destination configuration if access is not needed. You can build multi-stage pipelines where steps are executed in separate processes or containers - the `extract` and `normalize` step do not need destination dependencies, configuration, and actual connection.
-
-```py execute
-import tempfile
-
-import dlt
-from dlt.destinations import filesystem
-
-# just declare the destination.
-pipeline = dlt.pipeline("pipeline", destination="filesystem")
-# no destination credentials not config needed to extract
-pipeline.extract(["a", "b", "c"], table_name="letters")
-# same to normalize
-pipeline.normalize()
-# here dependencies dependencies will be imported, secrets pulled and destination accessed
-# we pass bucket_url explicitly and expect credentials passed by config provider
-bucket_url = f"file://{tempfile.mkdtemp()}"
-pipeline.load(destination=filesystem(bucket_url=bucket_url))
-```
-
-:::
-
-## Control how `dlt` creates table, column, and other identifiers
-
-`dlt` maps identifiers found in the source data into destination identifiers (i.e., table and column names) using [naming conventions](naming-convention.md) which ensure that
-character set, identifier length, and other properties fit into what the given destination can handle. For example, our [default naming convention (**snake case**)](./naming-convention.md#use-default-naming-convention-snake_case) converts all names in the source (i.e., JSON document fields) into snake case, case-insensitive identifiers.
-
-Each destination declares its preferred naming convention, support for case-sensitive identifiers, and case folding function that case-insensitive identifiers follow. For example:
-
-1. Redshift - by default, does not support case-sensitive identifiers and converts all of them to lower case.
-2. Snowflake - supports case-sensitive identifiers and considers upper-cased identifiers as case-insensitive (which is the default case folding).
-3. DuckDb - does not support case-sensitive identifiers but does not case fold them, so it preserves the original casing in the information schema.
-4. Athena - does not support case-sensitive identifiers and converts all of them to lower case.
-5. BigQuery - all identifiers are case-sensitive; there's no case-insensitive mode available via case folding (but it can be enabled at the dataset level).
-
-You can change the naming convention used in [many different ways](naming-convention.md#configure-naming-convention). Below, we set the preferred naming convention on the Snowflake destination to `sql_cs` to switch Snowflake to case-sensitive mode:
-
-```py
-import dlt
-snow_ = dlt.destinations.snowflake(naming_convention="sql_cs_v1")
-```
-
-Setting the naming convention will impact all new schemas being created (i.e., on the first pipeline run) and will re-normalize all existing identifiers.
-
 :::warning
 `dlt` prevents re-normalization of identifiers in tables that were already created at the destination. Use [refresh](pipeline.md#refresh-pipeline-data-and-state) mode to drop the data. You can also disable this behavior via [configuration](naming-convention.md#avoid-identifier-collisions).
 :::
@@ -2559,4 +2109,449 @@ Set `destination_scope` to retire only the absent records that a SQL condition s
 def dim_customer():
     ...
 ```
+
+`source_filter` selects the loaded records to merge. dlt discards the other loaded records and their nested rows. They do not count as present, so `scd2` retires their destination records. For the rules of both options, read [Merge conditions](#merge-conditions).
+
+### Handling nested structures with SCD type 2
+
+To explore how SCD Type 2 handles nested JSON structures, refer to the hands-on demonstration provided in the Colab Notebook linked below.
+
+Execute all steps directly in your browser:
+[Open in Colab.](https://colab.research.google.com/drive/1GpG3JKGWveB-kR7eNvlJLr6oO0nM7Fbv?usp=sharing)
+
+### Example: configure validity column names
+
+`_dlt_valid_from` and `_dlt_valid_to` are used by default as validity column names. Other names can be configured as follows:
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "validity_column_names": ["from", "to"],  # will use "from" and "to" instead of default values
+    }
+)
+def dim_customer():
+    ...
+...
+```
+
+### Example: configure active record timestamp
+
+You can configure the literal used to indicate an active record with `active_record_timestamp`. The default literal `NULL` is used if `active_record_timestamp` is omitted or set to `None`. Provide a date value if you prefer to use a high timestamp instead.
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        # accepts various types of date/datetime objects
+        "active_record_timestamp": "9999-12-31",
+    }
+)
+def dim_customer():
+    ...
+```
+
+### Example: configure boundary timestamp
+
+You can configure the "boundary timestamp" used for record validity windows with `boundary_timestamp`. The provided date(time) value is used as "valid from" for new records and as "valid to" for retired records. The timestamp at which a load package is created is used if `boundary_timestamp` is omitted.
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        # accepts various types of date/datetime objects
+        "boundary_timestamp": "2024-08-21T12:15:00+00:00",
+    }
+)
+def dim_customer():
+    ...
+```
+
+#### Reset boundary timestamp to the current load time
+
+To stop using a previously set `boundary_timestamp` and revert to the default (the current load package creation time), set `boundary_timestamp` to `None`. You can do this either at definition time or dynamically with `apply_hints` before a run.
+
+Definition-time (always use current load time):
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "boundary_timestamp": None,  # reset to current load time
+    }
+)
+def dim_customer():
+    ...
+
+# Per-run reset (override just for this run):
+dim_customer.apply_hints(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "boundary_timestamp": None,  # reset to current load time for this run
+    }
+)
+pipeline.run(dim_customer())
+```
+
+When `boundary_timestamp` is `None` (or omitted), `dlt` uses the load package's creation timestamp as the boundary for both retiring existing versions and creating new versions.
+
+### Example: Use your own row hash
+
+By default, `dlt` generates a row hash based on all columns provided by the resource and stores it in `_dlt_id`. You can use your own hash instead by specifying `row_version_column_name` in the `write_disposition` dictionary. You might already have a column present in your resource that can naturally serve as a row hash, in which case it's more efficient to use those pre-existing hash values than to generate new artificial ones. This option also allows you to use hashes based on a subset of columns, in case you want to ignore changes in some of the columns. When using your own hash, values for `_dlt_id` are randomly generated.
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "row_version_column_name": "row_hash",  # the column "row_hash" should be provided by the resource
+    }
+)
+def dim_customer():
+    ...
+...
+```
+
+:::note
+If your source data contains nested fields (like lists or arrays) that may return in different order across API calls, the automatically generated row hash will differ even when the actual data hasn't changed. Using `row_version_column_name` to provide your own hash based on stable fields is a good solution for this.
+:::
+
+### 🧪 Use scd2 with Arrow tables, Pandas or Polars DataFrames
+
+`dlt` will not add a **row hash** column to the tabular data automatically (we are working on it).
+You need to do that yourself by adding a transform function to the `scd2` resource that computes row hashes (using pandas.util, should be fairly fast).
+
+```py notype
+import dlt
+from dlt.sources.helpers.transform import add_row_hash_to_table
+
+scd2_r = dlt.resource(
+    arrow_table,
+    name="tabular",
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "row_version_column_name": "row_hash",
+    },
+).add_map(add_row_hash_to_table("row_hash"))
+```
+
+`add_row_hash_to_table` is the name of the transform function that will compute and create the `row_hash` column that is declared as holding the hash by `row_version_column_name`.
+
+:::tip
+You can modify existing resources that yield data in tabular form by calling `apply_hints` and passing the `scd2` config in `write_disposition` and then by
+adding the transform with `add_map`.
+:::
+
+### Nested tables
+
+Nested tables, if any, do not contain validity columns. Validity columns are only added to the root table. To get the validity columns for a nested record, join the nested table to its parent on `_dlt_parent_id`. By default, `_dlt_id` in the root table is the row hash of the record version. Deeper nested tables join through each parent level. If you set `root_key=True` on the source, nested tables also get `_dlt_root_id`, and you can join the root table directly.
+
+### Limitations
+
+* You cannot use columns like `updated_at` or integer `version` of a record that are unique within a `primary_key` (even if it is defined). The hash column
+must be unique for a root table. We are working to allow `updated_at` style tracking.
+* We do not detect changes in nested tables (except new records) if the row hash of the corresponding parent row does not change. Use `updated_at` or a similar
+column in the root table to stamp changes in nested data.
+
+## `upsert` strategy
+
+:::warning
+The `upsert` merge strategy is currently supported for these destinations:
+
+- `athena`
+- `bigquery`
+- `databricks`
+- `mssql`
+- `postgres`
+- `snowflake`
+- `filesystem` with `delta` table format (see limitations [here](../dlt-ecosystem/destinations/delta-iceberg#known-limitations)) and `iceberg` table format
+:::
+
+The `upsert` merge strategy does primary-key based *upserts*:
+
+- *update* a record if the key exists in the target table
+- *insert* a record if the key does not exist in the target table
+
+You can [delete records](#delete-records) with the `hard_delete` hint.
+
+### Skip unchanged records
+
+By default, `upsert` updates every record whose key exists in the target table, even when its values did not change. Set `skip_unchanged_rows` to update only the records that changed. Change consumers then see only the records that changed. For example, a Snowflake stream contains only the inserted and updated records:
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "upsert",
+        "skip_unchanged_rows": True,
+    },
+    primary_key="my_primary_key",
+)
+def my_upsert_resource():
+    ...
+...
+```
+
+The option works the same way for the [`cdc` strategy](#cdc-strategy).
+
+Change detection compares all columns except the `primary_key`, the `hard_delete` column, and the dlt columns `_dlt_id`, `_dlt_load_id`, `_dlt_parent_id`, and `_dlt_root_id`. dlt sets the `_dlt_load_id` of an updated record to the current load. An unchanged record keeps the `_dlt_load_id` of its last change. Change detection also applies to nested rows, so dlt does not update an unchanged list element.
+
+On the `filesystem` destination, the `iceberg` table format does not support `skip_unchanged_rows` with `upsert`. The vector destinations `lancedb`, `lance`, `qdrant` and `weaviate` do not support it either, because their `upsert` updates every matched record. With it, dlt stops before the load starts.
+
+#### Detect changes with your own row version
+
+To detect changes with one column instead of all columns, also set `row_version_column_name`. dlt then updates a record only when the value in this column changes. Changes in the other columns do not update the record. The resource must provide the column, for example a hash of the columns you track or a version counter from the source system. The column cannot contain `NULL` values:
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "upsert",
+        "skip_unchanged_rows": True,
+        "row_version_column_name": "row_hash",
+    },
+    primary_key="my_primary_key",
+)
+def my_upsert_resource():
+    ...
+...
+```
+
+Without `skip_unchanged_rows`, dlt ignores `row_version_column_name` and logs a warning. dlt still identifies records by `primary_key` and still generates `_dlt_id`. This is different from the [`scd2` strategy](#example-use-your-own-row-hash), where the row version column identifies the record. The row version applies to the root table only. dlt compares all columns of nested tables.
+
+### Filter the loaded records
+
+Set `source_filter` to merge only the loaded records that match a SQL condition. dlt discards the other loaded records. For the rules, read [Merge conditions](#merge-conditions). `upsert` does not delete records that are absent from the loaded data, so it does not support `destination_scope`. The `iceberg` table format and the vector destinations cannot apply a SQL condition, so they reject `source_filter` before the load starts.
+
+### `upsert` versus `delete-insert`
+
+Unlike the default `delete-insert` merge strategy, the `upsert` strategy:
+
+1. needs a `primary_key`
+2. expects this `primary_key` to be unique (`dlt` does not deduplicate)
+3. does not support `merge_key`
+4. uses `MERGE` or `UPDATE` operations to process updates
+
+### Example: `upsert` merge strategy
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "upsert"},
+    primary_key="my_primary_key"
+)
+def my_upsert_resource():
+    ...
+...
+```
+
+## `insert-only` strategy
+
+The `insert-only` merge strategy is supported for all destinations that support `upsert` (see [above](#upsert-strategy)), including `filesystem` with `delta` and `iceberg` table formats and `lancedb`.
+
+The `insert-only` merge strategy does primary-key based *inserts* without updating existing records:
+
+- *insert* a record if the key does not exist in the target table
+- *skip* a record if the key already exists in the target table (no update happens)
+
+This strategy is ideal for append-only data (events, logs, transactions) where existing records should never be modified. Re-running a pipeline only adds missing records, providing idempotent loads with better performance than `upsert` by skipping `UPDATE` operations entirely.
+
+You can use the `hard_delete` hint to filter out records marked for deletion before insertion. Unlike `upsert`, existing records in the target are never deleted — the hint only prevents new deleted records from being inserted.
+
+### `insert-only` versus `upsert`
+
+Unlike the `upsert` strategy, the `insert-only` strategy:
+
+1. **does not update** existing records, even when their values changed. `upsert` with [`skip_unchanged_rows`](#skip-unchanged-records) still updates the changed records
+2. provides better **performance** by skipping `UPDATE` operations
+
+Like `upsert`, the `insert-only` strategy:
+
+1. needs a `primary_key`
+2. expects this `primary_key` to be unique
+3. does not support `merge_key`
+4. generates deterministic `_dlt_id` based on primary key
+
+### Example: `insert-only` merge strategy
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "insert-only"},
+    primary_key="event_id"
+)
+def my_insert_only_resource():
+    ...
+...
+```
+
+### Nested tables without a root key
+
+`insert-only` never deletes nested records, so it does not need the `root key` (`_dlt_root_id`). It merges nested tables by their row key, which dlt derives from the parent `_dlt_id` and the position in the list. By default, dlt still propagates the root key for `insert-only`. To save storage space, disable it on the source. Unlike the general rule for [disabling root key propagation](#disable-root-key-propagation), this works for any nesting depth:
+
+```py
+@dlt.source(root_key=False)
+def events_source():
+    @dlt.resource(
+        write_disposition={"disposition": "merge", "strategy": "insert-only"},
+        primary_key="event_id",
+    )
+    def events():
+        yield [{"event_id": 1, "tags": [{"name": "a", "props": [{"k": "v"}]}]}]
+
+    return events
+```
+
+:::caution
+`upsert` and `cdc` delete nested records by the root key. If you may switch the resource to one of these strategies later, keep the root key. dlt cannot add `_dlt_root_id` to tables that already contain data.
+:::
+
+## `cdc` strategy
+
+:::note
+These destinations support the `cdc` merge strategy:
+
+- `duckdb` (`duckdb >= 1.4.0`)
+- `motherduck`
+- `ducklake`
+- `snowflake`
+- `postgres`
+- `bigquery`
+- `databricks`
+- `mssql`
+- `fabric`
+- `athena` with the `iceberg` table format
+- `filesystem` with the `delta` table format
+:::
+
+The `cdc` strategy treats the loaded data as a **complete snapshot of the source system**. It derives inserts, updates, and deletes from the snapshot:
+
+- It **inserts** a record whose key is not in the destination.
+- It **updates** a record whose key is in the destination.
+- It **deletes** a record that the destination has and the snapshot does not.
+
+If the source system deletes records without deletion markers, use `cdc` to mirror the source system. Set [`skip_unchanged_rows`](#skip-unchanged-records) so that `cdc` does not update unchanged records. As a result, change consumers see only the records that changed. For example, a Snowflake stream contains only the inserted, updated, and deleted records:
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "cdc",
+        "skip_unchanged_rows": True,
+    },
+    primary_key="my_primary_key"
+)
+def my_cdc_resource():
+    ...
+...
+```
+
+To detect changes with one column instead of all columns, also set `row_version_column_name`, as described in [Detect changes with your own row version](#detect-changes-with-your-own-row-version).
+
+### `cdc` versus `replace` and `delete-insert`
+
+[`replace`](./full-loading.md) replaces the whole table with the loaded data. `delete-insert` with a `merge_key` replaces partitions of the table. Both delete and insert every record they touch, including the unchanged records. As a result, every record looks modified downstream. `_dlt_load_id` then does not show when a record last changed.
+
+On Snowflake, the deletes and inserts also create new micro-partitions. The `staging-optimized` replace strategy swaps the table object. This breaks a stream on that table.
+
+If you need only the data, choose `replace` or `delete-insert`. If you also need to know what changed, choose `cdc`.
+
+### `cdc` versus `upsert`
+
+Unlike the `upsert` strategy, the `cdc` strategy:
+
+1. **deletes** records that are absent from the loaded snapshot
+2. supports `merge_key` and `destination_scope` to limit deletes to a part of the table
+3. does not insert a loaded record that the `hard_delete` column marks as deleted
+
+Like `upsert`, the `cdc` strategy:
+
+1. needs a `primary_key`
+2. expects this `primary_key` to be unique (`dlt` does not deduplicate)
+3. generates a deterministic `_dlt_id` based on the primary key
+4. skips unchanged records with [`skip_unchanged_rows`](#skip-unchanged-records)
+5. merges only the loaded records that `source_filter` selects
+
+:::caution
+Make sure that the `primary_key` is unique. With duplicate keys, the result is not deterministic. Snowflake raises an error. `duckdb` updates an existing record with one of the duplicates and inserts every duplicate of a new key.
+:::
+
+### Deleting records with `hard_delete`
+
+You can also [delete records](#delete-records) with the `hard_delete` hint. If the `hard_delete` column marks a loaded record as deleted, `cdc` deletes its destination record. `cdc` does not insert this loaded record.
+
+### Limiting deletes with `merge_key` and merge conditions
+
+By default, `cdc` compares the whole table and deletes every record that is absent from the snapshot. If you load only a part of the table, for example recent months, limit the deletes to that part.
+
+Set `merge_key` to delete absent records only in the partitions of the merge source:
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "cdc"},
+    primary_key="my_primary_key",
+    merge_key="month",
+)
+def my_partitioned_resource():
+    # yield a complete snapshot of the months you load
+    ...
+...
+```
+
+The `delta` table format does not support `merge_key` with `cdc`. Set a destination scope instead.
+
+`merge_key` works the same way for the [`scd2` strategy](#scd2-strategy). Without it, `scd2` retires every absent record. With it, `scd2` retires only the absent records whose `merge_key` is in the merge source. With `source_filter`, dlt takes the `merge_key` partitions from the merge source only.
+
+To limit the deletes with a SQL condition instead, set `destination_scope`. Read [Merge conditions](#merge-conditions).
+
+### Nested tables with `cdc`
+
+Nested rows follow their parent row. dlt deletes the nested rows of a deleted parent and the list elements that the load no longer has. dlt inserts new list elements. With `skip_unchanged_rows`, dlt does not update an unchanged element.
+
+### Limitations of `cdc`
+
+- The `primary_key` of the snapshot must be unique. `dlt` does not deduplicate the loaded data for this strategy.
+- A resource that yields no records produces no load job, so `cdc` deletes nothing. To delete the records of an empty snapshot, read [Delete all records with an empty snapshot](#delete-all-records-with-an-empty-snapshot).
+
+### Delete all records with an empty snapshot
+
+If the source system returns no records, yield [`dlt.mark.materialize_table_schema()`](resource.md#materialize-schema-without-rows). dlt then runs an empty load job, and the merge deletes every destination record. With `destination_scope`, it deletes only the records in the destination scope. With `merge_key`, it deletes nothing, because an empty snapshot has no partitions:
+
+```py
+@dlt.resource(
+    primary_key="id",
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "cdc",
+        "destination_scope": "region = 'eu'",
+    },
+)
+def customers():
+    rows = fetch_customers(region="eu")  # ty: ignore[unresolved-reference]
+    if not rows:
+        # an empty load job deletes every record in the destination scope
+        yield dlt.mark.materialize_table_schema()
+    yield from rows
+```
+
+## Merge conditions
+
+`destination_scope` and `source_filter` are SQL conditions that limit a merge:
+
+- **`destination_scope`** selects the destination records that the merge can delete or retire. `delete-insert`, `scd2`, and `cdc` support it.
+- **`source_filter`** selects the loaded records to merge. dlt **discards** the other loaded records. The remaining records are the merge source. Keys and `merge_key` partitions come only from the merge source.
+
+| strategy        | `destination_scope`       | `source_filter` |
+| --------------- | ------------------------- | --------------- |
+| `delete-insert` | yes, the delete condition | yes             |
+| `scd2`          | yes                       | yes             |
+| `cdc`           | yes                       | yes             |
+| `upsert`        | no                        | yes             |
+| `insert-only`   | no                        | no              |
+
+With an unsupported option, dlt raises an error when you define the resource. If the destination picks the strategy, dlt ignores the option and logs a warning.
 

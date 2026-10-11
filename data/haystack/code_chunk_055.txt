@@ -1,488 +1,3 @@
-Inherits arguments from [`dlthub ai mcp`](#dlthub-ai-mcp).
-
-**Options**
-
-* `-h, --help` - Show this help message and exit
-* `--stdio` - Use stdio transport mode
-* `--sse` - Use legacy sse transport instead of streamable-http
-* `--port PORT` - Port for the mcp server (default: 8000)
-* `--features [FEATURES ...]` - Mcp features to enable/disable. default: context, pipeline, secrets, toolkit, workspace. use +name to add, -name to remove (e.g. --features=-secrets,+context)
-* `--no-default-features` - Serve only the features named by --features, without the defaults above
-* `--access ACCESS` - Access the caller was granted, as `axis:verb,verb` pairs (e.g. data:read,local:read). tools requiring more are not served. `axis:` alone grants nothing on that axis. everything is served when omitted.
-
-</details>
-
-### `dlthub ai mcp install`
-
-Install MCP server config into the current project.
-
-**Usage**
-
-```sh
-dlthub ai mcp install [-h] [--agent {claude,cursor,codex}] [--features [FEATURES
-    ...]] [--name NAME] [--overwrite]
-```
-
-**Description**
-
-Install MCP server config into the current project.
-
-<details>
-
-<summary>Show Arguments and Options</summary>
-
-Inherits arguments from [`dlthub ai mcp`](#dlthub-ai-mcp).
-
-**Options**
-
-* `-h, --help` - Show this help message and exit
-* `--agent {claude,cursor,codex}` - Ai coding agent to install for. auto-detected if omitted.
-* `--features [FEATURES ...]` - Mcp feature sets to include in the server config
-* `--name NAME` - Server name in the mcp config (default: dlt-workspace)
-* `--overwrite` - Overwrite existing server config instead of skipping.
-
-</details>
-
-
-===== FILE: docs/website/docs/hub/cookbook/build-streamlit-dashboard.md =====
-
----
-title: Build and deploy a Streamlit app
-description: Build, serve, and deploy a Streamlit app on dltHub.
-keywords: [streamlit, dashboard, hub, app, deploy, dltHub]
----
-# Build and deploy a Streamlit app
-
-[Streamlit](https://docs.streamlit.io/) is a Python framework for turning a script into an interactive web app. On dltHub, a Streamlit app is a plain `.py` file that imports `streamlit`, and the runtime serves it as an interactive dashboard.
-
-This page walks through building a small dashboard against a loaded dlt dataset and deploying it to [app.dlthub.com](https://app.dlthub.com).
-
-## Prerequisites
-
-Add Streamlit to your workspace dependencies:
-
-```sh
-uv add streamlit
-```
-
-The example below reads from the `sample_shop_pipeline` that `uvx dlthub-start@latest` scaffolds (see [Deploy your first pipeline](../getting-started/onboarding.md)). The dashboard needs that data already loaded against the same destination it'll read from:
-
-```sh
-# Load locally (dev profile, DuckDB) so the dashboard works under `dlthub local serve`
-uv run dlthub local run load_sample_shop
-
-# OR, before deploying remotely, load against the prod destination on dltHub
-uv run dlthub run load_sample_shop
-```
-
-A dashboard can only display data that's already been loaded. If you skip this step the deployed app boots but every read returns "table not found".
-
-## Write the dashboard
-
-Create `sample_shop_dashboard.py` in the workspace root:
-
-```py
-"""Sample shop dashboard."""
-
-import dlt
-import streamlit as st
-
-
-st.set_page_config(page_title="Sample shop", layout="wide")
-st.title("Sample shop orders")
-
-
-@st.cache_data
-def load_data():
-    dataset = dlt.dataset(destination="warehouse", dataset_name="sample_shop")
-    return dataset["orders"].df(), dataset["customers"].df()
-
-
-orders, customers = load_data()
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Orders", f"{len(orders):,}")
-col2.metric("Customers", f"{len(customers):,}")
-col3.metric("Total revenue", f"${orders['order_total'].sum():,.2f}")
-col4.metric("Avg order value", f"${orders['order_total'].mean():.2f}")
-
-st.subheader("Top customers by spend")
-by_customer = (
-    orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("_o", "_c"))
-    .groupby("name", as_index=False)["order_total"].sum()
-    .sort_values("order_total", ascending=False)
-    .head(10)
-)
-st.dataframe(
-    by_customer.rename(columns={"name": "Customer", "order_total": "Total spend ($)"}),
-    width="stretch", hide_index=True,
-)
-
-st.subheader("Orders by store")
-by_store = orders.groupby("store_id").size().rename("orders").sort_values(ascending=False)
-st.bar_chart(by_store)
-```
-
-[`dlt.dataset(destination, dataset_name)`](../../general-usage/dataset-access/dataset.md) connects directly to a loaded dataset. Wrap the call in `@st.cache_data` so each widget interaction doesn't requery the destination.
-
-## Run it locally
-
-```sh
-uv run dlthub local serve sample_shop_dashboard.py
-```
-
-This boots the dashboard under the workspace's active local profile (default `dev`, which reads from `.dlt/config.toml`) and opens it in your browser.
-
-## Configure the `access` profile
-
-`dlthub serve` runs interactive jobs under the `access` profile by default. The minimal scaffold doesn't ship an `access` profile, so create one before deploying. Add the destination type in `.dlt/access.config.toml`:
-
-```toml
-[destination.warehouse]
-destination_type = "motherduck"
-```
-
-And the credentials in `.dlt/access.secrets.toml`. **Both `database` and `password` need to be in the secrets file** for MotherDuck:
-
-```toml
-[destination.warehouse.credentials]
-database = "dlt_test"
-password = "<read-only motherduck JWT>"
-```
-
-See the [Profiles in dltHub](../pipeline-operations/profiles.md) page for the full profile model.
-
-## Deploy to dltHub
-
-Add the dashboard to your `__deployment__.py` manifest so the workspace knows about it:
-
-```py
-"""Minimal dltHub workspace."""
-
-from pipeline import load_sample_shop
-import sample_shop_dashboard            # module-import → one job
-
-__all__ = ["load_sample_shop", "sample_shop_dashboard"]
-```
-
-Then deploy and serve:
-
-```sh
-uv run dlthub deploy                                       # publishes manifest + uploads code
-uv run dlthub serve sample_shop_dashboard.py               # boots the app remotely, opens URL
-```
-
-`dlthub serve` runs the app behind the workspace's auth — only your account can open the link. To create a publicly shareable URL:
-
-```sh
-uv run dlthub job publish sample_shop_dashboard.py         # public URL
-uv run dlthub job unpublish sample_shop_dashboard.py       # revoke
-```
-
-
-===== FILE: docs/website/docs/hub/data-apps/build-marimo-notebook.md =====
-
----
-title: Build and deploy a marimo notebook
-description: Build a marimo notebook on a loaded dlt dataset, serve it locally, and deploy it to dltHub as an interactive job.
-keywords: [marimo, notebook, dashboard, hub, data app, deploy, dltHub]
----
-# Build and deploy a marimo notebook
-
-[marimo](https://docs.marimo.io/) is a reactive Python notebook: when you change a cell or interact with a UI element, every dependent cell re-runs. On dltHub, a marimo notebook is a plain `.py` file that creates a `marimo.App`, and the runtime serves it as an interactive job. The built-in [workspace dashboard](../ingestion/dashboard.md) is itself a marimo notebook served that way.
-
-This page walks through building a notebook against a loaded dlt dataset and deploying it to [app.dlthub.com](https://app.dlthub.com). To explore data in marimo on your own machine, without a workspace, see [Explore data with marimo](../../general-usage/dataset-access/marimo.md). For the Streamlit version of this walkthrough, see [Build and deploy a Streamlit app](../cookbook/build-streamlit-dashboard.md).
-
-## Prerequisites
-
-Add marimo to your workspace dependencies:
-
-```sh
-uv add marimo
-```
-
-The example below reads from the `sample_shop_pipeline` that `uvx dlthub-start@latest` scaffolds (see [Deploy your first pipeline](../getting-started/onboarding.md)). The notebook needs that data already loaded against the same destination it'll read from:
-
-```sh
-# Load locally (dev profile, DuckDB) so the notebook works under `dlthub local serve`
-uv run dlthub local run load_sample_shop
-
-# OR, before deploying remotely, load against the prod destination on dltHub
-uv run dlthub run load_sample_shop
-```
-
-A notebook can only display data that's already been loaded. If you skip this step the deployed notebook boots but every read fails with "table not found".
-
-## Write the notebook
-
-Create `sample_shop_notebook.py` in the workspace root:
-
-```py
-"""Sample shop notebook: orders and customers loaded by load_sample_shop."""
-
-import marimo
-
-app = marimo.App(width="medium", app_title="Sample shop")
-
-
-@app.cell
-def imports():
-    import dlt
-    import marimo as mo
-
-    return dlt, mo
-
-
-@app.cell
-def read_dataset(dlt):
-    dataset = dlt.dataset(destination="warehouse", dataset_name="sample_shop")
-    orders = dataset["orders"].df()
-    customers = dataset["customers"].df()
-    return orders, customers
-
-
-@app.cell
-def headline(mo, orders, customers):
-    mo.hstack(
-        [
-            mo.stat(len(orders), label="Orders"),
-            mo.stat(len(customers), label="Customers"),
-            mo.stat(f"${orders['order_total'].sum():,.2f}", label="Revenue"),
-        ]
-    )
-    return
-
-
-@app.cell
-def store_filter(mo, orders):
-    store = mo.ui.dropdown(options=sorted(orders["store_id"].unique()), label="Store")
-    store
-    return (store,)
-
-
-@app.cell
-def orders_table(mo, orders, store):
-    selected = orders if store.value is None else orders[orders["store_id"] == store.value]
-    mo.ui.table(selected, selection=None)
-    return
-
-
-if __name__ == "__main__":
-    app.run()
-```
-
-Three things make this file a deployable notebook rather than an ordinary script:
-
-- **A module-level `marimo.App`.** dlt looks for one in the module, preferring a variable called `app` and otherwise taking the first module-level `marimo.App` it finds. Without it, the file is treated as a batch script.
-- **`app_title` and the module docstring.** Both are picked up and combined into the job description shown in the dltHub UI.
-- **Cells that declare their inputs.** Each cell takes the variables it reads as arguments and returns the ones later cells need. marimo derives the execution order from that, and re-runs only the cells affected by a change, so the dataset read does not need a cache decorator around it.
-
-[`dlt.dataset(destination, dataset_name)`](../../general-usage/dataset-access/dataset.md) connects directly to a loaded dataset. `warehouse` is a [named destination](../../general-usage/destination.md#use-named-destinations), so the same notebook reads from DuckDB locally and from your production destination once deployed.
-
-## Run it locally
-
-Edit the notebook in marimo's own editor while you build it:
-
-```sh
-uv run marimo edit sample_shop_notebook.py
-```
-
-Then run it the way the platform will, as a workspace job:
-
-```sh
-uv run dlthub local serve sample_shop_notebook.py
-```
-
-This resolves the job from the deployment manifest exactly as the runtime does, boots it under the workspace's active local profile (default `dev`), and prints `Listening on http://localhost:5000`.
-
-The two commands do different things: `marimo edit` opens the editor, while serving the job runs `marimo run`, the read-only app with the source hidden. That second form is what your viewers get.
-
-## Configure the `access` profile
-
-Interactive jobs run under the `access` profile on dltHub: a production profile meant for notebooks, usually holding read-only credentials. The minimal scaffold doesn't ship one, and without it interactive jobs fall back to the `prod` profile, which the CLI warns about before it launches.
-
-Add the destination type in `.dlt/access.config.toml`:
-
-```toml
-[destination.warehouse]
-destination_type = "motherduck"
-```
-
-And the credentials in `.dlt/access.secrets.toml`:
-
-```toml
-[destination.warehouse.credentials]
-database = "dlt_test"
-password = "<read-only motherduck JWT>"
-```
-
-See [Profiles in dltHub](../pipeline-operations/profiles.md) for the full profile model.
-
-## Deploy to dltHub
-
-Add the notebook to your `__deployment__.py` manifest so the workspace knows about it:
-
-```py
-"""Minimal dltHub workspace."""
-
-from pipeline import load_sample_shop
-import sample_shop_notebook            # module import, one job
-
-__all__ = ["load_sample_shop", "sample_shop_notebook"]
-```
-
-Importing the module, rather than a decorated function, is what turns it into a single job. dlt finds the `marimo.App` and registers an interactive notebook job with an HTTP trigger and a concurrency of one. See [the deployment module](../pipeline-operations/deployments.md#the-deployment-module) for the other forms.
-
-Then deploy and serve:
-
-```sh
-uv run dlthub deploy                                    # publishes manifest + uploads code
-uv run dlthub serve sample_shop_notebook.py             # boots the notebook remotely, opens URL
-```
-
-`dlthub serve` runs the notebook behind the workspace's auth, so only members of your workspace can open the link, including [viewers](../platform-capabilities/users-and-roles.md), who may launch interactive jobs. To create a publicly shareable URL:
-
-```sh
-uv run dlthub job publish sample_shop_notebook          # public URL
-uv run dlthub job unpublish sample_shop_notebook        # revoke
-```
-
-:::note
-`job publish` and `job unpublish` take the job name, not the file path. Passing `sample_shop_notebook.py` is read as a `section.name` job reference and fails to resolve.
-:::
-
-
-===== FILE: docs/website/docs/hub/data-discovery/datasets.md =====
-
----
-title: Datasets
-description: Datasets in dltHub — the serving layer for loaded data.
-keywords: [dataset, datasets, hub, governance, profile, catalog, dlthub]
----
-# Datasets
-
-A **dataset** is a physical collection of data and dlt metadata at a destination — including the schema, load history, traces, and quality results. In dltHub, datasets are the **serving layer**: schemas, annotations, and run metadata propagate from sources through transformations and end up inside the dataset, so notebooks, dashboards, and downstream agents read from a single source of truth.
-
-For the Python access surface — `pipeline.dataset()`, `ReadableRelation`, `.df()`/`.arrow()`, ibis, SQL — see the [OSS Dataset reference](../../general-usage/dataset-access/dataset.md). This page focuses on what's specific to running datasets on dltHub.
-
-## One destination, many datasets
-
-A destination is a physical system (DuckDB, MotherDuck, Snowflake, BigQuery, etc.). One destination can host any number of datasets, addressed by their `dataset_name`. Two pipelines writing into the same destination but different datasets stay isolated:
-
-```py
-import dlt
-
-# `warehouse` resolves via .dlt/<profile>.config.toml + .dlt/<profile>.secrets.toml
-
-orders_pipeline = dlt.pipeline(
-    pipeline_name="orders_pipeline",
-    destination="warehouse",
-    dataset_name="orders",
-)
-customers_pipeline = dlt.pipeline(
-    pipeline_name="customers_pipeline",
-    destination="warehouse",
-    dataset_name="customers",
-)
-```
-
-Both datasets live side-by-side in the same MotherDuck database as separate schemas.
-
-## Profile-aware materialization
-
-The same logical destination (and therefore the same dataset) resolves to **different physical systems per profile**. You write code once; switching profiles redirects materialization.
-
-In a workspace, the binding lives in `.dlt/<profile>.config.toml`:
-
-```toml
-# .dlt/dev.config.toml
-[destination.warehouse]
-destination_type = "duckdb"
-```
-
-```toml
-# .dlt/prod.config.toml
-[destination.warehouse]
-destination_type = "motherduck"
-```
-
-```py
-# pipeline.py — unchanged across profiles
-import dlt
-
-pipeline = dlt.pipeline(
-    pipeline_name="orders_pipeline",
-    destination="warehouse",          # resolves via the active profile
-    dataset_name="orders",
-)
-```
-
-| Profile  | `destination_type`                  | Where data lives                              |
-| -------- | ----------------------------------- | --------------------------------------------- |
-| `dev`    | `duckdb`                            | `.dlt/data/dev/warehouse.duckdb` (local file) |
-| `prod`   | `motherduck`                        | MotherDuck (cloud)                            |
-| `access` | `motherduck`, read-only credentials | MotherDuck (cloud), read-only                 |
-
-See [Profiles in dltHub](../pipeline-operations/profiles.md) for the full profile model and [Workspace setup](../pipeline-operations/workspace-setup.md) for the configuration file layout.
-
-## Catalog and discovery in the dashboard
-
-Every load writes schema, traces, and (if enabled) data-quality results into the dataset itself. The dltHub dashboard at [app.dlthub.com](https://app.dlthub.com) reads those tables and surfaces them across two main views:
-
-- **Datasets** — every dataset in your workspace listed with its destination, owning pipeline, runs, success rate, rows and bytes loaded, schema migrations, average run time, and last-run status.
-- **Notebooks** — the `dashboard (workspace)` notebook renders per-pipeline panels (schema inspection, data browsing, data-quality results, pipeline state, run traces, and load history). You can also add your own marimo notebooks.
-
-No additional configuration is needed; landing data into a workspace-configured destination is what populates these views.
-
-## What lives inside a dataset
-
-Alongside your tables, dlt writes a small set of system tables. They're present in every dataset and are the substrate for the dashboard, data quality, and downstream tooling.
-
-| Table                 | Source | Purpose                                                             |
-| --------------------- | ------ | ------------------------------------------------------------------- |
-| `_dlt_loads`          | OSS    | One row per load package — load_id, schema name, status, timestamp. |
-| `_dlt_pipeline_state` | OSS    | Pipeline state across runs (incremental cursors, source state).     |
-| `_dlt_version`        | OSS    | Schema versions over time.                                          |
-| `_dlt_dq_metrics`     | Hub    | Per-call metric snapshots written by `dq.run_metrics()`.            |
-| `_dlt_checks`         | Hub    | Per-call check pass/fail summaries written by `dq.run_checks()`.    |
-
-The first three are documented in the [OSS internal tables](../../general-usage/dataset-access/dataset.md#internal-dlt-tables) reference; the last two are written by the [Data Quality](../data-quality/index.md) runners.
-
-## Reading a dataset from another job or notebook
-
-A transformation, downstream job, or marimo notebook can read a dataset another pipeline produced — without re-extracting from source. In a workspace where the destination is configured in `.dlt/<profile>.config.toml`, this is enough:
-
-```py
-import dlt
-
-pipeline = dlt.attach("orders_pipeline")
-orders = pipeline.dataset()["orders"].df()
-```
-
-`dlt.attach` reconstructs the pipeline from its persisted state, picking up the destination from the active profile.
-
-:::note Platform deploys
-When deploying a notebook to the Platform, pass `destination` and `dataset_name` explicitly:
-
-```py
-pipeline = dlt.attach(
-    pipeline_name="orders_pipeline",
-    destination="warehouse",
-    dataset_name="orders",
-)
-```
-
-Notebooks running on the Platform require these arguments explicitly; local scripts can rely on the workspace configuration alone.
-:::
-
-A quick sanity check that returns a frame of `(table_name, row_count)` across the whole dataset:
-
-```py
-pipeline.dataset().row_counts().df()
-```
-
-## Serving datasets with marimo
-
 Marimo notebooks deployed against the `access` profile turn a dataset into a shareable read-only app: schema-aware widgets, SQL/Python access, and a URL that stakeholders open without provisioning credentials of their own. See [Marimo notebooks](../../general-usage/dataset-access/marimo.md) for the full integration.
 
 
@@ -3204,4 +2719,475 @@ This destination is available starting from dltHub version 0.9.0. It fully suppo
 
 1. The ability to create Iceberg tables in Snowflake by configuring `iceberg_mode` in your `config.toml` file.
 2. Additional configuration for Iceberg tables in Snowflake via:
+
+  - `external_volume`: The external volume name where Iceberg data is stored.
+  - `catalog`: The catalog name in which Iceberg tables are created. Defaults to `"SNOWFLAKE"`.
+  - `base_location`: A template string for the base path that Snowflake uses for storing the table data in external storage, supporting placeholders.
+  - `extra_placeholders`: Additional values that can be used in the `base_location` template.
+  - `catalog_sync`: The name of a [catalog integration](https://docs.snowflake.com/en/user-guide/tables-iceberg#catalog-integration) configured for [Snowflake Open Catalog](https://other-docs.snowflake.com/en/opencatalog/overview). If specified, Snowflake syncs Snowflake-managed Iceberg tables in the database with an external catalog in your Snowflake Open Catalog account.
+
+## Installation
+
+Install the `dlt` package with the `snowflake` extra:
+
+```sh
+pip install "dlt[hub,snowflake]"
+```
+
+Once the `snowflake` extra is installed, you can configure a pipeline to use `snowflake_plus` exactly the same way you would use the `snowflake` destination.
+
+## Setup
+
+1. [Configure your Snowflake credentials](../../dlt-ecosystem/destinations/snowflake.md#setup-guide)
+2. [Set up a database user and permissions](../../dlt-ecosystem/destinations/snowflake.md#set-up-the-database-user-and-permissions)
+3. [Configure an external volume in Snowflake](https://docs.snowflake.com/en/user-guide/tables-iceberg-configure-external-volume)
+4. Grant usage on the external volume to the role you are using to load data:
+
+```sql
+GRANT USAGE ON EXTERNAL VOLUME <external_volume_name> TO ROLE <role_name>;
+```
+
+5. If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-init@latest` (see the [installation guide](../getting-started/installation.md)). Then, from inside the workspace, add a Snowflake pipeline:
+
+```sh
+dlthub pipeline init sql_database snowflake
+```
+
+Add the configuration to your `config.toml` file. Set `external_volume` to the name of the external volume you created in step 3 and enable Iceberg table creation by setting `iceberg_mode`:
+
+```toml
+[destination.snowflake]
+external_volume = "<external_volume_name>"
+iceberg_mode = "all"
+```
+
+Use the `snowflake_plus` destination in your pipeline:
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_snowflake_plus_pipeline",
+    destination="snowflake_plus",
+    dataset_name="my_dataset"
+)
+
+@dlt.resource
+def my_iceberg_table():
+    ...
+```
+
+## Configuration
+
+The `snowflake_plus` destination extends the standard Snowflake configuration with additional options:
+
+### `iceberg_mode`
+
+Controls which tables are created as Iceberg tables.
+
+- Possible values:
+  - `"all"`: All tables including dlt system tables are created as Iceberg tables
+  - `"data_tables"`: Only data tables (non-dlt system tables) are created as Iceberg tables
+  - `"none"`: No tables are created as Iceberg tables
+- Required: No
+- Default: `"none"`
+
+### `external_volume`
+
+The external volume to store Iceberg metadata.
+
+- Required: Yes
+- Default: None
+
+### `catalog`
+
+The catalog to use for Iceberg tables.
+
+- Required: No
+- Default: `"SNOWFLAKE"`. This will use [Snowflake as the catalog](https://docs.snowflake.com/en/user-guide/tables-iceberg#label-tables-iceberg-snowflake-as-catalog) for the Iceberg tables.
+
+### `base_location`
+
+Template string for the base location where Iceberg data is stored in the external volume. Supports placeholders like `{dataset_name}` and `{table_name}`.
+
+- Required: No
+- Default: `"{dataset_name}/{table_name}"`
+
+### `extra_placeholders`
+
+Dictionary of additional values that can be used in the `base_location` template. The values can be static strings or functions that accept the dataset name and table name as arguments and return a string.
+
+- Required: No
+- Default: None
+
+### `catalog_sync`
+
+The name of a [catalog integration](https://docs.snowflake.com/en/user-guide/tables-iceberg#catalog-integration) for syncing Iceberg tables to an external catalog in [Snowflake Open Catalog](https://other-docs.snowflake.com/en/opencatalog/overview).
+
+- Required: No
+- Default: None
+
+Configure these options in your `config.toml` file under the `[destination.snowflake]` section.
+
+## Base location templating
+
+The `base_location` parameter controls where Snowflake stores your Iceberg table data and metadata in the external volume. It's a template string that supports the following built-in placeholders:
+
+- `{dataset_name}`: The name of your dataset
+- `{table_name}`: The name of the table
+
+For more flexibility, you can also define custom placeholders using the `extra_placeholders` option.
+
+### Examples
+
+1. The default pattern `{dataset_name}/{table_name}` creates paths like `my_dataset/customers` in your external volume.
+
+2. Custom static path:
+
+   ```toml
+   [destination.snowflake]
+   base_location = "custom/static/path"
+   ```
+
+   This creates all tables in the same directory `custom/static/path`.
+
+3. Using custom placeholders:
+
+   ```toml
+   [destination.snowflake]
+   base_location = "{env}/{dataset_name}/{table_name}"
+   extra_placeholders = { env = "prod" }
+   ```
+
+   This creates paths like `prod/my_dataset/customers`.
+
+### How Snowflake uses the base location
+
+When you provide a `base_location`, Snowflake uses it to create the paths where data and metadata are stored in your external cloud storage. The actual directory structure Snowflake creates follows this pattern:
+
+```text
+STORAGE_BASE_URL/BASE_LOCATION.<randomId>/[data | metadata]/
+```
+
+Where `<randomId>` is a random Snowflake-generated 8-character string appended to create a unique directory.
+
+For more details on how Snowflake organizes Iceberg table files in external storage, see the [Snowflake documentation on data and metadata directories](https://docs.snowflake.com/en/user-guide/tables-iceberg-storage#data-and-metadata-directories).
+
+## Table format for individual tables
+
+You can specify table format (Iceberg/Native) for individual `dlt` resources. For example:
+
+  ```py
+  @dlt.resource(
+    table_format="native"
+  )
+  def my_resource():
+      ...
+
+  pipeline = dlt.pipeline("loads_native", destination="snowflake_plus")
+  ```
+
+  Will create a native (non-iceberg) **my_resource** table, also when you set the [iceberg_mode](#iceberg_mode) to **all** or **data_tables**.
+
+## Write dispositions
+
+All standard write dispositions (`append`, `replace`, and `merge`) are supported for both regular Snowflake tables and Iceberg tables.
+
+## Data types
+
+The Snowflake Plus destination supports all standard Snowflake destination data types, with additional type mappings for Iceberg tables:
+
+| dlt Type    | Iceberg Type  |
+| ----------- | ------------- |
+| `text`      | `string`      |
+| `bigint`    | `long`, `int` |
+| `double`    | `double`      |
+| `bool`      | `boolean`     |
+| `timestamp` | `timestamp`   |
+| `date`      | `date`        |
+| `time`      | `time`        |
+| `decimal`   | `decimal`     |
+| `binary`    | `binary`      |
+| `json`      | `string`      |
+
+## Syncing Snowflake-managed Iceberg tables to Snowflake Open Catalog
+
+To enable querying of Snowflake-managed Iceberg tables by third-party engines (for example, Apache Spark) via an external catalog (Snowflake Open Catalog), use the `catalog_sync` configuration option. This setting specifies a [catalog integration](https://docs.snowflake.com/en/user-guide/tables-iceberg#catalog-integration) that syncs Iceberg tables to the external catalog.
+
+### Open Catalog Setup
+
+1. Create an [external catalog in Snowflake Open Catalog](https://other-docs.snowflake.com/en/opencatalog/create-catalog).
+
+2. Create a catalog integration in Snowflake. Example:
+
+```sql
+  CREATE OR REPLACE CATALOG INTEGRATION my_open_catalog_int
+    CATALOG_SOURCE = POLARIS
+    TABLE_FORMAT = ICEBERG
+    REST_CONFIG = (
+      CATALOG_URI = 'https://<orgname>-<my-snowflake-open-catalog-account-name>.snowflakecomputing.com/polaris/api/catalog'
+      CATALOG_NAME = 'myOpenCatalogExternalCatalogName'
+    )
+    REST_AUTHENTICATION = (
+      TYPE = OAUTH
+      OAUTH_CLIENT_ID = 'myClientId'
+      OAUTH_CLIENT_SECRET = 'myClientSecret'
+      OAUTH_ALLOWED_SCOPES = ('PRINCIPAL_ROLE:ALL')
+    )
+    ENABLED = TRUE;
+```
+
+Refer to the [Snowflake documentation](https://docs.snowflake.com/en/user-guide/tables-iceberg-open-catalog-sync#step-4-create-a-catalog-integration-for-open-catalog) for detailed setup instructions.
+
+3. Configure the `catalog_sync` option in your `config.toml`:
+
+```toml
+[destination.snowflake]
+# ... other configuration
+catalog_sync = "my_open_catalog_int"
+```
+
+## Additional Resources
+
+For more information on basic Snowflake destination functionality, please refer to the [Snowflake destination documentation](../../dlt-ecosystem/destinations/snowflake.md).
+
+
+===== FILE: docs/website/docs/hub/license.md =====
+
+---
+title: License
+description: dltHub License governing the use of dltHub Software and toolkits
+keywords: [license, eula, dlthub license, terms]
+---
+# dltHub License
+
+Copyright 2026 ScaleVector, GmbH. All rights reserved.
+
+## Definitions
+
+"Agreement" means the agreement between ScaleVector, GmbH and its affiliates
+(collectively, "dltHub") and you governing the use of dltHub Services, including
+dltHub Platform, as those terms are defined in the applicable dltHub Terms of Use
+available at: [https://dlthub.com/terms](https://dlthub.com/terms).
+
+"dltHub Services" means dltHub Platform and any other products or services offered
+by dltHub, as defined in the Agreement.
+
+"Derivative Works" means any work that is based on, incorporates, or is derived
+from the Licensed Materials, including but not limited to code generated with the
+assistance of the Licensed Materials, modified copies, adaptations, and projects
+into which the Licensed Materials is installed or integrated.
+
+"Licensed Materials" means the source code, object code, data, and/or other works,
+including educational materials, to which this license applies.
+
+## Scope of Use
+
+You may view, use, copy, modify, publish, and distribute the Licensed Materials
+solely in connection with dltHub Services under a governing Agreement. Any use of
+the Licensed Materials outside of dltHub Services is not permitted under this
+license.
+
+Without limiting the foregoing, the following are examples of permitted use:
+
+1. Using toolkits and skills provided by dltHub to develop, build, test,
+   and deploy data pipelines on dltHub Platform.
+2. Copying and modifying toolkit code for use exclusively with dltHub Services and on
+   dltHub Services.
+3. Using the Licensed Materials to generate code intended for deployment on dltHub
+   Platform.
+
+The following are examples of uses that are NOT permitted under this license:
+
+1. Using toolkits and skills provided by dltHub to generate code or pipelines for
+   deployment on a third-party runtime platform or orchestration service that is not
+   part of dltHub Services.
+2. Modifying toolkits to replace, bypass, or substitute components that are part of
+   dltHub services in order to operate within a third-party development environment.
+3. Incorporating the Licensed Materials or Derivative Works into any product or
+   service that competes with the Licensed Materials, or any other dltHub Services.
+4. Providing the Licensed Materials to third parties as part of a hosted or managed
+   service that replicates the functionality of dltHub Services.
+
+Use beyond the scope of this license requires a separate license agreement
+negotiated with dltHub on a case-by-case basis.
+
+## Redistribution
+
+Redistribution of the Licensed Materials, with or without modification, is
+permitted provided that this license notice is included in all copies or substantial
+portions of the Licensed Materials. All recipients are bound by the same scope of
+use restrictions set forth in this license.
+
+## Intellectual Property
+
+dltHub retains all right, title, and interest in and to the Licensed Materials as
+originally published.
+
+dltHub waives all intellectual property claims over Derivative Works, provided that:
+
+1. The use of the Licensed Materials complies with the scope of use set forth in
+   this license, and
+2. This license notice is retained in all copies or substantial portions of the
+   Licensed Materials contained within the Derivative Works.
+
+This waiver extends to the Licensed Materials itself as incorporated into Derivative
+Works—you are free to use, modify, and distribute it within your Derivative Works
+without further restriction, subject only to the scope of use and redistribution
+terms above.
+
+## Disclaimer and Limitation of Liability
+
+THE LICENSED MATERIALS ARE PROVIDED "AS IS" WITH ALL FAULTS. DLTHUB AND ITS
+LICENSORS DISCLAIM ALL WARRANTIES, WHETHER EXPRESS, IMPLIED, STATUTORY, OR
+OTHERWISE, INCLUDING WITHOUT LIMITATION THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, AND NONINFRINGEMENT. DLTHUB AND ITS LICENSORS'
+TOTAL AGGREGATE LIABILITY RELATING TO OR ARISING OUT OF YOUR USE OF OR DLTHUB'S
+PROVISIONING OF THE LICENSED MATERIALS SHALL BE LIMITED TO ONE THOUSAND DOLLARS
+($1,000). IN NO EVENT SHALL DLTHUB OR ITS LICENSORS BE LIABLE FOR ANY LOST PROFITS,
+LOSS OF REVENUE, LOST BUSINESS, COSTS OF COVER OR ANY INCIDENTAL, SPECIAL,
+EXEMPLARY OR PUNITIVE DAMAGES OF ANY KIND OR NATURE IN CONNECTION WITH THIS LICENSE
+OR THE LICENSED MATERIALS.
+
+
+===== FILE: docs/website/docs/hub/notifications/email.md =====
+
+---
+title: Send email notifications
+description: Subscribe to dltHub workspace failure and success alerts, or send custom emails from your pipeline code with SMTP.
+keywords: [email, alerts, notifications, failure alerts, run alerts, hub, dltHub, smtp]
+---
+# Send email notifications
+
+dltHub provides native email alerting managed directly from the Web UI, with no pipeline code changes required. You can also send custom emails directly from your pipeline code using SMTP.
+
+---
+
+## dltHub platform alerts
+
+:::tip Recommended
+Configuring alerts in the dltHub Web UI is the preferred way to monitor your workloads. It requires no code or secrets in your repository and captures platform-level failures (such as container crashes, timeouts, memory limits, and dependency issues) that occur outside your pipeline code.
+:::
+
+With platform alerts, dltHub sends transactional email notifications when pipeline runs fail or complete successfully.
+
+![dltHub workspace email alert configuration](https://storage.googleapis.com/dlt-blog-images/dlthub-screenshot-email-alert-config.png)
+
+### How to configure
+
+1. Open the dltHub Web UI and navigate to your workspace.
+
+2. In the left navigation, go to **Settings > Alerts** (`/w/<workspace_id>/settings/alerts`).
+
+3. Under **Alerts Configuration**, locate the trigger you want to configure:
+
+  - **Job run failures**: Fires whenever a job or pipeline run transitions to failed status.
+  - **Job run successes**: Fires whenever a job or pipeline run transitions to completed status.
+
+4. Toggle the alert switch **On**.
+
+5. Under **Email Recipients**, select who should receive the email:
+
+  - **Workspace owners only**: Default for failure alerts. Delivers to users with the Workspace Owner or Org Owner role.
+  - **All workspace members**: Sends notifications to all human members belonging to the workspace.
+  - **( ) No email recipients**: Disables email delivery for this trigger (useful when routing notifications exclusively to Slack).
+
+6. Under **Scope**, choose which jobs to monitor:
+
+  - **All jobs**: Delivers alerts for any job run in the workspace.
+  - **Specific pipelines**: Filters alerts to a selected list of pipelines.
+
+7. Click **Save** in the bottom changes bar to apply your configuration.
+
+### What the email includes
+
+Platform alert emails are pre-formatted and sent via high-deliverability infrastructure. Each email includes:
+
+- The name of the pipeline and workspace.
+- The failure reason and error excerpt (for failure alerts).
+- The exact UTC timestamp of the run.
+- A direct link to open the run details and logs in the dltHub Web UI.
+
+---
+
+## Custom email notification on pipeline failure (in-code alternative)
+
+:::note When to use custom in-code emails
+Platform alerts above notify you when a **job run** fails, whatever the cause. The custom notification below covers **pipeline failures** only: it runs inside your job, so it cannot report a job that fails before your code runs or is killed mid-run by the container runtime.
+
+Use this custom approach only if you need custom email templates, attachments, or need to send alerts to external recipients outside your dltHub workspace.
+:::
+
+If you need a different channel, recipient list, or message body than the platform alerts provide, send the email from the job itself. The pattern below uses Python's standard `smtplib` with Gmail SMTP, but the same shape works for any SMTP server (Outlook, Workspace SMTP relay, or transactional providers like Resend, SendGrid, Mailgun).
+
+### Prerequisites
+
+Generate a Gmail **App Password**, a 16-character credential that lets SMTP authenticate without your real password:
+
+1. Make sure **2-Step Verification** is enabled on the Google Account.
+2. Open [https://myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
+3. Create a new password and name it, e.g. "dltHub pipeline".
+4. Copy the 16 characters. Google displays them with spaces (`abcd efgh ijkl mnop`); the spaces are decorative, so strip them.
+
+App Passwords don't affect normal sign-in: your password, 2FA, and existing sessions are unchanged. You can revoke the App Password from the same page without touching the account.
+
+If you're on a **Google Workspace** domain, an administrator may have disabled App Passwords org-wide. In that case use a transactional provider (Resend, SendGrid, Mailgun). The wiring is the same; just point `smtplib` at their SMTP server and use their API key as the password.
+
+### Store credentials in your prod profile
+
+Add to `.dlt/prod.secrets.toml`:
+
+```toml
+[notifications.email]
+host = "smtp.gmail.com"
+port = 587
+sender = "you@example.com"
+recipient = "you@example.com"
+password = "abcdefghijklmnop"     # 16 chars, no spaces, no angle brackets
+```
+
+`sender` must be the **same Google Account** the App Password was generated on.
+
+:::tip Allowlist outbound IPs
+If your SMTP server requires IP allowlisting, enable [static egress IPs](../pipeline-operations/job-configuration.md#static-egress-ips) so the job's outbound traffic uses a known set of source IPs.
+:::
+
+### Wire it into your pipeline
+
+```python
+import smtplib
+import time
+from datetime import datetime, timezone
+from email.message import EmailMessage
+
+import dlt
+from dlt.hub import run
+
+
+def send_email(subject: str, body: str) -> None:
+    host = dlt.secrets["notifications.email.host"]
+    port = int(dlt.secrets["notifications.email.port"])
+    sender = dlt.secrets["notifications.email.sender"]
+    recipient = dlt.secrets["notifications.email.recipient"]
+    password = dlt.secrets["notifications.email.password"]
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.set_content(body)
+
+    with smtplib.SMTP(host, port) as s:
+        s.starttls()
+        s.login(sender, password)
+        s.send_message(msg)
+
+
+@run.pipeline("my_pipeline")
+def my_job():
+    pipeline = dlt.pipeline(
+        pipeline_name="my_pipeline",
+        destination="warehouse",
+        dataset_name="my_dataset",
+    )
 

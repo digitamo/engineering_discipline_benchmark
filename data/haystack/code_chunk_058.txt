@@ -1,636 +1,3 @@
-# enable signal handling for graceful shutdowns - it is disabled for pipelines running
-# in threads
-with signals.intercepted_signals():
-    # load data
-    asyncio.run(_run_async())
-# activate pipelines before they are used
-pipeline_1.activate()
-pipeline_1_count = pipeline_1.last_trace.last_normalize_info.row_counts["async_table"]  # ty: ignore
-print(pipeline_1_count)
-#> 10
-
-pipeline_2.activate()
-pipeline_2_count = pipeline_2.last_trace.last_normalize_info.row_counts["defer_table"]  # ty: ignore
-print(pipeline_2_count)
-#> 5
-```
-
-:::tip
-Please note the following:
-
-1. When running in multiple threads and using [parallel normalize step](#normalize), use the **spawn**
-process start method.
-2. If you created the `Pipeline` object in the worker thread and you use it from another (i.e., the main thread),
-call `pipeline.activate()` to inject the right context into the current thread.
-3. Note how `with signals.intercepted_signals():` was used to [enable graceful shutdown](../running-in-production/running.md#allow-a-graceful-shutdown) of pipelines running in a thread pool.
-:::
-
-### Parallelism across processes or machines
-
-You can also run pipelines in parallel across multiple machines. Please consult our [deployment guides](../walkthroughs/deploy-a-pipeline) for more information. Please take note of the pitfalls listed below.
-
-### Pitfalls
-
-Due to the way `dlt` works, there are a few general pitfalls to be aware of:
-
-1. Do not run pipelines with the same name and working dir in parallel on the same machine. dlt will not be able to manage state and temporary files properly if you do this.
-
-2. If you're running multiple pipelines in parallel that write to the same destination dataset and use a staging area, make sure to do one of the following:
-
-  - Assign a unique subfolder in the staging destination bucket for each pipeline, or
-  - [Disable automatic cleanup of the staging area](../dlt-ecosystem/staging#how-to-prevent-staging-files-truncation) after each load for all pipelines.
-
-    If you do not, files might be deleted by one pipeline that are still required to be loaded by another pipeline running in parallel.
-
-3. If you are using a write disposition that requires a staging dataset on the final destination, you should provide a unique staging dataset name for each pipeline, otherwise similar problems as noted above may occur. You can do this with the
-[`staging_dataset_name_layout` setting.](../dlt-ecosystem/staging#staging-dataset)
-
-## Keep pipeline working folder in a bucket on constrained environments
-
-`dlt` stores extracted data in load packages in order to load them atomically. In case you extract a lot of data at once (i.e. backfill) or
-your runtime env has constrained local storage (i.e. cloud functions) you can keep your data on a bucket by using [FUSE](https://github.com/libfuse/libfuse) or
-any other option which your cloud provider supplies.
-
-`dlt` users rename when saving files and  "committing" packages (folder rename). Those may be not supported on bucket filesystems. Often
-`rename` is translated into `copy` automatically. In other cases `dlt` will fallback to copy itself.
-
-In case of cloud function and gs bucket mounts, increasing the rename limit for folders is possible:
-
-```hcl
-volume_mounts {
-    mount_path = "/usr/src/ingestion/pipeline_storage"
-    name       = "pipeline_bucket"
-  }
-volumes {
-  name = "pipeline_bucket"
-  gcs {
-    bucket    = google_storage_bucket.dlt_pipeline_data_bucket.name
-    read_only = false
-    mount_options = [
-      "rename-dir-limit=100000"
-    ]
-  }
-}
-```
-
-## Handling storage limits
-
-If your storage reaches its limit, you are likely running dlt in a cloud environment with restricted disk space. To prevent issues, mount an external cloud storage location and set the `DLT_DATA_DIR` environment variable to point to it. This ensures that dlt uses the mounted storage as its data directory instead of local disk space.
-
-### Setting `DLT_DATA_DIR`
-
-You can configure `DLT_DATA_DIR` in your environment setup as follows:
-
-```py
-import os
-
-# Define the path to your mounted external storage
-data_dir = "/path/to/mounted/bucket/dlt_pipeline_data"
-
-# Set the DLT_DATA_DIR environment variable
-os.environ["DLT_DATA_DIR"] = data_dir
-
-# Rest of your pipeline code
-```
-
-This directs dlt to use the specified external storage for all data operations, preventing local storage constraints.
-
-
-===== FILE: docs/website/docs/reference/telemetry.md =====
-
----
-title: Telemetry
-description: Anonymous usage information with dlt telemetry
-keywords: [telemetry, usage information, opt out]
----
-# Telemetry
-
-`dlt` collects and reports **anonymous** usage information. This information is essential to figuring out how we should improve the library. Telemetry does not send any personal data. We create a random tracking cookie that is stored in your `~/.dlt` directory. You can disable telemetry at any moment or send it to your own servers instead.
-
-## How to opt out
-
-You can disable telemetry by adding `--disable-telemetry` to any dlt [command](command-line-interface.md).
-
-This command will disable telemetry both in the current project and globally for the whole machine:
-
-```sh
-dlt --disable-telemetry
-```
-
-While this command will also permanently disable telemetry and then initialize the `chess` pipeline:
-
-```sh
-dlt --disable-telemetry init chess duckdb
-```
-
-You can check the current telemetry status with this command:
-
-```sh
-dlt telemetry
-```
-
-Another way to disable telemetry is to set the `runtime.dlthub_telemetry` option in the `config.toml` file in the `.dlt` folder.
-
-```toml
-[runtime]
-
-dlthub_telemetry=false
-```
-
-## What we send when
-
-Anonymous telemetry is sent when:
-
-- Any `dlt` command is executed from the command line. The data contains the command name. In the case of the `dlt init` command, we also send the requested destination and data source names.
-- When `pipeline.run` is called, we send information when the [extract, normalize, and load](explainers/how-dlt-works.md) steps are completed. The data contains the destination name (e.g., `duckdb`), hashes of the dataset name, pipeline name, default schema name, destination fingerprint (which is a hash of selected destination configuration fields), elapsed time, and whether the step succeeded or not.
-- When `pipeline.dataset` is called, we send information about dataset access attempts. The data contains the destination name and type (e.g., `duckdb`), hashes of the dataset name, default and requested schema names, as well as whether the access attempt succeeded.
-- When `dbt` and `airflow` helpers are used
-
-Here is an example `dlt init` telemetry message:
-
-```json
-{
-  "anonymousId": "933dd165453d196a58adaf49444e9b4c",
-  "context": {
-    "ci_run": false,
-    "cpu": 8,
-    "exec_info": [],
-    "library": {
-      "name": "dlt",
-      "version": "0.2.0a25"
-    },
-    "os": {
-      "name": "Linux",
-      "version": "4.19.128-microsoft-standard"
-    },
-    "python": "3.8.11",
-    "run_context": {
-      "name": "dlt"
-    }
-  },
-  "event": "command_init",
-  "properties": {
-    "destination_name": "bigquery",
-    "elapsed": 3.1720383167266846,
-    "event_category": "command",
-    "event_name": "init",
-    "pipeline_name": "pipedrive",
-    "success": true
-  }
-}
-```
-
-Example for `load` pipeline run step:
-
-```json
-{
-  "anonymousId": "570816b273a41d16caacc26a797204d9",
-  "context": {
-    "ci_run": false,
-    "cpu": 3,
-    "exec_info": [],
-    "library": {
-      "name": "dlt",
-      "version": "0.2.0a26"
-    },
-    "os": {
-      "name": "Darwin",
-      "version": "21.6.0"
-    },
-    "python": "3.10.10",
-    "run_context": {
-      "name": "my_workspace",
-      "profile": "dev"
-    }
-  },
-  "event": "pipeline_load",
-  "properties": {
-    "destination_name": "duckdb",
-    "destination_fingerprint": "",
-    "pipeline_name_hash": "OpVShb3cX7qQAmOZSbV8",
-    "dataset_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
-    "default_schema_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
-    "elapsed": 2.234885,
-    "event_category": "pipeline",
-    "event_name": "load",
-    "success": true,
-    "transaction_id": "39c3b69c858836c36b9b7c6e046eb391"
-  }
-}
-```
-
-Example for data access telemetry:
-
-```json
-{
-  "anonymousId": "570816b273a41d16caacc26a797204d9",
-  "context": {
-    "ci_run": false,
-    "cpu": 3,
-    "exec_info": [],
-    "library": {
-      "name": "dlt",
-      "version": "1.15.0"
-    },
-    "os": {
-      "name": "Darwin",
-      "version": "21.6.0"
-    },
-    "python": "3.10.10",
-    "run_context": {
-      "name": "dlt"
-    }
-  },
-  "event": "data_access_connect",
-  "properties": {
-    "destination_name": "duckdb",
-    "destination_type": "duckdb",
-    "dataset_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
-    "default_schema_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
-    "requested_schema_name_hash": "49ShjWp8x9h+rmyqjP6G",
-    "event_category": "data_access",
-    "event_name": "connect",
-    "success": true
-  }
-}
-```
-
-## The message `context`
-
-The message `context` contains the following information:
-
-- `anonymousId`: a random tracking cookie stored in `~/.dlt/.anonymous_id`.
-- `ci_run`: a flag indicating if the message was sent from a CI environment (e.g., `GitHub Actions`, `Travis CI`).
-- `cpu`: contains the number of cores.
-- `exec_info`: contains a list of strings that identify the execution environment: (e.g., `kubernetes`, `docker`, `airflow`).
-- `run_context`: the name of the active run context (`dlt` for the default one) and, if the context supports profiles, the active profile name.
-- The `library`, `os`, and `python` give us some understanding of the runtime environment of the `dlt`.
-
-## Send telemetry data to your own tracker
-
-You can set up your own tracker to receive telemetry events. You can create a scalable, globally distributed edge service [using `dlt` and Cloudflare](https://dlthub.com/blog/dlt-segment-migration).
-
-Once your tracker is running, point `dlt` to it. You can use the global `config.toml` to redirect all pipelines on a given machine.
-
-```toml
-[runtime]
-dlthub_telemetry_endpoint="telemetry-tracker.services4745.workers.dev"
-```
-
-### Track events with Segment
-
-You can send anonymous telemetry to your own [Segment](https://segment.com/) account. You need to create an HTTP Server source and generate a WRITE KEY, which you then pass to the `config.toml` like this:
-
-```toml
-[runtime]
-dlthub_telemetry_endpoint="https://api.segment.io/v1/track"
-dlthub_telemetry_segment_write_key="<write_key>"
-```
-
-
-===== FILE: docs/website/docs/release-notes/1.12.1.md =====
-
----
-title: "Release highlights: 1.12.1"
-description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
-keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
----
-# Release highlights: 1.12.1
-
-This update includes substantial improvements to developer experience and stability, as well as bug fixes. Here's a breakdown of what's new:
-
----
-
-## Placeholder config & secret warning system
-
-**PR:** [#2636](https://github.com/dlt-hub/dlt/pull/2636)
-
-**Overview**
-
-* dlt now detects placeholder values during **config and secret resolution** (e.g., `"<configure me>"`, or timestamps like `1768-07-21T02:56:00Z`).
-* A **detailed warning** is emitted when placeholders are detected, helping users identify incomplete configuration.
-* Prevents confusing errors during pipeline runs and catches misconfigured values early in the development cycle.
-
-**Example placeholders**
-
-```toml
-[credentials]
-token = "<configure me>"
-started_at = "1768-07-21T02:56:73Z"  # random date
-```
-
-**Example warning**
-
-```text
-Placeholder value encountered when resolving config or secret:
-resolved_key: host, value: <configure me>, section: sources.sql_database.credentials.host
-Most likely, this comes from init-command, which creates basic templates for non-complex configs and secrets. The provider to adjust is secrets.toml at one of these locations:
-- /home/me/project/.dlt/secrets.toml
-- /home/me/.dlt/secrets.toml
-```
-
----
-
-## Warning for `None`-only columns
-
-**PR:** [#2633](https://github.com/dlt-hub/dlt/pull/2633)
-
-**Overview**
-
-* When normalizing data, if a column contains only `None`, dlt can’t infer its type.
-* This PR adds a **clear warning message** to help users fix this by providing an explicit type hint.
-* If no type hint is given, the column will be **excluded** from the destination table.
-
-**Example warning**
-
-```text
-The column `my_column` in table `my_table` did not receive any data during this load. Therefore, its type couldn't be inferred.
-
-Unless a type hint is provided, the column will not be materialized in the destination.
-```
-
-**Recommended fix**
-
-```py
-@dlt.resource(columns={"my_column": {"data_type": "text"}})
-def my_data():
-    yield {"my_column": None}
-```
-
----
-
-## Regular and standalone resources are now the same thing
-
-**Before**
-
-* Inner resources could not receive secrets or configs properly.
-* Required the `standalone=True` argument.
-
-```py notype
-@dlt.resource(standalone=True)
-def foo(access_token=dlt.secrets.value):
-    yield from generate_json_like_data(access_token)
-```
-
-```toml
-[sources.foo]
-access_token = "your_token"
-```
-
-**Now**
-
-* All `@dlt.resource` functions behave identically.
-* `standalone=True` is **ignored** and no longer required.
-* Inner resources adopt the config section from the source they are in: `sources.source_module.resource_name` this is canonical form.
-
-**Cleaner usage**
-
-```py notype
-@dlt.resource
-def foo(access_token=dlt.secrets.value):
-    yield from generate_json_like_data(access_token)
-```
-
-For inner resources:
-
-```py notype
-@dlt.source
-def bar():
-    @dlt.resource
-    def foo(access_token=dlt.secrets.value):
-        yield from generate_json_like_data(access_token)
-
-    return foo
-```
-
-```toml
-[sources.bar.foo]
-access_token = "your_token"
-```
-
----
-
-## Resources can `return` data (instead of `yield`)
-
-**Overview**
-
-* You can now return values instead of yielding.
-* Useful for static data or short lists.
-
-**Example**
-
-```py
-@dlt.resource
-def numbers():
-    return [{"key1": 1, "key2": 2}]
-```
-
-> `return` is automatically wrapped into a generator internally.
-
-:::warning
-Not recommended for large-scale use due to readability and stream control.
-:::
-
----
-
-## Performance and stability fixes
-
-**PR:** [#2756](https://github.com/dlt-hub/dlt/pull/2756)
-
-### 1. Snowflake: extremely slow merge query due to `OR` condition (n² complexity)
-
-* In **merge** write disposition with `delete-insert` strategy, the generated SQL used:
-
-```sql
-DELETE FROM main_table WHERE EXISTS (
-  SELECT 1 FROM staging_table
-  WHERE main.pk1 = staging.pk1 AND main.pk2 = staging.pk2
-     OR main.merge_key = staging.merge_key
-);
-```
-
-* This caused **very slow** performance due to `OR` logic in `EXISTS`, especially on large datasets.
-
-**New approach**
-
-* Rewrites the logic to two separate `DELETE` queries, executed in the same transaction:
-
-```sql
-DELETE ... WHERE EXISTS (JOIN ON primary_key);
-DELETE ... WHERE EXISTS (JOIN ON merge_key);
-```
-
-:::info
-⚡ Improves performance from **18 hours → 4 seconds** on large datasets.
-:::
-
-### 2. Skip deduplication option
-
-* New flag allows users to **disable deduplication** during `delete-insert` operations, further reducing merge cost.
-* Useful for **append-heavy** workloads with upstream deduplication.
-* Works for any destination that supports `delete-insert`.
-
-```py
-@dlt.resource(
-    primary_key="id",
-    write_disposition={
-        "disposition": "merge",
-        "strategy": "delete-insert",
-        "deduplicated": False
-    }
-)
-def data_resource():
-    yield from iter(())  # your data generator
-```
-
----
-
-## Iceberg: `upsert` merge strategy added
-
-**PR:** [#2671](https://github.com/dlt-hub/dlt/pull/2671)
-
-**Overview**
-
-* Iceberg now supports `merge` with **upsert** semantics, similar to Delta Lake.
-* Enables row-level updates using **primary and merge keys**.
-
-:::warning
-Known limitations due to current pyiceberg behavior:
-
-* Nested fields and struct joins are not fully supported in Arrow joins (required by upsert).
-* Non-unique keys in input data will raise hard errors — Iceberg enforces strict uniqueness.
-* Some failing tests stem from current pyiceberg limitations (e.g., recursion limits, Arrow type mismatches).
-:::
-
----
-
-## Bonus: Postgres now supports `parquet` via ADBC
-
-**PR:** [#2685](https://github.com/dlt-hub/dlt/pull/2685)
-
-```py
-@dlt.source  # your source
-def crm():
-    yield ...
-
-pipeline = dlt.pipeline(destination="postgres")
-pipeline.run(crm, loader_file_format="parquet")
-```
-
----
-
-## Full release notes
-
-[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
-
-
-===== FILE: docs/website/docs/release-notes/1.13-1.14.md =====
-
----
-title: "Release highlights: 1.12.3 - 1.14.1"
-description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
-keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
----
-# Release highlights: 1.12.3 & 1.13.0 & 1.14.1
-
-## Breaking change: Ibis dataset/relation functionality + new non-Ibis relation features
-
-**What changed**
-
-Accessing Ibis relations using `dataset["table_name"]` or `dataset.table_name` no longer works.
-
-**Migration required**
-
-To get an Ibis table relation, explicitly set the table type to get the *table expression first*, then convert it to a *table relation:*
-
-```py
-# Previously: dataset["customers"]  # now returns a regular relation
-dataset: dlt.Dataset = pipeline.dataset() # or `dlt.dataset(destination, dataset_name)`
-
-customers_expression = dataset.table("customers", table_type="ibis")
-customers_relation = dataset(customers_expression)  # ty: ignore[invalid-argument-type]
-
-df = customers_relation.df()  # fetch as DataFrame
-```
-
-Check out the [updated docs](../general-usage/dataset-access/dataset#modifying-queries-with-ibis-expressions) and [migration guide](../general-usage/dataset-access/dataset#migrating-from-the-previous-dlt--ibis-implementation) for full details and examples.
-
-:::note
-If you were using `dataset` without having Ibis installed, or without using any Ibis features, no changes are needed.
-:::
-
----
-
-**New: non-Ibis relation enhancements**
-
-You can now use a more SQL-like interface on regular relations:
-
-```py notype
-customers = dataset.table("customers")
-
-# Sort
-customers.order_by("created_at").fetchall()
-
-# Filter
-customers.filter("id = 1").fetchall()
-
-# Aggregation
-customers.select("id").max().scalar()
-```
-
----
-
-## REST API: New paginator for header-based cursors
-
-**PR: #2798**
-
-**Overview**
-
-The new `header_cursor` paginator enables pagination for APIs that return the next page cursor in the **response headers**, such as those using custom headers like `NextPageToken`.
-
-**Use case**
-
-Some REST APIs respond like this:
-
-```text
-# response header
-Content-Type: application/json
-NextPageToken: 123456
-```
-
-```text
-# response JSON
-[
-  {"id": 1, "name": "item1"},
-  {"id": 2, "name": "item2"}
-]
-```
-
-To fetch the next page:
-
-```text
-https://api.example.com/items?page=123456
-```
-
-**Example configuration**
-
-```py
-{
-  "path": "items",
-  "paginator": {
-    "type": "header_cursor",
-    "cursor_key": "NextPageToken",  # name of the response header
-    "cursor_param": "page"          # query parameter used to pass the token
-  }
-}
-```
-
-You can now extract cursors from headers just like from JSON paths in the response body.
-
----
-
-## Autocompletion in Notebooks: Dataset and relation
-
 **PR: #2891**
 
 **Overview**
@@ -3245,4 +2612,243 @@ In this course, you'll go far beyond the basics. You’ll build production-grade
 Learn how to build flexible REST API connectors from scratch using `@dlt.resource` and the powerful `RESTClient`.
 
 ### **Lesson 2: Custom Sources – SQL Databases** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_2_custom_sources_sql_databases_.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_2_custom_sources_sql_databases_.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_2_custom_sources_sql_databases_.ipynb)
+
+Connect to any SQL-compatible database, reflect table schemas, write query adapters, and selectively ingest data using `sql_database`.
+
+### **Lesson 3: Custom Sources – Filesystems & Cloud Storage** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_3_custom_sources_filesystem_and_cloud_storage.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_3_custom_sources_filesystem_and_cloud_storage.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_3_custom_sources_filesystem_and_cloud_storage.ipynb)
+
+Build sources that read from local or remote files (S3, GCS, Azure).
+
+### **Lesson 4: Custom Destinations – Reverse ETL** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_4_destinations_reverse_etl.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_4_destinations_reverse_etl.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_4_destinations_reverse_etl.ipynb)
+
+Use `@dlt.destination` to send data back to APIs like Notion, Slack, or Airtable. Learn batching, retries, and idempotent patterns.
+
+### **Lesson 5: Transforming Data Before & After Load** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_5_transform_data_before_and_after_loading.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_5_transform_data_before_and_after_loading.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_5_transform_data_before_and_after_loading.ipynb)
+
+Learn when and how to apply `add_map`, `add_filter`, `@dlt.transformer`, or even post-load transformations via SQL or Ibis. Control exactly how your data looks.
+
+### **Lesson 6: Write Disposition Strategies & Advanced Tricks** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_6_write_disposition_strategies_and_advanced_tricks.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_6_write_disposition_strategies_and_advanced_tricks.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_6_write_disposition_strategies_and_advanced_tricks.ipynb)
+
+Understand how to use `replace` and `merge`, and combine them with schema hints and incremental loading.
+
+### **Lesson 7: Data Contracts** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_7_data_contracts.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_7_data_contracts.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_7_data_contracts.ipynb)
+
+Define expectations on schema, enforce data types and behaviors, and lock down your schema evolution. Ensure reliable downstream use of your data.
+
+### **Lesson 8: Logging & Tracing** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_8_logging_and_tracing.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_8_logging_and_tracing.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_8_logging_and_tracing.ipynb)
+
+Track every step of your pipeline: from extraction to load. Use logs, traces, and metadata to debug and analyze performance.
+
+### **Lesson 9: Performance Optimization** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_9_performance_optimisation.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_9_performance_optimisation.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_9_performance_optimisation.ipynb)
+
+Handle large datasets, tune buffer sizes, parallelize resource extraction, optimize memory usage, and reduce pipeline runtime.
+
+## Homework & Certification
+
+You’ve finished the dlt Advanced Course — well done! Test your skills with the [**Advanced Certification Homework**](https://dlthub.learnworlds.com/course/dlt-advanced).
+
+
+===== FILE: docs/website/docs/tutorial/education.md =====
+
+---
+title: Education
+description: Learn the fundamentals and advanced concepts of dlt with self-paced courses. Start with pipelines, resources, sources, pagination, schema, and state, then move on to custom sources, complex APIs, destinations, transformations, data contracts, performance optimization, and production deployment.
+keywords: [dlt, fundamentals, advanced, tutorial, pipeline, python, data engineering, resources, sources, pagination, authentication, configuration, schema, state, incremental loading, write disposition, custom sources, custom destinations, transformations, data contracts, logging, tracing, performance optimization, deployment, airflow, lambda, github actions, dagster, duckdb]
+---
+# Welcome to self-paced `dlt` courses
+
+Here you'll find self-paced `dlt` courses designed to help you grow from beginner to advanced data engineer. Each course is structured with hands-on lessons that you can complete at your own pace.
+
+## Available Courses
+
+### [dlt Fundamentals Course](./fundamentals-course.md)
+
+**Perfect for beginners!** This course introduces you to `dlt`, covering the essential concepts you need to get started with data pipelines.
+
+**What you'll learn:**
+
+- Pipelines, resources, and sources
+- Configuration and authentication
+- Schema management and state
+- Incremental loading and write dispositions
+- Working with REST APIs and databases
+- Pipeline metadata and debugging
+
+[**Start the fundamentals course →**](./fundamentals-course.md)
+
+---
+
+### [Advanced dlt Course](./advanced-course.md)
+
+**For experienced users!** Take your `dlt` skills to the next level with advanced patterns, custom implementations, and production best practices.
+
+**What you'll learn:**
+
+- Building custom sources for REST APIs, SQL databases, and filesystems
+- Creating custom destinations and reverse ETL patterns
+- Advanced data transformations and pipeline optimization
+- Data contracts and schema enforcement
+- Logging, tracing, and performance optimization
+
+[**Start the advanced course →**](./advanced-course.md)
+
+
+===== FILE: docs/website/docs/tutorial/filesystem.md =====
+
+---
+title: Load data from a cloud storage or a file system
+description: Learn how to load data files like JSON, JSONL, CSV, and Parquet from a cloud storage (AWS S3, Google Cloud Storage, Google Drive, Azure Blob Storage) or a local file system using dlt.
+keywords: [dlt, tutorial, filesystem, cloud storage, file system, python, data pipeline, incremental loading, json, jsonl, csv, parquet, duckdb]
+---
+# Load data from a cloud storage or a file system
+
+This tutorial is for you if you need to load data files like JSONL, CSV, and Parquet from either Cloud Storage (e.g., AWS S3, Google Cloud Storage, Google Drive, Azure Blob Storage), a remote (SFTP), or a local file system.
+
+## What you will learn
+
+- How to set up a file system or cloud storage as a data source
+- Configuration basics for file systems and cloud storage
+- Loading methods
+- Incremental loading of data from file systems or cloud storage
+- How to load data of any type
+
+## 0. Prerequisites
+
+- Python 3.10 or higher installed
+- Virtual environment set up
+- `dlt` installed. Follow the instructions in the [installation guide](../reference/installation) to create a new virtual environment and install dlt.
+
+## 1. Setting up a new project
+
+To help you get started quickly, dlt provides some handy CLI commands. One of these commands will help you set up a new dlt project:
+
+```sh
+dlt init filesystem duckdb
+```
+
+This command creates a project that loads data from a file system into a DuckDB database. You can easily switch out duckdb for any other [supported destinations](../dlt-ecosystem/destinations).
+After running this command, your project will have the following structure:
+
+```text
+filesystem_pipeline.py
+requirements.txt
+.dlt/
+    config.toml
+    secrets.toml
+```
+
+Here’s what each file does:
+
+- `filesystem_pipeline.py`: This is the main script where you'll define your data pipeline. It contains several different examples of loading data from the filesystem source.
+- `requirements.txt`: This file lists all the Python dependencies required for your project.
+- `.dlt/`: This directory contains the [configuration files](../general-usage/credentials/) for your project:
+  - `secrets.toml`: This file stores your API keys, tokens, and other sensitive information.
+  - `config.toml`: This file contains the configuration settings for your dlt project.
+
+:::note
+When deploying your pipeline in a production environment, managing all configurations with files might not be convenient. In this case, we recommend you use environment variables to store secrets and configs instead. Read more about [configuration providers](../general-usage/credentials/setup#choose-where-to-store-configuration) available in dlt.
+:::
+
+## 2. Creating the pipeline
+
+The filesystem source provides users with building blocks for loading data from any type of files. You can break down the data extraction into two steps:
+
+1. Listing the files in the bucket/directory.
+2. Reading the files and yielding records.
+
+dlt's filesystem source includes several resources:
+
+- The `filesystem` resource lists files in the directory or bucket.
+- Several readers resources (`read_csv`, `read_parquet`, `read_jsonl`) read files and yield the records. These resources have a special type; they are called [transformers](../general-usage/resource#process-resources-with-dlttransformer). Transformers expect items from another resource. In this particular case, transformers expect a `FileItem` object and transform it into multiple records.
+
+Let's initialize a source and create a pipeline for loading CSV files from Google Cloud Storage to DuckDB. You can replace the code from `filesystem_pipeline.py` with the following:
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_csv
+
+files = filesystem(bucket_url="gs://filesystem-tutorial", file_glob="encounters*.csv")
+reader = (files | read_csv()).with_name("encounters")
+pipeline = dlt.pipeline(pipeline_name="hospital_data_pipeline", dataset_name="hospital_data", destination="duckdb")
+
+info = pipeline.run(reader)
+print(info)
+```
+
+What's happening in the snippet above?
+
+1. We import the `filesystem` resource and initialize it with a bucket URL (`gs://filesystem-tutorial`) and the `file_glob` parameter. dlt uses `file_glob` to filter file names in the bucket. `filesystem` returns a generator object.
+2. We pipe the file names yielded by the filesystem resource to the transformer resource `read_csv` to read each file and iterate over records from the file. We name this transformer resource `"encounters"` using the `with_name()` method. dlt will use the resource name `"encounters"` as a table name when loading the data.
+
+:::note
+A [transformer](../general-usage/resource#process-resources-with-dlttransformer) in dlt is a special type of resource that processes each record from another resource. This lets you chain multiple resources together.
+:::
+
+3. We create the dlt pipeline, configuring it with the name `hospital_data_pipeline` and DuckDB as the destination.
+4. We call `pipeline.run()`. This is where the underlying generators are iterated:
+
+ - dlt retrieves remote data,
+ - normalizes data,
+ - creates or updates the table in the destination,
+ - loads the extracted data into the destination.
+
+5. `print(info)` outputs the pipeline running stats we get from `pipeline.run()`.
+
+## 3. Configuring the filesystem source
+
+:::note
+In this tutorial, we will work with the publicly accessed dataset [Hospital Patient Records](https://mavenanalytics.io/data-playground?order=date_added%2Cdesc&search=Hospital%20Patient%20Records), which contains synthetic electronic health care records. You can use the exact credentials from this tutorial to load this dataset from GCP.
+<details>
+<summary>Citation</summary>
+Jason Walonoski, Mark Kramer, Joseph Nichols, Andre Quina, Chris Moesel, Dylan Hall, Carlton Duffett, Kudakwashe Dube, Thomas Gallagher, Scott McLachlan, Synthea: An approach, method, and software mechanism for generating synthetic patients and the synthetic electronic health care record, Journal of the American Medical Informatics Association, Volume 25, Issue 3, March 2018, Pages 230–238, https://doi.org/10.1093/jamia/ocx079
+</details>
+:::
+
+Next, we need to configure the connection. Specifically, we’ll set the bucket URL and credentials. This example uses Google Cloud Storage. For other cloud storage services, see the [Filesystem configuration section](../dlt-ecosystem/verified-sources/filesystem#configuration).
+
+Let's specify the bucket URL and credentials. We can do this using the following methods:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+```toml
+# secrets.toml
+[sources.filesystem.credentials]
+client_email = "public-access@dlthub-sandbox.iam.gserviceaccount.com"
+project_id = "dlthub-sandbox"
+private_key = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDGWsVHJRjliojx\nTo+j1qu+x8PzC5ZHZrMx6e8OD6tO8uxMyl65ByW/4FZkVXkS4SF/UYPigGN+rel4\nFmySTbP9orva4t3Pk1B9YSvQMB7V5IktmTIW9Wmdmn5Al8Owb1RehgIidm1EX/Z9\nLr09oLpO6+jUu9RIP2Lf2mVQ6tvkgl7UOdpdGACSNGzRiZgVZDOaDIgH0Tl4UWmK\n6iPxhwZy9YC2B1beLB/NU+F6DUykrEpBzCFQTqFoTUcuDAEvuvpU9JrU2iBMiOGw\nuP3TYSiudhBjmauEUWaMiqWAgFeX5ft1vc7/QWLdI//SAjaiTAu6pTer29Q0b6/5\niGh0jRXpAgMBAAECggEAL8G9C9MXunRvYkH6/YR7F1T7jbH1fb1xWYwsXWNSaJC+\nagKzabMZ2KfHxSJ7IxuHOCNFMKyex+pRcvNbMqJ4upGKzzmeFBMw5u8VYGulkPQU\nPyFKWRK/Wg3PZffkSr+TPargKrH+vt6n9x3gvEzNbqEIDugmRTrVsHXhvOi/BrYc\nWhppHSVQidWZi5KVwDEPJjDQiHEcYI/vfIy1WhZ8VuPAaE5nMZ1m7gTdeaWWKIAj\n/p2ZkLgRdCY8vNkfaNDAxDbvH+CMuTtOw55GydzsYYiofANS6xZ8CedGkYaGi82f\nqGdLghX61Sg3UAb5SI36T/9XbuCpTf3B/SMV20ew8QKBgQDm2yUxL71UqI/xK9LS\nHWnqfHpKmHZ+U9yLvp3v79tM8XueSRKBTJJ4H+UvVQrXlypT7cUEE+sGpTrCcDGL\nm8irtdUmMvdi7AnRBgmWdYKig/kgajLOUrjXqFt/BcFgqMyTfzqPt3xdp6F3rSEK\nHE6PQ8I3pJ0BJOSJRa6Iw2VH1QKBgQDb9WbVFjYwTIKJOV4J2plTK581H8PI9FSt\nUASXcoMTixybegk8beGdwfm2TkyF/UMzCvHfuaUhf+S0GS5Zk31Wkmh1YbmFU4Q9\nm9K/3eoaqF7CohpigB0wJw4HfqNh6Qt+nICOMCv++gw7+/UwfV72dCqr0lpzfX5F\nAsez8igTxQKBgDsq/axOnQr+rO3WGpGJwmS8BKfrzarxGXyjnV0qr51X4yQdfGWx\nV3T8T8RC2qWI8+tQ7IbwB/PLE3VURg6PHe6MixXgSDGNZ7KwBnMOqS23/3kEXwMs\nhn2Xg+PZeMeqW8yN9ldxYqmqViMTN32c5bGoXzXdtfPeHcjlGCerVOEFAoGADVPi\nRjkRUX3hTvVF6Gzxa2OyQuLI1y1O0C2QCakrngyI0Dblxl6WFBwDyHMYGepNnxMj\nsr2p7sy0C+GWuGDCcHNwluQz/Ish8SW28F8+5xyamUp/NMa0fg1vwS6AMdeQFbzf\n4T2z/MAj66KJqcV+8on5Z+3YAzVwaDgR56pdmU0CgYBo2KWcNWAhZ1Qa6sNrITLV\nGlxg6tWP3OredZrmKb1kj5Tk0V+EwVN+HnKzMalv6yyyK7SWq1Z6rvCye37vy27q\nD7xfuz0c0H+48uWJpdLcsxpTioopsRPayiVDKlHSe/Qa+MEjAG3ded5TJiC+5iSw\nxWJ51y0wpme0LWgzzoLbRw==\n-----END PRIVATE KEY-----\n"
+
+# config.toml
+[sources.filesystem]
+bucket_url="gs://filesystem-tutorial"
+```
+
+  </TabItem>
+
+<TabItem value="env">
+
+```sh
+export SOURCES__FILESYSTEM__CREDENTIALS__CLIENT_EMAIL="public-access@dlthub-sandbox.iam.gserviceaccount.com"
+export SOURCES__FILESYSTEM__CREDENTIALS__PROJECT_ID="dlthub-sandbox"
+export SOURCES__FILESYSTEM__CREDENTIALS__PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDGWsVHJRjliojx\nTo+j1qu+x8PzC5ZHZrMx6e8OD6tO8uxMyl65ByW/4FZkVXkS4SF/UYPigGN+rel4\nFmySTbP9orva4t3Pk1B9YSvQMB7V5IktmTIW9Wmdmn5Al8Owb1RehgIidm1EX/Z9\nLr09oLpO6+jUu9RIP2Lf2mVQ6tvkgl7UOdpdGACSNGzRiZgVZDOaDIgH0Tl4UWmK\n6iPxhwZy9YC2B1beLB/NU+F6DUykrEpBzCFQTqFoTUcuDAEvuvpU9JrU2iBMiOGw\nuP3TYSiudhBjmauEUWaMiqWAgFeX5ft1vc7/QWLdI//SAjaiTAu6pTer29Q0b6/5\niGh0jRXpAgMBAAECggEAL8G9C9MXunRvYkH6/YR7F1T7jbH1fb1xWYwsXWNSaJC+\nagKzabMZ2KfHxSJ7IxuHOCNFMKyex+pRcvNbMqJ4upGKzzmeFBMw5u8VYGulkPQU\nPyFKWRK/Wg3PZffkSr+TPargKrH+vt6n9x3gvEzNbqEIDugmRTrVsHXhvOi/BrYc\nWhppHSVQidWZi5KVwDEPJjDQiHEcYI/vfIy1WhZ8VuPAaE5nMZ1m7gTdeaWWKIAj\n/p2ZkLgRdCY8vNkfaNDAxDbvH+CMuTtOw55GydzsYYiofANS6xZ8CedGkYaGi82f\nqGdLghX61Sg3UAb5SI36T/9XbuCpTf3B/SMV20ew8QKBgQDm2yUxL71UqI/xK9LS\nHWnqfHpKmHZ+U9yLvp3v79tM8XueSRKBTJJ4H+UvVQrXlypT7cUEE+sGpTrCcDGL\nm8irtdUmMvdi7AnRBgmWdYKig/kgajLOUrjXqFt/BcFgqMyTfzqPt3xdp6F3rSEK\nHE6PQ8I3pJ0BJOSJRa6Iw2VH1QKBgQDb9WbVFjYwTIKJOV4J2plTK581H8PI9FSt\nUASXcoMTixybegk8beGdwfm2TkyF/UMzCvHfuaUhf+S0GS5Zk31Wkmh1YbmFU4Q9\nm9K/3eoaqF7CohpigB0wJw4HfqNh6Qt+nICOMCv++gw7+/UwfV72dCqr0lpzfX5F\nAsez8igTxQKBgDsq/axOnQr+rO3WGpGJwmS8BKfrzarxGXyjnV0qr51X4yQdfGWx\nV3T8T8RC2qWI8+tQ7IbwB/PLE3VURg6PHe6MixXgSDGNZ7KwBnMOqS23/3kEXwMs\nhn2Xg+PZeMeqW8yN9ldxYqmqViMTN32c5bGoXzXdtfPeHcjlGCerVOEFAoGADVPi\nRjkRUX3hTvVF6Gzxa2OyQuLI1y1O0C2QCakrngyI0Dblxl6WFBwDyHMYGepNnxMj\nsr2p7sy0C+GWuGDCcHNwluQz/Ish8SW28F8+5xyamUp/NMa0fg1vwS6AMdeQFbzf\n4T2z/MAj66KJqcV+8on5Z+3YAzVwaDgR56pdmU0CgYBo2KWcNWAhZ1Qa6sNrITLV\nGlxg6tWP3OredZrmKb1kj5Tk0V+EwVN+HnKzMalv6yyyK7SWq1Z6rvCye37vy27q\nD7xfuz0c0H+48uWJpdLcsxpTioopsRPayiVDKlHSe/Qa+MEjAG3ded5TJiC+5iSw\nxWJ51y0wpme0LWgzzoLbRw==\n-----END PRIVATE KEY-----\n"
+export SOURCES__FILESYSTEM__BUCKET_URL="gs://filesystem-tutorial"
+```
+
+  </TabItem>
+
+<TabItem value="code">
+
+```py notype
+import os
+
+from dlt.common.configuration.specs import GcpClientCredentials
+from dlt.sources.filesystem import filesystem, read_csv
 

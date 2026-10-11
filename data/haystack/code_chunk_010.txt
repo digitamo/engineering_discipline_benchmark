@@ -1,1084 +1,3 @@
-diff --git a/dlt/common/data_types/type_helpers.py b/dlt/common/data_types/type_helpers.py
-index 24619ee35..62ab47bf2 100644
---- a/dlt/common/data_types/type_helpers.py
-+++ b/dlt/common/data_types/type_helpers.py
-@@ -156,6 +156,15 @@ def _text_to_wei(value: str) -> Wei:
-         raise ValueError(trim_value)
- 
- 
-+def _float_to_decimal(value: float) -> Decimal:
-+    """Uses `str` that produces most precise stable decimal representaion of given `value`"""
-+    return Decimal(str(value))
-+
-+
-+def _float_to_wei(value: float) -> Wei:
-+    return Wei(str(value))
-+
-+
- def _numeric_to_bigint(value: Any) -> int:
-     if value % 1 != 0:
-         raise ValueError(value)
-@@ -206,12 +215,12 @@ _COERCE_DISPATCH: Dict[Tuple[TDataType, TDataType], Callable[[Any], Any]] = {
-     # to decimal
-     ("decimal", "text"): _text_to_decimal,
-     ("decimal", "bigint"): Decimal,
--    ("decimal", "double"): Decimal,
-+    ("decimal", "double"): _float_to_decimal,
-     ("decimal", "wei"): Decimal,
-     # to wei
-     ("wei", "text"): _text_to_wei,
-     ("wei", "bigint"): Wei,
--    ("wei", "double"): Wei,
-+    ("wei", "double"): _float_to_wei,
-     ("wei", "decimal"): Wei,
-     # to bool
-     ("bool", "text"): str2bool,
-diff --git a/docs/website/docs/general-usage/schema.md b/docs/website/docs/general-usage/schema.md
-index c47de0566..38d3c54e0 100644
---- a/docs/website/docs/general-usage/schema.md
-+++ b/docs/website/docs/general-usage/schema.md
-@@ -200,6 +200,12 @@ On the other hand, if the `id` field was already a string, then introducing new
- 
- Now go ahead and try to add a new record where `id` is a float number; you should see a new field `id__v_double` in the schema.
- 
-+#### Float to decimal coercion
-+
-+When coercing a Python `float` (IEEE 754 double-precision binary) to `decimal` or `wei`, `dlt` converts via `str()` first to avoid binary expansion artifacts. For example, `34.7` as a float would expand to `34.700000000000002842...` if passed directly to `Decimal()`, so `dlt` uses `Decimal(str(34.7))` which preserves `34.7`.
-+
-+This follows user intent when a decimal type is explicitly chosen over float, but it is **not mathematically precise** — the `str()` conversion finds the first stable decimal representation and discards the unstable binary tail. If your decimals represent currency or require exact precision, avoid storing them as floats in the source data. Use `Decimal('34.70')` or strings instead.
-+
- #### No-coercion normalizer
- 
- If you use `relational_no_coercion` (see [Data normalizer](#data-normalizer)), **every** type mismatch produces a variant column. No cross-type conversion is attempted. For example, sending `"200"` to a `bigint` column creates `col__v_text` instead of parsing it as an integer. This gives you stricter schema control: the original values are always preserved exactly as received, and mismatches are immediately visible as separate columns.
-diff --git a/tests/common/schema/test_coercion.py b/tests/common/schema/test_coercion.py
-index d0f67fd6d..a8e7a1efe 100644
---- a/tests/common/schema/test_coercion.py
-+++ b/tests/common/schema/test_coercion.py
-@@ -138,7 +138,7 @@ def test_coerce_to_numeric(dec_cls: Type[Any], data_type: TDataType) -> None:
-     # mind that 1276.37 does not have binary representation as used in float
-     v = coerce_value(data_type, "double", 1276.37)
-     assert type(v) is dec_cls
--    assert v.quantize(Decimal("1.00")) == dec_cls("1276.37")
-+    assert v == dec_cls("1276.37")
- 
-     # wei to decimal and reverse
-     v = coerce_value(data_type, "decimal", Decimal("1276.37"))
-@@ -153,6 +153,25 @@ def test_coerce_to_numeric(dec_cls: Type[Any], data_type: TDataType) -> None:
-         coerce_value(data_type, "text", "p912.12")
- 
- 
-+def test_coerce_double_to_decimal_no_float_expansion() -> None:
-+    """Decimal(str(float)) should not exhibit IEEE 754 double-precision expansion."""
-+    # 34.7 as float would expand to 34.70000000000000284... with Decimal(34.7)
-+    # using Decimal(str(34.7)) preserves "34.7"
-+    result = coerce_value("decimal", "double", 34.7)
-+    assert result == Decimal("34.7")
-+    assert str(result) == "34.7"
-+
-+    # same issue applies to Wei which extends Decimal
-+    result = coerce_value("wei", "double", 34.7)
-+    assert result == Wei("34.7")
-+    assert str(result) == "34.7"
-+
-+    # get the "binary" float by quantizing properly and avoid casting
-+    qd = Decimal.from_float(34.70000000000000284).quantize(Decimal("1." + "0" * 15))
-+    # 15 digits scale, round up
-+    assert qd == Decimal("34.700000000000003")
-+
-+
- def test_coerce_type_from_hex_text() -> None:
-     # hex text into various types
-     assert coerce_value("wei", "text", " 0xff") == 255
-
-
-===== COMMIT 00e5ca61 =====
-
-
-commit 00e5ca613
-Author: rudolfix
-Date: 2026-05-27
-
-    documents the order of PipelineTasksGroup and dlt.pipeline creation (#3982)
-
-diff --git a/dlt/helpers/airflow_helper.py b/dlt/helpers/airflow_helper.py
-index f62ac0b03..a74d5ce93 100644
---- a/dlt/helpers/airflow_helper.py
-+++ b/dlt/helpers/airflow_helper.py
-@@ -414,12 +414,14 @@ class PipelineTasksGroup(TaskGroup):
-             Any: Airflow tasks created in order of creation.
-         """
- 
--        # make sure that pipeline was created after dag was initialized
-+        # make sure that pipeline was created after PipelineTasksGroup was instantiated
-         if not pipeline.pipelines_dir.startswith(os.environ[DLT_DATA_DIR]):
-             raise ValueError(
--                "Please create your Pipeline instance after AirflowTasks are created. The dlt"
--                f" pipelines directory {pipeline.pipelines_dir} is not set correctly"
--                f" ({os.environ[DLT_DATA_DIR]} expected)."
-+                f"Pipeline {pipeline.pipeline_name} has pipelines_dir set to"
-+                f" '{pipeline.pipelines_dir}' but a fresh random working directory under"
-+                f" '{os.environ[DLT_DATA_DIR]}' is expected. Instantiate PipelineTasksGroup"
-+                " BEFORE creating the Pipeline so dlt.pipeline() picks up the per-worker"
-+                f" random working directory set by PipelineTasksGroup in {DLT_DATA_DIR}."
-             )
- 
-         with self:
-diff --git a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
-index 92b9f6d3c..2fb242a6c 100644
---- a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
-+++ b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
-@@ -152,7 +152,7 @@ def load_data():
-     # Import your source from the pipeline script
-     from pipeline_or_source_script import source
- 
--    # Modify the pipeline parameters
-+    # Create the pipeline after instance of `PipelineTasksGroup` is created
-     pipeline = dlt.pipeline(
-         pipeline_name='pipeline_name',
-         dataset_name='dataset_name',
-@@ -226,6 +226,10 @@ load_data()
- When you run the `load_data` DAG above, Airflow will call the `source` function every 30 seconds (by default) to be able to monitor the tasks. Make sure that your source function does not perform any long-lasting operations, e.g., reflecting the source database. In the case of [sql_database](../../dlt-ecosystem/verified-sources/sql_database/index.md), we added an option to delay database reflection until data is accessed by a resource.
- :::
- 
-+:::caution
-+Always instantiate `PipelineTasksGroup` **before** creating the `dlt.pipeline`. The constructor of `PipelineTasksGroup` overrides the `DLT_DATA_DIR` environment variable to a fresh random per-worker directory so that Airflow workers, which are reused across DAG runs, do not leak pipeline state between runs.
-+:::
-+
- ### 3. Import sources and move the relevant code from the pipeline script
- 
- You should now move your working code from the pipeline script you previously ran to the newly created DAG script.
-diff --git a/tests/helpers/airflow_tests/test_airflow_wrapper.py b/tests/helpers/airflow_tests/test_airflow_wrapper.py
-index b92195df5..a74891164 100644
---- a/tests/helpers/airflow_tests/test_airflow_wrapper.py
-+++ b/tests/helpers/airflow_tests/test_airflow_wrapper.py
-@@ -1016,3 +1016,36 @@ def test_on_before_run() -> None:
-                 mock.call(f'on_before_run test: {pendulum.tomorrow().format("YYYY-MM-DD")}'),
-             ]
-         )
-+
-+
-+def test_pipeline_created_before_task_group_raises() -> None:
-+    # creating dlt.pipeline before PipelineTasksGroup uses a pipelines_dir that does not
-+    # match the per-worker random dir set by PipelineTasksGroup. add_run must surface a
-+    # clear error pointing at the ordering and the workaround.
-+    @dag(schedule=None, start_date=DEFAULT_DATE, catchup=False, default_args=default_args)
-+    def dag_wrong_order():
-+        early_pipeline = dlt.pipeline(
-+            pipeline_name="pipeline_wrong_order",
-+            dataset_name="mock_data_" + uniq_id(),
-+            destination=dlt.destinations.duckdb(credentials=":pipeline:"),
-+        )
-+        tasks = PipelineTasksGroup(
-+            "pipeline_wrong_order",
-+            local_data_folder=get_test_storage_root(),
-+            wipe_local_data=False,
-+        )
-+        with pytest.raises(ValueError) as exc_info:
-+            tasks.add_run(
-+                early_pipeline,
-+                mock_data_source(),
-+                decompose="none",
-+                trigger_rule="all_done",
-+                retries=0,
-+            )
-+        message = str(exc_info.value)
-+        assert "PipelineTasksGroup" in message
-+        assert "BEFORE creating the Pipeline" in message
-+        assert "DLT_DATA_DIR" in message
-+        assert "pipelines_dir" in message
-+
-+    dag_wrong_order()
-
-
-===== COMMIT 38a0a24d =====
-
-
-commit 38a0a24d9
-Author: elvis kahoro
-Date: 2026-05-26
-
-    Update README.md (#3971)
-
-diff --git a/README.md b/README.md
-index 1948779dc..ff3cd5c37 100644
---- a/README.md
-+++ b/README.md
-@@ -124,7 +124,7 @@ Please read [CONTRIBUTING](CONTRIBUTING.md) before you make a PR.
-   </a>
- </p>
- 
--[Blacksmith](https://blacksmith.sh/?utm_source=dlt&utm_medium=readme&utm_campaign=sponsorship) is a CI/CD platform that accelerates GitHub Actions by reducing queue times and improving build performance. It helps teams run workflows faster and more efficiently, making it easier to maintain a smooth development pipeline. We're grateful to Blacksmith for sponsoring dlt with free CI/CD minutes, which helps us keep builds fast and our costs lower.
-+[Blacksmith](https://blacksmith.sh/?utm_source=dlt&utm_medium=readme&utm_campaign=sponsorship) is a drop-in replacement for GitHub-hosted runners that speed up our CI/CD pipelines by 2x and up to 75% cheaper. We're grateful to Blacksmith for sponsoring us with free CI/CD minutes--which helps us keep builds fast and our costs lower.
- 
- ## License
- 
-
-
-===== COMMIT a0114a2c =====
-
-
-commit a0114a2c7
-Author: Jsu
-Date: 2026-05-26
-
-    typos: wether -> whether, invididual -> individual (#3973)
-
-diff --git a/dlt/dataset/dataset.py b/dlt/dataset/dataset.py
-index 087d91e4d..607c917d3 100644
---- a/dlt/dataset/dataset.py
-+++ b/dlt/dataset/dataset.py
-@@ -163,7 +163,7 @@ class Dataset:
-     def sqlglot_schema(self) -> SQLGlotSchema:
-         """SQLGlot schema of the dataset derived from all dlt schemas."""
-         # NOTE: no cache for now, it is probably more expensive to compute the current schema hash
--        # to see wether this is stale than to compute a new sqlglot schema
-+        # to see whether this is stale than to compute a new sqlglot schema
-         return lineage.create_sqlglot_schema(
-             {self.dataset_name: list(self.schemas)}, dialect=self.destination_dialect
-         )
-diff --git a/dlt/destinations/impl/dremio/sql_client.py b/dlt/destinations/impl/dremio/sql_client.py
-index c9299df95..9354020f1 100644
---- a/dlt/destinations/impl/dremio/sql_client.py
-+++ b/dlt/destinations/impl/dremio/sql_client.py
-@@ -158,7 +158,7 @@ class DremioSqlClient(SqlClientBase[pydremio.DremioConnection]):
-         return isinstance(ex, (pyarrow.lib.ArrowInvalid, pydremio.MalformedQueryError))
- 
-     def create_dataset(self) -> None:
--        # We create a sentinel table which defines wether we consider the dataset created
-+        # We create a sentinel table which defines whether we consider the dataset created
-         sentinel_table_name = self.make_qualified_table_name(self.SENTINEL_TABLE_NAME)
-         self.execute_sql(f"CREATE TABLE {sentinel_table_name} (_dlt_id BIGINT)")
- 
-diff --git a/dlt/extract/hints.py b/dlt/extract/hints.py
-index efff31d3e..e90346efc 100644
---- a/dlt/extract/hints.py
-+++ b/dlt/extract/hints.py
-@@ -212,12 +212,12 @@ class DltResourceHints:
- 
-     @property
-     def has_dynamic_table_name(self) -> bool:
--        """Tells the extractor wether computed table name may change based on invididual data items"""
-+        """Tells the extractor whether computed table name may change based on individual data items"""
-         return self._table_name_hint_fun is not None
- 
-     @property
-     def has_other_dynamic_hints(self) -> bool:
--        """Tells the extractor wether computed hints may change based on invididual data items"""
-+        """Tells the extractor whether computed hints may change based on individual data items"""
-         return self._table_has_other_dynamic_hints
- 
-     @property
-
-
-===== COMMIT 2b92d086 =====
-
-
-commit 2b92d0864
-Author: Jorrit Sandbrink
-Date: 2026-05-26
-
-    add spn fabric token refresh automation (#3925)
-
-diff --git a/.github/workflows/test_destinations_remote.yml b/.github/workflows/test_destinations_remote.yml
-index 5931b11dd..523281b10 100644
---- a/.github/workflows/test_destinations_remote.yml
-+++ b/.github/workflows/test_destinations_remote.yml
-@@ -158,6 +158,7 @@ jobs:
-               filesystem_drivers: "[\"memory\"]"
-               extras: "--extra fabric"
-               pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
-+              post_secrets_commands: "uv run python tests/load/fabric/refresh_spn_fabric_token.py"
- 
-             # Postgres and Redshift (used to be test_destinations.yml)
-             - name: redshift
-@@ -245,6 +246,10 @@ jobs:
-       - name: create secrets.toml
-         run: pwd && echo "$DLT_SECRETS_TOML" > tests/.dlt/secrets.toml
- 
-+      - name: Run post secrets commands
-+        run: ${{ matrix.post_secrets_commands }}
-+        if: ${{ matrix.post_secrets_commands }}
-+
-       # NOTE: essential tests are always run
-       - name: Run essential tests Linux
-         run: make test-dest-remote-essential
-diff --git a/tests/load/fabric/refresh_spn_fabric_token.py b/tests/load/fabric/refresh_spn_fabric_token.py
-new file mode 100644
-index 000000000..5d1126c04
---- /dev/null
-+++ b/tests/load/fabric/refresh_spn_fabric_token.py
-@@ -0,0 +1,42 @@
-+# https://learn.microsoft.com/en-us/fabric/data-warehouse/service-principals#token-renewal-and-initialization-requirements
-+
-+import os
-+
-+import requests
-+
-+from azure.identity import ClientSecretCredential
-+
-+import dlt
-+from dlt.destinations.impl.fabric.configuration import FabricCredentials
-+
-+
-+def main() -> None:
-+    # get SPN credentials
-+    os.environ["DLT_PROJECT_DIR"] = "tests"
-+    credentials = dlt.secrets.get("destination.fabric.credentials", FabricCredentials)
-+    if credentials is None:
-+        raise RuntimeError("`destination.fabric.credentials` is not configured.")
-+
-+    # get bearer token
-+    token = (
-+        ClientSecretCredential(
-+            tenant_id=credentials.azure_tenant_id,
-+            client_id=credentials.azure_client_id,
-+            client_secret=credentials.azure_client_secret,
-+        )
-+        .get_token("https://api.fabric.microsoft.com/.default")
-+        .token
-+    )
-+
-+    # call public Fabric API endpoint to refresh token (any endpoint will do)
-+    response = requests.get(
-+        "https://api.fabric.microsoft.com/v1/workspaces",
-+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-+        timeout=30,
-+    )
-+    response.raise_for_status()
-+    print("Refreshed Fabric SPN token successfully.")
-+
-+
-+if __name__ == "__main__":
-+    main()
-
-
-===== COMMIT 86d7dbdd =====
-
-
-commit 86d7dbdd3
-Author: Alberto
-Date: 2026-05-26
-
-    feat (dlthub pro): static_egress_ips (#3961)
-
-diff --git a/dlt/_workspace/deployment/decorators.py b/dlt/_workspace/deployment/decorators.py
-index 943985d45..c26bd6842 100644
---- a/dlt/_workspace/deployment/decorators.py
-+++ b/dlt/_workspace/deployment/decorators.py
-@@ -371,7 +371,8 @@ def job(
- 
-         require: Runtime resource requirements. Accepts `TRequireSpec` with:
-             `dependency_groups`, `profile` (workspace profile), `machine`
--            (machine spec), `region` (runner placement).
-+            (machine spec), `region` (runner placement), `static_egress_ips`
-+            (static outbound IPs for third-party allowlists).
- 
-         deliver: A `@dlt.source`, standalone `@dlt.resource`, or called source
-             instance for delivery association.
-@@ -472,7 +473,7 @@ def interactive(
-             `tags`, `starred`, `manual`. The `interface` argument is merged
-             into expose automatically.
-         require: Runtime resource requirements. Accepts `TRequireSpec` with:
--            `dependency_groups`, `profile`, `machine`, `region`.
-+            `dependency_groups`, `profile`, `machine`, `region`, `static_egress_ips`.
-         spec: Optional configuration spec class.
- 
-     Returns:
-@@ -539,7 +540,7 @@ def pipeline_run(
-         expose: UI presentation (`TJobExposeSpec`): `tags`, `starred`, `manual`.
- 
-         require: Resource requirements (`TRequireSpec`): `dependency_groups`,
--            `profile`, `machine`, `region`.
-+            `profile`, `machine`, `region`, `static_egress_ips`.
- 
-         interval: Overall time range for interval-based scheduling.
- 
-diff --git a/dlt/_workspace/deployment/typing.py b/dlt/_workspace/deployment/typing.py
-index 61091f732..f34a15de5 100644
---- a/dlt/_workspace/deployment/typing.py
-+++ b/dlt/_workspace/deployment/typing.py
-@@ -106,6 +106,8 @@ class TRequireSpec(TypedDict, total=False):
-     """Runner region for placement (e.g. `"us-east-1"`, `"eu-west"`)."""
-     timezone: str
-     """IANA timezone for cron ticks and intervals (e.g. `"America/New_York"`). Default: UTC."""
-+    static_egress_ips: bool
-+    """When `True`, route outbound traffic through the workspace static egress IPs."""
- 
- 
- class TEntryPoint(TypedDict):
-diff --git a/docs/website/docs/hub/runtime/job-configuration.md b/docs/website/docs/hub/runtime/job-configuration.md
-index 21397c7b4..e9f248493 100644
---- a/docs/website/docs/hub/runtime/job-configuration.md
-+++ b/docs/website/docs/hub/runtime/job-configuration.md
-@@ -1,7 +1,7 @@
- ---
- title: Job configuration
- description: Per-job options on the dltHub platform — execution timeouts, dependency groups, and TOML configuration sections
--keywords: [dlthub platform, job configuration, timeout, dependency groups, execute, require, expose, section]
-+keywords: [dlthub platform, job configuration, timeout, dependency groups, static egress, execute, require, expose, section]
- ---
- 
- # Job configuration
-@@ -44,6 +44,25 @@ def transform(run_context: TJobRunContext):
- 
- The dltHub platform composes the execution environment from the workspace's base dependencies plus the job's declared groups.
- 
-+## Static egress IPs
-+
-+Use this when you must whitelist outbound IP addresses so external systems can grant your jobs access to private resources. Opt in per job so outbound requests use your workspace's static egress IPs:
-+
-+```py
-+@run.pipeline(my_pipeline, require={"static_egress_ips": True})
-+def sync_from_vendor():
-+    ...
-+```
-+
-+Static egress routing forces job traffic through the US region. See [Regions and data residency](regions.md) for how regional data planes relate to your organization.
-+
-+The static egress IPs are:
-+- 4.205.113.62
-+- 44.221.24.144
-+- 34.193.87.36
-+- 98.80.106.70
-+- 54.81.217.233
-+
- ## Job configuration via TOML
- 
- Jobs read configuration through dlt's standard config system. The default section is the containing module name:
-diff --git a/tests/workspace/deployment/test_decorators.py b/tests/workspace/deployment/test_decorators.py
-index 0c16b9d30..b6b1f948b 100644
---- a/tests/workspace/deployment/test_decorators.py
-+++ b/tests/workspace/deployment/test_decorators.py
-@@ -368,9 +368,21 @@ def test_job_definition_omits_unset_fields() -> None:
-     assert "tags" not in job_def
-     assert "deliver" not in job_def
-     assert "expose" not in job_def
-+    assert "require" not in job_def
-     assert job_def["triggers"] == []
- 
- 
-+def test_require_static_egress_ips_stored_on_job_definition() -> None:
-+    """`require.static_egress_ips` is passed through to the job definition."""
-+
-+    @job(require={"static_egress_ips": True})
-+    def vendor_sync():
-+        pass
-+
-+    job_def = vendor_sync.to_job_definition()
-+    assert job_def["require"]["static_egress_ips"] is True
-+
-+
- def test_config_key_discovery() -> None:
-     """Config keys from dlt.config.value defaults are discovered in job definition."""
- 
-
-
-===== COMMIT 67266602 =====
-
-
-commit 672666028
-Author: Elisabeth Reitmayr
-Date: 2026-05-26
-
-    docs CI: smarter verify-redirects and dedicated CI step (#3970)
-
-diff --git a/.github/workflows/build_docs.yml b/.github/workflows/build_docs.yml
-index fbbb040dd..baf963d12 100644
---- a/.github/workflows/build_docs.yml
-+++ b/.github/workflows/build_docs.yml
-@@ -32,3 +32,6 @@ jobs:
- 
-       - name: Install python dependencies
-         run: cd docs/website && npm run build
-+
-+      - name: Verify redirects
-+        run: cd docs/website && npm run verify-redirects
-diff --git a/docs/website/README.md b/docs/website/README.md
-index aff106c60..a196c6d8d 100644
---- a/docs/website/README.md
-+++ b/docs/website/README.md
-@@ -64,7 +64,34 @@ For most authoring purposes, once you are happy with your changes running locall
- $ npm run build
- ```
- 
--That command generates static content into the `build` directory, which can be served using any static contents hosting service, for example, `npm run serve`
-+That command generates static content into the `build` directory, which can be served using `npm run serve`.
-+
-+### What `npm run build` does
-+
-+The full build runs these steps in order:
-+
-+1. **`npm run update-versions`** — clones `dlt`, checks out the `master` branch, freezes the content into `versioned_docs/version-master/`. This is the **master snapshot** (served at `/docs/`); your branch is served at `/docs/devel/`. See [Docs versions](#docs-versions) below.
-+2. **`make preprocess-docs`** (from `docs/`) — Python preprocessor: expands `<!--@@@DLT_SNIPPET-->` markers, generates the API reference, etc.
-+3. **`docusaurus build --out-dir build/docs`** — the static site build itself. Fails on broken internal markdown links.
-+4. **`node scripts/verify-llms-txt.js`** — checks the generated `llms.txt` index against the sidebar.
-+
-+### Running individual checks
-+
-+After a full build, you can re-run the verifiers standalone — useful when iterating on one concern without rebuilding everything:
-+
-+```
-+$ npm run verify-llms          # llms.txt index check
-+$ npm run verify-redirects     # redirect targets check
-+```
-+
-+**`verify-redirects` is no longer part of `npm run build` — CI runs it as a dedicated `Verify redirects` step in `.github/workflows/build_docs.yml`.** To reproduce CI locally:
-+
-+```
-+$ npm run build
-+$ npm run verify-redirects
-+```
-+
-+Run this whenever you add or change entries in `redirects.js`. See [Redirects](#redirects) below for how to interpret the output (errors vs. devel-only warnings)
- 
- ## Deployment
- 
-@@ -78,7 +105,14 @@ This will build the project fully and serve via a local wrangler webserver which
- 
- ## Redirects
- 
--Simple redirects are managed with the cloudflare worker in `worker.js`. 
-+Redirects are defined in [`redirects.js`](redirects.js) as one shared list, consumed in two places:
-+
-+- **Cloudflare worker (`worker.ts`)** — serves the redirects in production.
-+- **`scripts/verify-redirects.js`** — runs in CI to check every `to` target resolves to an HTML page in `build/docs/`.
-+
-+The docs site builds two snapshots: `master` (frozen at the last `dlt` release, mounted at `/docs/`) and `devel` (your current branch, mounted at `/docs/devel/`). Verification checks targets against master first. If a target only resolves under `build/docs/devel/<path>` it emits a **warning** ("devel-only — awaits next release") instead of an error. This is the expected state during a docs restructure: once the next `dlt` release refreshes master, the warning auto-clears. Targets that resolve in neither snapshot still error and block CI.
-+
-+Verification runs as a dedicated `Verify redirects` step in `.github/workflows/build_docs.yml`, after the docs build.
- 
- ## Docs versions
- 
-@@ -152,7 +186,7 @@ Hub pages receive special treatment in swizzled theme components:
- - **`src/theme/DocBreadcrumbs`** — When the current URL contains `/hub/`, a dltHub logo is rendered next to the breadcrumb trail (via the `breadcrumbsContainerPlus` CSS class and an `<img>` tag).
- - **`src/components/DltHubFeatureAdmonition.js`** — A reusable admonition component imported by hub pages to display licensing/feature notices.
- 
--In production, the Cloudflare worker (`worker.js`) redirects the legacy `/plus/` URL prefix to `/hub/`.
-+In production, the Cloudflare worker (`worker.ts`) redirects the legacy `/plus/` URL prefix to `/hub/`.
- 
- ## Page overlays (Root.js)
- 
-diff --git a/docs/website/docs/hub/getting-started/runtime-tutorial.md b/docs/website/docs/hub/getting-started/runtime-tutorial.md
-index d2e49bd09..fe03693af 100644
---- a/docs/website/docs/hub/getting-started/runtime-tutorial.md
-+++ b/docs/website/docs/hub/getting-started/runtime-tutorial.md
-@@ -219,7 +219,7 @@ To stop a schedule, remove the trigger from the decorator (or remove the job fro
- ## Review and manage jobs in the UI
- 
- The command line is great for development, but the dltHub web UI gives you a bird's-eye view of everything running in the cloud.
--Visit [dlthub.app](https://dlthub.app)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
-+Visit [app.dlthub.com](https://app.dlthub.com)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
- 
- 1. A list of existing jobs.
- 2. An overview of scheduled runs.
-diff --git a/docs/website/package.json b/docs/website/package.json
-index 10ada4f97..17f0cc241 100644
---- a/docs/website/package.json
-+++ b/docs/website/package.json
-@@ -4,7 +4,7 @@
-   "private": true,
-   "scripts": {
-     "start": "cd .. && make preprocess-docs && concurrently --kill-others \"make preprocess-docs-watch \" \"cd website && docusaurus start\"",
--    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js && node scripts/verify-redirects.js",
-+    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js",
-     "clear": "docusaurus clear",
-     "serve": "docusaurus serve --dir build/docs",
-     "clear-versions": "node tools/clear_versions.js",
-diff --git a/docs/website/scripts/verify-redirects.js b/docs/website/scripts/verify-redirects.js
-index 663802d2f..6632bae14 100644
---- a/docs/website/scripts/verify-redirects.js
-+++ b/docs/website/scripts/verify-redirects.js
-@@ -21,6 +21,7 @@ const redirects = require('../redirects.js');
- // ---------------------------------------------------------------------------
- let errors = 0;
- let warnings = 0;
-+let develOnlyWarnings = 0;
- 
- function error(msg) {
-   console.error(`  ERROR: ${msg}`);
-@@ -44,6 +45,14 @@ function targetExists(rel) {
-   return candidates.some((c) => fs.existsSync(c));
- }
- 
-+function targetExistsOnDevel(rel) {
-+  const candidates = [
-+    path.join(BUILD_DIR, 'devel', rel + '.html'),
-+    path.join(BUILD_DIR, 'devel', rel, 'index.html'),
-+  ];
-+  return candidates.some((c) => fs.existsSync(c));
-+}
-+
- // ---------------------------------------------------------------------------
- // Main
- // ---------------------------------------------------------------------------
-@@ -92,9 +101,15 @@ for (const r of redirects) {
- 
-   checked++;
-   const rel = r.to.replace(/^\/docs\//, '').replace(/\/$/, '');
--  if (!targetExists(rel)) {
--    error(`redirect target ${r.to} has no HTML page (from: ${r.from}, checked ${rel}.html and ${rel}/index.html)`);
-+  if (targetExists(rel)) {
-+    continue;
-+  }
-+  if (targetExistsOnDevel(rel)) {
-+    warn(`(devel-only): ${r.to} — resolves on devel, awaits next release (from: ${r.from})`);
-+    develOnlyWarnings++;
-+    continue;
-   }
-+  error(`redirect target ${r.to} has no HTML page (from: ${r.from}, checked ${rel}.html and ${rel}/index.html)`);
- }
- 
- if (skipped > 0) {
-@@ -102,7 +117,12 @@ if (skipped > 0) {
- }
- 
- if (errors === 0) {
--  ok(`all ${checked} checked redirect targets resolve to existing pages`);
-+  if (develOnlyWarnings === 0) {
-+    ok(`all ${checked} checked redirect targets resolve to existing pages`);
-+  } else {
-+    const masterResolved = checked - develOnlyWarnings;
-+    ok(`${masterResolved}/${checked} checked redirect targets resolve in master; ${develOnlyWarnings} resolve only on devel (await next release)`);
-+  }
- }
- 
- // Summary
-
-
-===== COMMIT ecb61edf =====
-
-
-commit ecb61edf3
-Author: Jean-Baptiste Braun
-Date: 2026-05-22
-
-    fix(sftp): cap paramiko<5 in sftp extra (#3931) (#3966)
-
-diff --git a/pyproject.toml b/pyproject.toml
-index c0d6b9bc8..63b077c75 100644
---- a/pyproject.toml
-+++ b/pyproject.toml
-@@ -118,7 +118,8 @@ hf = [
-     "pyarrow>=21.0.0",  # minimum version that supports CDC (https://huggingface.co/blog/parquet-cdc)
- ]
- sftp = [
--    "paramiko>=3.3.0"
-+    # paramiko 5.0.0 dropped GSSAPI support and broke SFTP filesystem (#3931). cap until upgrade evaluated.
-+    "paramiko>=3.3.0,<5"
- ]
- http = [
-     "aiohttp>3.9.0"
-diff --git a/uv.lock b/uv.lock
-index 994f11e5c..a72952fa6 100644
---- a/uv.lock
-+++ b/uv.lock
-@@ -2855,7 +2855,7 @@ requires-dist = [
-     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.6.7,!=3.9.11,!=3.9.12,!=3.9.13,!=3.9.14,!=3.10.1,<4" },
-     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.10.1" },
-     { name = "packaging", specifier = ">=21.1" },
--    { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.3.0" },
-+    { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.3.0,<5" },
-     { name = "pathvalidate", specifier = ">=2.5.2" },
-     { name = "pendulum", specifier = ">=2.1.2" },
-     { name = "pendulum", marker = "python_full_version >= '3.14'", specifier = ">=3.0.0" },
-
-
-===== COMMIT 6f10e633 =====
-
-
-commit 6f10e633e
-Author: Alberto
-Date: 2026-05-22
-
-    Change workers to blacksmith (#3873)
-
-diff --git a/.github/workflows/build_docs.yml b/.github/workflows/build_docs.yml
-index b4f35c9fe..fbbb040dd 100644
---- a/.github/workflows/build_docs.yml
-+++ b/.github/workflows/build_docs.yml
-@@ -7,7 +7,7 @@ on:
- jobs:
-   build_docs:
-     name: docs | build docs
--    runs-on: ubuntu-latest
-+    runs-on: blacksmith-8vcpu-ubuntu-2404
- 
-     steps:
-       - name: Check out
-diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
-index 6380a3121..39beef10a 100644
---- a/.github/workflows/lint.yml
-+++ b/.github/workflows/lint.yml
-@@ -13,7 +13,7 @@ jobs:
-       fail-fast: true
-       matrix:
-         os:
--          - ubuntu-latest
-+          - blacksmith-8vcpu-ubuntu-2404
-         python-version: ["3.10", "3.11", "3.12", "3.13"]
- 
-     defaults:
-@@ -64,7 +64,7 @@ jobs:
-   matrix_job_required_check:
-     name: lint | code & tests
-     needs: run_lint
--    runs-on: ubuntu-latest
-+    runs-on: blacksmith-2vcpu-ubuntu-2404
-     if: always()
-     steps:
-       - name: Check matrix job results
-diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
-index 629a9f288..189c16940 100644
---- a/.github/workflows/main.yml
-+++ b/.github/workflows/main.yml
-@@ -21,7 +21,7 @@ jobs:
-   authorize_secrets:
-     name: secrets available (internal PRs only)
-     if: ${{ github.event.pull_request.head.repo.full_name == github.repository && (github.event.action == 'opened' || github.event.action == 'synchronize') }}
--    runs-on: ubuntu-latest
-+    runs-on: blacksmith-2vcpu-ubuntu-2404
-     steps:
-       - run: true
- 
-diff --git a/.github/workflows/test_common.yml b/.github/workflows/test_common.yml
-index 6dc7839e1..753bb930b 100644
---- a/.github/workflows/test_common.yml
-+++ b/.github/workflows/test_common.yml
-@@ -21,45 +21,45 @@ jobs:
-         include:
- 
-           # macos tests
--          - os: macos-latest
-+          - os: blacksmith-12vcpu-macos-latest
-             python-version: "3.11"
-             shell: bash
- 
-           # linux tests
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.10"
-             shell: bash
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.11"
-             shell: bash
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.12"
-             shell: bash
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.13"
-             shell: bash
- 
--          - os: "macos-14"
-+          - os: blacksmith-12vcpu-macos-latest
-             python-version: "3.14"
-             shell: bash
- 
-           # linux test with minimal dependencies
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.11"
-             shell: bash
-             uv_sync_args: '--resolution lowest-direct' # could also be 'direct'
- 
-           # linux test with newest available allowed packages (will update lockfile, should not be committed if run locally)
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.11"
-             shell: bash
-             uv_sync_args: '--upgrade' # could also be 'direct'
- 
-           # windows tests
--          - os: windows-latest
-+          - os: blacksmith-8vcpu-windows-2025
-             python-version: "3.11"
-             shell: cmd
--          - os: windows-latest
-+          - os: blacksmith-8vcpu-windows-2025
-             python-version: "3.13"
-             shell: cmd
- 
-diff --git a/.github/workflows/test_destinations_local.yml b/.github/workflows/test_destinations_local.yml
-index cc9281f0f..89e79a043 100644
---- a/.github/workflows/test_destinations_local.yml
-+++ b/.github/workflows/test_destinations_local.yml
-@@ -89,7 +89,7 @@ jobs:
-     defaults:
-       run:
-         shell: bash
--    runs-on: "ubuntu-latest"
-+    runs-on: blacksmith-8vcpu-ubuntu-2404
- 
-     # Service containers to run with `container-job`
-     services:
-diff --git a/.github/workflows/test_sources_local.yml b/.github/workflows/test_sources_local.yml
-index 18dbf155d..d4ed62253 100644
---- a/.github/workflows/test_sources_local.yml
-+++ b/.github/workflows/test_sources_local.yml
-@@ -39,7 +39,7 @@ jobs:
-     defaults:
-       run:
-         shell: bash
--    runs-on: "ubuntu-latest"
-+    runs-on: blacksmith-8vcpu-ubuntu-2404
- 
-     steps:
-       - name: Check out
-diff --git a/.github/workflows/test_tools_airflow.yml b/.github/workflows/test_tools_airflow.yml
-index a4721fbfe..2ad85a6f7 100644
---- a/.github/workflows/test_tools_airflow.yml
-+++ b/.github/workflows/test_tools_airflow.yml
-@@ -7,7 +7,7 @@ on:
- jobs:
-   run_airflow:
-     name: tools | airflow ${{ matrix.airflow-version }} tests
--    runs-on: ubuntu-latest
-+    runs-on: blacksmith-8vcpu-ubuntu-2404
-     strategy:
-       fail-fast: false
-       matrix:
-diff --git a/.github/workflows/test_tools_build_images.yml b/.github/workflows/test_tools_build_images.yml
-index 124687ef9..79cf25b1c 100644
---- a/.github/workflows/test_tools_build_images.yml
-+++ b/.github/workflows/test_tools_build_images.yml
-@@ -7,7 +7,7 @@ on:
- jobs:
-   run_airflow:
-     name: tools | docker images build
--    runs-on: ubuntu-latest
-+    runs-on: blacksmith-8vcpu-ubuntu-2404
- 
-     steps:
-       - name: Check out
-diff --git a/.github/workflows/test_tools_dashboard.yml b/.github/workflows/test_tools_dashboard.yml
-index c5c101935..25cb8a896 100644
---- a/.github/workflows/test_tools_dashboard.yml
-+++ b/.github/workflows/test_tools_dashboard.yml
-@@ -22,40 +22,40 @@ jobs:
-         include:
- 
-           # macos tests
--          - os: "macos-14"
-+          - os: blacksmith-12vcpu-macos-latest
-             python-version: "3.12"
-             shell: bash
- 
-           # linux tests
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.10"
-             shell: bash
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.11"
-             shell: bash
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.12"
-             shell: bash
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.13"
-             shell: bash
- 
-           # linux test with minimal dependencies
--          - os: ubuntu-latest
-+          - os: blacksmith-8vcpu-ubuntu-2404
-             python-version: "3.11"
-             shell: bash
-             uv_sync_args: '--resolution lowest-direct' # could also be 'direct'
- 
-           # mac test with newest available allowed packages (will update lockfile, should not be committed if run locally)
-           # TODO: revert to linux
--          - os: "macos-14"
-+          - os: blacksmith-12vcpu-macos-latest
-             python-version: "3.11"
-             shell: bash
-             uv_sync_args: '--upgrade' # could also be 'direct'
- 
- 
-           # windows tests
--          - os: windows-latest
-+          - os: blacksmith-8vcpu-windows-2025
-             python-version: "3.12"
-             shell: cmd
- 
-@@ -113,7 +113,7 @@ jobs:
-   matrix_job_required_check:
-     name: common | common tests
-     needs: run_common
--    runs-on: ubuntu-latest
-+    runs-on: blacksmith-2vcpu-ubuntu-2404
-     if: always()
-     steps:
-       - name: Check matrix job results
-diff --git a/.github/workflows/test_tools_dbt_cloud.yml b/.github/workflows/test_tools_dbt_cloud.yml
-index 8a45f89fc..0f83b1afc 100644
---- a/.github/workflows/test_tools_dbt_cloud.yml
-+++ b/.github/workflows/test_tools_dbt_cloud.yml
-@@ -19,7 +19,7 @@ jobs:
-     defaults:
-       run:
-         shell: bash
--    runs-on: "ubuntu-latest"
-+    runs-on: blacksmith-8vcpu-ubuntu-2404
- 
-     steps:
- 
-diff --git a/.github/workflows/test_tools_dbt_runner.yml b/.github/workflows/test_tools_dbt_runner.yml
-index 9f1cae2c1..d1377a1a1 100644
---- a/.github/workflows/test_tools_dbt_runner.yml
-+++ b/.github/workflows/test_tools_dbt_runner.yml
-@@ -16,7 +16,7 @@ jobs:
-     defaults:
-       run:
-         shell: bash
--    runs-on: "ubuntu-latest"
-+    runs-on: blacksmith-8vcpu-ubuntu-2404
- 
-     steps:
- 
-
-
-===== COMMIT ead29e31 =====
-
-
-commit ead29e315
-Author: Anton Burnashev
-Date: 2026-05-20
-
-    Rename dlthub-runtime to dlthub-platform (#3957)
-
-diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md b/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md
-index 66aaafa9d..6cba60c89 100644
---- a/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md
-+++ b/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md
-@@ -170,5 +170,5 @@ By the end of this guide you should have:
- - A working `@dlt.hub.transformation` script that populates the CDM
- 
- Next steps:
--- [Deploy and schedule your pipeline](llm-native-workflow.md#handover-to-other-toolkits) with the `dlthub-runtime` toolkit
-+- [Deploy and schedule your pipeline](llm-native-workflow.md#handover-to-other-toolkits) with the `dlthub-platform` toolkit
- - [Replace the local destination with your data warehouse](../../walkthroughs/share-a-dataset.md)
-\ No newline at end of file
-diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
-index 7ba63c1b5..3b1e56d3d 100644
---- a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
-+++ b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
-@@ -299,11 +299,11 @@ Once your pipeline is validated, you can continue to the next phase of the data
-   Two skills drive the workflow: `/explore-data` (entry point skill) connects to your data, profiles it by mapping the intent to the available data and identifying potential gaps, while `/build-notebook` assembles the charts into a marimo dashboard and launches it in your browser.
-   The toolkit is designed for iterative development: create one chart and launch the notebook, then iterate — add or refine charts and re-launch.
- 
--- **`dlthub-runtime`** — deploy, schedule, and monitor your pipeline in production
-+- **`dlthub-platform`** — deploy, schedule, and monitor your pipeline in production
- 
- ```sh
- uv run dlthub ai toolkit install data-exploration
--uv run dlthub ai toolkit install dlthub-runtime
-+uv run dlthub ai toolkit install dlthub-platform
- ```
- 
- ## Results
-diff --git a/docs/website/docs/hub/getting-started/installation.md b/docs/website/docs/hub/getting-started/installation.md
-index b058b41a0..76fe0010b 100644
---- a/docs/website/docs/hub/getting-started/installation.md
-+++ b/docs/website/docs/hub/getting-started/installation.md
-@@ -62,7 +62,7 @@ If you don't have `uv` yet, either [install it first](#configuration-of-the-pyth
- pipx run dlthub-start
- ```
- 
--Either way, it prompts for a workspace name, scaffold, and which AI agents to wire up (Claude / Cursor / Codex), scaffolds a workspace with `.dlt/.workspace` already set, vendors the AI toolkits (`rest-api-pipeline`, `transformations`, `dlthub-runtime`, `data-exploration`), and runs `uv sync` so `dlt[hub]` and all workspace dependencies are installed.
-+Either way, it prompts for a workspace name, scaffold, and which AI agents to wire up (Claude / Cursor / Codex), scaffolds a workspace with `.dlt/.workspace` already set, vendors the AI toolkits (`rest-api-pipeline`, `transformations`, `dlthub-platform`, `data-exploration`), and runs `uv sync` so `dlt[hub]` and all workspace dependencies are installed.
- 
- For the recommended defaults non-interactively, pass a name explicitly:
- 
-diff --git a/tests/workspace/cli/dlthub/ai/utils.py b/tests/workspace/cli/dlthub/ai/utils.py
-index 779f25bc5..79a0d879a 100644
---- a/tests/workspace/cli/dlthub/ai/utils.py
-+++ b/tests/workspace/cli/dlthub/ai/utils.py
-@@ -19,7 +19,7 @@ from dlt._workspace.cli.dlthub.ai.utils import (
- from dlt._workspace.cli.dlthub.ai.typing import TToolkitIndexEntry, TToolkitInfo
- 
- # known toolkits in the repo (init is now visible)
--KNOWN_TOOLKITS = ["data-exploration", "init", "rest-api-pipeline", "dlthub-runtime"]
-+KNOWN_TOOLKITS = ["data-exploration", "init", "rest-api-pipeline", "dlthub-platform"]
- INSTALLABLE_TOOLKITS = [t for t in KNOWN_TOOLKITS if t != "init"]
- AGENT_NAMES = ["claude", "cursor", "codex"]
- 
-
-
-===== COMMIT af227334 =====
-
-
-commit af227334a
-Author: Alena Astrakhantseva
-Date: 2026-05-20
-
-    Update the app link in runtime-tutorial.md (#3959)
-
-diff --git a/docs/website/docs/hub/getting-started/runtime-tutorial.md b/docs/website/docs/hub/getting-started/runtime-tutorial.md
-index d2e49bd09..fe03693af 100644
---- a/docs/website/docs/hub/getting-started/runtime-tutorial.md
-+++ b/docs/website/docs/hub/getting-started/runtime-tutorial.md
-@@ -219,7 +219,7 @@ To stop a schedule, remove the trigger from the decorator (or remove the job fro
- ## Review and manage jobs in the UI
- 
- The command line is great for development, but the dltHub web UI gives you a bird's-eye view of everything running in the cloud.
--Visit [dlthub.app](https://dlthub.app)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
-+Visit [app.dlthub.com](https://app.dlthub.com)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
- 
- 1. A list of existing jobs.
- 2. An overview of scheduled runs.
-
-
-===== COMMIT 0b3cd347 =====
-
-
-commit 0b3cd3474
-Author: Anton Burnashev
-Date: 2026-05-20
-
-    fix: update redirect paths for hub introduction (#3958)
-
-diff --git a/docs/website/redirects.js b/docs/website/redirects.js
-index 36047e00f..c8d6ae18a 100644
---- a/docs/website/redirects.js
-+++ b/docs/website/redirects.js
-@@ -19,7 +19,7 @@ const REDIRECTS = [
-     },
-     {
-         from: "/docs/hub",
--        to: "/docs/hub/intro"
-+        to: "/docs/hub/introduction"
-     },
- 
-     // docs section redirects
-@@ -130,7 +130,11 @@ const REDIRECTS = [
-     },
-     {
-         from: "/docs/hub/reference",
--        to: "/docs/hub/intro"
-+        to: "/docs/hub/introduction"
-+    },
-+    {
-+        from: "/docs/hub/intro",
-+        to: "/docs/hub/introduction"
-     },
-     {
-         from: "/docs/general-usage/connectors",
-
-
-===== COMMIT 68b6276c =====
-
-
-commit 68b6276c0
-Author: rudolfix
-Date: 2026-05-20
-
-    fixes docs redirects
-
 diff --git a/docs/website/redirects.js b/docs/website/redirects.js
 index 36047e00f..4428255ae 100644
 --- a/docs/website/redirects.js
@@ -2237,4 +1156,1520 @@ Author: Thierry Jean
 Date: 2026-05-05
 
     docs(cookbook): add Arize Phoenix example (#3914)
+
+diff --git a/docs/docs_tools/examples/prepare_examples_tests.py b/docs/docs_tools/examples/prepare_examples_tests.py
+index 3939c9044..e2ef6eff4 100644
+--- a/docs/docs_tools/examples/prepare_examples_tests.py
++++ b/docs/docs_tools/examples/prepare_examples_tests.py
+@@ -20,6 +20,7 @@ SKIP_EXAMPLES: List[str] = [
+     "qdrant_zendesk",
+     "incremental_loading",
+     "logfire_telemetry_export",
++    "arize_phoenix_export",
+ ]
+ # Examples will be skipped from forked subprocesses
+ SKIP_FORK_EXAMPLES: List[str] = ["custom_destination_lancedb"]
+diff --git a/docs/examples/arize_phoenix_export/__init__.py b/docs/examples/arize_phoenix_export/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/docs/examples/arize_phoenix_export/arize_phoenix_export.py b/docs/examples/arize_phoenix_export/arize_phoenix_export.py
+new file mode 100644
+index 000000000..5d4e9cfca
+--- /dev/null
++++ b/docs/examples/arize_phoenix_export/arize_phoenix_export.py
+@@ -0,0 +1,412 @@
++"""
++---
++title: Export Arize Phoenix Telemetry
++description: Export traces, spans, and evaluations from Arize Phoenix to your data lake
++keywords: [arize, phoenix, opentelemetry, traces, spans, evaluations, observability, llm, export]
++---
++
++[Arize Phoenix](https://phoenix.arize.com/) is an open-source observability platform for AI and LLM
++applications. It captures traces, spans, and evaluations (e.g. relevance scores, hallucination checks)
++that are sent via the OpenTelemetry (OTel) protocol.
++
++To enable analytics, reporting, and offline evaluation, this telemetry needs to be exported to a
++data lakehouse or warehouse. Arize Phoenix persists data in a relational database — either **PostgreSQL**
++(recommended for production) or **SQLite** (the default for single-node deployments).
++
++The `dlt` library's built-in `sql_database()` source makes extraction straightforward:
++
++* Connect directly to Phoenix's Postgres or SQLite backend with a connection string.
++* Use `resolve_foreign_keys=True` so dlt automatically links child tables (e.g. spans → traces).
++* Load to **DuckDB** for zero-config local analytics, or swap to any other dlt destination.
++
++## Credentials
++
++### PostgreSQL
++
++Add the following block to `.dlt/secrets.toml`, filling in the values from your deployment:
++
++```toml
++# .dlt/secrets.toml
++[sources.sql_database.credentials]
++drivername = "postgresql"
++host = "localhost"
++port = 5432
++database = "phoenix"
++username = "phoenix"
++password = "phoenix"
++```
++
++You also need the psycopg2 driver installed:
++
++```bash
++pip install psycopg2-binary
++```
++
++Where to find these values:
++- **Docker Compose**: look for the `db` service in your `docker-compose.yml`. The credentials are
++  set via `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` environment variables. The host
++  is the service name (or `localhost` if the port is published to the host).
++- **Helm chart**: check `values.yaml` under `postgresql.auth` or the `PHOENIX_SQL_DATABASE_URL`
++  environment variable on the Phoenix deployment.
++
++### SQLite
++
++Add the following block to `.dlt/secrets.toml`, pointing `database` at the `.db` file on disk:
++
++```toml
++# .dlt/secrets.toml
++[sources.sql_database.credentials]
++drivername = "sqlite"
++database = "/path/to/phoenix.db"
++```
++
++Where to find the file:
++- **Docker Compose**: the SQLite file lives at `/phoenix/storage/phoenix.db` inside the container.
++  Volume-mount it to a host path so the pipeline can read it directly:
++  ```yaml
++  volumes:
++    - ./data/phoenix.db:/phoenix/storage/phoenix.db
++  ```
++  Then set `database` to the host-side path (e.g. `./data/phoenix.db`).
++- **No volume mount**: copy the file out first with
++  `docker cp <container>:/phoenix/storage/phoenix.db ./phoenix.db`, then point `database` at the
++  copied file.
++
++NOTE. You need the `dlt[sql-database]` extra installed:
++
++```bash
++pip install "dlt[sql-database]"
++```
++
++## Data model
++
++dlt automatically discovers every table in the Phoenix database and infers their relationships from
++foreign keys — no schema configuration required. The exact set of tables you get depends on which
++Phoenix features you have used: tables are only created in the database once the corresponding
++feature is exercised. For example, the `datasets` and `dataset_examples` tables do not exist until
++you create a dataset through the Phoenix web UI.
++
++The tables most relevant for AI observability are:
++
++- **`projects`** — top-level containers; each project groups a set of traces.
++- **`traces`** — a trace is a complete request or workflow, identified by a `trace_id`.
++- **`spans`** — the core table. Every OTEL span belongs to a trace. Spans carry timing, status,
++  LLM token counts, input/output values, and arbitrary OpenInference attributes.
++- **`span_annotations`** — evaluations attached to individual spans (e.g. relevance score,
++  hallucination label), produced by human raters or automated LLM judges.
++- **`trace_annotations`** — same as `span_annotations` but scoped to a full trace.
++- **`datasets`** — curated collections of examples, created via the Phoenix web UI or SDK.
++- **`dataset_examples`** — the individual rows inside a dataset, each linked back to a source span.
++- **`dataset_versions`** — snapshot history of a dataset, enabling reproducible evaluations.
++- **`experiments`** — prompt playground runs executed against a dataset version.
++- **`experiment_runs`** — individual outputs produced by an experiment for each dataset example.
++
++Some tables are internal to Phoenix (e.g. migration tracking, internal job queues).
++You can explicitly select a subset of tables to load via the parameter `sql_database(..., table_names=...)`.
++
++```mermaid
++erDiagram
++    alembic_version{
++    text version_num PK
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    users{
++    bigint id PK
++    bigint user_role_id
++    text username
++    text email
++    text profile_picture_url
++    binary password_hash
++    binary password_salt
++    bool reset_password
++    text oauth2_client_id
++    text oauth2_user_id
++    timestamp created_at
++    timestamp updated_at
++    text auth_method
++    text ldap_unique_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    user_roles{
++    bigint id PK
++    text name
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    projects{
++    bigint id PK
++    text name
++    text description
++    text gradient_start_color
++    text gradient_end_color
++    timestamp created_at
++    timestamp updated_at
++    bigint trace_retention_policy_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    project_trace_retention_policies{
++    bigint id PK
++    text name
++    text cron_expression
++    json rule
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    generative_models{
++    bigint id PK
++    text name
++    text provider
++    text name_pattern
++    bool is_built_in
++    timestamp start_time
++    timestamp created_at
++    timestamp updated_at
++    timestamp deleted_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    token_prices{
++    bigint id PK
++    bigint model_id
++    text token_type
++    bool is_prompt
++    double base_rate
++    json customization
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    evaluators{
++    bigint id PK
++    text name
++    text description
++    json metadata
++    text kind
++    bigint user_id
++    timestamp created_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    builtin_evaluators{
++    bigint id PK
++    text kind
++    text key
++    json input_schema
++    json output_configs
++    timestamp synced_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    dataset_examples{
++    bigint id PK
++    bigint dataset_id
++    bigint span_rowid
++    timestamp created_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    datasets{
++    bigint id PK
++    text name
++    text description
++    json metadata
++    timestamp created_at
++    timestamp updated_at
++    bigint user_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    spans{
++    bigint id PK
++    bigint trace_rowid
++    text span_id
++    text parent_id
++    text name
++    text span_kind
++    timestamp start_time
++    timestamp end_time
++    json attributes
++    json events
++    text status_code
++    text status_message
++    bigint cumulative_error_count
++    bigint cumulative_llm_token_count_prompt
++    bigint cumulative_llm_token_count_completion
++    bigint llm_token_count_prompt
++    bigint llm_token_count_completion
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    traces{
++    bigint id PK
++    bigint project_rowid
++    text trace_id
++    timestamp start_time
++    timestamp end_time
++    bigint project_session_rowid
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    project_sessions{
++    bigint id PK
++    text session_id
++    bigint project_id
++    timestamp start_time
++    timestamp end_time
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    dataset_example_revisions{
++    bigint id PK
++    bigint dataset_example_id
++    bigint dataset_version_id
++    json input
++    json output
++    json metadata
++    text revision_kind
++    timestamp created_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    dataset_versions{
++    bigint id PK
++    bigint dataset_id
++    text description
++    json metadata
++    timestamp created_at
++    bigint user_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    span_annotations{
++    bigint id PK
++    bigint span_rowid
++    text name
++    text label
++    double score
++    text explanation
++    json metadata
++    text annotator_kind
++    timestamp created_at
++    timestamp updated_at
++    bigint user_id
++    text identifier
++    text source
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    project_annotation_configs{
++    bigint id PK
++    bigint project_id
++    bigint annotation_config_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    annotation_configs{
++    bigint id PK
++    text name
++    json config
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    span_costs{
++    bigint id PK
++    bigint span_rowid
++    bigint trace_rowid
++    bigint model_id
++    timestamp span_start_time
++    double total_cost
++    double total_tokens
++    double prompt_cost
++    double prompt_tokens
++    double completion_cost
++    double completion_tokens
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    span_cost_details{
++    bigint id PK
++    bigint span_cost_id
++    text token_type
++    bool is_prompt
++    double cost
++    double tokens
++    double cost_per_token
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    users ||--|{ user_roles : ""
++    projects ||--|{ project_trace_retention_policies : ""
++    token_prices ||--|{ generative_models : ""
++    evaluators ||--|{ users : ""
++    builtin_evaluators ||--|{ evaluators : ""
++    dataset_examples ||--|{ datasets : ""
++    dataset_examples ||--|{ spans : ""
++    datasets ||--|{ users : ""
++    spans ||--|{ traces : ""
++    traces ||--|{ projects : ""
++    traces ||--|{ project_sessions : ""
++    project_sessions ||--|{ projects : ""
++    dataset_example_revisions ||--|{ dataset_versions : ""
++    dataset_example_revisions ||--|{ dataset_examples : ""
++    dataset_versions ||--|{ datasets : ""
++    dataset_versions ||--|{ users : ""
++    span_annotations ||--|{ users : ""
++    span_annotations ||--|{ spans : ""
++    project_annotation_configs ||--|{ projects : ""
++    project_annotation_configs ||--|{ annotation_configs : ""
++    span_costs ||--|{ traces : ""
++    span_costs ||--|{ spans : ""
++    span_costs ||--|{ generative_models : ""
++    span_cost_details ||--|{ span_costs : ""
++```
++
++"""
++
++import dlt
++from dlt.sources.sql_database import sql_database
++
++
++@dlt.source
++def arize_phoenix_source(credentials=dlt.secrets.value):
++    """Returns all Arize Phoenix tables as a dlt source.
++
++    Reads directly from Phoenix's relational backend (PostgreSQL or SQLite) using
++    dlt's built-in `sql_database` source. Foreign key relationships are resolved
++    automatically so destination tables reference each other correctly.
++
++    The primary tables of interest are:
++
++    - **spans**: Every OTEL span recorded by Phoenix — the core unit of telemetry.
++      Each row represents one span with timing, attributes, status, and token counts.
++    - **traces**: Groups of related spans sharing the same `trace_id`.
++    - **projects**: Phoenix projects that spans are assigned to.
++    - **span_annotations**: Human or model-generated evaluations attached to spans
++      (e.g. relevance score, hallucination label).
++    - **trace_annotations**: Evaluations at the trace level.
++    - **datasets / dataset_examples**: Curated examples used in prompt playgrounds
++      or regression test suites.
++
++    Args:
++        credentials: SQLAlchemy-compatible connection string or credential dict,
++            loaded from `secrets.toml`. Supports both PostgreSQL and SQLite URIs.
++
++    Returns:
++        A list of dlt resources — one per Phoenix database table.
++    """
++    return sql_database(
++        credentials=credentials,
++        resolve_foreign_keys=True,
++    )
++
++
++if __name__ == "__main__":
++    pipeline = dlt.pipeline(
++        pipeline_name="arize_phoenix",
++        # can be configure to any dlt destination
++        destination="duckdb",
++    )
++    load_info = pipeline.run(arize_phoenix_source())
++    print(load_info)
+
+
+===== COMMIT 88bd3437 =====
+
+
+commit 88bd34377
+Author: djudjuu
+Date: 2026-05-05
+
+    control section opening from url (#3686)
+
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index ca9b58464..7c169d086 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -792,33 +792,47 @@ def ui_controls(mo_cli_arg_with_test_identifiers: bool):
+         label=utils.ui.small(strings.app_refresh_button),
+     )
+ 
++    # read sections from query params to allow navigation via URL
++    try:
++        _open_sections = (cast(str, mo.query_params().get("sections")) or "").split(",")
++    except Exception:
++        _open_sections = []
++
+     # page switches
+     dlt_section_sync_switch: mo.ui.switch = mo.ui.switch(
+         value=True, label="sync" if mo_cli_arg_with_test_identifiers else ""
+     )
+     dlt_section_info_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="overview" if mo_cli_arg_with_test_identifiers else ""
++        value="overview" in _open_sections,
++        label="overview" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_schema_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="schema" if mo_cli_arg_with_test_identifiers else ""
++        value="schema" in _open_sections,
++        label="schema" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_browse_data_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="data" if mo_cli_arg_with_test_identifiers else ""
++        value="data" in _open_sections,
++        label="data" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_state_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="state" if mo_cli_arg_with_test_identifiers else ""
++        value="state" in _open_sections,
++        label="state" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_trace_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="trace" if mo_cli_arg_with_test_identifiers else ""
++        value="trace" in _open_sections,
++        label="trace" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_loads_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="loads" if mo_cli_arg_with_test_identifiers else ""
++        value="loads" in _open_sections,
++        label="loads" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_ibis_browser_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="ibis" if mo_cli_arg_with_test_identifiers else ""
++        value="ibis" in _open_sections,
++        label="ibis" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_data_quality_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="data_quality" if mo_cli_arg_with_test_identifiers else ""
++        value="data_quality" in _open_sections,
++        label="data_quality" if mo_cli_arg_with_test_identifiers else "",
+     )
+ 
+     # other switches
+diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
+index 8c5b9f45e..d63aa8f1d 100644
+--- a/tests/e2e/helpers/dashboard/test_e2e.py
++++ b/tests/e2e/helpers/dashboard/test_e2e.py
+@@ -396,3 +396,42 @@ def test_broken_trace_pipeline(page: Page, broken_trace_pipeline: Any, pipelines
+     # should also render the trace section, but there should be an error message
+     _open_section(page, "trace")
+     expect(page.get_by_text("Error while building trace section:")).to_be_visible()
++
++
++def test_sections_query_param(page: Page, fruit_pipeline: Any):
++    """Sections specified in ?sections= query param should be pre-opened."""
++    # navigate with sections=trace,loads in the URL
++    page.goto("http://localhost:2718/?pipeline=fruit_pipeline&sections=trace,loads")
++
++    # wait for the pipeline to load
++    expect(page.get_by_role("switch", name="trace")).to_be_visible(timeout=20000)
++
++    # trace and loads switches should be checked (verifies URL params are parsed correctly)
++    expect(page.get_by_role("switch", name="trace")).to_be_checked()
++    expect(page.get_by_role("switch", name="loads")).to_be_checked()
++
++    # other sections should NOT be checked
++    expect(page.get_by_role("switch", name="overview")).not_to_be_checked()
++    expect(page.get_by_role("switch", name="schema")).not_to_be_checked()
++    expect(page.get_by_role("switch", name="data")).not_to_be_checked()
++    expect(page.get_by_role("switch", name="state")).not_to_be_checked()
++
++    # navigate away to release the DuckDB lock before the next test's fixture
++    _go_home(page)
++
++
++def test_sections_query_param_all(page: Page, fruit_pipeline: Any):
++    """All sections should open when all are specified in ?sections= query param."""
++    page.goto(
++        "http://localhost:2718/?pipeline=fruit_pipeline"
++        "&sections=overview,schema,data,state,trace,loads"
++    )
++
++    # wait for the pipeline to load
++    expect(page.get_by_role("switch", name="overview")).to_be_visible(timeout=20000)
++
++    # all specified switches should be checked
++    for section in ["overview", "schema", "data", "state", "trace", "loads"]:
++        expect(page.get_by_role("switch", name=section)).to_be_checked()
++
++    _go_home(page)
+
+
+===== COMMIT f191e724 =====
+
+
+commit f191e7248
+Author: Anuun Chinbat
+Date: 2026-05-05
+
+    Fix/3592 bypass non interactive flag prompts (#3910)
+
+diff --git a/dlt/_workspace/cli/_dlt.py b/dlt/_workspace/cli/_dlt.py
+index 27fef889c..a244ff4fc 100644
+--- a/dlt/_workspace/cli/_dlt.py
++++ b/dlt/_workspace/cli/_dlt.py
+@@ -88,11 +88,29 @@ class NonInteractiveAction(argparse.Action):
+         option_string: str = None,
+     ) -> None:
+         fmt.ALWAYS_CHOOSE_DEFAULT = True
+-        fmt.note(
+-            "Non interactive mode. Default choices are automatically made for confirmations and"
+-            " prompts."
++
++
++class YesAction(argparse.Action):
++    def __init__(
++        self,
++        option_strings: Sequence[str],
++        dest: Any = argparse.SUPPRESS,
++        default: Any = argparse.SUPPRESS,
++        help: str = None,  # noqa
++    ) -> None:
++        super(YesAction, self).__init__(
++            option_strings=option_strings, dest=dest, default=default, nargs=0, help=help
+         )
+ 
++    def __call__(
++        self,
++        parser: argparse.ArgumentParser,
++        namespace: argparse.Namespace,
++        values: Any,
++        option_string: str = None,
++    ) -> None:
++        fmt.ALWAYS_CONFIRM = True
++
+ 
+ class DebugAction(argparse.Action):
+     def __init__(
+@@ -145,6 +163,12 @@ def _create_parser() -> Tuple[argparse.ArgumentParser, Dict[str, SupportsCliComm
+             " prompts."
+         ),
+     )
++    parser.add_argument(
++        "-y",
++        "--yes",
++        action=YesAction,
++        help="Automatically accept all confirmations.",
++    )
+     parser.add_argument(
+         "--debug",
+         action=DebugAction,
+diff --git a/dlt/_workspace/cli/echo.py b/dlt/_workspace/cli/echo.py
+index b28e6fffb..969c9ed46 100644
+--- a/dlt/_workspace/cli/echo.py
++++ b/dlt/_workspace/cli/echo.py
+@@ -6,26 +6,36 @@ import click
+ 
+ ALWAYS_CHOOSE_DEFAULT = False
+ ALWAYS_CHOOSE_VALUE: Any = None
++ALWAYS_CONFIRM = False
+ 
+ 
+ @contextlib.contextmanager
+-def always_choose(always_choose_default: bool, always_choose_value: Any) -> Iterator[None]:
++def always_choose(
++    always_choose_default: bool,
++    always_choose_value: Any,
++    always_confirm: bool = False,
++) -> Iterator[None]:
+     """Temporarily answer all confirmations and prompts with preset values.
+ 
+     Args:
+         always_choose_default: When True, confirm/prompt calls return their default.
+         always_choose_value: When set, confirm/prompt calls return this value instead.
++        always_confirm: When True, confirm calls always return True, regardless of
++            `always_choose_default` and `always_choose_value`.
+     """
+-    global ALWAYS_CHOOSE_DEFAULT, ALWAYS_CHOOSE_VALUE
++    global ALWAYS_CHOOSE_DEFAULT, ALWAYS_CHOOSE_VALUE, ALWAYS_CONFIRM
+     _always_choose_default = ALWAYS_CHOOSE_DEFAULT
+     _always_choose_value = ALWAYS_CHOOSE_VALUE
++    _always_confirm = ALWAYS_CONFIRM
+     ALWAYS_CHOOSE_DEFAULT = always_choose_default
+     ALWAYS_CHOOSE_VALUE = always_choose_value
++    ALWAYS_CONFIRM = always_confirm
+     try:
+         yield
+     finally:
+         ALWAYS_CHOOSE_DEFAULT = _always_choose_default
+         ALWAYS_CHOOSE_VALUE = _always_choose_value
++        ALWAYS_CONFIRM = _always_confirm
+ 
+ 
+ @contextlib.contextmanager
+@@ -49,7 +59,9 @@ def suppress_echo() -> Iterator[None]:
+ def maybe_no_stdin() -> ContextManager[None]:
+     """Automatically choose default values if stdin not connected"""
+     return always_choose(
+-        True if not sys.stdin.isatty() else ALWAYS_CHOOSE_DEFAULT, ALWAYS_CHOOSE_VALUE
++        True if not sys.stdin.isatty() else ALWAYS_CHOOSE_DEFAULT,
++        ALWAYS_CHOOSE_VALUE,
++        ALWAYS_CONFIRM,
+     )
+ 
+ 
+@@ -79,6 +91,8 @@ def note(msg: str) -> None:
+ 
+ 
+ def confirm(text: str, default: Optional[bool] = None) -> bool:
++    if ALWAYS_CONFIRM:
++        return True
+     if ALWAYS_CHOOSE_VALUE:
+         return bool(ALWAYS_CHOOSE_VALUE)
+     if ALWAYS_CHOOSE_DEFAULT:
+diff --git a/docs/website/docs/reference/command-line-interface.md b/docs/website/docs/reference/command-line-interface.md
+index 837499135..165ddc10e 100644
+--- a/docs/website/docs/reference/command-line-interface.md
++++ b/docs/website/docs/reference/command-line-interface.md
+@@ -30,7 +30,7 @@ Creates, adds, inspects and deploys dlt pipelines. Further help is available at
+ **Usage**
+ ```sh
+ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+-    [--non-interactive] [--debug] [--no-pwd]
++    [--non-interactive] [-y] [--debug] [--no-pwd]
+     {telemetry,schema,pipeline,init,deploy,dashboard,ai} ...
+ ```
+ 
+@@ -44,6 +44,7 @@ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+ * `--disable-telemetry` - Disables telemetry before command is executed
+ * `--enable-telemetry` - Enables telemetry before command is executed
+ * `--non-interactive` - Non interactive mode. default choices are automatically made for confirmations and prompts.
++* `-y, --yes` - Automatically accept all confirmations.
+ * `--debug` - Displays full stack traces on exceptions. useful for debugging if the output is not clear enough.
+ * `--no-pwd` - Do not add current working directory to sys.path. by default $pwd is added to reproduce python behavior when running scripts.
+ 
+diff --git a/tests/workspace/cli/common/test_cli_invoke.py b/tests/workspace/cli/common/test_cli_invoke.py
+index 33c6edc1a..f0e7f6b2f 100644
+--- a/tests/workspace/cli/common/test_cli_invoke.py
++++ b/tests/workspace/cli/common/test_cli_invoke.py
+@@ -3,9 +3,11 @@ import sys
+ import pytest
+ import shutil
+ from pathlib import Path
++from typing import Iterator
+ from pytest_console_scripts import ScriptRunner
+ from unittest.mock import patch
+ 
++import dlt
+ from dlt.common.runners.venv import Venv
+ from dlt.common.utils import custom_environ
+ 
+@@ -16,6 +18,15 @@ from tests.utils import get_test_storage_root
+ BASE_COMMANDS = ["init", "deploy", "pipeline", "telemetry", "schema"]
+ 
+ 
++@pytest.fixture(autouse=True)
++def reset_echo_globals() -> Iterator[None]:
++    """Reset echo globals to their default values."""
++    yield
++    fmt.ALWAYS_CHOOSE_DEFAULT = False
++    fmt.ALWAYS_CHOOSE_VALUE = None
++    fmt.ALWAYS_CONFIRM = False
++
++
+ @pytest.fixture(autouse=True)
+ def disable_debug() -> None:
+     # reset debug flag so other tests may pass
+@@ -222,6 +233,61 @@ def test_invoke_deploy_mock(script_runner: ScriptRunner) -> None:
+         }
+ 
+ 
++@pytest.mark.parametrize(
++    "flags,confirms",
++    [
++        (["-y"], True),
++        (["--yes"], True),
++        (["--yes", "--non-interactive"], True),
++        (["-y", "--non-interactive"], True),
++        (["--non-interactive"], False),
++    ],
++    ids=[
++        "short",
++        "long",
++        "yes-and-non-interactive",
++        "y-and-non-interactive",
++        "non-interactive-only",
++    ],
++)
++def test_yes_flag_auto_confirms(
++    script_runner: ScriptRunner, flags: list[str], confirms: bool
++) -> None:
++    """Destructive commands like sync and drop ask for confirmation with default=False.
++    --non-interactive uses the default, so nothing happens. -y/--yes overrides to True, so the commands actually execute.
++    """
++    result = script_runner.run(["dlt", "init", "chess", "duckdb"])
++    assert result.returncode == 0
++
++    os.environ.pop("DESTINATION__DUCKDB__CREDENTIALS", None)
++    venv = Venv.restore_current()
++    venv.run_script("chess_pipeline.py")
++
++    # sync
++    result = script_runner.run(["dlt", *flags, "pipeline", "chess_pipeline", "sync"])
++    assert result.returncode == 0, f"STDERR: {result.stderr}"
++    if confirms:
++        assert "Dropping local state" in result.stdout
++        assert "Restoring from destination" in result.stdout
++    else:
++        assert "Dropping local state" not in result.stdout
++
++    pipeline = dlt.attach(pipeline_name="chess_pipeline")
++    assert "players_games" in pipeline.default_schema.tables
++
++    # drop
++    result = script_runner.run(
++        ["dlt", *flags, "pipeline", "chess_pipeline", "drop", "players_games"]
++    )
++    assert result.returncode == 0, f"STDERR: {result.stderr}"
++    pipeline = dlt.attach(pipeline_name="chess_pipeline")
++    if confirms:
++        assert "Selected resource(s): ['players_games']" in result.stdout
++        assert "players_games" not in pipeline.default_schema.tables
++    else:
++        assert "players_games" in pipeline.default_schema.tables
++
++
+ @pytest.mark.skipif(sys.stdin.isatty(), reason="stdin connected, test skipped")
+ def test_no_tty() -> None:
+     with fmt.maybe_no_stdin():
+diff --git a/tests/workspace/cli/test_pipeline_command.py b/tests/workspace/cli/test_pipeline_command.py
+index e02269857..d7a5e8f67 100644
+--- a/tests/workspace/cli/test_pipeline_command.py
++++ b/tests/workspace/cli/test_pipeline_command.py
+@@ -4,6 +4,7 @@ import contextlib
+ import pytest
+ import logging
+ from subprocess import CalledProcessError
++from typing import Any
+ 
+ import dlt
+ from dlt.common.runners.venv import Venv
+@@ -19,6 +20,21 @@ from tests.workspace.cli.utils import (
+ )
+ 
+ 
++CHOOSE_PRIORITY_CASES = [
++    # always_confirm=True overrides everything
++    (dict(always_choose_default=True, always_choose_value=False, always_confirm=True), True),
++    # always_choose_value overrides always_choose_default
++    (dict(always_choose_default=True, always_choose_value=True, always_confirm=False), True),
++    # always_choose_default kicks in only when value/confirm are off
++    (dict(always_choose_default=True, always_choose_value=None, always_confirm=False), False),
++]
++CHOOSE_PRIORITY_IDS = [
++    "always-confirm-overrides-everything",
++    "always-choose-value-overrides-always-choose-default",
++    "always-choose-default-kicks-in-if-allowed",
++]
++
++
+ def test_pipeline_command_operations(repo_dir: str) -> None:
+     _init_command.init_command("chess", "duckdb", repo_dir)
+ 
+@@ -199,7 +215,10 @@ def test_pipeline_command_failed_jobs(repo_dir: str) -> None:
+         assert "JOB file type: jsonl" in _out
+ 
+ 
+-def test_pipeline_command_drop_partial_loads(repo_dir: str) -> None:
++@pytest.mark.parametrize("choose_kwargs,confirms", CHOOSE_PRIORITY_CASES, ids=CHOOSE_PRIORITY_IDS)
++def test_pipeline_command_drop_partial_loads(
++    repo_dir: str, choose_kwargs: dict[str, Any], confirms: bool
++) -> None:
+     _init_command.init_command("chess", "dummy", repo_dir)
+     os.environ["EXCEPTION_PROB"] = "1.0"
+ 
+@@ -234,17 +253,21 @@ def test_pipeline_command_drop_partial_loads(repo_dir: str) -> None:
+     print(_out)
+ 
+     with io.StringIO() as buf, contextlib.redirect_stdout(buf):
+-        with echo.always_choose(False, True):
++        with echo.always_choose(**choose_kwargs):
+             _pipeline_command.pipeline_command("drop-pending-packages", "chess_pipeline", None, 1)
+             _out = buf.getvalue()
+-            assert "Pending packages deleted" in _out
+     print(_out)
+ 
+-    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
+-        _pipeline_command.pipeline_command("drop-pending-packages", "chess_pipeline", None, 1)
+-        _out = buf.getvalue()
+-        assert "No pending packages found" in _out
+-    print(_out)
++    if confirms:
++        assert "Pending packages deleted" in _out
++        # verify packages are gone
++        with io.StringIO() as buf, contextlib.redirect_stdout(buf):
++            _pipeline_command.pipeline_command("drop-pending-packages", "chess_pipeline", None, 1)
++            _out = buf.getvalue()
++            assert "No pending packages found" in _out
++        print(_out)
++    else:
++        assert "Pending packages deleted" not in _out
+ 
+ 
+ def test_drop_from_wrong_dir(repo_dir: str) -> None:
+@@ -290,7 +313,10 @@ def test_drop_from_wrong_dir(repo_dir: str) -> None:
+         assert "WARNING: You should run this from the same directory as the pipeline script" in _out
+ 
+ 
+-def test_pipeline_command_drop_with_global_args(repo_dir: str) -> None:
++@pytest.mark.parametrize("choose_kwargs,confirms", CHOOSE_PRIORITY_CASES, ids=CHOOSE_PRIORITY_IDS)
++def test_pipeline_command_drop_with_global_args(
++    repo_dir: str, choose_kwargs: dict[str, Any], confirms: bool
++) -> None:
+     """Test that global CLI arguments don't cause errors in pipeline drop command."""
+     _init_command.init_command("chess", "duckdb", repo_dir)
+ 
+@@ -303,9 +329,8 @@ def test_pipeline_command_drop_with_global_args(repo_dir: str) -> None:
+         print(cpe.stderr)
+         raise
+ 
+-    # Test drop command with global arguments that should be ignored
+     with io.StringIO() as buf, contextlib.redirect_stdout(buf):
+-        with echo.always_choose(False, True):
++        with echo.always_choose(**choose_kwargs):
+             _pipeline_command.pipeline_command(
+                 "drop",
+                 "chess_pipeline",
+@@ -316,8 +341,10 @@ def test_pipeline_command_drop_with_global_args(repo_dir: str) -> None:
+                 debug=False,  # Another global arg
+             )
+         _out = buf.getvalue()
+-        assert "Selected resource(s): ['players_games']" in _out
+ 
+-    # Verify the command actually executed
+     pipeline = dlt.attach(pipeline_name="chess_pipeline")
+-    assert "players_games" not in pipeline.default_schema.tables
++    if confirms:
++        assert "Selected resource(s): ['players_games']" in _out
++        assert "players_games" not in pipeline.default_schema.tables
++    else:
++        assert "players_games" in pipeline.default_schema.tables
+
+
+===== COMMIT 55078eb0 =====
+
+
+commit 55078eb0b
+Author: Anuun Chinbat
+Date: 2026-05-05
+
+    fix: correctly materialize empty tables for multi-table resources (#3901)
+
+diff --git a/dlt/extract/extract.py b/dlt/extract/extract.py
+index 9628e4aa9..11267e7b7 100644
+--- a/dlt/extract/extract.py
++++ b/dlt/extract/extract.py
+@@ -345,42 +345,30 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
+     ) -> None:
+         schema = source.schema
+         json_extractor = extractors["object"]
+-        resources_with_items = set().union(*[e.resources_with_items for e in extractors.values()])
++        tables_with_items = set().union(*[e.tables_with_items for e in extractors.values()])
+         # find REPLACE resources that did not yield any pipe items and create empty jobs for them
+         # NOTE: do not include tables that have never seen data
+         data_tables = {t["name"]: t for t in schema.data_tables(seen_data_only=True)}
+         tables_by_resources = utils.group_tables_by_resource(data_tables)
+         for resource in source.resources.selected.values():
+-            if resource.write_disposition != "replace" or resource.name in resources_with_items:
+-                continue
+             if resource.name not in tables_by_resources:
+                 continue
+             for table in tables_by_resources[resource.name]:
++                write_disposition = table.get("write_disposition") or resource.write_disposition
++                if write_disposition != "replace" or table["name"] in tables_with_items:
++                    continue
+                 # we only need to write empty files for the root tables
+                 if not utils.is_nested_table(table):
+                     json_extractor.write_empty_items_file(table["name"])
+ 
+-        # collect resources that received empty materialized lists and had no items
+-        resources_with_empty = (
++        # collect tables that received empty materialized lists and had no items
++        tables_with_empty = (
+             set()
+-            .union(*[e.resources_with_empty for e in extractors.values()])
+-            .difference(resources_with_items)
++            .union(*[e.tables_with_empty for e in extractors.values()])
++            .difference(tables_with_items)
+         )
+-        # get all possible tables
+-        data_tables = {t["name"]: t for t in schema.data_tables()}
+-        tables_by_resources = utils.group_tables_by_resource(data_tables)
+-        for resource_name in resources_with_empty:
+-            if resource := source.resources.selected.get(resource_name):
+-                if tables := tables_by_resources.get("resource_name"):
+-                    # write empty tables
+-                    for table in tables:
+-                        # we only need to write empty files for the root tables
+-                        if not utils.is_nested_table(table):
+-                            json_extractor.write_empty_items_file(table["name"])
+-                else:
+-                    table_name = json_extractor._get_static_table_name(resource, None)
+-                    if table_name:
+-                        json_extractor.write_empty_items_file(table_name)
++        for table_name in tables_with_empty:
++            json_extractor.write_empty_items_file(table_name)
+ 
+     def _extract_single_source(
+         self,
+diff --git a/dlt/extract/extractors.py b/dlt/extract/extractors.py
+index 983ab9c21..3110cdd02 100644
+--- a/dlt/extract/extractors.py
++++ b/dlt/extract/extractors.py
+@@ -124,10 +124,10 @@ class Extractor:
+         self.schema = schema
+         self.naming = schema.naming
+         self.collector = collector
+-        self.resources_with_items: Set[str] = set()
+-        """Tracks resources that received items"""
+-        self.resources_with_empty: Set[str] = set()
+-        """Track resources that received empty materialized list"""
++        self.tables_with_items: Set[str] = set()
++        """Tracks tables that received items"""
++        self.tables_with_empty: Set[str] = set()
++        """Tracks tables that received empty materialized list"""
+         self.load_id = load_id
+         self.item_storage = item_storage
+         self._table_contracts: Dict[str, TSchemaContractDict] = {}
+@@ -190,10 +190,10 @@ class Extractor:
+         self.collector.update(table_name, inc=new_rows_count)
+         # if there were rows or item was empty arrow table
+         if new_rows_count > 0 or self.__class__ is ArrowExtractor:
+-            self.resources_with_items.add(resource_name)
++            self.tables_with_items.add(table_name)
+         else:
+             if isinstance(items, MaterializedEmptyList):
+-                self.resources_with_empty.add(resource_name)
++                self.tables_with_empty.add(table_name)
+ 
+     def _import_item(
+         self,
+@@ -210,7 +210,7 @@ class Extractor:
+             meta.file_format,
+         )
+         self.collector.update(table_name, inc=metrics.items_count)
+-        self.resources_with_items.add(resource_name)
++        self.tables_with_items.add(table_name)
+ 
+     def _write_to_dynamic_table(self, resource: DltResource, items: TDataItems, meta: Any) -> None:
+         if not isinstance(items, list):
+diff --git a/tests/extract/test_extract.py b/tests/extract/test_extract.py
+index 7f20ea4c0..b80dac3b5 100644
+--- a/tests/extract/test_extract.py
++++ b/tests/extract/test_extract.py
+@@ -13,6 +13,7 @@ from dlt.common.storages import (
+ )
+ from dlt.common.storages.schema_storage import SchemaStorage
+ from dlt.common.typing import TTableNames, TDataItems
++from dlt.common.utils import uniq_id
+ 
+ from dlt.extract import DltResource, DltSource
+ from dlt.extract.exceptions import DataItemRequiredForDynamicTableHints, ResourceExtractionError
+@@ -613,6 +614,54 @@ def test_materialize_table_schema_with_pipe_items():
+     assert found_empty_list
+ 
+ 
++@pytest.mark.parametrize(
++    "yield_one,yield_two",
++    [(True, False), (False, True), (False, False), (True, True)],
++    ids=["only_first", "only_second", "neither", "both"],
++)
++def test_materialize_table_schema_multi_table(yield_one: bool, yield_two: bool) -> None:
++    """Empty table materialization works correctly for resources that produce multiple tables."""
++
++    @dlt.resource
++    def multi_table():
++        yield dlt.mark.with_hints(
++            dlt.mark.materialize_table_schema(),
++            dlt.mark.make_hints(
++                table_name="table_one",
++                write_disposition="replace",
++                columns={"col_one": {"data_type": "text"}},
++            ),
++            create_table_variant=True,
++        )
++        yield dlt.mark.with_hints(
++            dlt.mark.materialize_table_schema(),
++            dlt.mark.make_hints(
++                table_name="table_two",
++                write_disposition="replace",
++                columns={"col_two": {"data_type": "bigint"}},
++            ),
++            create_table_variant=True,
++        )
++        if yield_one:
++            yield dlt.mark.with_table_name({"col_one": "val"}, table_name="table_one")
++        if yield_two:
++            yield dlt.mark.with_table_name({"col_two": 5}, table_name="table_two")
++
++    p = dlt.pipeline(
++        pipeline_name="materialize_multi_" + uniq_id(),
++        destination="duckdb",
++        dev_mode=True,
++    )
++    extract_info = p.extract(multi_table())
++
++    extracted_tables = {
++        job.job_file_info.table_name for job in extract_info.load_packages[0].jobs["new_jobs"]
++    }
++    # both tables should always have jobs — either with data or empty files
++    assert "table_one" in extracted_tables
++    assert "table_two" in extracted_tables
++
++
+ @pytest.mark.parametrize(
+     "with_custom_metrics", [True, False], ids=["with_custom_metrics", "without_custom_metrics"]
+ )
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index 31a0a656a..e0c41242b 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -86,6 +86,7 @@ from tests.pipeline.utils import (
+     load_table_counts,
+     load_tables_to_dicts,
+     many_delayed,
++    table_exists,
+ )
+ 
+ from dlt.destinations.dataset import get_destination_client_initial_config
+@@ -3573,6 +3574,109 @@ def test_yielding_empty_list_creates_table() -> None:
+             assert rows[0] == (1, None)
+ 
+ 
++@pytest.mark.parametrize(
++    "yield_one,yield_two",
++    [(True, False), (False, True), (False, False), (True, True)],
++    ids=["only_first", "only_second", "neither", "both"],
++)
++def test_materialize_table_schema_multi_table_duckdb(yield_one: bool, yield_two: bool) -> None:
++    """End-to-end check that a multi-table resource materializes both tables in duckdb,
++    whether they receive data or not. Dispatch happens via `with_table_name` and table
++    variants are pre-declared with `materialize_table_schema()`.
++    """
++
++    @dlt.resource
++    def multi_table():
++        yield dlt.mark.with_hints(
++            dlt.mark.materialize_table_schema(),
++            dlt.mark.make_hints(
++                table_name="table_one",
++                write_disposition="replace",
++                columns={"col_one": {"data_type": "text"}},
++            ),
++            create_table_variant=True,
++        )
++        yield dlt.mark.with_hints(
++            dlt.mark.materialize_table_schema(),
++            dlt.mark.make_hints(
++                table_name="table_two",
++                write_disposition="replace",
++                columns={"col_two": {"data_type": "bigint"}},
++            ),
++            create_table_variant=True,
++        )
++        if yield_one:
++            yield dlt.mark.with_table_name({"col_one": "val"}, table_name="table_one")
++        if yield_two:
++            yield dlt.mark.with_table_name({"col_two": 5}, table_name="table_two")
++
++    pipeline = dlt.pipeline(
++        pipeline_name="materialize_multi_e2e_" + uniq_id(),
++        destination="duckdb",
++        dev_mode=True,
++    )
++    load_info = pipeline.run(multi_table())
++    assert_load_info(load_info)
++
++    expected = {
++        "table_one": 1 if yield_one else 0,
++        "table_two": 1 if yield_two else 0,
++    }
++    assert_table_counts(pipeline, expected)
++
++    schema_tables = pipeline.default_schema.tables
++    assert "col_one" in schema_tables["table_one"]["columns"]
++    assert "col_two" in schema_tables["table_two"]["columns"]
++
++
++def test_materialize_table_schema_with_nested_hints_duckdb() -> None:
++    """Pre-declared nested table via `nested_hints` is added to the schema but does NOT
++    materialize at the destination when only the root yields `materialize_table_schema()`.
++    The normalizer attaches parent/child linking columns only when real nested data flows
++    through it, so an empty nested table cannot be meaningfully created up front.
++    """
++
++    @dlt.resource(
++        name="users",
++        write_disposition="replace",
++        columns=[
++            {"name": "id", "data_type": "bigint", "nullable": False},
++            {"name": "name", "data_type": "text"},
++        ],
++        nested_hints={
++            "purchases": dlt.mark.make_nested_hints(
++                columns=[{"name": "price", "data_type": "decimal"}],
++            ),
++        },
++    )
++    def users_with_nested():
++        yield dlt.mark.materialize_table_schema()
++
++    pipeline = dlt.pipeline(
++        pipeline_name="materialize_nested_e2e_" + uniq_id(),
++        destination="duckdb",
++        dev_mode=True,
++    )
++    load_info = pipeline.run(users_with_nested())
++    assert_load_info(load_info)
++
++    # root table is materialized empty in duckdb with declared columns
++    assert table_exists(pipeline, "users")
++    assert load_table_counts(pipeline, "users") == {"users": 0}
++    users_columns = pipeline.default_schema.tables["users"]["columns"]
++    assert {"id", "name", "_dlt_load_id", "_dlt_id"}.issubset(users_columns.keys())
++
++    # nested table is computed into the schema from `nested_hints`
++    assert "users__purchases" in pipeline.default_schema.tables
++    nested_columns = pipeline.default_schema.tables["users__purchases"]["columns"]
++    assert "price" in nested_columns
++
++    # but it is NOT created at the destination — no MaterializedEmptyList ever flows
++    # through `_write_item` for the nested name, and parent linkage columns are produced
++    # by the normalizer only on real nested rows
++    assert not table_exists(pipeline, "users__purchases")
++
++
+ @pytest.mark.parametrize(
+     "local_path_kind",
+     (
+
+
+===== COMMIT 9c825eb4 =====
+
+
+commit 9c825eb47
+Author: Travior
+Date: 2026-05-05
+
+    fix `with_load_id` breaking on non-root sibling branches (#3878)
+
+diff --git a/dlt/dataset/relation.py b/dlt/dataset/relation.py
+index 7982daa57..13988f864 100644
+--- a/dlt/dataset/relation.py
++++ b/dlt/dataset/relation.py
+@@ -29,9 +29,8 @@ from dlt.common.schema.typing import (
+     TTableSchema,
+     TTableSchemaColumns,
+     C_DLT_LOAD_ID,
+-    TTableReference,
+ )
+-from dlt.common.schema import utils as schema_utils, TSchemaTables
++from dlt.common.schema import utils as schema_utils
+ from dlt.common.typing import Self, TSortOrder, TypedDict
+ from dlt.common.exceptions import ValueErrorWithKnownValues
+ from dlt.dataset import lineage
+@@ -590,16 +589,14 @@ class Relation(WithSqlClient):
+     def with_load_id_col(self) -> dlt.Relation:
+         """Return the relation with the `_dlt_load_id` included.
+ 
+-        This only works on relations created via ``.table()``.
++        This only works on relations created via `.table()`.
+ 
+-        There are 3 cases:
+-        - If the relation is a root table, this is a no-op
+-        - If the relation has a root key, join relation to root table
+-        - If the relation has a parent key, iteratively join the root to the relation
+-        - Else raise
++        If the relation already includes `_dlt_load_id`, it is returned unchanged.
++        Otherwise, the root table is joined to add the column to the current relation.
+ 
+-        This should only raise if the `dlt.Schema` was tempered, breaking the
+-        dlt-generated root and parent relationships.
++        Raises:
++            ValueError: If called on a non-table relation, a root table without
++                `_dlt_load_id`, or a relation whose root load ID column cannot be located.
+         """
+         if not self._table_name or self._query is not None:
+             raise ValueError(
+@@ -607,16 +604,34 @@ class Relation(WithSqlClient):
+                 " It can't be applied to arbitrary relation."
+             )
+ 
+-        table_schema = self._dataset.schema.tables[self._table_name]
++        normalized_load_id = self._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID)
+ 
+-        if self._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID) in self.columns:
++        if normalized_load_id in self.columns:
+             return self
+-        elif schema_utils.has_column_with_prop(table_schema, "root_key"):
+-            return _add_load_id_via_root_key(self)
+-        elif schema_utils.has_column_with_prop(table_schema, "parent_key"):
+-            return _add_load_id_via_parent_key(self)
+-        else:
+-            raise ValueError
++
++        root_table_name = schema_utils.get_root_table(
++            self._dataset.schema.tables, self._table_name
++        )["name"]
++        if root_table_name == self._table_name:
++            raise ValueError(f"{root_table_name} is a root table, but load id column is not present.")
++
++        join_alias = "_dlt_root"
++        joined = self.join(root_table_name, alias=join_alias)
++        joined_expression = joined.sqlglot_expression.copy()
++        left_projection = joined_expression.selects[: len(self.sqlglot_expression.selects)]
++        load_id_output_name = f"{join_alias}__{normalized_load_id}"
++        load_id_expr = next(
++            (expr for expr in joined_expression.selects if expr.output_name == load_id_output_name),
++            None,
++        )
++        if load_id_expr is None:
++            raise ValueError(f"Could not locate column {normalized_load_id}")
++
++        joined_expression.set("expressions", [*left_projection, load_id_expr.this.copy()])
++
++        rel = self.__copy__()
++        rel._sqlglot_expression = joined_expression
++        return rel
+ 
+     def from_loads(
+         self,
+@@ -726,154 +741,3 @@ def _get_relation_output_columns_schema(
+         allow_partial=allow_partial,
+     )
+     return columns_schema, normalized_query
+-
+-
+-def _add_load_id_via_root_key_query(
+-    table_name: str,
+-    root_table_name: str,
+-    child_root_key: str,
+-    root_row_key: str,
+-    *,
+-    normalized_load_id: str = C_DLT_LOAD_ID,
+-) -> sge.Select:
+-    child_table = sge.Table(
+-        this=sge.to_identifier(table_name, quoted=True),
+-        alias=sge.TableAlias(this=sge.to_identifier("child", quoted=False)),
+-    )
+-    root_table_expr = sge.Table(
+-        this=sge.to_identifier(root_table_name, quoted=True),
+-        alias=sge.TableAlias(this=sge.to_identifier("root", quoted=False)),
+-    )
+-
+-    # Build column list: child.*, root._dlt_load_id
+-    columns = [
+-        sge.Column(table=sge.to_identifier("child", quoted=False), this=sge.Star()),
+-        sge.Column(
+-            table=sge.to_identifier("root", quoted=False),
+-            this=sge.to_identifier(normalized_load_id, quoted=True),
+-        ),
+-    ]
+-
+-    join_condition = sge.EQ(
+-        this=sge.Column(
+-            table=sge.to_identifier("child", quoted=False),
+-            this=sge.to_identifier(child_root_key, quoted=True),
+-        ),
+-        expression=sge.Column(
+-            table=sge.to_identifier("root", quoted=False),
+-            this=sge.to_identifier(root_row_key, quoted=True),
+-        ),
+-    )
+-
+-    query = (
+-        sge.Select(expressions=columns)
+-        .from_(child_table)
+-        .join(root_table_expr, on=join_condition, join_type="INNER")
+-    )
+-    return query
+-
+-
+-def _add_load_id_via_root_key(relation: dlt.Relation) -> dlt.Relation:
+-    """Return the input relation with the `_dlt_load_id` column added.
+-
+-    This is done by joining the `root_table._dlt_id` with the `table._dlt_root_id`
+-    """
+-    origin_table_name: str = relation._table_name
+-    tables_schema = relation._dataset.schema.tables
+-    root_table = schema_utils.get_root_table(tables_schema, origin_table_name)
+-    root_table_name = root_table["name"]
+-
+-    ref = schema_utils.create_root_child_reference(tables_schema, origin_table_name)
+-    child_root_key = ref["columns"][0]
+-    root_row_key = ref["referenced_columns"][0]
+-
+-    # Construct SELECT with INNER JOIN
+-    query = _add_load_id_via_root_key_query(
+-        table_name=origin_table_name,
+-        root_table_name=root_table_name,
+-        child_root_key=child_root_key,
+-        root_row_key=root_row_key,
+-        normalized_load_id=relation._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID),
+-    )
+-
+-    rel = relation.__copy__()
+-    rel._sqlglot_expression = query
+-    return rel
+-
+-
+-def _add_load_id_via_parent_key_query(
+-    table_name: str, table_schemas: TSchemaTables, normalized_load_id: str = C_DLT_LOAD_ID
+-) -> sge.Select:
+-    # The reference_chain goes from root to the queried table
+-    # Each reference contains: child table -> parent table relationship
+-    # We need to build joins from the queried table back to root
+-    reference_chain = []
+-    root_table_name = schema_utils.get_root_table(table_schemas, table_name)["name"]
+-    for reference in schema_utils.get_all_parent_child_references_from_root(
+-        table_schemas, root_table_name
+-    ):
+-        reference_chain.append(reference)
+-        if reference["table"] == table_name:
+-            break
+-
+-    queried_table = sge.Table(
+-        this=sge.to_identifier(table_name, quoted=True),
+-        alias=sge.TableAlias(this=sge.to_identifier("t0", quoted=False)),
+-    )
+-
+-    # build final table query with all columns explicitly + _dlt_load_id from root table
+-    columns = [
+-        sge.Column(
+-            table=sge.to_identifier("t0", quoted=False),
+-            this=sge.to_identifier(col_name, quoted=True),
+-        )
+-        for col_name in table_schemas[table_name]["columns"]
+-    ]
+-    columns.append(
+-        sge.Column(
+-            table=sge.to_identifier(f"t{len(reference_chain)}", quoted=False),
+-            this=sge.to_identifier(normalized_load_id, quoted=True),
+-        )
+-    )
+-    query = sge.Select(expressions=columns).from_(queried_table)
+-
+-    # loop through references from table to root to append INNER JOINs
+-    for i, ref in enumerate(reversed(reference_chain)):
+-        parent_alias = f"t{i + 1}"
+-        parent_table = sge.Table(
+-            this=sge.to_identifier(ref["referenced_table"], quoted=True),
+-            alias=sge.TableAlias(this=sge.to_identifier(parent_alias, quoted=False)),
+-        )
+-        join_condition = sge.EQ(
+-            this=sge.Column(
+-                table=sge.to_identifier(f"t{i}", quoted=False),
+-                this=sge.to_identifier(ref["columns"][0], quoted=True),
+-            ),
+-            expression=sge.Column(
+-                table=sge.to_identifier(parent_alias, quoted=False),
+-                this=sge.to_identifier(ref["referenced_columns"][0], quoted=True),
+-            ),
+-        )
+-        query = query.join(parent_table, on=join_condition, join_type="INNER")
+-
+-    return query
+-
+-
+-def _add_load_id_via_parent_key(relation: dlt.Relation) -> dlt.Relation:
+-    """Return the input relation with the `_dlt_load_id` column added.
+-
+-    This is done by iteratively joining the `root_table._dlt_id` with `child._dlt_parent_id`
+-    until the input relation is reached.
+-    """
+-    origin_table_name: str = relation._table_name
+-    table_schemas = relation._dataset.schema.tables
+-
+-    query = _add_load_id_via_parent_key_query(
+-        table_name=origin_table_name,
+-        table_schemas=table_schemas,
+-        normalized_load_id=relation._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID),
+-    )
+-
+-    rel = relation.__copy__()
+-    rel._sqlglot_expression = query
+-    return rel
+diff --git a/tests/dataset/test_relation.py b/tests/dataset/test_relation.py
+index 7a6c3333e..0bafcfb19 100644
+--- a/tests/dataset/test_relation.py
++++ b/tests/dataset/test_relation.py
+@@ -6,6 +6,7 @@ import pytest
+ from sqlglot import expressions as sge
+ 
+ import dlt
++from dlt.common.utils import uniq_id
+ from dlt.common.schema.schema import Schema
+ from dlt.common.schema.typing import C_DLT_LOAD_ID, LOADS_TABLE_NAME, VERSION_TABLE_NAME
+ from dlt.common.schema.utils import new_table
+@@ -195,6 +196,45 @@ def test_relation_with_load_id(
+     assert list(df.columns) == expected_columns
+ 
+ 
++def test_relation_with_load_id_on_parallel_child_branch(tmp_path) -> None:
++    data = [
++        {
++            "id": 1,
++            "orders": [{"order_id": 101, "total_amount": 100.0}],
++            "profiles": [{"type": "personal"}],
++        },
++        {
++            "id": 2,
++            "orders": [{"order_id": 102, "total_amount": 200.0}],
++            "profiles": [{"type": "work"}],
++        },
++    ]
++
++    @dlt.resource(name="users")
++    def users():
++        yield data
++
++    pipeline = dlt.pipeline(
++        pipeline_name="parallel_child_branch_" + uniq_id(),
++        pipelines_dir=str(tmp_path / "pipelines_dir"),
++        destination=dlt.destinations.duckdb(str(tmp_path / "parallel_child_branch.duckdb")),
++        dev_mode=True,
++    )
++    pipeline.run(users(), dataset_name="test")
++
++    table = pipeline.dataset().table("users__profiles")
++    output = table.with_load_id_col()
++    expected_columns = table.columns + [C_DLT_LOAD_ID]
++
++    assert output.columns == expected_columns
++
++    df = output.df()
++
++    assert len(df) == len(data)
++    assert list(df.columns) == expected_columns
++    assert set(df[C_DLT_LOAD_ID]) == {pipeline.last_trace.last_normalize_info.loads_ids[0]}
++
++
+ @pytest.mark.parametrize("selected_load_id_idx", [[0], [1], [0, 1]])
+ @pytest.mark.parametrize("table_name", ["products", "users__orders", "users__orders__items"])
+ @pytest.mark.parametrize("add_load_id_column", [True, False])
+
+
+===== COMMIT d44ae685 =====
+
+
+commit d44ae685f
+Author: Travior
+Date: 2026-05-05
+
+    Improve docs around `join` usage (#3902)
 

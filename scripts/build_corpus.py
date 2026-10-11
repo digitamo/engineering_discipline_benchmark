@@ -63,7 +63,10 @@ CORPUS_EXCLUDE = (
     ".github/PULL_REQUEST_TEMPLATE.md",
 )
 
-# Second line of defence. Path rules miss files whose name gives nothing away.
+# Second line of defence. Path rules miss files whose names give nothing away.
+# The agent-harness markers matter because the corpus ships code that installs
+# agent skills: it mentions AGENTS.md and SKILL.md as paths, carries no coding
+# standards itself, but is agent tooling and belongs outside the filler.
 CONTAMINATION_PHRASES = (
     "no black boxes",
     "dry and yagni",
@@ -71,6 +74,12 @@ CONTAMINATION_PHRASES = (
     "ai harness",
     "agent definition",
     "coding style guide",
+    "agents.md",
+    "skill.md",
+    ".codex",
+    ".claude",
+    "claudecode",
+    "claude_code",
 )
 
 # Large, protocol-focused RFCs. Chosen for size and because they describe wire

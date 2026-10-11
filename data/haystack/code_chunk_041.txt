@@ -1,394 +1,3 @@
-  :::warning
-  `bigint` maps to BigQuery's **INT64** data type.
-  Automatic partitioning requires converting an INT64 column to a UNIX timestamp, which `GENERATE_ARRAY` doesn't natively support.
-  With a 10,000 partition limit, we can’t cover the full INT64 range.
-  Instead, we set 86,400-second boundaries to enable daily partitioning.
-  This captures typical values, but extremely large/small outliers go to an `__UNPARTITIONED__` catch-all partition.
-  :::
-
-* `cluster` - creates cluster column(s). Many columns per table are supported and only when a new table is created.
-
-:::warning
-**Deprecation Notice:**
-Per-column `cluster` hints are deprecated and will be removed in a future release.
-**To migrate, use the `cluster` argument of the `bigquery_adapter` instead.**
-See the [example below](#use-an-adapter-to-apply-hints-to-a-resource) for how to specify clustering columns with the adapter.
-:::
-
-### Table and column identifiers
-
-BigQuery uses case-sensitive identifiers by default, and this is what `dlt` assumes. If the dataset you use has case-insensitive identifiers (you have such an option
-when you create it), make sure that you use a case-insensitive [naming convention](../../general-usage/naming-convention.md#case-sensitive-and-insensitive-destinations) or you tell `dlt` about it so identifier collisions are properly detected.
-
-```toml
-[destination.bigquery]
-has_case_sensitive_identifiers=false
-```
-
-You have an option to allow `dlt` to set the case sensitivity for newly created datasets. In that case, it will follow the case sensitivity of the current
-naming convention (i.e., the default **snake_case** will create a dataset with case-insensitive identifiers).
-
-```toml
-[destination.bigquery]
-should_set_case_sensitivity_on_new_dataset=true
-```
-
-The option above is off by default.
-
-## Staging support
-
-BigQuery supports GCS as a file staging destination. `dlt` will upload files in the parquet format to GCS and ask BigQuery to copy their data directly into the database.
-Please refer to the [Google Storage filesystem documentation](./filesystem.md#google-storage) to learn how to set up your GCS bucket with the bucket_url and credentials.
-If you use the same service account for GCS and your BigQuery deployment, you do not need to provide additional authentication for BigQuery to be able to read from your bucket.
-
-Alternatively to parquet files, you can specify jsonl as the staging file format. For this, set the `loader_file_format` argument of the `run` command of the pipeline to `jsonl`.
-
-### BigQuery/GCS staging example
-
-```py
-# Create a dlt pipeline that will load
-# chess player data to the BigQuery destination
-# via a GCS bucket.
-pipeline = dlt.pipeline(
-    pipeline_name='chess_pipeline',
-    destination='bigquery',
-    staging='filesystem', # Add this to activate the staging location.
-    dataset_name='player_data'
-)
-```
-
-## Additional destination options
-
-You can configure the data location and various timeouts as shown below. This information is not a secret so it can be placed in `config.toml` as well:
-
-```toml
-[destination.bigquery]
-location="US"
-http_timeout=15.0
-file_upload_timeout=1800.0
-retry_deadline=60.0
-```
-
-* `location` sets the [BigQuery data location](https://cloud.google.com/bigquery/docs/locations) (default: **US**)
-* `http_timeout` sets the timeout when connecting and getting a response from the BigQuery API (default: **15 seconds**)
-* `file_upload_timeout` is a timeout for file upload when loading local files: the total time of the upload may not exceed this value (default: **30 minutes**, set in seconds)
-* `retry_deadline` is a deadline for a [DEFAULT_RETRY used by Google](https://cloud.google.com/python/docs/reference/storage/1.39.0/retry_timeout)
-* `ignore_unknown_values` is a configuration option that allows BigQuery to ignore rows with unknown or unexpected values during data loading. When enabled, rows containing fields that are not defined in the schema will be skipped instead of causing the entire load job to fail. This can be useful when dealing with inconsistent or evolving data sources.
-
-### dbt support
-
-This destination [integrates with dbt](../transformations/dbt/dbt.md) via [dbt-bigquery](https://github.com/dbt-labs/dbt-bigquery).
-Credentials, if explicitly defined, are shared with `dbt` along with other settings like **location**, retries, and timeouts.
-In the case of implicit credentials (i.e., available in a cloud function), `dlt` shares the `project_id` and delegates obtaining credentials to the `dbt` adapter.
-
-### Syncing of dlt state
-
-This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
-
-## BigQuery adapter
-
-You can use the `bigquery_adapter` to add BigQuery-specific hints to a resource.
-These hints influence how data is loaded into BigQuery tables, such as specifying partitioning, clustering, and numeric column rounding modes.
-Hints can be defined at both the column level and table level.
-
-The adapter updates the DltResource with metadata about the destination column and table DDL options.
-
-### Use an adapter to apply hints to a resource
-
-Here is an example of how to use the `bigquery_adapter` method to apply hints to a resource on both the column level and table level:
-
-```py
-
-import dlt
-from dlt.destinations.adapters import bigquery_adapter
-
-
-@dlt.resource(
-    columns=[
-        {"name": "event_date", "data_type": "date"},
-        {"name": "user_id", "data_type": "bigint"},
-        # Other columns.
-    ]
-)
-def event_data():
-    yield from [
-        {"event_date": datetime.date.today() + datetime.timedelta(days=i)} for i in range(100)
-    ]
-
-
-# Apply column options.
-bigquery_adapter(
-    event_data, partition="event_date", cluster=["event_date", "user_id"]
-)
-
-# Apply table level options.
-bigquery_adapter(event_data, table_description="Dummy event data.")
-
-# Load data in "streaming insert" mode (only available with
-# write_disposition="append").
-bigquery_adapter(event_data, insert_api="streaming")
-```
-
-In the example above, the adapter specifies that `event_date` should be used for partitioning and both `event_date` and `user_id` should be used for clustering (in the given order) when the table is created.
-
-Some things to note with the adapter's behavior:
-
-- You can only partition on one column (refer to [supported hints](#supported-column-hints)).
-- You can cluster on as many columns as you would like.
-- Sequential adapter calls on the same resource accumulate parameters, akin to an OR operation, for a unified execution.
-
-:::warning
-At the time of writing, table level options aren't supported for `ALTER` operations.
-
-Note that `bigquery_adapter` updates the resource *in place*, but returns the resource for convenience, i.e., both the following are valid:
-
-```py
-from dlt.destinations.adapters import bigquery_adapter
-
-bigquery_adapter(my_resource, partition="partition_column_name")
-my_resource = bigquery_adapter(my_resource, partition="partition_column_name")
-```
-
-Refer to the [full API specification](../../api_reference/dlt/destinations/impl/bigquery/bigquery_adapter) for more details.
-:::
-
-<!--@@@DLT_TUBA bigquery-->
-
-
-===== FILE: docs/website/docs/dlt-ecosystem/destinations/clickhouse.md =====
-
----
-title: ClickHouse
-description: ClickHouse `dlt` destination
-keywords: [ clickhouse, destination, data warehouse ]
----
-# ClickHouse
-
-## Install dlt with ClickHouse
-
-To install the dlt library with ClickHouse dependencies:
-
-```sh
-pip install "dlt[clickhouse]"
-```
-
-<!--@@@DLT_DESTINATION_CAPABILITIES clickhouse-->
-
-## Setup guide
-
-### 1. Initialize the dlt project
-
-Let's start by initializing a new `dlt` project as follows:
-
-```sh
-dlt init chess clickhouse
-```
-
-`dlt init` command will initialize your pipeline with chess as the source and ClickHouse as the destination.
-
-The above command generates several files and directories, including `.dlt/secrets.toml` and a requirements file for ClickHouse. You can install the necessary dependencies specified in the requirements file by executing it as follows:
-
-```sh
-pip install -r requirements.txt
-```
-
-or with `pip install "dlt[clickhouse]"`, which installs the `dlt` library and the necessary dependencies for working with ClickHouse as a destination.
-
-### 2. Setup ClickHouse database
-
-To load data into ClickHouse, you need to create a ClickHouse database. While we recommend asking our GPT-4 assistant for details, we've provided a general outline of the process below:
-
-1. You can use an existing ClickHouse database or create a new one.
-
-2. To create a new database, connect to your ClickHouse server using the `clickhouse-client` command line tool or a SQL client of your choice.
-
-3. Run the following SQL commands to create a new database, user, and grant the necessary permissions:
-
-   ```sql
-   CREATE DATABASE IF NOT EXISTS dlt;
-   CREATE USER dlt IDENTIFIED WITH sha256_password BY 'Dlt*12345789234567';
-   GRANT CREATE, ALTER, SELECT, DELETE, DROP, TRUNCATE, OPTIMIZE, SHOW, INSERT, dictGet ON dlt.* TO dlt;
-   GRANT SELECT ON INFORMATION_SCHEMA.COLUMNS TO dlt;
-   GRANT CREATE TEMPORARY TABLE, S3 ON *.* TO dlt;
-   ```
-
-### 3. Add credentials
-
-1. Next, set up the ClickHouse credentials in the `.dlt/secrets.toml` file as shown below:
-
-   ```toml
-   [destination.clickhouse.credentials]
-   database = "dlt"                         # The database name you created.
-   username = "dlt"                         # ClickHouse username, default is usually "default".
-   password = "Dlt*12345789234567"          # ClickHouse password, if any.
-   host = "localhost"                       # ClickHouse server host.
-   port = 9000                              # ClickHouse native TCP protocol port, default is 9000.
-   http_port = 8443                         # ClickHouse HTTP port, default is 9000.
-   secure = 1                               # Set to 1 if using HTTPS, else 0.
-   ```
-
-   :::info Network Ports
-    The `http_port` parameter specifies the port number to use when connecting to the ClickHouse server's HTTP interface.
-    The default non-secure HTTP port for ClickHouse is `8123`.
-    This is different from the default port `9000`, which is used for the native TCP protocol.
-
-    You must additionally set `http_port` if you are not using external staging (i.e., you don't set the `staging` destination parameter in your pipeline). This is because dlt's built-in ClickHouse local storage staging uses the [clickhouse-connect](https://github.com/ClickHouse/clickhouse-connect) library, which communicates with ClickHouse over HTTP.
-
-    Make sure your ClickHouse server is configured to accept HTTP connections on the port specified by `http_port`. For example:
-
-  - If you set `http_port = 8123` (default non-secure HTTP port), then ClickHouse should be listening for HTTP requests on port 8123.
-  - If you set `http_port = 8443`, then ClickHouse should be listening for secure HTTPS requests on port 8443.
-
-   If you're using external staging, you can omit the `http_port` parameter, since clickhouse-connect will not be used in this case.
-
-   For local development and testing with ClickHouse running locally, it is recommended to use the default non-secure HTTP port `8123` by setting `http_port=8123` or omitting the parameter.
-
-   Please see the [ClickHouse network port documentation](https://clickhouse.com/docs/en/guides/sre/network-ports) for further reference.
-   :::
-
-2. You can pass a database connection string similar to the one used by the `clickhouse-driver` library. The credentials above will look like this:
-
-   ```toml
-   # Keep it at the top of your TOML file, before any section starts
-   destination.clickhouse.credentials="clickhouse://dlt:Dlt*12345789234567@localhost:9000/dlt?secure=1"
-   ```
-
-### 3. Add configuration options
-
-You can set the following configuration options in the `.dlt/secrets.toml` file:
-
-```toml
-[destination.clickhouse]
-dataset_table_separator = "___"                         # The default separator for dataset table names from the dataset.
-table_engine_type = "merge_tree"                        # The default table engine to use.
-dataset_sentinel_table_name = "dlt_sentinel_table"      # The default name for sentinel tables.
-staging_use_https = true                                # Whether to connect to the staging bucket via https (defaults to True)
-select_sequential_consistency = 1                       # Ensures read-after-write consistency on ClickHouse Cloud (defaults to 1)
-```
-
-### Session timezone
-
-ClickHouse uses the server timezone unless you set one. `session_timezone` sets it per connection. It
-does not change the column types that `CREATE TABLE` produces: `dlt` writes the zone into the type
-itself, as `DateTime64(6, 'UTC')`.
-
-```toml
-[destination.clickhouse.credentials]
-session_timezone = "Europe/Berlin"
-```
-
-## Write disposition
-
-All [write dispositions](../../general-usage/incremental-loading#choosing-a-write-disposition) are supported.
-
-If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be atomically swapped with the staging tables via [`EXCHANGE TABLES`](https://clickhouse.com/docs/en/sql-reference/statements/exchange) (requires `Atomic`, `Replicated` or `Shared` database engine).
-
-## Data loading
-
-Data is loaded into ClickHouse using the most efficient method depending on the data source:
-
-- For local files, the `clickhouse-connect` library is used to directly load files into ClickHouse tables using the `INSERT` command.
-- For files in remote storage like S3, Google Cloud Storage, or Azure Blob Storage, ClickHouse table functions like `s3`, `gcs`, and `azureBlobStorage` are used to read the files and insert the data into tables.
-
-### Read-after-write consistency
-
-By default, dlt sets `select_sequential_consistency=1` on all ClickHouse connections. This ensures
-that `SELECT` queries always see the results of preceding writes, even on ClickHouse Cloud
-(SharedMergeTree) or self-hosted clusters where queries may be routed to different nodes. If you are
-running read-only workloads and want to avoid the small metadata check overhead, set it to `0` in
-your configuration:
-
-```toml
-[destination.clickhouse]
-select_sequential_consistency = 0
-```
-
-### Merge on replicated clusters
-
-When merging tables that have nested children, `dlt` creates short-lived temp tables to stage delete
-keys and insert keys. The temp tables follow the configured `table_engine_type` so the staged rows replicate the same way the destination tables do. Single-table merges use lightweight `DELETE` directly
-and don't need temp tables.
-
-## Datasets
-
-ClickHouse does not support multiple datasets in one database; dlt relies on datasets to exist for multiple reasons.
-To make ClickHouse work with `dlt`, tables generated by `dlt` in your ClickHouse database will have their names prefixed with the dataset name, separated by
-the configurable `dataset_table_separator`.
-Additionally, a special sentinel table that doesn't contain any data will be created, so dlt knows which virtual datasets already exist in a
-clickhouse
-destination.
-
-:::tip
-`dataset_name` is optional for ClickHouse. When skipped `dlt` will create all tables without prefix. Note that staging dataset
-tables will still be prefixed with `_staging` (or other name that you configure).
-:::
-
-## Supported file formats
-
-- [JSONL](../file-formats.md#jsonl) is the preferred format for both direct loading and staging.
-- [Parquet](../file-formats.md#parquet) is supported for both direct loading and staging.
-
-The `clickhouse` destination has a few specific deviations from the default SQL destinations:
-
-1. ClickHouse has an experimental `object` datatype, but we've found it to be a bit unpredictable, so the dlt `clickhouse` destination will load the `json` datatype to a `text` column.
-   If you need
-   this feature, get in touch with our Slack community, and we will consider adding it.
-2. ClickHouse does not support the `time` datatype. Time will be loaded to a `text` column.
-3. ClickHouse does not support the `binary` datatype. Binary will be loaded to a `text` column. When loading from JSONL, this will be a base64 string; when loading from parquet, this will be
-   the `binary` object converted to `text`.
-4. ClickHouse accepts adding columns to a populated table that aren’t null.
-5. ClickHouse can produce rounding errors under certain conditions when using the float/double datatype. Make sure to use decimal if you can’t afford to have rounding errors. Loading the value 12.7001 to a double column with the loader file format jsonl set will predictably produce a rounding error, for example.
-
-## Supported column hints
-
-ClickHouse supports the following [column hints](../../general-usage/schema#tables-and-columns):
-
-- `primary_key` - marks the column as part of the primary key. Multiple columns can have this hint to create a composite primary key.
-
-## Choosing a table engine
-
-dlt defaults to the `MergeTree` table engine. You can specify an alternate table engine in two ways:
-
-### Setting a default table engine in the configuration
-
-You can set a default table engine for all resources and dlt tables by adding the `table_engine_type` parameter to your ClickHouse credentials in the `.dlt/secrets.toml` file:
-
-```toml
-[destination.clickhouse]
-# ... (other configuration options)
-table_engine_type = "merge_tree"                        # The default table engine to use.
-```
-
-### Setting the table engine for specific resources
-
-You can also set the table engine for specific resources using the clickhouse_adapter, which will override the default engine set in `.dlt/secrets.toml` for that resource:
-
-```py
-from dlt.destinations.adapters import clickhouse_adapter
-
-@dlt.resource()
-def my_resource():
-    ...
-
-clickhouse_adapter(my_resource, table_engine_type="merge_tree")
-```
-
-Supported values for `table_engine_type` are:
-
-- `merge_tree` (default) - creates tables using the `MergeTree` engine, suitable for most use cases. [Learn more about MergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree).
-- `shared_merge_tree` - creates tables using the `SharedMergeTree` engine, optimized for cloud-native environments with shared storage. This table is **only** available on ClickHouse Cloud, and it is the default selection if `merge_tree` is selected. [Learn more about SharedMergeTree](https://clickhouse.com/docs/en/cloud/reference/shared-merge-tree).
-- `replicated_merge_tree` - creates tables using the `ReplicatedMergeTree` engine, which supports data replication across multiple nodes for high availability. [Learn more about ReplicatedMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replication). This defaults to `shared_merge_tree` on ClickHouse Cloud.
-- `replacing_merge_tree` - creates tables using the `ReplacingMergeTree` engine, which deduplicates rows with the same sorting key during background merges. See [native deduplication with ReplacingMergeTree](#native-deduplication-with-replacingmergetree) below. [Learn more about ReplacingMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replacingmergetree).
-- Experimental support for the `Log` engine family with `stripe_log` and `tiny_log`.
-
-For local development and testing with ClickHouse running locally, the `MergeTree` engine is recommended.
-
-### Native deduplication with ReplacingMergeTree
-
-When loading data with `append` write disposition, you can use ClickHouse's `ReplacingMergeTree` engine to handle deduplication and deletes at the storage engine level — without using dlt's `merge` write disposition. This is useful when you want ClickHouse to manage upserts natively, for example when appending CDC events or syncing data from an external source where rows may repeat.
-
-To enable this, combine `replacing_merge_tree` with dlt column hints:
-
 - **`primary_key`** — defines the dedup key. Rows with the same key are considered duplicates.
 - **`dedup_sort`** (optional) — specifies the version column. ClickHouse keeps the row with the **highest** value in this column. Must be a non-nullable `UInt*`, `Date`, or `DateTime` type. If omitted, ClickHouse uses last-write-wins semantics (the most recently inserted row survives).
 - **`hard_delete`** (optional) — specifies a `UInt8` deletion marker column. Rows where this column is `1` are filtered out when querying with `FINAL`. To physically remove deleted rows during background merges, set the `clean_deleted_rows` table setting (see example below). Requires `dedup_sort` to be set (ClickHouse constraint: `is_deleted` requires a version column).
@@ -3143,4 +2752,565 @@ Fabric Warehouse requires Azure Active Directory Service Principal authenticatio
 - Copy the **SQL connection string** - it should be in the format: `<guid>.datawarehouse.fabric.microsoft.com`
 
 ### Create a pipeline
+
+1. Initialize a project with a pipeline that loads to Fabric by running:
+
+```sh
+dlt init chess fabric
+```
+
+2. Install the necessary dependencies for Fabric by running:
+
+```sh
+pip install -r requirements.txt
+```
+
+or run:
+
+```sh
+pip install "dlt[fabric]"
+```
+
+3. Enter your credentials into `.dlt/secrets.toml`.
+
+```toml
+[destination.fabric.credentials]
+host = "<your-warehouse-guid>.datawarehouse.fabric.microsoft.com"
+database = "mydb"
+azure_tenant_id = "your-azure-tenant-id"
+azure_client_id = "your-client-id"
+azure_client_secret = "your-client-secret"
+port = 1433
+connect_timeout = 30
+```
+
+## Write disposition
+
+All write dispositions are supported, including the [`upsert`](../../general-usage/merge-loading.md#upsert-strategy) and [`insert-only`](../../general-usage/merge-loading.md#insert-only-strategy) merge strategies.
+
+If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be dropped and recreated with an `ALTER SCHEMA ... TRANSFER`. The operation is atomic: Fabric supports DDL transactions.
+
+## Staging support
+
+Fabric Warehouse supports staging data via **OneLake Lakehouse** or **Azure Blob / Data Lake Storage** using the `COPY INTO` command for efficient bulk loading. This is the recommended approach for large datasets.
+
+### Examples
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    destination="fabric",
+    staging="filesystem",
+    dataset_name='my_dataset'
+)
+```
+
+#### `.dlt/secrets.toml` when using OneLake
+
+```toml
+[destination.fabric.credentials]
+# your fabric credentials
+
+[destination.filesystem]
+bucket_url = "abfss://<your-workspace-guid>@onelake.dfs.fabric.microsoft.com/<your-lakehouse-guid>/Files"
+
+[destination.filesystem.credentials]
+azure_storage_account_name = "onelake"
+azure_account_host = "onelake.blob.fabric.microsoft.com"
+# use same Service Principal credentials as in [destination.fabric.credentials]
+azure_tenant_id = "your-tenant-id"
+azure_client_id = "your-client-id"
+azure_client_secret = "your-client-secret"
+```
+
+**Finding your GUIDs**:
+
+1. Navigate to your Fabric workspace in the browser
+2. The workspace GUID is in the URL: `https://fabric.microsoft.com/groups/<workspace_guid>/...`
+3. Open your Lakehouse
+4. The lakehouse GUID is in the URL: `https://fabric.microsoft.com/.../lakehouses/<lakehouse_guid>`
+
+#### `.dlt/secrets.toml` when using Azure Blob / Data Lake Storage
+
+```toml
+[destination.fabric.credentials]
+# your fabric credentials
+
+[destination.filesystem]
+bucket_url = "az://your-container-name"
+
+[destination.filesystem.credentials]
+azure_storage_account_name = "your-storage-account-name"
+azure_storage_account_key = "your-storage-account-key"
+```
+
+## Data loading
+
+Data is loaded via INSERT statements by default. Fabric Warehouse has a limit of 1000 rows per INSERT, and this is what we use.
+
+## Supported file formats
+
+* [insert-values](../file-formats.md#sql-insert) is the default and currently only supported format
+
+## Supported column hints
+
+**fabric** will create unique indexes for all columns with `unique` hints. This behavior **is disabled by default**.
+
+### Table and column identifiers
+
+Fabric Warehouse (like SQL Server) uses **case-insensitive identifiers** but preserves the casing of identifiers stored in the INFORMATION SCHEMA. You can use [case-sensitive naming conventions](../../general-usage/naming-convention.md#case-sensitive-and-insensitive-destinations) to keep the identifier casing. Note that you risk generating identifier collisions, which are detected by `dlt` and will fail the load process.
+
+## Syncing of `dlt` state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+## Data types
+
+Fabric Warehouse differs from standard SQL Server in several important ways:
+
+### VARCHAR vs NVARCHAR
+
+Fabric Warehouse uses `varchar` for text columns instead of `nvarchar`. Because `varchar` lengths are counted in
+bytes while `precision` counts characters, the precision is multiplied by 4 (the worst case for UTF-8):
+
+- `text` → `varchar(max)`
+- `text` with `precision` → `varchar(precision * 4)`, for example `precision=25` → `varchar(100)`
+- `text` with `precision` above 2000 → `varchar(max)`, since 8000 is the longest length Fabric accepts
+
+### DATETIME2 vs DATETIMEOFFSET
+
+Fabric uses `datetime2` for timestamps instead of `datetimeoffset`:
+
+- `timestamp` → `datetime2(6)` (precision limited to 0-6, not 0-7)
+- `time` → `time(6)` (explicit precision required)
+
+### JSON Storage
+
+Fabric does not support native JSON columns. JSON objects are stored as `varchar(max)` columns.
+
+## Collation Support
+
+Fabric Warehouse supports UTF-8 collations. The destination automatically configures `LongAsMax=yes` which is required for UTF-8 collations to work properly.
+
+**Default collation**: `Latin1_General_100_BIN2_UTF8` (case-sensitive, UTF-8)
+
+You can specify a different collation:
+
+```toml
+[destination.fabric]
+collation = "Latin1_General_100_CI_AS_KS_WS_SC_UTF8"  # case-insensitive
+```
+
+Or in code:
+
+```py
+pipeline = dlt.pipeline(
+    destination=dlt.destinations.fabric(
+        credentials={},
+        collation="Latin1_General_100_CI_AS_KS_WS_SC_UTF8"
+    )
+)
+```
+
+## Additional destination options
+
+The **fabric** destination **does not** create UNIQUE indexes by default on columns with the `unique` hint (i.e., `_dlt_id`). To enable this behavior:
+
+```toml
+[destination.fabric]
+create_indexes=true
+```
+
+You can explicitly set the ODBC driver name:
+
+```toml
+[destination.fabric.credentials]
+driver="ODBC Driver 18 for SQL Server"
+```
+
+## Differences from MSSQL Destination
+
+While Fabric Warehouse is based on SQL Server, there are key differences:
+
+1. **Authentication**: Fabric requires Service Principal; username/password auth is not supported
+2. **Type System**: Uses `varchar` and `datetime2` instead of `nvarchar` and `datetimeoffset`
+3. **Collation**: Optimized for UTF-8 collations with automatic `LongAsMax` configuration
+4. **SQL Dialect**: Uses `fabric` SQLglot dialect for proper SQL generation
+
+### dbt support
+
+Integration with [dbt](../transformations/dbt/dbt.md) is supported via [dbt-fabric](https://github.com/Microsoft/dbt-fabric). Both Service Principal and default Azure credentials are supported and shared with dbt runners.
+
+## Troubleshooting
+
+### ODBC Driver Not Found
+
+If you see "No supported ODBC driver found", install the Microsoft ODBC Driver 18 for SQL Server:
+
+```sh
+# Ubuntu/Debian
+curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+curl https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+sudo apt-get update
+sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18
+```
+
+### Authentication Failures
+
+Ensure your Service Principal has:
+
+- Proper permissions on the Fabric workspace
+- Access to the target database/warehouse
+- Correct tenant ID (your Azure AD tenant, not the workspace/capacity ID)
+
+### UTF-8 Character Issues
+
+If you experience character encoding issues:
+
+1. Verify your warehouse uses a UTF-8 collation
+2. Check that `LongAsMax=yes` is in the connection (automatically added by this destination)
+3. Consider using the case-insensitive UTF-8 collation if needed
+
+## Additional Resources
+
+- [Microsoft Fabric Documentation](https://learn.microsoft.com/en-us/fabric/)
+- [Fabric Warehouse Documentation](https://learn.microsoft.com/en-us/fabric/data-warehouse/)
+- [Service Principal Setup Guide](https://learn.microsoft.com/en-us/fabric/security/service-principals)
+
+<!--@@@DLT_TUBA fabric-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/filesystem.md =====
+
+---
+title: Object store & filesystem
+description: Store data in remote file systems and object store services like AWS S3, Google Cloud Storage, or Azure Blob Storage
+keywords: [filesystem, s3, gcs, azure, blob storage, sftp, cloud storage, data lake, staging]
+---
+# Object store & filesystem
+
+The filesystem destination stores data in remote file systems and cloud storage services like **AWS S3**, **Google Cloud Storage**, or **Azure Blob Storage**. Underneath, it uses [fsspec](https://github.com/fsspec/filesystem_spec) to abstract file operations. Its primary role is to be used as a staging area for other destinations, but you can also quickly build a data lake with it.
+
+## Install dlt with filesystem
+
+Install the dlt library with filesystem dependencies:
+
+```sh
+pip install "dlt[filesystem]"
+```
+
+This installs the `s3fs` and `botocore` packages.
+
+:::warning
+
+You may also install the dependencies independently. Try:
+
+```sh
+pip install dlt
+pip install s3fs
+```
+
+so pip does not fail on backtracking.
+:::
+
+<!--@@@DLT_DESTINATION_CAPABILITIES filesystem-->
+
+## Initialize the dlt project
+
+Let's start by initializing a new dlt project as follows:
+
+```sh
+dlt init chess filesystem
+```
+
+:::note
+This command will initialize your pipeline with chess as the source and AWS S3 as the destination.
+:::
+
+## Set up the destination and credentials
+
+### AWS S3
+
+The command above creates a sample `secrets.toml` and requirements file for an AWS S3 bucket. You can install those dependencies by running:
+
+```sh
+pip install -r requirements.txt
+```
+
+To edit the dlt credentials file with your secret info, open `.dlt/secrets.toml`, which looks like this:
+
+```toml
+[destination.filesystem]
+bucket_url = "s3://[your_bucket_name]" # replace with your bucket name,
+
+[destination.filesystem.credentials]
+aws_access_key_id = "please set me up!" # copy the access key here
+aws_secret_access_key = "please set me up!" # copy the secret access key here
+```
+
+If you have your credentials stored in `~/.aws/credentials`, just remove the **[destination.filesystem.credentials]** section above, and dlt will fall back to your **default** profile in local credentials. If you want to switch the profile, pass the profile name as follows (here: `dlt-ci-user`):
+
+```toml
+[destination.filesystem.credentials]
+profile_name="dlt-ci-user"
+```
+
+You can also specify an AWS region:
+
+```toml
+[destination.filesystem.credentials]
+region_name="eu-central-1"
+```
+
+You need to create an S3 bucket and a user who can access that bucket. dlt does not create buckets automatically.
+
+1. You can create the S3 bucket in the AWS console by clicking on "Create Bucket" in S3 and assigning the appropriate name and permissions to the bucket.
+2. Once the bucket is created, you'll have the bucket URL. For example, if the bucket name is `dlt-ci-test-bucket`, then the bucket URL will be:
+
+   ```text
+   s3://dlt-ci-test-bucket
+   ```
+
+3. To grant permissions to the user being used to access the S3 bucket, go to IAM > Users, and click on “Add Permissions”.
+4. Below you can find a sample policy that gives the minimum permission required by dlt to a bucket we created above. The policy contains permissions to list files in a bucket, get, put, and delete objects. **Remember to place your bucket name in the Resource section of the policy!**
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "DltBucketAccess",
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:DeleteObject",
+                "s3:GetObjectAttributes",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::dlt-ci-test-bucket/*",
+                "arn:aws:s3:::dlt-ci-test-bucket"
+            ]
+        }
+    ]
+}
+```
+
+5. To obtain the access and secret key for the user, go to IAM > Users and in the “Security Credentials”, click on “Create Access Key”, and preferably select “Command Line Interface” and create the access key.
+6. Obtain the “Access Key” and “Secret Access Key” created that are to be used in "secrets.toml".
+
+#### Using S3 compatible storage
+
+To use an S3 compatible storage other than AWS S3, such as [MinIO](https://min.io/), [Tigris](https://www.tigrisdata.com), [Cloudflare R2](https://www.cloudflare.com/en-ca/developer-platform/r2/), or [Google
+Cloud Storage](https://cloud.google.com/storage/docs/interoperability), you may supply an `endpoint_url` in the config. This should be set along with AWS credentials:
+
+```toml
+[destination.filesystem]
+bucket_url = "s3://[your_bucket_name]" # replace with your bucket name,
+
+[destination.filesystem.credentials]
+aws_access_key_id = "please set me up!" # copy the access key here
+aws_secret_access_key = "please set me up!" # copy the secret access key here
+endpoint_url = "https://<account_id>.r2.cloudflarestorage.com" # copy your endpoint URL here
+```
+
+For Tigris, set `endpoint_url = "https://t3.storage.dev"` and use your Tigris access key ID (prefixed `tid_`) and secret access key (prefixed `tsec_`). Tigris uses a single global endpoint and doesn't charge egress fees, which matters when warehouses in different regions load from the same staging bucket.
+
+#### Adding additional configuration
+
+To pass any additional arguments to `fsspec`, you may supply `kwargs` and `client_kwargs` in `toml` config.
+
+```toml
+[destination.filesystem.kwargs]
+use_ssl=true
+auto_mkdir=true
+
+[destination.filesystem.client_kwargs]
+verify="public.crt"
+```
+
+To pass additional arguments via env variables, use **stringified dictionary**:
+`DESTINATION__FILESYSTEM__KWARGS='{"use_ssl": true, "auto_mkdir": true}`
+
+You can also override default `fsspec` settings used by `dlt`:
+
+```toml
+[destination.filesystem.kwargs]
+use_listings_cache=false  # listing cache disabled by default as you typically add files
+listings_expiry_time=60.0
+skip_instance_cache=false  # instance cache enabled by default, it is thread isolated anyway
+```
+
+There's however no good reason to do that, except debugging `fsspec` internal problems. You could try
+to enable listing cache but this cache is not shared across threads which `dlt` load steps uses to
+parallelize writes. You may get unpredictable cache invalidation behavior.
+
+### Google storage
+
+Run `pip install "dlt[gs]"` which will install the `gcfs` package.
+
+To edit the `dlt` credentials file with your secret info, open `.dlt/secrets.toml`.
+You'll see AWS credentials by default.
+Use Google cloud credentials that you may know from [BigQuery destination](bigquery)
+
+```toml
+[destination.filesystem]
+bucket_url = "gs://[your_bucket_name]" # replace with your bucket name,
+
+[destination.filesystem.credentials]
+project_id = "project_id" # please set me up!
+private_key = "private_key" # please set me up!
+client_email = "client_email" # please set me up!
+```
+
+:::note
+Note that you can share the same credentials with BigQuery, replace the `[destination.filesystem.credentials]` section with a less specific one: `[destination.credentials]` which applies to both destinations.
+:::
+
+If you have default Google Cloud credentials in your environment (i.e., on cloud function), remove the credentials sections above and `dlt` will fall back to the available default.
+
+Use **Cloud Storage** admin to create a new bucket. Then assign the **Storage Object Admin** role to your service account.
+
+### Azure Blob Storage
+
+Run `pip install "dlt[az]"` which will install the `adlfs` package to interface with Azure Blob Storage.
+
+Edit the credentials in `.dlt/secrets.toml`, you'll see AWS credentials by default; replace them with your Azure credentials.
+
+#### Supported schemes
+
+`dlt` supports both forms of the blob storage urls:
+
+```toml
+[destination.filesystem]
+bucket_url = "az://<container_name>/path" # replace with your container name and path
+```
+
+and
+
+```toml
+[destination.filesystem]
+bucket_url = "abfss://<container_name>@<storage_account_name>.dfs.core.windows.net/path"
+```
+
+You can use `az`, `abfss`, `azure` and `abfs` url schemes.
+
+If you need to use a custom host for your storage account, you can set it up like below:
+
+```toml
+[destination.filesystem.credentials]
+# The storage account name is always required
+azure_account_host = "<storage_account_name>.<host_base>"
+```
+
+Remember to include `storage_account_name` with your base host i.e. `dlt_ci.blob.core.usgovcloudapi.net`.
+
+`dlt` will use this host to connect to Azure Blob Storage without any modifications:
+
+:::tip OneLake (Fabric)
+Use the Blob endpoint (`azure_account_host = "onelake.blob.fabric.microsoft.com"`).
+
+**IMPORTANT**: OneLake bucket URLs must use **GUIDs** for workspace and lakehouse, not display names:
+
+```toml
+bucket_url = "abfss://<workspace_guid>@onelake.dfs.fabric.microsoft.com/<lakehouse_guid>/Files"
+```
+
+Find GUIDs in your browser URL when viewing workspace/lakehouse in Fabric portal.
+:::
+
+Two forms of Azure credentials are supported:
+
+#### SAS token credentials
+
+Supply storage account name and either SAS token or storage account key
+
+```toml
+[destination.filesystem.credentials]
+# The storage account name is always required
+azure_storage_account_name = "account_name" # please set me up!
+# You can set either account_key or sas_token, only one is needed
+azure_storage_account_key = "account_key" # please set me up!
+azure_storage_sas_token = "sas_token" # please set me up!
+```
+
+If you have the correct Azure credentials set up on your machine (e.g., via Azure CLI),
+you can omit both `azure_storage_account_key` and `azure_storage_sas_token` and `dlt` will fall back to the available default.
+Note that `azure_storage_account_name` is still required as it can't be inferred from the environment.
+
+#### Service principal credentials
+
+Supply a client ID, client secret, and a tenant ID for a service principal authorized to access your container.
+
+```toml
+[destination.filesystem.credentials]
+azure_storage_account_name = "account_name" # please set me up!
+azure_client_id = "client_id" # please set me up!
+azure_client_secret = "client_secret"
+azure_tenant_id = "tenant_id" # please set me up!
+```
+
+:::warning
+**Concurrent blob uploads**
+`dlt` limits the number of concurrent connections for a single uploaded blob to 1. By default, `adlfs` that we use splits blobs into 4 MB chunks and uploads them concurrently, which leads to gigabytes of used memory and thousands of connections for larger load packages. You can increase the maximum concurrency as follows:
+
+```toml
+[destination.filesystem.kwargs]
+max_concurrency=3
+```
+
+:::
+
+### Hugging Face
+
+The filesystem destination supports loading into [Hugging Face Datasets](https://huggingface.co/docs/datasets/index) using the `hf://` protocol. See the [Hugging Face destination](huggingface) page for setup and configuration details.
+
+### Local file system
+
+If for any reason you want to have those files in a local folder, set up the `bucket_url` as follows (you are free to use `config.toml` for that as there are no secrets required):
+
+```toml
+[destination.filesystem]
+bucket_url = "file:///absolute/path"  # three slashes (file:///) for an absolute path
+```
+
+:::tip
+For handling deeply nested layouts, consider enabling automatic directory creation for the local filesystem destination. This can be done by setting `kwargs` in `secrets.toml`:
+
+```toml
+[destination.filesystem]
+kwargs = '{"auto_mkdir": true}'
+```
+
+Or by setting an environment variable:
+
+```sh
+export DESTINATION__FILESYSTEM__KWARGS = '{"auto_mkdir": true/false}'
+```
+
+:::
+
+`dlt` correctly handles the native local file paths. Indeed, using the `file://` schema may not be intuitive, especially for Windows users.
+
+```toml
+[destination.unc_destination]
+bucket_url = 'C:\a\b\c'
+```
+
+In the example above, we specify `bucket_url` using **TOML's literal strings** that do not require [escaping of backslashes](https://github.com/toml-lang/toml/blob/main/toml.md#string).
+
+```toml
+[destination.unc_destination]
+bucket_url = '\\localhost\c$\a\b\c'  # UNC equivalent of C:\a\b\c
+
+[destination.posix_destination]
+bucket_url = '/var/local/data'  # absolute POSIX style path
+
+[destination.relative_destination]
+bucket_url = '_storage/data'  # relative POSIX style path
+```
+
+In the examples above, we define a few named filesystem destinations:
 

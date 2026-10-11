@@ -1,1354 +1,3 @@
-diff --git a/dlt/common/data_writers/writers.py b/dlt/common/data_writers/writers.py
-index 76d9b423f..73679d63b 100644
---- a/dlt/common/data_writers/writers.py
-+++ b/dlt/common/data_writers/writers.py
-@@ -518,7 +518,9 @@ class ArrowToParquetWriter(ParquetDataWriter):
-         # pyarrow writer starts a row group for each item it writes (even with 0 rows)
-         # it also converts batches into tables internally. by creating a single table
-         # we allow the user rudimentary control over row group size via max buffered items
--        table = concat_batches_and_tables_in_order(items)
-+        table = concat_batches_and_tables_in_order(
-+            items, promote_options=self.parquet_format.arrow_concat_promote_options
-+        )
-         # release batch references - concat is zero-copy so table shares the
-         # underlying buffers via Arrow refcounting. clearing the input list
-         # drops the Python-level RecordBatch/Table references so only the
-diff --git a/dlt/common/destination/configuration.py b/dlt/common/destination/configuration.py
-index 80fa7b685..2deccb4aa 100644
---- a/dlt/common/destination/configuration.py
-+++ b/dlt/common/destination/configuration.py
-@@ -37,6 +37,10 @@ class ParquetFormatConfiguration(BaseConfiguration):
-     """When False, constant columns (like _dlt_load_id) will use regular arrays instead of
-     dictionary-encoded arrays. Set to False for destinations using ADBC drivers that don't
-     support dictionary types (e.g., MSSQL)."""
-+    arrow_concat_promote_options: Literal["none", "default", "permissive"] = "none"
-+    """PyArrow concat_tables promote_options for Arrow table concatenation. "none" (default)
-+    requires identical schemas and enables zero-copy concat. "default" promotes within type
-+    families (e.g. int32 to int64). "permissive" promotes across families (e.g. int64 to double)."""
- 
-     def max_timestamp_precision(self) -> int:
-         if (self.flavor or "").lower() == "spark":
-diff --git a/dlt/common/libs/pyarrow.py b/dlt/common/libs/pyarrow.py
-index 85652ad08..0f91cd420 100644
---- a/dlt/common/libs/pyarrow.py
-+++ b/dlt/common/libs/pyarrow.py
-@@ -910,10 +910,15 @@ def cast_arrow_schema_types(
- 
- 
- def concat_batches_and_tables_in_order(
--    tables_or_batches: Iterable[Union[pyarrow.Table, pyarrow.RecordBatch]]
-+    tables_or_batches: Iterable[Union[pyarrow.Table, pyarrow.RecordBatch]],
-+    promote_options: str = "none",
- ) -> pyarrow.Table:
--    """Concatenate iterable of tables and batches into a single table, preserving row order. Zero copy is used during
--    concatenation so schemas must be identical.
-+    """Concatenate iterable of tables and batches into a single table, preserving row order.
-+
-+    Args:
-+        promote_options: PyArrow concat_tables promote_options. "none" (default) requires identical
-+            schemas and enables zero-copy concat. "default" promotes within type families (e.g.
-+            int32→int64). "permissive" promotes across families (e.g. int64→double).
-     """
-     batches = []
-     tables = []
-@@ -929,8 +934,8 @@ def concat_batches_and_tables_in_order(
-             raise ValueError(f"Unsupported type: `{type(item)}`")
-     if batches:
-         tables.append(pyarrow.Table.from_batches(batches))
--    # "none" option ensures 0 copy concat
--    return pyarrow.concat_tables(tables, promote_options="none")
-+    # "none" ensures 0 copy concat; "default"/"permissive" allow type promotion
-+    return pyarrow.concat_tables(tables, promote_options=promote_options)
- 
- 
- def transpose_rows_to_columns(
-diff --git a/docs/website/docs/dlt-ecosystem/file-formats/parquet.md b/docs/website/docs/dlt-ecosystem/file-formats/parquet.md
-index cff46da8e..156f48fb8 100644
---- a/docs/website/docs/dlt-ecosystem/file-formats/parquet.md
-+++ b/docs/website/docs/dlt-ecosystem/file-formats/parquet.md
-@@ -49,6 +49,7 @@ Under the hood, `dlt` uses the [pyarrow parquet writer](https://arrow.apache.org
- - `allow_truncated_timestamps` - will raise if precision is lost on truncated timestamps.
- - `write_page_index`: Boolean specifying whether a [page index](https://github.com/apache/parquet-format/blob/master/PageIndex.md) is written. Defaults to `False`.
- - `use_content_defined_chunking`: Boolean specifying whether [Content-Defined Chunking](https://github.com/apache/arrow/pull/45360) is used. Defaults to `False`. Requires `pyarrow>=21.0.0`, ignored otherwise.
-+- `arrow_concat_promote_options`: Controls type promotion when concatenating multiple Arrow tables/DataFrames. Accepts `"none"` (default), `"default"`, or `"permissive"`. See [Handling schema mismatches](../verified-sources/arrow-pandas.md#handling-schema-mismatches-across-batches) for details.
- 
- :::tip
- The default parquet version used by `dlt` is 2.4. It coerces timestamps to microseconds and truncates nanoseconds silently. Such a setting
-@@ -75,6 +76,7 @@ DATA_WRITER__FLAVOR
- DATA_WRITER__VERSION
- DATA_WRITER__DATA_PAGE_SIZE
- DATA_WRITER__TIMESTAMP_TIMEZONE
-+DATA_WRITER__ARROW_CONCAT_PROMOTE_OPTIONS
- ```
- 
- :::tip
-diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md b/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md
-index be7fbdc52..f0719c0b4 100644
---- a/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md
-+++ b/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md
-@@ -1,7 +1,7 @@
- ---
- title: Arrow Table / Pandas
- description: dlt source for Arrow tables and Pandas dataframes
--keywords: [arrow, pandas, parquet, source]
-+keywords: [arrow, pandas, parquet, source, schema mismatch]
- ---
- import Header from './_source-info-header.md';
- 
-@@ -77,6 +77,31 @@ The output file format is chosen automatically based on the destination's capabi
- * synapse
- 
- 
-+## Handling schema mismatches across batches
-+
-+When a resource yields multiple Arrow tables or DataFrames, `dlt` concatenates them before writing to disk. By default, all batches must have **identical schemas** — any type difference (e.g., `int64` vs `float64`) raises an `ArrowInvalid` error. This is common when reading multiple source files where pandas infers slightly different types per file.
-+
-+The `arrow_concat_promote_options` setting controls how type differences are resolved:
-+
-+| Value | Behavior |
-+|-------|----------|
-+| `"none"` (default) | Requires identical schemas. Zero-copy concatenation. |
-+| `"default"` | Fills missing columns with nulls. Promotes `null`-typed columns to concrete types. Rejects cross-family type differences. |
-+| `"permissive"` | Full type promotion (e.g., `int64` → `float64`). Fills missing columns with nulls. |
-+
-+```toml
-+[sources.data_writer]
-+arrow_concat_promote_options = "permissive"
-+```
-+
-+```sh
-+DATA_WRITER__ARROW_CONCAT_PROMOTE_OPTIONS=permissive
-+```
-+
-+:::note
-+Setting this to anything other than `"none"` disables zero-copy concatenation, which may increase memory usage for large batches. This maps directly to the `promote_options` parameter of [`pyarrow.concat_tables`](https://arrow.apache.org/docs/python/generated/pyarrow.concat_tables.html).
-+:::
-+
- ## Add `_dlt_load_id` and `_dlt_id` to your tables
- 
- `dlt` does not add any data lineage columns by default when loading Arrow tables. This is to give the best performance and avoid unnecessary data copying.
-diff --git a/tests/common/data_writers/utils.py b/tests/common/data_writers/utils.py
-index 842038532..c8a33ecef 100644
---- a/tests/common/data_writers/utils.py
-+++ b/tests/common/data_writers/utils.py
-@@ -4,6 +4,7 @@ from typing import Type, Optional
- from dlt.common.data_writers.buffered import BufferedDataWriter
- from dlt.common.data_writers.writers import TWriter, ALL_WRITERS
- from dlt.common.destination import DestinationCapabilitiesContext
-+from dlt.common.destination.configuration import ParquetFormatConfiguration
- 
- from tests.utils import get_test_storage_root
- 
-diff --git a/tests/libs/test_parquet_writer.py b/tests/libs/test_parquet_writer.py
-index 42d9051ab..b5595098a 100644
---- a/tests/libs/test_parquet_writer.py
-+++ b/tests/libs/test_parquet_writer.py
-@@ -10,6 +10,7 @@ from dlt.common import pendulum, Decimal, json
- from dlt.common.configuration import inject_section
- from dlt.common.data_writers.writers import ArrowToParquetWriter, ParquetDataWriter
- from dlt.common.destination import DestinationCapabilitiesContext
-+from dlt.common.destination.configuration import ParquetFormatConfiguration
- from dlt.common.schema.utils import new_column
- from dlt.common.configuration.specs.config_section_context import ConfigSectionContext
- 
-@@ -388,6 +389,92 @@ def test_arrow_parquet_row_group_size() -> None:
-         assert reader.metadata.row_group(1).num_rows == 0
- 
- 
-+def _caps_with_promote(promote_options: str) -> DestinationCapabilitiesContext:
-+    caps = DestinationCapabilitiesContext.generic_capabilities()
-+    caps.parquet_format = ParquetFormatConfiguration(arrow_concat_promote_options=promote_options)  # type: ignore[arg-type]
-+    return caps
-+
-+
-+@pytest.mark.parametrize("promote_options", ["none", "default"])
-+def test_arrow_concat_promote_options_rejects_mismatched_types(promote_options: str) -> None:
-+    """promote_options="none" and "default" both reject int64/float64 schema mismatch."""
-+    c1 = {"col1": new_column("col1", "bigint")}
-+    table_int = pa.Table.from_pydict({"col1": pa.array([1, 2], type=pa.int64())})
-+    table_float = pa.Table.from_pydict({"col1": pa.array([3.0, 4.0], type=pa.float64())})
-+
-+    with pytest.raises((pa.lib.ArrowInvalid, pa.lib.ArrowTypeError)):
-+        with get_writer(
-+            ArrowToParquetWriter,
-+            buffer_max_items=10,
-+            caps=_caps_with_promote(promote_options),
-+        ) as writer:
-+            writer.write_data_item(table_int, columns=c1)
-+            writer.write_data_item(table_float, columns=c1)
-+
-+
-+def test_arrow_concat_promote_options_permissive() -> None:
-+    """promote_options="permissive" promotes int64 to double on cross-family mismatch."""
-+    c1 = {"col1": new_column("col1", "bigint")}
-+    table_int = pa.Table.from_pydict({"col1": pa.array([1, 2], type=pa.int64())})
-+    table_float = pa.Table.from_pydict({"col1": pa.array([3.0, 4.0], type=pa.float64())})
-+
-+    with get_writer(
-+        ArrowToParquetWriter,
-+        buffer_max_items=10,
-+        caps=_caps_with_promote("permissive"),
-+    ) as writer:
-+        writer.write_data_item(table_int, columns=c1)
-+        writer.write_data_item(table_float, columns=c1)
-+
-+    with pa.parquet.ParquetFile(writer.closed_files[0].file_path) as reader:
-+        table = reader.read()
-+        assert table.schema.field("col1").type == pa.float64()
-+        assert table.column("col1").to_pylist() == [1.0, 2.0, 3.0, 4.0]
-+
-+
-+@pytest.mark.parametrize("promote_options", ["default", "permissive"])
-+def test_arrow_concat_promote_options_null_column(promote_options: str) -> None:
-+    """Both "default" and "permissive" promote null + string to string."""
-+    cols = {"col1": new_column("col1", "text")}
-+    table_str = pa.Table.from_pydict({"col1": pa.array(["a", "b"], type=pa.string())})
-+    table_null = pa.Table.from_pydict({"col1": pa.array([None, None], type=pa.null())})
-+
-+    with get_writer(
-+        ArrowToParquetWriter,
-+        buffer_max_items=10,
-+        caps=_caps_with_promote(promote_options),
-+    ) as writer:
-+        writer.write_data_item(table_str, columns=cols)
-+        writer.write_data_item(table_null, columns=cols)
-+
-+    with pa.parquet.ParquetFile(writer.closed_files[0].file_path) as reader:
-+        table = reader.read()
-+        assert table.schema.field("col1").type == pa.string()
-+        assert table.column("col1").to_pylist() == ["a", "b", None, None]
-+
-+
-+def test_arrow_concat_promote_options_permissive_missing_column() -> None:
-+    """promote_options="permissive" fills missing columns with null."""
-+    c1 = {"col1": new_column("col1", "bigint")}
-+    table_two_cols = pa.Table.from_pydict(
-+        {"col1": pa.array([1], type=pa.int64()), "col2": pa.array(["x"], type=pa.string())}
-+    )
-+    table_one_col = pa.Table.from_pydict({"col1": pa.array([2], type=pa.int64())})
-+
-+    with get_writer(
-+        ArrowToParquetWriter,
-+        buffer_max_items=10,
-+        caps=_caps_with_promote("permissive"),
-+    ) as writer:
-+        writer.write_data_item(table_two_cols, columns=c1)
-+        writer.write_data_item(table_one_col, columns=c1)
-+
-+    with pa.parquet.ParquetFile(writer.closed_files[0].file_path) as reader:
-+        table = reader.read()
-+        assert table.column("col1").to_pylist() == [1, 2]
-+        assert table.column("col2").to_pylist() == ["x", None]
-+
-+
- def test_empty_tables_get_flushed() -> None:
-     c1 = {"col1": new_column("col1", "bigint")}
-     single_elem_table = pa.Table.from_pylist([{"col1": 1}])
-
-
-===== COMMIT 5ff1651d =====
-
-
-commit 5ff1651dc
-Author: Travior
-Date: 2026-03-12
-
-    switch lancedb example from spotify to podcastindex (#3736)
-
-diff --git a/docs/examples/custom_destination_lancedb/.dlt/config.toml b/docs/examples/custom_destination_lancedb/.dlt/config.toml
-index 4fd35e115..51b642bdd 100644
---- a/docs/examples/custom_destination_lancedb/.dlt/config.toml
-+++ b/docs/examples/custom_destination_lancedb/.dlt/config.toml
-@@ -1,2 +1,2 @@
- [lancedb]
--db_path = "spotify.db"
-\ No newline at end of file
-+db_path = "podcast.db"
-\ No newline at end of file
-diff --git a/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml b/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml
-index 9c86df320..8711116be 100644
---- a/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml
-+++ b/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml
-@@ -1,7 +1,7 @@
--[spotify]
--client_id = ""
--client_secret = ""
-+[sources.podcastindex]
-+api_key = ""
-+api_secret = ""
- 
--# provide the openai api key here
-+# provide the OpenAI API key here
- [destination.lancedb.credentials]
- embedding_model_provider_api_key = ""
-\ No newline at end of file
-diff --git a/docs/examples/custom_destination_lancedb/.gitignore b/docs/examples/custom_destination_lancedb/.gitignore
-index c73564481..2b143ae4d 100644
---- a/docs/examples/custom_destination_lancedb/.gitignore
-+++ b/docs/examples/custom_destination_lancedb/.gitignore
-@@ -1 +1 @@
--spotify.db
-\ No newline at end of file
-+podcast.db
-\ No newline at end of file
-diff --git a/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py b/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
-index c33630f37..d41f3db88 100644
---- a/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
-+++ b/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
-@@ -8,10 +8,10 @@ keywords: [destination, credentials, example, lancedb, custom destination, vecto
- This example showcases a Python script that demonstrates the integration of LanceDB, an open-source vector database,
- as a custom destination within the dlt ecosystem.
- The script illustrates the implementation of a custom destination as well as the population of the LanceDB vector
--store with data from various sources.
-+store with podcast episode data from Podcast Index.
- This highlights the seamless interoperability between dlt and LanceDB.
- 
--You can get a Spotify client ID and secret from https://developer.spotify.com/.
-+You can get a Podcast Index API key and secret from https://api.podcastindex.org/developer_home.
- 
- We'll learn how to:
- - Use the [custom destination](../dlt-ecosystem/destinations/destination.md)
-@@ -19,12 +19,13 @@ We'll learn how to:
- - Use Pydantic for unified dlt and lancedb schema validation
- """
- 
--__source_name__ = "spotify"
-+__source_name__ = "podcastindex"
- 
--import datetime  # noqa: I251
- from dataclasses import dataclass, fields
-+import hashlib
- import os
- from pathlib import Path
-+import time
- from typing import Any
- 
- import lancedb
-@@ -32,11 +33,10 @@ from lancedb.embeddings import get_registry
- from lancedb.pydantic import LanceModel, Vector
- 
- import dlt
-+from dlt.common.configuration import configspec
- from dlt.common.schema import TTableSchema
- from dlt.common.typing import TDataItems, TSecretStrValue
--from dlt.sources.helpers import requests
--from dlt.common.configuration import configspec
--from dlt.sources.helpers.rest_client import RESTClient, AuthConfigBase
-+from dlt.sources.helpers.rest_client import AuthConfigBase, RESTClient
- 
- # access secrets to get openai key
- openai_api_key: str = dlt.secrets.get(
-@@ -62,14 +62,12 @@ os.environ["OPENAI_API_KEY"] = openai_api_key
- class EpisodeSchema(LanceModel):
-     """Used for dlt and lance schema validation"""
- 
--    id: str  # noqa: A003
--    name: str
-+    id: int  # noqa: A003
-+    title: str
-     description: str = func.SourceField()
--    release_date: datetime.date
--    audio_preview_url: str
--    duration_ms: int
--    href: str
--    uri: str
-+    datePublished: int
-+    link: str
-+    duration: int
-     # there is more data but we are not using it ...
- 
- 
-@@ -81,67 +79,61 @@ class EpisodeSchemaVector(EpisodeSchema):
- 
- @dataclass(frozen=True)
- class Shows:
--    monday_morning_data_chat: str = "3Km3lBNzJpc1nOTJUtbtMh"
--    superdatascience_podcast: str = "1n8P7ZSgfVLVJ3GegxPat1"
--    lex_fridman: str = "2MAi0BvDc6GTFvKFPXnkCL"
-+    latent_space: str = "6058902"
-+    superdatascience_podcast: str = "4299005"
-+    lex_fridman: str = "745287"
- 
- 
- @configspec
--class SpotifyAuth(AuthConfigBase):
--    client_id: str = None
--    client_secret: TSecretStrValue = None
-+class PodcastIndexAuth(AuthConfigBase):
-+    api_key: str = None
-+    api_secret: TSecretStrValue = None
- 
-     def __call__(self, request) -> Any:
--        if not hasattr(self, "access_token"):
--            self.access_token = self._get_access_token()
--        request.headers["Authorization"] = f"Bearer {self.access_token}"
-+        epoch_time = int(time.time())
-+        signature = hashlib.sha1(
-+            f"{self.api_key}{self.api_secret}{str(epoch_time)}".encode()
-+        ).hexdigest()
-+        headers = {
-+            "X-Auth-Date": str(epoch_time),
-+            "X-Auth-Key": self.api_key,
-+            "Authorization": signature,
-+            "User-Agent": "DltPipeline/1.0",
-+        }
-+        request.headers.update(headers)
-         return request
- 
--    def _get_access_token(self) -> Any:
--        auth_url = "https://accounts.spotify.com/api/token"
--        auth_response = requests.post(
--            auth_url,
--            {
--                "grant_type": "client_credentials",
--                "client_id": self.client_id,
--                "client_secret": self.client_secret,
--            },
--        )
--        return auth_response.json()["access_token"]
--
- 
- @dlt.source
--def spotify_shows(
--    client_id: str = dlt.secrets.value,
--    client_secret: str = dlt.secrets.value,
-+def podcast_episodes(
-+    api_key: str = dlt.secrets.value,
-+    api_secret: str = dlt.secrets.value,
- ):
--    spotify_base_api_url = "https://api.spotify.com/v1"
-+    podcast_index_base_api_url = "https://api.podcastindex.org/api/1.0"
-     client = RESTClient(
--        base_url=spotify_base_api_url,
--        auth=SpotifyAuth(client_id=client_id, client_secret=client_secret),
-+        base_url=podcast_index_base_api_url,
-+        auth=PodcastIndexAuth(api_key=api_key, api_secret=api_secret),
-     )
- 
-     for show in fields(Shows):
-         show_name = show.name
-         show_id = show.default
--        url = f"/shows/{show_id}/episodes"
-+        url = f"/episodes/byfeedid?id={show_id}"
-         yield dlt.resource(
--            client.paginate(url, params={"limit": 50}),
-+            client.get(url, params={"limit": 50}).json()["items"] or [],
-             name=show_name,
-             primary_key="id",
--            parallelized=True,
-             max_table_nesting=0,
--            # reuse lance model to filter out all non-matching items and extra columns from spotify api
-+            # reuse lance model to filter out all non-matching items and extra columns from the Podcast Index API
-             # 1. unknown columns are removed ("columns": "discard_value")
--            # 2. non validating items (ie. without id or url) are removed ("data_type": "discard_row")
--            # 3. for some reason None values are returned as well 🤯, add_filter takes care of that
-+            # 2. non-validating items (for example missing `id` or `link`) are removed ("data_type": "discard_row")
-             columns=EpisodeSchema,
-             schema_contract={
-                 "tables": "evolve",
-                 "columns": "discard_value",
-                 "data_type": "discard_row",
-             },
--        ).add_filter(lambda i: i is not None)
-+        ).add_filter(lambda i: i["description"] != "")
- 
- 
- @dlt.destination(batch_size=250, name="lancedb")
-@@ -169,13 +161,13 @@ if __name__ == "__main__":
-             pass
- 
-     pipeline = dlt.pipeline(
--        pipeline_name="spotify",
-+        pipeline_name="podcastindex",
-         destination=lancedb_destination,
--        dataset_name="spotify_podcast_data",
-+        dataset_name="podcastindex_data",
-         progress="log",
-     )
- 
--    load_info = pipeline.run(spotify_shows())
-+    load_info = pipeline.run(podcast_episodes())
-     print(load_info)
- 
-     row_counts = pipeline.last_trace.last_normalize_info
-
-
-===== COMMIT 92f885ce =====
-
-
-commit 92f885cee
-Author: rudolfix
-Date: 2026-03-12
-
-    (chore) adds cli docs check to docs ci workflow (#3739)
-
-diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
-index 69808c87c..bd3278d54 100644
---- a/.github/workflows/lint.yml
-+++ b/.github/workflows/lint.yml
-@@ -49,10 +49,6 @@ jobs:
-           export PATH=$PATH:"/c/Program Files/usr/bin" # needed for Windows
-           make lint
- 
--      - name: Check that cli docs are up to date
--        run: make check-cli-docs
--        if: ${{ matrix.python-version == '3.11' }}
--
-       - name: Check filesizes
-         uses: ppremk/lfs-warning@v3.2
-         with:
-diff --git a/.github/workflows/test_docs.yml b/.github/workflows/test_docs.yml
-index 4f7d73d29..46ffacaf4 100644
---- a/.github/workflows/test_docs.yml
-+++ b/.github/workflows/test_docs.yml
-@@ -79,6 +79,12 @@ jobs:
-         run:  docker compose -f "tests/load/weaviate/docker-compose.yml" up -d
- 
- 
-+      - name: Install root project for CLI docs check
-+        run: uv sync --extra cli
-+
-+      - name: Check that CLI docs are up to date
-+        run: make check-cli-docs
-+
-       - name: Install dependencies
-         run: cd docs && make dev
- 
-diff --git a/dlt/_workspace/cli/commands.py b/dlt/_workspace/cli/commands.py
-index 4d01248c7..6cad6a1b5 100644
---- a/dlt/_workspace/cli/commands.py
-+++ b/dlt/_workspace/cli/commands.py
-@@ -69,7 +69,7 @@ version if run again with an existing `source` name. You will be warned if files
-             ),
-         )
-         parser.add_argument(
--            "destination", nargs="?", help="Name of a destination ie. bigquery or redshift"
-+            "destination", nargs="?", help="Name of a destination i.e. bigquery or redshift"
-         )
-         parser.add_argument(
-             "--location",
-
-
-===== COMMIT 988996c0 =====
-
-
-commit 988996c0a
-Author: Elisabeth Reitmayr
-Date: 2026-03-11
-
-    Docs/ai workbench license (#3729)
-
-diff --git a/README.md b/README.md
-index befac0305..810507ef2 100644
---- a/README.md
-+++ b/README.md
-@@ -96,9 +96,7 @@ You can find examples for various use cases in the [examples](docs/examples) fol
- * `minor` new features, sometimes automatic migrations
- * `patch` bug fixes
- 
--We suggest that you allow only `patch` level updates automatically:
--* Using the [Compatible Release Specifier](https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release). For example **dlt~=1.0** allows only versions **>=1.0** and less than **<1.1**
--* Poetry [caret requirements](https://python-poetry.org/docs/dependency-specification/). For example **^1.0** allows only versions **>=1.0** to **<1.0**
-+We suggest that you allow only `patch` level updates automatically using the [Compatible Release Specifier](https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release). For example **dlt~=1.23.0** allows only versions **>=1.23.0** and less than **<1.24.0**
- 
- Please also see our [release notes](https://github.com/dlt-hub/dlt/releases) for notable changes between versions.
- 
-diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
-index 0b704a0e5..b14434f45 100644
---- a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
-+++ b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
-@@ -6,6 +6,10 @@ keywords: [cursor, claude, codex, llm, restapi, ai, workbench, toolkit]
- 
- # REST API Source with dltHub AI Workbench
- 
-+:::info
-+The dltHub AI Workbench is a part of the dltHub platform. View the license [here](https://github.com/dlt-hub/dlthub-ai-workbench/blob/master/LICENSE). Sign up [here](https://dlthub.com/solutions/for-small-data-teams) for early access to dltHub.
-+:::
-+
- ## Overview
- 
- Build a custom REST API connector for any of the 8k+ available sources — often in a single session. Instead of generating ad-hoc code, the AI assistant follows a defined sequence of steps from start to finish to help you build production-grade pipelines following the dltHub best practices. 
-@@ -291,7 +295,7 @@ Once your pipeline is validated, you can continue to the next phase of the data
- - **`data-exploration`** — query loaded data and create marimo notebooks, charts, and dashboards
- - **`dlthub-runtime`** — deploy, schedule, and monitor your pipeline in production 
- 
--[Sign up for dltHub Early Access](https://info.dlthub.com/waiting-list)
-+[Sign up for dltHub Early Access](https://dlthub.com/solutions/for-small-data-teams)
- 
- ```sh
- uv run dlt ai toolkit data-exploration install
-diff --git a/docs/website/docs/hub/EULA.md b/docs/website/docs/hub/EULA.md
-index 9930adf1a..fc709519f 100644
---- a/docs/website/docs/hub/EULA.md
-+++ b/docs/website/docs/hub/EULA.md
-@@ -184,4 +184,8 @@ If it turns out that a section of this EULA isn’t enforceable, then that secti
- 
- You and we agree that no joint venture, partnership, employment, or agency relationship exists between us.
- 
--The EULA, along with any Specific Terms, make up the entire agreement between us in relation to its subject matter and supersede all prior agreements, representations, and understandings.
-\ No newline at end of file
-+The EULA, along with any Specific Terms, make up the entire agreement between us in relation to its subject matter and supersede all prior agreements, representations, and understandings.
-+
-+# EULA for dltHub AI Workbench
-+
-+The dltHub AI Workbench has a separate license which can be accessed [here](https://github.com/dlt-hub/dlthub-ai-workbench/blob/master/LICENSE).
-\ No newline at end of file
-
-
-===== COMMIT 3809b453 =====
-
-
-commit 3809b4533
-Author: UD
-Date: 2026-03-06
-
-    feat(ducklake): add `override_data_path` option to ATTACH statement (#3709)
-
-diff --git a/dlt/destinations/impl/ducklake/configuration.py b/dlt/destinations/impl/ducklake/configuration.py
-index 46034cb94..5fe33ed6e 100644
---- a/dlt/destinations/impl/ducklake/configuration.py
-+++ b/dlt/destinations/impl/ducklake/configuration.py
-@@ -128,6 +128,7 @@ class DuckLakeClientConfiguration(WithLocalFiles, DestinationClientDwhWithStagin
-     )
-     credentials: DuckLakeCredentials = None
-     create_indexes: bool = False  # does nothing but required
-+    override_data_path: bool = False
- 
-     def fingerprint(self) -> str:
-         """Use fingerprint of underlying storage. This is precise to bucket level"""
-diff --git a/dlt/destinations/impl/ducklake/ducklake.py b/dlt/destinations/impl/ducklake/ducklake.py
-index 1ab2f995c..d90cf70d1 100644
---- a/dlt/destinations/impl/ducklake/ducklake.py
-+++ b/dlt/destinations/impl/ducklake/ducklake.py
-@@ -160,6 +160,7 @@ class DuckLakeClient(DuckDbClient):
-             staging_dataset_name=config.normalize_staging_dataset_name(schema),
-             credentials=config.credentials,
-             capabilities=capabilities,
-+            override_data_path=config.override_data_path,
-         )
- 
-     def initialize_storage(self, truncate_tables: Iterable[str] = None) -> None:
-diff --git a/dlt/destinations/impl/ducklake/sql_client.py b/dlt/destinations/impl/ducklake/sql_client.py
-index ad944382c..44400acc6 100644
---- a/dlt/destinations/impl/ducklake/sql_client.py
-+++ b/dlt/destinations/impl/ducklake/sql_client.py
-@@ -26,10 +26,12 @@ class DuckLakeSqlClient(DuckDbSqlClient):
-         staging_dataset_name: str,
-         credentials: DuckLakeCredentials,
-         capabilities: DestinationCapabilitiesContext,
-+        override_data_path: bool = False,
-     ) -> None:
-         super().__init__(dataset_name, staging_dataset_name, credentials, capabilities)
-         self.credentials: DuckLakeCredentials = credentials
-         self._attach_statement: str = None
-+        self.override_data_path = override_data_path
- 
-     def create_dataset(self) -> None:
-         if self.has_dataset():
-@@ -122,6 +124,7 @@ class DuckLakeSqlClient(DuckDbSqlClient):
-         ducklake_name: str,
-         catalog: ConnectionStringCredentials,
-         storage_url: str,
-+        override_data_path: bool = False,
-     ) -> str:
-         attach_params = ""
-         if isinstance(catalog, DuckDbCredentials):
-@@ -147,7 +150,8 @@ class DuckLakeSqlClient(DuckDbSqlClient):
-         else:
-             raise NotImplementedError(str(catalog))
-         attach_statement += f" AS {ducklake_name}"
--        attach_statement += f" (DATA_PATH '{storage_url}'{attach_params})"
-+        override_param = ", OVERRIDE_DATA_PATH true" if override_data_path else ""
-+        attach_statement += f" (DATA_PATH '{storage_url}'{attach_params}{override_param})"
-         return attach_statement
- 
-     @property
-@@ -160,4 +164,5 @@ class DuckLakeSqlClient(DuckDbSqlClient):
-                 ducklake_name=self.credentials.ducklake_name,
-                 catalog=self.credentials.catalog,
-                 storage_url=self.credentials.storage_url,
-+                override_data_path=self.override_data_path,
-             )
-diff --git a/docs/website/docs/dlt-ecosystem/destinations/ducklake.md b/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
-index 56ce1c090..60879dd40 100644
---- a/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
-+++ b/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
-@@ -126,6 +126,34 @@ You can set additional connection options, pragmas and extensions - `ducklake` c
- ducklake_max_retry_count=100
- ```
- 
-+### Override data path
-+DuckLake stores file paths in the catalog relative to a base `DATA_PATH` that is set at creation time. When `override_data_path` is set to `True`, the `DATA_PATH` provided in the current connection replaces the stored one for both reads and writes. The stored value in the catalog is not modified.
-+
-+Typical use cases:
-+- Populating a ducklake locally and then uploading the catalog and data files to remote storage together
-+- Accessing the same catalog from different environments where the storage is at a different path (e.g., data replicated to another bucket)
-+
-+```toml
-+[destination.ducklake]
-+override_data_path=true
-+```
-+
-+Or via environment variable `DESTINATION__DUCKLAKE__OVERRIDE_DATA_PATH=true`, or in code:
-+```py
-+import dlt
-+from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
-+
-+destination = dlt.destinations.ducklake(
-+    credentials=DuckLakeCredentials(
-+        catalog="sqlite:///catalog.sqlite",
-+        storage="s3://new-bucket/data",
-+    ),
-+    override_data_path=True,
-+)
-+```
-+
-+See the [DuckLake docs on connecting](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details on `OVERRIDE_DATA_PATH`.
-+
- ### Configure in code
- You can create ducklake destination instance and configure it in code. In most cases you will just set additional options while still using the configuration:
- ```py
-@@ -237,5 +265,4 @@ This destination fully supports [dlt state sync](../../general-usage/state#synci
- * open table interface for table maintenance like we have for iceberg and delta.
- * better partitioning support.
- * Motherduck as catalog if possible.
--* support additional `ATTACH` options like `OVERRIDE_DATA_PATH`
- * implement callbacks that will be called on creation of :memory: database and `ATTACH` command so those can be fully customized.
-diff --git a/tests/load/ducklake/test_ducklake_client.py b/tests/load/ducklake/test_ducklake_client.py
-index e753cba6b..21f1f7583 100644
---- a/tests/load/ducklake/test_ducklake_client.py
-+++ b/tests/load/ducklake/test_ducklake_client.py
-@@ -266,6 +266,39 @@ def test_attach_statement_doesnt_use_postgresql() -> None:
-     assert "postgresql" not in expected_attach_statement
- 
- 
-+def test_ducklake_attach_statement_with_override_data_path() -> None:
-+    expected_attach_statement = (
-+        "ATTACH IF NOT EXISTS 'ducklake:postgres:postgres://loader:loader@localhost:5432/dlt_data'"
-+        " AS foo (DATA_PATH '/path/to/storage', METADATA_SCHEMA 'foo',"
-+        " OVERRIDE_DATA_PATH true)"
-+    )
-+    attach_statement = DuckLakeSqlClient.build_attach_statement(
-+        catalog=ConnectionStringCredentials("postgres://loader:loader@localhost:5432/dlt_data"),
-+        ducklake_name="foo",
-+        storage_url="/path/to/storage",
-+        override_data_path=True,
-+    )
-+    assert expected_attach_statement == attach_statement
-+
-+
-+def test_ducklake_override_data_path_config() -> None:
-+    configuration = resolve_configuration(
-+        DuckLakeClientConfiguration(override_data_path=True)._bind_dataset_name(dataset_name="foo")
-+    )
-+    assert configuration.override_data_path is True
-+
-+    from dlt.destinations.impl.ducklake.configuration import _get_ducklake_capabilities
-+
-+    sql_client = DuckLakeSqlClient(
-+        dataset_name="foo",
-+        staging_dataset_name="foo_staging",
-+        credentials=configuration.credentials,
-+        capabilities=_get_ducklake_capabilities(),
-+        override_data_path=configuration.override_data_path,
-+    )
-+    assert "OVERRIDE_DATA_PATH true" in sql_client.attach_statement
-+
-+
- def test_ducklake_conn_pool_always_open() -> None:
-     # connection pool is embedded in configuration, configuration is a singleton during loading
-     # phase which the pool needs. See DuckDbConnectionPool
-
-
-===== COMMIT ca639756 =====
-
-
-commit ca639756a
-Author: aditypan
-Date: 2026-03-06
-
-    Fetch Databricks Compute Credentials (#3667)
-
-diff --git a/dlt/destinations/impl/databricks/configuration.py b/dlt/destinations/impl/databricks/configuration.py
-index d901d8287..d87f4efb7 100644
---- a/dlt/destinations/impl/databricks/configuration.py
-+++ b/dlt/destinations/impl/databricks/configuration.py
-@@ -1,5 +1,6 @@
- import dataclasses
- from typing import ClassVar, Final, Optional, Any, Dict, List, List, Dict, cast, Callable
-+from urllib.parse import urlparse
- 
- from dlt.common import logger
- from dlt.common.typing import TSecretStrValue
-@@ -37,30 +38,32 @@ class DatabricksCredentials(CredentialsConfiguration):
-     ]
- 
-     def on_resolved(self) -> None:
--        if not ((self.client_id and self.client_secret) or self.access_token):
--            try:
--                # attempt context authentication
--                from databricks.sdk import WorkspaceClient
--
--                w = WorkspaceClient()
--                self.access_token = (
--                    w.dbutils.notebook.entry_point.getDbutils()
--                    .notebook()
--                    .getContext()
--                    .apiToken()
--                    .getOrElse(None)
--                )
--            except Exception:
--                self.access_token = None
-+        try:
-+            from databricks.sdk import WorkspaceClient
- 
--            try:
--                from databricks.sdk import WorkspaceClient
-+            w = WorkspaceClient()
-+        except Exception:
-+            w = None
- 
--                w = WorkspaceClient()
--                self.access_token = w.config.authenticate
--                logger.info(f"Will attempt to use default auth of type {w.config.auth_type}")
--            except Exception:
--                pass
-+        if not ((self.client_id and self.client_secret) or self.access_token):
-+            if w is not None:
-+                try:
-+                    # attempt context authentication via notebook token
-+                    self.access_token = (
-+                        w.dbutils.notebook.entry_point.getDbutils()
-+                        .notebook()
-+                        .getContext()
-+                        .apiToken()
-+                        .getOrElse(None)
-+                    )
-+                except Exception:
-+                    self.access_token = None
-+
-+                try:
-+                    self.access_token = w.config.authenticate
-+                    logger.info(f"Will attempt to use default auth of type {w.config.auth_type}")
-+                except Exception:
-+                    pass
- 
-             if not self.access_token:
-                 raise ConfigurationValueError(
-@@ -70,24 +73,52 @@ class DatabricksCredentials(CredentialsConfiguration):
-                 )
- 
-         if not self.server_hostname or not self.http_path:
--            try:
--                # attempt to fetch warehouse details
--                from databricks.sdk import WorkspaceClient
--
--                w = WorkspaceClient()
--                # warehouse ID may be present in an env variable
--                if w.config.warehouse_id:
--                    warehouse = w.warehouses.get(w.config.warehouse_id)
--                else:
--                    # for some reason list of warehouses has different type than a single one 🤯
--                    warehouse = list(w.warehouses.list())[0]
--                logger.info(
--                    f"Will attempt to use warehouse {warehouse.id} to get sql connection params"
--                )
--                self.server_hostname = self.server_hostname or warehouse.odbc_params.hostname
--                self.http_path = self.http_path or warehouse.odbc_params.path
--            except Exception:
--                pass
-+            if w is not None:
-+                # try to get server_hostname from workspace URL
-+                if not self.server_hostname:
-+                    try:
-+                        workspace_url = w.config.host
-+                        if workspace_url:
-+                            self.server_hostname = urlparse(workspace_url).hostname
-+                            logger.info(
-+                                f"Using server_hostname from workspace: {self.server_hostname}"
-+                            )
-+                    except Exception:
-+                        pass
-+
-+                # try to get http_path from notebook cluster context
-+                if not self.http_path:
-+                    try:
-+                        notebook_context = (
-+                            w.dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-+                        )
-+                        cluster_id = notebook_context.clusterId().get()
-+                        workspace_id = notebook_context.workspaceId().get()
-+                        if cluster_id and workspace_id:
-+                            self.http_path = f"/sql/protocolv1/o/{workspace_id}/{cluster_id}"
-+                            logger.info(f"Using http_path from cluster context: {self.http_path}")
-+                    except Exception:
-+                        pass
-+
-+                # fallback: try to fetch warehouse details
-+                if not self.server_hostname or not self.http_path:
-+                    try:
-+                        if w.config.warehouse_id:
-+                            warehouse = w.warehouses.get(w.config.warehouse_id)
-+                        else:
-+                            # for some reason list of warehouses has different type
-+                            # than a single one
-+                            warehouse = list(w.warehouses.list())[0]
-+                        logger.info(
-+                            "Will attempt to use warehouse"
-+                            f" {warehouse.id} to get sql connection params"
-+                        )
-+                        self.server_hostname = (
-+                            self.server_hostname or warehouse.odbc_params.hostname
-+                        )
-+                        self.http_path = self.http_path or warehouse.odbc_params.path
-+                    except Exception:
-+                        pass
- 
-         for param in ("catalog", "server_hostname", "http_path"):
-             if not getattr(self, param):
-diff --git a/docs/website/docs/dlt-ecosystem/destinations/databricks.md b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
-index 02b3e6f54..7545e75c3 100644
---- a/docs/website/docs/dlt-ecosystem/destinations/databricks.md
-+++ b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
-@@ -255,8 +255,10 @@ See [Staging support](#staging-support) for authentication options when `dlt` co
- If none of auth methods above is configured, `dlt` attempts to get authorization from the Databricks workspace context. The context may
- come, for example, from a Notebook (runtime) or via standard set of env variables that Databricks Python sdk recognizes (ie. **DATABRICKS_TOKEN** or **DATABRICKS_HOST**)
- 
--`dlt` is able to set `server_hostname` and `http_path` from available warehouses. We use default warehouse id (**DATABRICKS_WAREHOUSE_ID**)
--if set (via env variable), or a first one on warehouse's list.
-+When `server_hostname` or `http_path` are not provided, `dlt` attempts to derive them automatically:
-+
-+1. **Notebook cluster context** (tried first): when running inside a Databricks Notebook, `dlt` reads `server_hostname` from the workspace URL and constructs `http_path` from the workspace ID and cluster ID of the compute attached to the notebook. This allows dlt to use the notebook's own cluster without requiring a SQL warehouse.
-+2. **SQL warehouse discovery** (fallback): if the cluster context is not available (e.g., running outside a notebook, or on a Shared Access Mode cluster), `dlt` looks for an available SQL warehouse. We use default warehouse id (**DATABRICKS_WAREHOUSE_ID**) if set (via env variable), or the first one on the warehouse's list.
- 
- ## Write disposition
- All write dispositions are supported.
-diff --git a/tests/load/databricks/test_databricks_configuration.py b/tests/load/databricks/test_databricks_configuration.py
-index 7ebd52d1c..1ec84c14e 100644
---- a/tests/load/databricks/test_databricks_configuration.py
-+++ b/tests/load/databricks/test_databricks_configuration.py
-@@ -99,44 +99,266 @@ def test_databricks_abfss_converter() -> None:
-     )
- 
- 
--def test_databricks_auth_invalid() -> None:
--    with pytest.raises(ConfigurationValueError, match="Authentication failed:*"):
--        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID"] = ""
--        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET"] = ""
--        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = ""
-+def _setup_sdk_auth(mock_ws):
-+    """Enable SDK default authentication on the mock WorkspaceClient."""
-+    mock_ws.config.authenticate = lambda: {"Authorization": "Bearer token"}
-+    mock_ws.config.auth_type = "pat"
-+
-+
-+def _setup_notebook_context(
-+    mock_ws,
-+    mocker,
-+    cluster_id="0123-456789-abcdefgh",
-+    workspace_id="1234567890123456",
-+    api_token="nb-token",
-+):
-+    """Set up the dbutils notebook context chain on the mock WorkspaceClient."""
-+    mock_cluster_id = mocker.MagicMock()
-+    mock_cluster_id.get.return_value = cluster_id
-+    mock_workspace_id = mocker.MagicMock()
-+    mock_workspace_id.get.return_value = workspace_id
-+
-+    mock_context = mocker.MagicMock()
-+    mock_context.clusterId.return_value = mock_cluster_id
-+    mock_context.workspaceId.return_value = mock_workspace_id
-+
-+    mock_option = mocker.MagicMock()
-+    mock_option.getOrElse.return_value = api_token
-+    mock_context.apiToken.return_value = mock_option
-+
-+    mock_notebook = mocker.MagicMock()
-+    mock_notebook.getContext.return_value = mock_context
-+    mock_dbutils = mocker.MagicMock()
-+    mock_dbutils.notebook.return_value = mock_notebook
-+    mock_entry_point = mocker.MagicMock()
-+    mock_entry_point.getDbutils.return_value = mock_dbutils
-+    mock_ws.dbutils.notebook.entry_point = mock_entry_point
-+
-+
-+def _setup_warehouse(
-+    mock_ws,
-+    mocker,
-+    warehouse_id="wh-1",
-+    hostname="warehouse.databricks.com",
-+    path="/sql/1.0/warehouses/wh-1",
-+):
-+    """Set up warehouse mock. Uses get() if warehouse_id is set on config, list() otherwise."""
-+    mock_warehouse = mocker.MagicMock()
-+    mock_warehouse.id = warehouse_id
-+    mock_warehouse.odbc_params.hostname = hostname
-+    mock_warehouse.odbc_params.path = path
-+    if mock_ws.config.warehouse_id:
-+        mock_ws.warehouses.get.return_value = mock_warehouse
-+    else:
-+        mock_ws.warehouses.list.return_value = iter([mock_warehouse])
-+
-+
-+@pytest.fixture
-+def mock_databricks_env(mocker):
-+    """Clears Databricks-related env vars and provides a mock WorkspaceClient.
-+
-+    Returns a mock WorkspaceClient instance. By default, notebook context and
-+    warehouse discovery are disabled (raise exceptions). Tests can override
-+    specific attributes on the returned mock as needed.
-+    """
-+    # clear only DESTINATION__DATABRICKS__ prefixed env vars to avoid
-+    # interfering with other destination tests
-+    for key in list(os.environ.keys()):
-+        if key.startswith("DESTINATION__DATABRICKS__") or key.startswith("DATABRICKS_"):
-+            del os.environ[key]
-+
-+    mock_ws = mocker.MagicMock()
-+    mock_ws.dbutils.notebook.entry_point.getDbutils.side_effect = Exception("No notebook context")
-+    mock_ws.config.authenticate = None
-+    mock_ws.config.warehouse_id = None
-+    mock_ws.config.host = None
-+    mock_ws.warehouses.list.return_value = iter([])
-+    mocker.patch("databricks.sdk.WorkspaceClient", return_value=mock_ws)
-+    return mock_ws
-+
-+
-+def test_databricks_auth_invalid(mock_databricks_env) -> None:
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID"] = ""
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET"] = ""
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = ""
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = "test_catalog"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "test.databricks.com"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = "/sql/1.0/test"
-+
-+    with pytest.raises(ConfigurationValueError, match="Authentication failed:.*"):
-         bricks = databricks()
-         bricks.configuration(None, accept_partial=True)
- 
- 
--def test_databricks_missing_config_catalog() -> None:
-+def test_databricks_missing_config_catalog(mock_databricks_env) -> None:
-+    mock_databricks_env.warehouses.list.side_effect = Exception("No warehouses")
-+
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = "test_token"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "test.databricks.com"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = "/sql/1.0/test"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = ""
-+
-     with pytest.raises(
-         ConfigurationValueError, match="Configuration error: Missing required parameter `catalog`"
-     ):
--        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = ""
-         bricks = databricks()
-         bricks.configuration(None, accept_partial=True)
- 
- 
--def test_databricks_missing_config_http_path() -> None:
-+def test_databricks_missing_config_http_path(mock_databricks_env) -> None:
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = "test_token"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "test.databricks.com"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = "test_catalog"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = ""
-+
-     with pytest.raises(
-         ConfigurationValueError,
-         match="Configuration error: Missing required parameter `http_path`",
-     ):
--        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = ""
-         bricks = databricks()
-         bricks.configuration(None, accept_partial=True)
- 
- 
--def test_databricks_missing_config_server_hostname() -> None:
-+def test_databricks_missing_config_server_hostname(mock_databricks_env) -> None:
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = "test_token"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = "test_catalog"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = "/sql/1.0/test"
-+    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = ""
-+
-     with pytest.raises(
-         ConfigurationValueError,
-         match="Configuration error: Missing required parameter `server_hostname`",
-     ):
--        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = ""
-         bricks = databricks()
-         bricks.configuration(None, accept_partial=True)
- 
- 
-+def test_shared_cluster_authentication(mock_databricks_env) -> None:
-+    """Test that default SDK authentication is used when no explicit credentials
-+    are provided and notebook context is unavailable."""
-+
-+    def mock_authenticator():
-+        return {"Authorization": "Bearer mock-token"}
-+
-+    mock_databricks_env.config.authenticate = mock_authenticator
-+    mock_databricks_env.config.auth_type = "azure-cli"
-+
-+    creds = DatabricksCredentials(
-+        catalog="test_catalog",
-+        server_hostname="test.databricks.com",
-+        http_path="/sql/1.0/test",
-+    )
-+    creds.on_resolved()
-+
-+    assert callable(creds.access_token)
-+    assert creds.access_token == mock_authenticator
-+
-+    params = creds.to_connector_params()
-+    assert "credentials_provider" in params
-+    assert callable(params["credentials_provider"])
-+
-+
-+def test_cluster_context_connection_params(mock_databricks_env, mocker) -> None:
-+    """Test that server_hostname and http_path are derived from the notebook
-+    cluster context when not explicitly provided."""
-+    mock_ws = mock_databricks_env
-+    mock_ws.config.host = "https://adb-1234567890123456.12.azuredatabricks.net"
-+    _setup_sdk_auth(mock_ws)
-+    _setup_notebook_context(mock_ws, mocker)
-+
-+    creds = DatabricksCredentials(catalog="test_catalog")
-+    creds.on_resolved()
-+
-+    assert creds.server_hostname == "adb-1234567890123456.12.azuredatabricks.net"
-+    assert creds.http_path == "/sql/protocolv1/o/1234567890123456/0123-456789-abcdefgh"
-+
-+
-+def test_warehouse_provides_both_params(mock_databricks_env, mocker) -> None:
-+    """No workspace URL, no cluster context — both server_hostname and http_path
-+    come from the first warehouse on the list."""
-+    _setup_sdk_auth(mock_databricks_env)
-+    _setup_warehouse(mock_databricks_env, mocker)
-+
-+    creds = DatabricksCredentials(catalog="test_catalog")
-+    creds.on_resolved()
-+
-+    assert creds.server_hostname == "warehouse.databricks.com"
-+    assert creds.http_path == "/sql/1.0/warehouses/wh-1"
-+
-+
-+def test_hostname_from_workspace_http_path_from_warehouse(mock_databricks_env, mocker) -> None:
-+    """Workspace URL resolves server_hostname before warehouse fallback, so
-+    warehouse only fills in http_path."""
-+    mock_databricks_env.config.host = "https://adb-123.azuredatabricks.net"
-+    _setup_sdk_auth(mock_databricks_env)
-+    _setup_warehouse(mock_databricks_env, mocker)
-+
-+    creds = DatabricksCredentials(catalog="test_catalog")
-+    creds.on_resolved()
-+
-+    assert creds.server_hostname == "adb-123.azuredatabricks.net"
-+    assert creds.http_path == "/sql/1.0/warehouses/wh-1"
-+
-+
-+def test_warehouse_id_selects_specific_warehouse(mock_databricks_env, mocker) -> None:
-+    """When DATABRICKS_WAREHOUSE_ID is set, warehouses.get() is used instead
-+    of warehouses.list()."""
-+    _setup_sdk_auth(mock_databricks_env)
-+    mock_databricks_env.config.warehouse_id = "specific-wh"
-+    _setup_warehouse(
-+        mock_databricks_env,
-+        mocker,
-+        warehouse_id="specific-wh",
-+        path="/sql/1.0/warehouses/specific-wh",
-+    )
-+
-+    creds = DatabricksCredentials(catalog="test_catalog")
-+    creds.on_resolved()
-+
-+    mock_databricks_env.warehouses.get.assert_called_once_with("specific-wh")
-+    assert creds.server_hostname == "warehouse.databricks.com"
-+    assert creds.http_path == "/sql/1.0/warehouses/specific-wh"
-+
-+
-+def test_explicit_params_skip_auto_resolution(mock_databricks_env) -> None:
-+    """Test that explicitly provided server_hostname and http_path are not
-+    overwritten by auto-resolution."""
-+    mock_databricks_env.config.host = "https://should-not-overwrite.databricks.net"
-+    _setup_sdk_auth(mock_databricks_env)
-+
-+    creds = DatabricksCredentials(
-+        catalog="test_catalog",
-+        server_hostname="explicit.databricks.com",
-+        http_path="/sql/1.0/explicit",
-+    )
-+    creds.on_resolved()
-+
-+    assert creds.server_hostname == "explicit.databricks.com"
-+    assert creds.http_path == "/sql/1.0/explicit"
-+
-+
-+def test_notebook_token_overwritten_by_sdk_auth(mock_databricks_env, mocker) -> None:
-+    """Test that w.config.authenticate always takes precedence over notebook
-+    token — matches devel behavior where the second try block overwrites."""
-+
-+    def sdk_authenticator():
-+        return {"Authorization": "Bearer sdk-token"}
-+
-+    mock_databricks_env.config.authenticate = sdk_authenticator
-+    mock_databricks_env.config.auth_type = "azure-cli"
-+    _setup_notebook_context(mock_databricks_env, mocker)
-+
-+    creds = DatabricksCredentials(
-+        catalog="test_catalog",
-+        server_hostname="test.databricks.com",
-+        http_path="/sql/1.0/test",
-+    )
-+    creds.on_resolved()
-+
-+    # sdk authenticator overwrites notebook token (devel parity)
-+    assert creds.access_token is sdk_authenticator
-+
-+
- @pytest.mark.parametrize("auth_type", ("pat", "oauth2"))
- def test_default_credentials(auth_type: str) -> None:
-     # create minimal default env
-
-
-===== COMMIT b3990a91 =====
-
-
-commit b3990a910
-Author: AyushPatel101
-Date: 2026-03-06
-
-    fix: set start_out_of_range flag when row equals start_value with range_start="open" (#3708)
-
-diff --git a/dlt/extract/incremental/transform.py b/dlt/extract/incremental/transform.py
-index 5a7b46cf8..634897bcb 100644
---- a/dlt/extract/incremental/transform.py
-+++ b/dlt/extract/incremental/transform.py
-@@ -328,7 +328,7 @@ class JsonIncremental(IncrementalTransform):
- 
-             if self.range_start == "open" and processed_row_value == self.start_value:
-                 # We only want greater than start_value
--                return None, False, False
-+                return None, True, False
- 
-             # skip the record that is not a start_value or new_value: that record was already processed
-             if self.start_value is None:
-diff --git a/tests/extract/test_incremental.py b/tests/extract/test_incremental.py
-index 9be3d27d3..2f21de5a6 100644
---- a/tests/extract/test_incremental.py
-+++ b/tests/extract/test_incremental.py
-@@ -2301,6 +2301,29 @@ def test_out_of_range_flags(item_type: TestDataItemFormat) -> None:
-     pipeline.extract(ascending_single_item())
- 
- 
-+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
-+def test_start_out_of_range_open_equals_start_value(item_type: TestDataItemFormat) -> None:
-+    """start_out_of_range is set when row equals start_value with range_start='open'"""
-+
-+    @dlt.resource
-+    def descending(
-+        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
-+            "updated_at", initial_value=10, row_order="desc", range_start="open"
-+        )
-+    ) -> Any:
-+        # descending from 12 down to 8, with value 10 == start_value
-+        for i in [12, 11, 10, 9, 8]:
-+            yield data_to_item_format(item_type, [{"updated_at": i}])
-+            # 10 equals start_value and range_start="open" so it's out of range
-+            if i <= 10:
-+                assert updated_at.start_out_of_range is True
-+
-+    # early stopping should close the generator when row_order="desc"
-+    data = list(descending)
-+    # only 12 and 11 are > 10 (open range excludes 10)
-+    assert data_item_length(data) == 2
-+
-+
- @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
- def test_async_row_order_out_of_range(item_type: TestDataItemFormat) -> None:
-     @dlt.resource
-
-
-===== COMMIT 3201e053 =====
-
-
-commit 3201e053d
-Author: Denis Krivenko
-Date: 2026-03-05
-
-    fix: docstring typo in BigQuery factory (#3705)
-
-diff --git a/dlt/destinations/impl/bigquery/factory.py b/dlt/destinations/impl/bigquery/factory.py
-index 3d3781823..d0ed90da1 100644
---- a/dlt/destinations/impl/bigquery/factory.py
-+++ b/dlt/destinations/impl/bigquery/factory.py
-@@ -179,7 +179,7 @@ class bigquery(Destination[BigQueryClientConfiguration, "BigQueryClient"]):
-         environment: str = None,
-         **kwargs: Any,
-     ) -> None:
--        """Configure the MsSql destination to use in a pipeline.
-+        """Configure the BigQuery destination to use in a pipeline.
- 
-         All arguments provided here supersede other configuration sources such as environment variables and dlt config files.
- 
-
-
-===== COMMIT bcf8b93a =====
-
-
-commit bcf8b93a5
-Author: Travior
-Date: 2026-03-05
-
-    fix(lance): allow `dataset_name=None` when instantiating dataset (#3710)
-
-diff --git a/dlt/destinations/impl/lancedb/sql_client.py b/dlt/destinations/impl/lancedb/sql_client.py
-index 423792620..3dc173878 100644
---- a/dlt/destinations/impl/lancedb/sql_client.py
-+++ b/dlt/destinations/impl/lancedb/sql_client.py
-@@ -124,9 +124,19 @@ class LanceDBSQLClient(DuckDbSqlClient):
- 
-     def create_view(self, table_name: str) -> None:
-         lance_table_uri = get_lance_table_uri(self.lancedb_client, table_name)
-+
-+        # lancedb allows omitting the dataset_name, calling `make_qualified_table_name` will
-+        # prepend the dataset_name even if it is None
-+        if self.dataset_name:
-+            view_name = self.make_qualified_table_name(table_name)
-+        else:
-+            view_name = self.capabilities.escape_identifier(
-+                self.capabilities.casefold_identifier(table_name)
-+            )
-+
-         create_view_sql = _prepare_create_view_statement(
-             lance_table_uri=lance_table_uri,
--            view_name=self.make_qualified_table_name(table_name),
-+            view_name=view_name,
-         )
-         try:
-             self.open_connection().execute(create_view_sql)
-diff --git a/tests/load/lancedb/test_pipeline.py b/tests/load/lancedb/test_pipeline.py
-index fc855c109..c738f735d 100644
---- a/tests/load/lancedb/test_pipeline.py
-+++ b/tests/load/lancedb/test_pipeline.py
-@@ -561,6 +561,10 @@ def test_empty_dataset_allowed() -> None:
-     assert client.sentinel_table == "dltSentinelTable"  # type: ignore
-     assert_table(pipe, "content", expected_items_count=3)
- 
-+    dataset = pipe.dataset()
-+    rows = dataset.content.select("value").fetchall()
-+    assert len(rows) == 3
-+
- 
- def test_lancedb_remove_nested_orphaned_records_with_chunks() -> None:
-     @dlt.resource(
-
-
-===== COMMIT 68c9b7f3 =====
-
-
-commit 68c9b7f30
-Author: rudolfix
-Date: 2026-03-04
-
-    (feat) adds iceberg table properties (#3699)
-
 diff --git a/dlt/common/libs/deltalake.py b/dlt/common/libs/deltalake.py
 index decc968d1..5d50923ea 100644
 --- a/dlt/common/libs/deltalake.py
@@ -2799,4 +1448,1342 @@ Author: rudolfix
 Date: 2026-03-01
 
     fix: replace commonprefix with commonpath in FileStorage.is_path_in_storage (CWE-22) (#3678)
+
+diff --git a/dlt/common/storages/file_storage.py b/dlt/common/storages/file_storage.py
+index e1f502bd9..f7a005d2a 100644
+--- a/dlt/common/storages/file_storage.py
++++ b/dlt/common/storages/file_storage.py
+@@ -268,9 +268,11 @@ class FileStorage:
+         if not os.path.isabs(path):
+             path = os.path.join(self.storage_path, path)
+         file = os.path.realpath(path)
+-        # return true, if the common prefix of both is equal to directory
+-        # e.g. /a/b/c/d.rst and directory is /a/b, the common prefix is /a/b
+-        return os.path.commonprefix([file, self.storage_path]) == self.storage_path
++        try:
++            return os.path.commonpath([file, self.storage_path]) == self.storage_path
++        except ValueError:
++            # paths on different drives on windows
++            return False
+ 
+     def to_relative_path(self, path: str) -> str:
+         if path == "":
+diff --git a/tests/common/storages/test_file_storage.py b/tests/common/storages/test_file_storage.py
+index 9d53f2cc0..4f197fd31 100644
+--- a/tests/common/storages/test_file_storage.py
++++ b/tests/common/storages/test_file_storage.py
+@@ -75,6 +75,10 @@ def test_in_storage(test_storage: FileStorage) -> None:
+         )
+         is True
+     )
++    # CWE-22: sibling directory with prefix-matching name must not pass
++    # os.path.commonprefix would incorrectly match "/storage_evil" against "/storage"
++    sibling_path = test_storage.storage_path + "_evil/secret.txt"
++    assert test_storage.is_path_in_storage(sibling_path) is False
+ 
+ 
+ def test_from_wd_to_relative_path(test_storage: FileStorage) -> None:
+
+
+===== COMMIT 7c760e05 =====
+
+
+commit 7c760e055
+Author: rudolfix
+Date: 2026-03-01
+
+    (fix) dev mode survives attach and reset (#3662)
+
+diff --git a/dlt/common/destination/client.py b/dlt/common/destination/client.py
+index fb6157fec..1d1dd887b 100644
+--- a/dlt/common/destination/client.py
++++ b/dlt/common/destination/client.py
+@@ -613,20 +613,31 @@ class JobClientBase(ABC):
+ class WithStateSync(ABC):
+     @abstractmethod
+     def get_stored_schema(self, schema_name: str = None) -> Optional[StorageSchemaInfo]:
+-        """
+-        Retrieves newest schema with given name from destination storage
++        """Retrieves newest schema with given name from destination storage.
++
+         If no name is provided, the newest schema found is retrieved.
++        Returns None if the schema is not found or if the dataset/storage tables
++        do not exist (DestinationUndefinedEntity is suppressed by SQL implementations).
+         """
+         pass
+ 
+     @abstractmethod
+     def get_stored_schema_by_hash(self, version_hash: str) -> StorageSchemaInfo:
+-        """retrieves the stored schema by hash"""
++        """Retrieves the stored schema by hash.
++
++        Returns None if not found or if the dataset/storage tables do not exist
++        (DestinationUndefinedEntity is suppressed by SQL implementations).
++        """
+         pass
+ 
+     @abstractmethod
+     def get_stored_state(self, pipeline_name: str) -> Optional[StateInfo]:
+-        """Loads compressed state from destination storage"""
++        """Loads compressed state from destination storage.
++
++        Returns None if no state is found for the given pipeline name.
++        Raises DestinationUndefinedEntity if the state or loads tables do not exist
++        on the destination (e.g. pipeline never ran).
++        """
+         pass
+ 
+ 
+diff --git a/dlt/common/destination/configuration.py b/dlt/common/destination/configuration.py
+index 9af547a1c..80fa7b685 100644
+--- a/dlt/common/destination/configuration.py
++++ b/dlt/common/destination/configuration.py
+@@ -40,7 +40,7 @@ class ParquetFormatConfiguration(BaseConfiguration):
+ 
+     def max_timestamp_precision(self) -> int:
+         if (self.flavor or "").lower() == "spark":
+-            base = get_precision_from_datetime_unit("ns")  # INT96 → treat as ns-capable
++            base = get_precision_from_datetime_unit("ns")  # INT96 -> treat as ns-capable
+         else:
+             v = float(self.version or "0.0")
+             base = (
+diff --git a/dlt/common/libs/sqlglot.py b/dlt/common/libs/sqlglot.py
+index 7de8aa7ee..58599344b 100644
+--- a/dlt/common/libs/sqlglot.py
++++ b/dlt/common/libs/sqlglot.py
+@@ -960,11 +960,11 @@ def bind_query(
+ 
+     Binding steps performed:
+     1. **Table name expansion**: Resolves table references to fully qualified physical paths
+-       (e.g., for ClickHouse: `dataset.table` → `dataset___table`)
++       (e.g., for ClickHouse: `dataset.table` -> `dataset___table`)
+     2. **Identifier case-folding**: Applies destination-specific case transformation
+        (`str.upper` for Snowflake, `str.lower` for most databases, `str` for case-sensitive)
+     3. **Identifier quoting**: Quotes all identifiers for safe execution and to preserve
+-       exact casing (e.g., `column_name` → `"column_name"`)
++       exact casing (e.g., `column_name` -> `"column_name"`)
+     4. **Alias preservation**: For case-folding destinations, adds aliases to SELECT columns
+        to maintain compatibility with dlt schema naming (e.g., `SELECT "VALUE" AS "value"`)
+ 
+diff --git a/dlt/common/pipeline.py b/dlt/common/pipeline.py
+index a28ffdd1a..75fe8e6df 100644
+--- a/dlt/common/pipeline.py
++++ b/dlt/common/pipeline.py
+@@ -479,6 +479,8 @@ class TPipelineLocalState(TypedDict, total=False):
+     """Run dir when pipeline was instantiated for a first time, defaults to cwd on OSS run context"""
+     last_run_context: Optional[TLastRunContext]
+     """Context from the last successful pipeline run or sync"""
++    _dev_mode: bool
++    """Tracks whether pipeline was created in dev_mode"""
+ 
+ 
+ class TPipelineState(TVersionedState, total=False):
+diff --git a/dlt/dataset/dataset.py b/dlt/dataset/dataset.py
+index 9ce399187..f3dd4699a 100644
+--- a/dlt/dataset/dataset.py
++++ b/dlt/dataset/dataset.py
+@@ -10,6 +10,7 @@ import dlt
+ from dlt.common.destination.exceptions import OpenTableClientNotAvailable
+ from dlt.common.libs.sqlglot import TSqlGlotDialect
+ from dlt.common.json import json
++from dlt.common.versioned_state import decompress_state
+ from dlt.common.destination.reference import AnyDestination, TDestinationReferenceArg, Destination
+ from dlt.common.destination.client import JobClientBase, SupportsOpenTables, WithStateSync
+ from dlt.common.schema import Schema
+@@ -21,7 +22,10 @@ from dlt.destinations.sql_client import SqlClientBase, WithSqlClient
+ from dlt.dataset import lineage
+ from dlt.dataset.utils import get_destination_clients
+ from dlt.destinations.queries import build_row_counts_expr
+-from dlt.common.destination.exceptions import SqlClientNotAvailable
++from dlt.common.destination.exceptions import (
++    DestinationUndefinedEntity,
++    SqlClientNotAvailable,
++)
+ 
+ if TYPE_CHECKING:
+     from dlt.common.libs.ibis import ir
+@@ -41,6 +45,8 @@ class Dataset:
+         self._destination: AnyDestination = Destination.from_reference(destination)
+         self._dataset_name = dataset_name
+         self._schema: Union[dlt.Schema, str, None] = schema
++        self._pipeline_name: Optional[str] = None
++        """If _schema not provided, used to get default schema from state"""
+         # self._sqlglot_schema: SQLGlotSchema = None
+         self._sql_client: SqlClientBase[Any] = None
+         self._opened_sql_client: SqlClientBase[Any] = None
+@@ -79,7 +85,7 @@ class Dataset:
+             )
+ 
+         if not maybe_schema:
+-            maybe_schema = _get_dataset_schema_from_destination_using_dataset_name(self)
++            maybe_schema = _get_dataset_schema_from_dataset_dlt_tables(self)
+ 
+         if not maybe_schema:
+             # uses local dlt pipeline data instead of destination
+@@ -445,21 +451,37 @@ def _get_dataset_schema_from_destination_using_schema_name(
+     return schema
+ 
+ 
+-def _get_dataset_schema_from_destination_using_dataset_name(
++def _get_dataset_schema_from_dataset_dlt_tables(
+     dataset: dlt.Dataset,
+ ) -> Optional[dlt.Schema]:
+-    schema = None
++    """Resolves schema from destination. First tries pipeline state to get default_schema_name,
++    then falls back to most recently stored schema."""
+     with get_destination_clients(
+         schema=dlt.Schema(dataset.dataset_name),
+         destination=dataset._destination,
+         destination_dataset_name=dataset.dataset_name,
+     )[0] as client:
+         if isinstance(client, WithStateSync):
++            # try to resolve via pipeline state for correct default schema
++            pipeline_name = dataset._pipeline_name
++            if pipeline_name:
++                try:
++                    stored_state = client.get_stored_state(pipeline_name)
++                except DestinationUndefinedEntity:
++                    # state tables may not exist if pipeline never ran
++                    stored_state = None
++                if stored_state:
++                    state = decompress_state(stored_state.state)
++                    schema_name = state.get("default_schema_name")
++                    if schema_name:
++                        stored_schema = client.get_stored_schema(schema_name)
++                        if stored_schema:
++                            return dlt.Schema.from_stored_schema(json.loads(stored_schema.schema))
++            # fall back to most recently stored schema
+             stored_schema = client.get_stored_schema()
+             if stored_schema:
+-                schema = dlt.Schema.from_stored_schema(json.loads(stored_schema.schema))
+-
+-    return schema
++                return dlt.Schema.from_stored_schema(json.loads(stored_schema.schema))
++    return None
+ 
+ 
+ def _get_load_ids(dataset: dlt.Dataset) -> list[str]:
+diff --git a/dlt/pipeline/pipeline.py b/dlt/pipeline/pipeline.py
+index f4608f942..c46e28d31 100644
+--- a/dlt/pipeline/pipeline.py
++++ b/dlt/pipeline/pipeline.py
+@@ -295,7 +295,8 @@ class Pipeline(SupportsPipeline):
+     # default_schema_name: str
+     schema_names: List[str]
+     dev_mode: bool
+-    must_attach_to_local_pipeline: bool
++    attached_pipeline: bool
++    """Pipeline got attached to existing working dir"""
+     pipelines_dir: str
+     """A directory where the pipelines' working directories are created"""
+     _destination: AnyDestination
+@@ -354,11 +355,19 @@ class Pipeline(SupportsPipeline):
+         self._init_working_dir(pipeline_name, pipelines_dir)
+ 
+         with self.managed_state() as state:
+-            self._configure(import_schema_path, export_schema_path, must_attach_to_local_pipeline)
++            self._configure(
++                import_schema_path,
++                export_schema_path,
++                must_attach_to_local_pipeline,
++                managed_state=state,
++            )
+             # changing the destination could be dangerous if pipeline has pending load packages
+             self._set_destinations(destination=destination, staging=staging, initializing=True)
+             # set the pipeline properties from state, destination and staging will not be set
+             self._state_to_props(state)
++            # restore dev_mode flag from state when attaching
++            if must_attach_to_local_pipeline:
++                self.dev_mode = state["_local"].get("_dev_mode", False)
+             # TODO: compare run_context with last_run_context restored from props. warn on changed uri
+             # we overwrite the state with the values from init
+             self._set_dataset_name(dataset_name)
+@@ -1246,7 +1255,11 @@ class Pipeline(SupportsPipeline):
+             self._wipe_working_folder()
+ 
+     def _configure(
+-        self, import_schema_path: str, export_schema_path: str, must_attach_to_local_pipeline: bool
++        self,
++        import_schema_path: str,
++        export_schema_path: str,
++        attach_pipeline: bool,
++        managed_state: Optional[TPipelineState] = None,
+     ) -> None:
+         # create schema storage and folders
+         self._schema_storage_config = SchemaStorageConfiguration(
+@@ -1260,21 +1273,40 @@ class Pipeline(SupportsPipeline):
+ 
+         # are we running again?
+         has_state = self._pipeline_storage.has_file(Pipeline.STATE_FILE)
+-        if must_attach_to_local_pipeline and not has_state:
++        if attach_pipeline and not has_state:
+             raise CannotRestorePipelineException(
+                 self.pipeline_name,
+                 self.pipelines_dir,
+                 f"the pipeline was not found in {self.working_dir}.",
+             )
+ 
+-        self.must_attach_to_local_pipeline = must_attach_to_local_pipeline
+-        # attach to pipeline if folder exists and contains state
++        self.attached_pipeline = attach_pipeline
++
++        # detect dev->non-dev transition from already-loaded state
++        if managed_state is not None and has_state and not attach_pipeline:
++            if managed_state["_local"].get("_dev_mode", False) and not self.dev_mode:
++                logger.warning(
++                    f"Pipeline {self.pipeline_name} was previously created with"
++                    " dev_mode=True and is now being re-created with dev_mode=False."
++                    " Local pipeline state and schemas will be reset. The pipeline"
++                    " will sync state from the destination on the next run or"
++                    " dataset access."
++                )
++                managed_state.clear()  # type: ignore[attr-defined]
++                managed_state.update(default_pipeline_state())
++                has_state = False
++
++        # attach to pipeline if state exists
+         if has_state:
+             self._attach_pipeline()
+         else:
+             # this will erase the existing working folder
+             self._create_pipeline()
+ 
++        # persist current dev_mode for future transition detection
++        if managed_state is not None and not attach_pipeline:
++            managed_state["_local"]["_dev_mode"] = self.dev_mode
++
+         # create schema storage
+         self._schema_storage = LiveSchemaStorage(self._schema_storage_config, makedirs=True)
+ 
+@@ -1890,6 +1922,8 @@ class Pipeline(SupportsPipeline):
+                 self.dataset_name,
+                 schema=schema,
+             )
++            # allow dataset to lazily resolve schema from pipeline state
++            dataset._pipeline_name = self.pipeline_name
+             success = True
+             return dataset
+         except Exception:
+diff --git a/dlt/pipeline/state_sync.py b/dlt/pipeline/state_sync.py
+index 84183ffa2..61d2e06e4 100644
+--- a/dlt/pipeline/state_sync.py
++++ b/dlt/pipeline/state_sync.py
+@@ -142,6 +142,7 @@ def default_pipeline_state() -> TPipelineState:
+         "_state_engine_version": PIPELINE_STATE_ENGINE_VERSION,
+         "_local": {
+             "first_run": True,
++            "_dev_mode": False,
+             # keep the initial run dir when the pipeline was created
+             "initial_cwd": os.path.abspath(dlt.current.run_context().local_dir),
+         },
+diff --git a/tests/load/pipeline/test_pipelines.py b/tests/load/pipeline/test_pipelines.py
+index f563d861f..39a4a551c 100644
+--- a/tests/load/pipeline/test_pipelines.py
++++ b/tests/load/pipeline/test_pipelines.py
+@@ -413,16 +413,40 @@ def test_run_dev_mode(destination_config: DestinationTestConfiguration) -> None:
+     # print(p.default_schema.to_pretty_yaml())
+     # print(info)
+ 
+-    # restore the pipeline
++    # attach the pipeline
+     p = dlt.attach()
+     # restored pipeline should be never put in full refresh
+-    assert p.dev_mode is False
++    assert p.dev_mode is True
+     # assert parent table (easy), None First (db order)
+     assert_table_column(p, "lists", [None, None, "a"], info=info)
+     # child tables contain nested lists
+     data_list = cast(List[str], data[1]) + cast(List[str], data[2])
+     assert_table_column(p, "lists__value", sorted(data_list))
+ 
++    # now restore the pipeline via attach
++    p._wipe_working_folder()
++    p = dlt.attach(
++        dataset_name=info.dataset_name,
++        destination=destination_config.destination_factory(),
++        staging=destination_config.staging,
++    )
++    # now dev mode is false
++    assert p.dev_mode is False
++    # but you can read data
++    assert_table_column(p, "lists", [None, None, "a"], info=info)
++
++    # now restore via pipeline
++    p._wipe_working_folder()
++    p = dlt.pipeline(
++        dataset_name=info.dataset_name,
++        destination=destination_config.destination_factory(),
++        staging=destination_config.staging,
++    )
++    # now dev mode is false
++    assert p.dev_mode is False
++    # but you can read data
++    assert_table_column(p, "lists", [None, None, "a"], info=info)
++
+ 
+ @pytest.mark.essential
+ @pytest.mark.parametrize(
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index ad00f35df..022a0d5c9 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -350,6 +350,203 @@ def test_run_dev_mode_underscored_dataset() -> None:
+     assert r_p.dataset_name.endswith(p._pipeline_instance_id)
+ 
+ 
++@pytest.mark.parametrize("dataset_name", ["my_test_dataset", None])
++def test_dev_mode_to_non_dev_resets_state(dataset_name: Optional[str]) -> None:
++    """After dev_mode→non-dev, state is fully reset (#3276)."""
++    pipeline_name = "pipe_dev_mode_" + uniq_id()
++    p = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset_name,
++        dev_mode=True,
++    )
++    dev_instance_id = p._pipeline_instance_id
++    assert p.dataset_name.endswith(dev_instance_id)
++    p.run([{"id": 1}, {"id": 2}], table_name="items")
++
++    p2 = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset_name,
++        dev_mode=False,
++    )
++    assert not p2.dataset_name.endswith(dev_instance_id)
++    assert p2.first_run is True
++    assert p2.default_schema_name is None
++    assert p2.schema_names == []
++    if dataset_name:
++        assert p2.dataset_name == dataset_name
++
++
++def test_dev_mode_attach_preserves_state_and_flag() -> None:
++    """attach() preserves dev data, dev_mode flag, and flag survives multiple attaches."""
++    pipeline_name = "pipe_dev_mode_" + uniq_id()
++
++    p = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name="my_data",
++        dev_mode=True,
++    )
++    dev_dataset = p.dataset_name
++    dev_instance_id = p._pipeline_instance_id
++    info = p.run([{"id": 1}, {"id": 2}], table_name="items")
++    assert_load_info(info)
++
++    # attach preserves dev state and data
++    r_p = dlt.attach(pipeline_name=pipeline_name)
++    assert r_p.dataset_name == dev_dataset
++    assert r_p.dev_mode is True
++    rows = r_p.dataset().items.fetchall()
++    assert len(rows) == 2
++
++    # second attach still preserves _dev_mode flag
++    r_p2 = dlt.attach(pipeline_name=pipeline_name)
++    assert r_p2.dev_mode is True
++
++    # transition to non-dev still triggers reset after multiple attaches
++    p2 = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name="my_data",
++        dev_mode=False,
++    )
++    assert p2.dataset_name == "my_data"
++    assert not p2.dataset_name.endswith(dev_instance_id)
++    assert p2.first_run is True
++
++
++def test_dev_mode_reset_dataset_readable_without_run() -> None:
++    """After non-dev→dev→non-dev reset, dataset() can still read original data."""
++    pipeline_name = "pipe_dev_mode_" + uniq_id()
++    dataset = "read_test"
++
++    # 1. production run
++    p = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset,
++        dev_mode=False,
++    )
++    info = p.run([{"id": 1, "val": "prod"}], table_name="items")
++    assert_load_info(info)
++    # simulare another schema after a short gap so it will be loaded as default
++    # at the end
++    sleep(0.3)
++    p.run([{"id": 2, "val": "stage"}], table_name="items_2", schema=Schema("second"))
++
++    # 2. dev run with different data
++    p_dev = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset,
++        dev_mode=True,
++    )
++    info_dev = p_dev.run([{"id": 99, "val": "dev"}], table_name="items")
++    assert_load_info(info_dev)
++
++    # 3. back to non-dev — no run(), just dataset()
++    p2 = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset,
++        dev_mode=False,
++    )
++    assert p2.first_run is True
++    assert p2.default_schema_name is None
++    # data from original production run should be readable
++    ds = p2.dataset()
++    assert not ds.schema.is_new
++    rows = ds.items.fetchall()
++    ids = {r[0] for r in rows}
++    assert 1 in ids
++    assert 99 not in ids
++
++
++def test_dev_mode_reset_syncs_with_destination() -> None:
++    """non-dev run → dev run → non-dev run restores original data via destination sync."""
++    pipeline_name = "pipe_dev_mode_" + uniq_id()
++    dataset = "prod_data"
++
++    # 1. production run
++    p = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset,
++        dev_mode=False,
++    )
++    info = p.run([{"id": 1, "val": "prod"}], table_name="items")
++    assert_load_info(info)
++    assert p.dataset_name == dataset
++    assert p.first_run is False
++
++    # 2. dev experiment with different data
++    p_dev = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset,
++        dev_mode=True,
++    )
++    assert p_dev.dataset_name.startswith(dataset)
++    assert p_dev.dataset_name != dataset
++    info_dev = p_dev.run([{"id": 99, "val": "dev"}], table_name="items")
++    assert_load_info(info_dev)
++
++    # 3. back to production — reset triggers, sync_destination restores original state
++    p2 = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset,
++        dev_mode=False,
++    )
++    assert p2.dataset_name == dataset
++    assert p2.first_run is True
++    # run to trigger sync_destination which restores state from destination
++    info2 = p2.run([{"id": 2, "val": "prod2"}], table_name="items")
++    assert_load_info(info2)
++    assert p2.first_run is False
++    # original production data + new row visible, not the dev data
++    rows = p2.dataset().items.fetchall()
++    ids = {r[0] for r in rows}
++    assert 1 in ids
++    assert 2 in ids
++    assert 99 not in ids
++
++
++def test_dev_mode_configured_via_env_then_removed() -> None:
++    """dev_mode set via config env var, then removed — should reset to regular dataset (#3276)."""
++    pipeline_name = "pipe_cfg_dev_" + uniq_id()
++    dataset_name = "cfg_data"
++    env_key = f"PIPELINES__{pipeline_name.upper()}__DEV_MODE"
++
++    # 1. enable dev_mode via env var and run
++    os.environ[env_key] = "true"
++    try:
++        p = dlt.pipeline(
++            pipeline_name=pipeline_name,
++            destination="duckdb",
++            dataset_name=dataset_name,
++        )
++        assert p.dev_mode is True
++        dev_dataset = p.dataset_name
++        assert dev_dataset != dataset_name
++        info = p.run([{"id": 1}], table_name="items")
++        assert_load_info(info)
++    finally:
++        del os.environ[env_key]
++
++    # 2. config removed — dev_mode defaults to False, should detect transition and reset
++    p2 = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset_name,
++    )
++    assert p2.dev_mode is False
++    assert p2.dataset_name == dataset_name
++    assert p2.first_run is True
++    assert p2.default_schema_name is None
++
++
+ def test_dataset_pipeline_never_ran() -> None:
+     p = dlt.pipeline(destination="duckdb", dev_mode=True, dataset_name="_main_")
+     # we get a dataset with an empty schema with the name of the dataset
+@@ -367,6 +564,64 @@ def test_dataset_unknown_schema() -> None:
+     assert set(dataset.schema.tables.keys()) == {"_dlt_version", "_dlt_loads"}
+ 
+ 
++def test_dataset_no_state_but_has_schema() -> None:
++    """When restore_from_destination is disabled, state is not stored but schemas are.
++    dataset() should still resolve schema from destination."""
++    pipeline_name = "pipe_no_state_" + uniq_id()
++    dataset_name = "no_state_ds"
++    p = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset_name,
++    )
++    p.config.restore_from_destination = False
++    p.run([{"id": 1}], table_name="items")
++
++    # re-create pipeline — no sync_destination, local state wiped by dev_mode
++    p2 = dlt.pipeline(
++        pipeline_name=pipeline_name,
++        destination="duckdb",
++        dataset_name=dataset_name,
++        dev_mode=True,
++    )
++    p2.config.restore_from_destination = False
++    # point back at original dataset to test schema resolution without state
++    p2.dataset_name = dataset_name
++    dataset = p2.dataset()
++    # schema should be resolved from _dlt_version table (schemas are always stored)
++    assert not dataset.schema.is_new
++    assert "items" in dataset.schema.tables
++
++
++def test_dataset_empty_dataset_on_destination() -> None:
++    """When dataset exists on destination but has no dlt tables, schema falls back to empty."""
++    p = dlt.pipeline(
++        pipeline_name="pipe_empty_" + uniq_id(),
++        destination="duckdb",
++        dataset_name="empty_ds",
++    )
++    # create the duckdb schema (dataset) with a non-dlt table
++    with p.sql_client() as client:
++        client.execute_sql(f'CREATE SCHEMA IF NOT EXISTS "{p.dataset_name}"')
++        client.execute_sql(f'CREATE TABLE "{p.dataset_name}".dummy (x INT)')
++    dataset = p.dataset()
++    assert dataset.schema.is_new
++    assert set(dataset.schema.tables.keys()) == {"_dlt_version", "_dlt_loads"}
++
++
++def test_dataset_non_existing_dataset_on_destination() -> None:
++    """When dataset does not exist at all on destination, schema falls back to empty."""
++    p = dlt.pipeline(
++        pipeline_name="pipe_noexist_" + uniq_id(),
++        destination="duckdb",
++        dataset_name="this_dataset_does_not_exist",
++    )
++    dataset = p.dataset()
++    assert dataset.schema.is_new
++    assert dataset.schema.name == p.dataset_name
++    assert set(dataset.schema.tables.keys()) == {"_dlt_version", "_dlt_loads"}
++
++
+ def test_pipeline_with_non_alpha_name() -> None:
+     name = "another pipeline %__8329イロハニホヘト"
+     # contains %
+
+
+===== COMMIT 5e2d6ecf =====
+
+
+commit 5e2d6ecf9
+Author: rudolfix
+Date: 2026-03-01
+
+    (fix) implements monotonic wall clock (#3695)
+
+diff --git a/dlt/_workspace/deployment/package_builder.py b/dlt/_workspace/deployment/package_builder.py
+index 64e033eb5..631f2520d 100644
+--- a/dlt/_workspace/deployment/package_builder.py
++++ b/dlt/_workspace/deployment/package_builder.py
+@@ -4,10 +4,10 @@ from pathlib import Path
+ import tarfile
+ import yaml
+ 
+-from dlt.common.time import precise_time
++from dlt.common.storages.load_package import create_load_id
+ from dlt.common.utils import digest256_tar_stream
+ 
+-from dlt._workspace.deployment.file_selector import BaseFileSelector, WorkspaceFileSelector
++from dlt._workspace.deployment.file_selector import BaseFileSelector
+ from dlt._workspace.deployment.manifest import (
+     TDeploymentFileItem,
+     TDeploymentManifest,
+@@ -71,7 +71,7 @@ class PackageBuilder:
+ 
+     def build_package(self, file_selector: BaseFileSelector) -> Tuple[Path, str]:
+         """Create deployment package file, return (path, content_hash)"""
+-        package_name = DEFAULT_DEPLOYMENT_PACKAGE_LAYOUT.format(timestamp=str(precise_time()))
++        package_name = DEFAULT_DEPLOYMENT_PACKAGE_LAYOUT.format(timestamp=create_load_id())
+         package_path = Path(self.run_context.get_data_entity(package_name))
+ 
+         with open(package_path, "w+b") as f:
+diff --git a/dlt/_workspace/helpers/dashboard/runner.py b/dlt/_workspace/helpers/dashboard/runner.py
+index a31233d85..0326b53c2 100644
+--- a/dlt/_workspace/helpers/dashboard/runner.py
++++ b/dlt/_workspace/helpers/dashboard/runner.py
+@@ -62,8 +62,8 @@ def _wait_http_up(
+     timeout_s: float = HTTP_READY_TIMEOUT_S,
+     wait_on_ok: float = HTTP_READY_WAIT_ON_OK_S,
+ ) -> None:
+-    start = time.time()
+-    while time.time() - start < timeout_s:
++    start = time.monotonic()
++    while time.monotonic() - start < timeout_s:
+         try:
+             with urllib.request.urlopen(url, timeout=1.0):
+                 time.sleep(wait_on_ok)
+diff --git a/dlt/common/data_writers/buffered.py b/dlt/common/data_writers/buffered.py
+index be1a956c2..f89cdaa35 100644
+--- a/dlt/common/data_writers/buffered.py
++++ b/dlt/common/data_writers/buffered.py
+@@ -1,5 +1,4 @@
+ import gzip
+-import time
+ import contextlib
+ from typing import ClassVar, Iterator, List, IO, Any, Optional, Type, Generic
+ 
+@@ -16,6 +15,7 @@ from dlt.common.schema.typing import TTableSchemaColumns
+ from dlt.common.configuration import with_config, known_sections, configspec
+ from dlt.common.configuration.specs import BaseConfiguration
+ from dlt.common.destination import DestinationCapabilitiesContext
++from dlt.common.time import MonotonicPreciseTime
+ from dlt.common.utils import uniq_id
+ 
+ 
+@@ -67,6 +67,7 @@ class BufferedDataWriter(Generic[TWriter]):
+         # the open function is either gzip.open or open
+         self.open = gzip.open if self.should_compress else open
+ 
++        self._clock = MonotonicPreciseTime()
+         self._current_columns: TTableSchemaColumns = None
+         self._file_name: str = None
+         self._buffered_items: List[TDataItem] = []
+@@ -107,7 +108,7 @@ class BufferedDataWriter(Generic[TWriter]):
+             self._buffered_items.append(item)
+         self._buffered_items_count += new_rows_count
+         # set last modification date
+-        self._last_modified = time.time()
++        self._last_modified = self._clock()
+         # flush if max buffer exceeded, the second path of the expression prevents empty data frames to pile up in the buffer
+         if (
+             self._buffered_items_count >= self.buffer_max_items
+@@ -130,7 +131,7 @@ class BufferedDataWriter(Generic[TWriter]):
+         self._rotate_file()
+         if columns is not None:
+             self._current_columns = dict(columns)
+-        self._last_modified = time.time()
++        self._last_modified = self._clock()
+         return self._rotate_file(allow_empty_file=True)
+ 
+     def import_file(
+@@ -162,7 +163,7 @@ class BufferedDataWriter(Generic[TWriter]):
+         except FileNotFoundError as f_ex:
+             raise FileImportNotFound(file_path, self._file_name) from f_ex
+ 
+-        self._last_modified = time.time()
++        self._last_modified = self._clock()
+         metrics = metrics._replace(
+             file_path=self._file_name,
+             created=self._created,
+@@ -231,7 +232,7 @@ class BufferedDataWriter(Generic[TWriter]):
+         else:
+             self._file_name = f"{base_filename}.{file_extension}"
+ 
+-        self._created = time.time()
++        self._created = self._clock()
+         return metrics
+ 
+     def _flush_items(self, allow_empty_file: bool = False) -> None:
+diff --git a/dlt/common/libs/pyiceberg.py b/dlt/common/libs/pyiceberg.py
+index 6b1856acd..e978f164b 100644
+--- a/dlt/common/libs/pyiceberg.py
++++ b/dlt/common/libs/pyiceberg.py
+@@ -2,6 +2,7 @@ import os
+ from typing import Dict, Any, List, Optional, Union
+ from pathlib import Path
+ import warnings
++import time
+ 
+ from fsspec import AbstractFileSystem
+ from packaging.version import Version
+@@ -10,7 +11,6 @@ from dlt import version
+ from dlt.common import logger
+ from dlt.common.configuration import configspec
+ from dlt.common.destination.exceptions import DestinationUndefinedEntity
+-from dlt.common.time import precise_time
+ from dlt.common.libs.pyarrow import cast_arrow_schema_types
+ from dlt.common.libs.utils import load_open_tables
+ from dlt.common.pipeline import SupportsPipeline
+@@ -79,14 +79,14 @@ def write_iceberg_table(
+     data: pa.Table,
+     write_disposition: TWriteDisposition,
+ ) -> None:
+-    start_ts = precise_time()
++    start_ts = time.monotonic()
+     if write_disposition == "append":
+         table.append(ensure_iceberg_compatible_arrow_data(data))
+     elif write_disposition == "replace":
+         table.overwrite(ensure_iceberg_compatible_arrow_data(data))
+     logger.debug(
+         f"pyiceberg: {write_disposition} arrow with {data.num_rows} rows to table {table.name()} at"
+-        f" location {table.location()} took {(precise_time() - start_ts)} seconds."
++        f" location {table.location()} took {(time.monotonic() - start_ts)} seconds."
+     )
+ 
+ 
+diff --git a/dlt/common/runtime/collector.py b/dlt/common/runtime/collector.py
+index e42ad69f4..ef6168243 100644
+--- a/dlt/common/runtime/collector.py
++++ b/dlt/common/runtime/collector.py
+@@ -27,6 +27,7 @@ else:
+     tqdm = EnlCounter = EnlStatusBar = EnlManager = Any
+ 
+ from dlt.common import logger as dlt_logger
++from dlt.common.time import MonotonicPreciseTime
+ from dlt.common.exceptions import MissingDependencyException
+ from dlt.common.runtime.collector_base import Collector
+ from dlt.common.warnings import DltDeprecationWarning
+@@ -137,6 +138,7 @@ class LogCollector(Collector):
+                 )
+                 dump_system_stats = False
+         self.dump_system_stats = dump_system_stats
++        self._clock = MonotonicPreciseTime()
+         self.last_log_time: float = None
+ 
+     def update(
+@@ -154,7 +156,7 @@ class LogCollector(Collector):
+             self.counters[counter_key] = 0
+             self.counter_info[counter_key] = LogCollector.CounterInfo(
+                 description=f"{name} ({label})" if label else name,
+-                start_time=time.time(),
++                start_time=self._clock(),
+                 total=total,
+             )
+             self.messages[counter_key] = None
+@@ -175,10 +177,10 @@ class LogCollector(Collector):
+ 
+     def maybe_log(self) -> None:
+         """Check if should report and if so, call self.on_log"""
+-        current_time = time.time()
++        current_time = self._clock()
+         if self.last_log_time is None or current_time - self.last_log_time >= self.log_period:
+             self.on_log()
+-            self.last_log_time = time.time()
++            self.last_log_time = self._clock()
+ 
+     def _counter_to_log_line(
+         self, counter_key: str, count: int, info: CounterInfo, current_time: float
+@@ -223,7 +225,7 @@ class LogCollector(Collector):
+ 
+     def dump_counters(self) -> None:
+         """Dump all counters to log using the shared formatting methods."""
+-        current_time = time.time()
++        current_time = self._clock()
+         log_lines = []
+ 
+         step_header = f" {self.step} ".center(80, "-")
+@@ -253,7 +255,7 @@ class LogCollector(Collector):
+         self.counters = defaultdict(int)
+         self.counter_info = {}
+         self.messages = {}
+-        self.last_log_time = time.time()
++        self.last_log_time = self._clock()
+ 
+     def _stop(self) -> None:
+         self.on_log()
+diff --git a/dlt/common/runtime/telemetry.py b/dlt/common/runtime/telemetry.py
+index b1bf4c467..4a45bf6a4 100644
+--- a/dlt/common/runtime/telemetry.py
++++ b/dlt/common/runtime/telemetry.py
+@@ -114,11 +114,11 @@ def with_telemetry(
+             props = {p: bound_args.arguments[p] for p in args if p in bound_args.arguments}
+             # append additional props from kwargs
+             props.update(kwargs)
+-            start_ts = time.time()
++            start_ts = time.monotonic()
+ 
+             def _track(success: bool) -> None:
+                 with contextlib.suppress(Exception):
+-                    props["elapsed"] = time.time() - start_ts
++                    props["elapsed"] = time.monotonic() - start_ts
+                     props["success"] = success
+                     # resolve runtime config and init telemetry
+                     if not _TELEMETRY_STARTED:
+diff --git a/dlt/common/storages/load_package.py b/dlt/common/storages/load_package.py
+index c62d8ee8f..c0e693d71 100644
+--- a/dlt/common/storages/load_package.py
++++ b/dlt/common/storages/load_package.py
+@@ -52,7 +52,7 @@ from dlt.common.versioned_state import (
+     json_decode_state,
+     json_encode_state,
+ )
+-from dlt.common.time import precise_time
++from dlt.common.time import precise_time, increasing_precise_time
+ 
+ TJobFileFormat = Literal["sql", "reference", TLoaderFileFormat]
+ """Loader file formats with internal job types"""
+@@ -138,7 +138,7 @@ def create_load_id() -> str:
+     `dlt` executes packages in order of load ids
+     `dlt` considers a state with the highest load id to be the most up to date when restoring state from destination
+     """
+-    return str(precise_time())
++    return str(increasing_precise_time())
+ 
+ 
+ # folders to manage load jobs in a single load package
+diff --git a/dlt/common/storages/transactional_file.py b/dlt/common/storages/transactional_file.py
+index 86e9b73d1..a25f9bb3f 100644
+--- a/dlt/common/storages/transactional_file.py
++++ b/dlt/common/storages/transactional_file.py
+@@ -177,10 +177,10 @@ class TransactionalFile:
+         self._fs.touch(self.lock_path)
+         locks = self._sync_locks()
+         active_lock = min(locks)
+-        start = time.time()
++        start = time.monotonic()
+ 
+         while active_lock != self.lock_path:
+-            if not blocking or (timeout > 0 and time.time() - start > timeout):
++            if not blocking or (timeout > 0 and time.monotonic() - start > timeout):
+                 self._fs.rm(self.lock_path)
+                 return False
+ 
+diff --git a/dlt/common/time.py b/dlt/common/time.py
+index 05aaf5fa0..d5fe27ab2 100644
+--- a/dlt/common/time.py
++++ b/dlt/common/time.py
+@@ -1,5 +1,6 @@
+ import contextlib
+ import datetime  # noqa: I251
++import math
+ import re
+ import sys
+ from typing import Any, Optional, Union, overload, TypeVar, Callable  # noqa
+@@ -33,6 +34,56 @@ except ImportError:
+     precise_time = _built_in_time
+ 
+ 
++class MonotonicPreciseTime:
++    """Wall-clock timer guaranteed to never go backward.
++
++    Reads wall clock on every call and tracks the highest value seen.  When the
++    wall clock jumps backward (NTP step corrections, VM/WSL clock drift) the
++    previous high-water mark is returned instead.
++
++    Args:
++        strictly_increasing: every call returns a value strictly greater than
++            the previous one by bumping with ``math.nextafter`` when the wall
++            clock does not advance. Use for callers that need unique timestamps.
++
++    Not thread-safe. Use ``LockedMonotonicPreciseTime`` for shared instances.
++    """
++
++    def __init__(self, strictly_increasing: bool = False) -> None:
++        self._last: float = precise_time()
++        self._strictly_increasing = strictly_increasing
++
++    def __call__(self) -> float:
++        wall = precise_time()
++        if wall > self._last:
++            self._last = wall
++        elif self._strictly_increasing:
++            self._last = math.nextafter(self._last, math.inf)
++        return self._last
++
++
++class LockedMonotonicPreciseTime(MonotonicPreciseTime):
++    """Thread-safe variant using a lock (one uncontended futex CAS)."""
++
++    def __init__(self, strictly_increasing: bool = False) -> None:
++        import threading
++
++        super().__init__(strictly_increasing=strictly_increasing)
++        self._lock = threading.Lock()
++
++    def __call__(self) -> float:
++        wall = precise_time()
++        with self._lock:
++            if wall > self._last:
++                self._last = wall
++            elif self._strictly_increasing:
++                self._last = math.nextafter(self._last, math.inf)
++            return self._last
++
++
++increasing_precise_time = LockedMonotonicPreciseTime(strictly_increasing=True)
++
++
+ def timestamp_within(
+     timestamp: float, min_exclusive: Optional[float], max_inclusive: Optional[float]
+ ) -> bool:
+diff --git a/dlt/destinations/_adbc_jobs.py b/dlt/destinations/_adbc_jobs.py
+index 3cf9c5a4f..8a2dc7f71 100644
+--- a/dlt/destinations/_adbc_jobs.py
++++ b/dlt/destinations/_adbc_jobs.py
+@@ -91,7 +91,7 @@ class AdbcParquetCopyJob(RunnableLoadJob, HasFollowupJobs, ABC):
+             catalog_name, schema_name = self._set_catalog_and_schema()
+             kwargs = dict(catalog_name=catalog_name, db_schema_name=schema_name)
+ 
+-            t_ = time.time()
++            t_ = time.monotonic()
+             rows = cur.adbc_ingest(
+                 self.load_table_name,
+                 _iter_batches(self._file_path),
+@@ -101,7 +101,7 @@ class AdbcParquetCopyJob(RunnableLoadJob, HasFollowupJobs, ABC):
+             conn.commit()
+             logger.info(
+                 f"{rows} rows copied from {self._file_name} to"
+-                f" {self.load_table_name}.{schema_name} in {time.time()-t_} s"
++                f" {self.load_table_name}.{schema_name} in {time.monotonic()-t_} s"
+             )
+ 
+ 
+diff --git a/dlt/extract/items_transform.py b/dlt/extract/items_transform.py
+index 00fa53b27..c479f5b24 100644
+--- a/dlt/extract/items_transform.py
++++ b/dlt/extract/items_transform.py
+@@ -190,7 +190,7 @@ class LimitItem(ItemTransform[TDataItem, Dict[str, Any]]):
+         self.gen = pipe.gen
+         self.count = 0
+         self.exhausted = False
+-        self.start_time = time.time()
++        self.start_time = time.monotonic()
+ 
+         return self
+ 
+@@ -223,7 +223,7 @@ class LimitItem(ItemTransform[TDataItem, Dict[str, Any]]):
+         # detect when the limit is reached, max time or yield count
+         if (
+             (self.count >= self.max_items and self.max_items >= 0)
+-            or (self.max_time and time.time() - self.start_time > self.max_time)
++            or (self.max_time and time.monotonic() - self.start_time > self.max_time)
+             or self.max_items == 0
+         ):
+             self.exhausted = True
+diff --git a/tests/common/destination/test_reference.py b/tests/common/destination/test_reference.py
+index 050823f27..dafb1816e 100644
+--- a/tests/common/destination/test_reference.py
++++ b/tests/common/destination/test_reference.py
+@@ -14,9 +14,10 @@ from dlt.common.typing import is_subclass
+ from dlt.common.normalizers.naming import sql_ci_v1, sql_cs_v1
+ 
+ from tests.common.configuration.utils import environment
+-from tests.utils import IMPLEMENTED_DESTINATIONS, get_test_storage_root
++from tests.utils import IMPLEMENTED_DESTINATIONS, get_test_storage_root, skipifworktree
+ 
+ 
++@skipifworktree
+ def test_import_unknown_destination() -> None:
+     # standard destination
+     with pytest.raises(UnknownDestinationModule) as unk_ex:
+diff --git a/tests/common/runtime/test_run_context.py b/tests/common/runtime/test_run_context.py
+index 5a2456085..bd206989e 100644
+--- a/tests/common/runtime/test_run_context.py
++++ b/tests/common/runtime/test_run_context.py
+@@ -20,7 +20,12 @@ from dlt.common.storages.configuration import _make_file_url
+ from dlt.common.utils import set_working_dir
+ 
+ import tests
+-from tests.utils import MockableRunContext, get_test_storage_root, disable_temporary_telemetry
++from tests.utils import (
++    MockableRunContext,
++    get_test_storage_root,
++    disable_temporary_telemetry,
++    skipifworktree,
++)
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -33,6 +38,7 @@ def preserve_logger() -> Iterator[None]:
+         logger.LOGGER = old_logger
+ 
+ 
++@skipifworktree
+ def test_run_context() -> None:
+     ctx = PluggableRunContext()
+     run_context = ctx.context
+diff --git a/tests/common/test_time.py b/tests/common/test_time.py
+index 5504269ec..d3641e31e 100644
+--- a/tests/common/test_time.py
++++ b/tests/common/test_time.py
+@@ -1,12 +1,19 @@
+ import pytest
+ import os
+ import time
++from contextlib import contextmanager
+ from datetime import datetime, date, timezone, timedelta, time as dt_time  # noqa: I251
++from unittest import mock
++
+ from pendulum.tz import UTC, fixed_timezone
+-from contextlib import contextmanager
+ 
+ from dlt.common import pendulum
++from dlt.common.storages.load_package import create_load_id
+ from dlt.common.time import (
++    MonotonicPreciseTime,
++    LockedMonotonicPreciseTime,
++    increasing_precise_time,
++    precise_time,
+     parse_iso_like_datetime,
+     timestamp_before,
+     timestamp_within,
+@@ -18,9 +25,9 @@ from dlt.common.time import (
+     ensure_pendulum_datetime_non_utc,
+     ensure_pendulum_time,
+     normalize_timezone,
++    datetime_obj_to_str,
+ )
+ from dlt.common.typing import TAnyDateTime
+-from dlt.common.time import datetime_obj_to_str
+ 
+ 
+ @contextmanager
+@@ -763,3 +770,99 @@ def test_ensure_pendulum_time_invalid(value) -> None:
+     else:
+         with pytest.raises(TypeError):
+             ensure_pendulum_time(value)
++
++
++@pytest.mark.parametrize(
++    "clock_cls",
++    [MonotonicPreciseTime, LockedMonotonicPreciseTime],
++    ids=["unlocked", "locked"],
++)
++def test_monotonic_precise_time_never_goes_backward(clock_cls: type) -> None:
++    clock = clock_cls()
++    values = [clock() for _ in range(10_000)]
++    for i in range(1, len(values)):
++        assert values[i] >= values[i - 1], f"went backward at index {i}"
++
++
++@pytest.mark.parametrize(
++    "clock_cls",
++    [MonotonicPreciseTime, LockedMonotonicPreciseTime],
++    ids=["unlocked", "locked"],
++)
++def test_monotonic_precise_time_tracks_wall_clock(clock_cls: type) -> None:
++    clock = clock_cls()
++    m = clock()
++    w = precise_time()
++    # should be within 100ms of wall clock
++    assert abs(m - w) < 0.1, f"monotonic {m} too far from wall {w}"
++
++
++@pytest.mark.parametrize(
++    "clock_cls",
++    [MonotonicPreciseTime, LockedMonotonicPreciseTime],
++    ids=["unlocked", "locked"],
++)
++def test_monotonic_precise_time_survives_backward_step(clock_cls: type) -> None:
++    """Simulate a wall-clock backward jump and verify the high-water mark holds."""
++    clock = clock_cls()
++    t0 = clock()
++
++    # simulate clock jumping backward by 5 seconds
++    with mock.patch("dlt.common.time.precise_time", return_value=t0 - 5.0):
++        t1 = clock()
++    assert t1 == t0, "clock must return high-water mark when wall clock goes backward"
++
++    # after the backward step, a normal reading must still be >= high-water mark
++    t2 = clock()
++    assert t2 >= t0
++
++
++@pytest.mark.parametrize(
++    "clock_cls",
++    [MonotonicPreciseTime, LockedMonotonicPreciseTime],
++    ids=["unlocked", "locked"],
++)
++def test_strictly_increasing_advances_on_frozen_clock(clock_cls: type) -> None:
++    """With strictly_increasing=True, every call returns a strictly greater value."""
++    clock = clock_cls(strictly_increasing=True)
++    t0 = clock()
++
++    # freeze wall clock at current value
++    with mock.patch("dlt.common.time.precise_time", return_value=t0):
++        values = [clock() for _ in range(50)]
++
++    for i in range(1, len(values)):
++        assert values[i] > values[i - 1], f"not strictly increasing at index {i}"
++
++    # values should still be very close to wall clock (nextafter increments)
++    assert values[-1] - t0 < 0.001
++
++
++def test_increasing_precise_time_is_strictly_increasing() -> None:
++    """Module-level increasing_precise_time must produce unique values."""
++    assert isinstance(increasing_precise_time, LockedMonotonicPreciseTime)
++    values = [increasing_precise_time() for _ in range(100)]
++    for i in range(1, len(values)):
++        assert values[i] > values[i - 1], f"not strictly increasing at index {i}"
++
++
++def test_create_load_id_strictly_increasing() -> None:
++    """create_load_id must return strictly increasing values even under clock jitter."""
++    ids = [create_load_id() for _ in range(100)]
++    for i in range(1, len(ids)):
++        assert float(ids[i]) > float(
++            ids[i - 1]
++        ), f"load id not strictly increasing at index {i}: {ids[i - 1]} >= {ids[i]}"
++
++    # simulate a backward jump: mock the module-level singleton
++    baseline = float(create_load_id())
++    with mock.patch(
++        "dlt.common.storages.load_package.increasing_precise_time",
++        return_value=baseline - 10.0,
++    ):
++        backward_id = float(create_load_id())
++    assert backward_id == baseline - 10.0  # mock fully replaces the callable
++
++    # after removing the mock the real singleton still has its high-water mark
++    restored = float(create_load_id())
++    assert restored >= baseline
+diff --git a/tests/extract/test_decorators.py b/tests/extract/test_decorators.py
+index 9374d7699..5b9f6719b 100644
+--- a/tests/extract/test_decorators.py
++++ b/tests/extract/test_decorators.py
+@@ -47,7 +47,7 @@ from dlt.extract.exceptions import (
+ from dlt.extract.items import TableNameMeta
+ 
+ from tests.common.utils import load_yml_case
+-from tests.utils import auto_unload_modules
++from tests.utils import auto_unload_modules, skipifworktree
+ 
+ 
+ @pytest.fixture(autouse=True, scope="function")
+@@ -832,6 +832,7 @@ def test_source_shorthand_reference() -> None:
+     assert list(factory(["A", "B"])) == ["A", "B"]
+ 
+ 
++@skipifworktree
+ def test_source_reference() -> None:
+     # sources accessible via full type
+     factory = SourceReference.find("tests.extract.test_decorators.alpha_source")
+diff --git a/tests/load/pipeline/test_scd2.py b/tests/load/pipeline/test_scd2.py
+index c9a3ec43e..3651d7d6d 100644
+--- a/tests/load/pipeline/test_scd2.py
++++ b/tests/load/pipeline/test_scd2.py
+@@ -672,7 +672,7 @@ def test_boundary_timestamp(
+     ]
+     current_time: Dict[str, Optional[float]] = {"ts": None}
+     with mock.patch(
+-        "dlt.common.storages.load_package.precise_time",
++        "dlt.common.storages.load_package.increasing_precise_time",
+         side_effect=lambda: current_time["ts"],
+     ):
+         # load 1 — initial load
+diff --git a/tests/utils.py b/tests/utils.py
+index d92524a92..04408a09f 100644
+--- a/tests/utils.py
++++ b/tests/utils.py
+@@ -369,14 +369,18 @@ class MockableRunContext(RunContext):
+ 
+ @pytest.fixture(autouse=True)
+ def auto_unload_modules() -> Iterator[None]:
+-    """Unload all modules inspected in this tests"""
++    """Restore sys.modules to pre-test state: unload added modules, re-add removed ones."""
+     prev_modules = dict(sys.modules)
+     try:
+         yield
+     finally:
+-        mod_diff = set(sys.modules.keys()) - set(prev_modules.keys())
+-        for mod in mod_diff:
++        # remove modules added during the test
++        for mod in set(sys.modules.keys()) - set(prev_modules.keys()):
+             del sys.modules[mod]
++        # restore modules removed during the test
++        for mod, module in prev_modules.items():
++            if mod not in sys.modules:
++                sys.modules[mod] = module
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -610,6 +614,11 @@ skipifgithubci = pytest.mark.skipif(
+     is_running_in_github_ci(), reason="This test does not work on github CI"
+ )
+ 
++skipifworktree = pytest.mark.skipif(
++    os.path.basename(os.path.abspath(".")) != "dlt",
++    reason="Test requires run dir to be 'dlt' (skipped in worktrees)",
++)
++
+ 
+ @contextlib.contextmanager
+ def reset_providers(settings_dir: str) -> Iterator[ConfigProvidersContainer]:
+diff --git a/tests/workspace/helpers/dashboard/test_pipeline_operations.py b/tests/workspace/helpers/dashboard/test_pipeline_operations.py
+index 2385a3f96..252474697 100644
+--- a/tests/workspace/helpers/dashboard/test_pipeline_operations.py
++++ b/tests/workspace/helpers/dashboard/test_pipeline_operations.py
+@@ -135,7 +135,8 @@ def test_get_steps_data_and_status(
+     assert len(steps_data) == len(expected_steps)
+     assert status == expected_status
+ 
+-    assert all(step.duration_ms > 0 for step in steps_data)
++    # not always true due to clock jitter
++    # assert all(step.duration_ms > 0 for step in steps_data)
+     if expected_status == "succeeded":
+         assert all(step.step_exception is None for step in trace.steps)
+     else:
+
+
+===== COMMIT c50696bf =====
+
+
+commit c50696bfb
+Author: rudolfix
+Date: 2026-02-28
+
+    bumps dlt to 1.22.2 (#3693)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index c77d890ec..26e4ba405 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "dlt"
+-version = "1.22.1"
++version = "1.22.2"
+ description = "dlt is an open-source python-first scalable data loading library that does not require any backend to run."
+ authors = [{ name = "dltHub Inc.", email = "services@dlthub.com" }]
+ requires-python = ">=3.9.2, <3.15"
+diff --git a/uv.lock b/uv.lock
+index 47cd7c61a..bdf9a3c91 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2073,7 +2073,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.22.1"
++version = "1.22.2"
+ source = { editable = "." }
+ dependencies = [
+     { name = "click" },
+
+
+===== COMMIT 0321aa12 =====
+
+
+commit 0321aa120
+Author: Alena Astrakhantseva
+Date: 2026-02-27
+
+    Docs for HF destination (#3687)
 

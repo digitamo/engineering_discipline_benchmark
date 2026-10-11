@@ -1,1162 +1,3 @@
-diff --git a/dlt/_workspace/cli/dlthub/utils.py b/dlt/_workspace/cli/dlthub/utils.py
-index 9601585df..a69e3e60a 100644
---- a/dlt/_workspace/cli/dlthub/utils.py
-+++ b/dlt/_workspace/cli/dlthub/utils.py
-@@ -67,6 +67,7 @@ WORKSPACE_DEPS: List[str] = [
-     "pathspec>=0.11.2",
-     "pydbml>=1.2.0",
-     "croniter>=6.0.0",
-+    "s3fs>=2022.4.0",
- ]
- 
- 
-diff --git a/dlt/_workspace/deployment/requirements.py b/dlt/_workspace/deployment/requirements.py
-index c3963da31..3f4b2d088 100644
---- a/dlt/_workspace/deployment/requirements.py
-+++ b/dlt/_workspace/deployment/requirements.py
-@@ -9,7 +9,7 @@ import shutil
- import subprocess
- import sys
- from pathlib import Path
--from typing import Any, BinaryIO, Dict, List, Literal, Optional, Sequence
-+from typing import Any, BinaryIO, Dict, List, Literal, Optional, Sequence, Set
- 
- import tomlkit
- from packaging.requirements import Requirement
-@@ -268,22 +268,12 @@ def build_launcher_requirements() -> Dict[str, List[str]]:
- 
- 
- def build_dashboard_group() -> List[str]:
--    """Specs for the `DASHBOARD_JOB_REF` group."""
--    return sorted(
--        set(
--            _BASE_LAUNCHER_SPECS
--            + [
--                "botocore",
--                "ibis-framework",
--                "marimo",
--                "numpy",
--                "pandas",
--                "pyarrow",
--                "s3fs",
--                "uvicorn",
--            ]
--        )
--    )
-+    """Specs for the `DASHBOARD_JOB_REF` group.
-+
-+    Matches the dashboard runner's dependency gate plus `s3fs` for artifact access;
-+    the launcher baseline (croniter, dlthub, dlt) comes from `launcher_requirements`.
-+    """
-+    return sorted(["ibis-framework", "marimo", "pyarrow", "s3fs"])
- 
- 
- def _inject_dlt_into_launchers(launcher_requirements: Dict[str, List[str]]) -> None:
-@@ -340,16 +330,20 @@ def export_workspace_requirements(
-     else:
-         groups = {MAIN_GROUP: []}
- 
--    groups[DASHBOARD_JOB_REF] = build_dashboard_group()
--
-     resolved_default_groups = list(default_groups) if default_groups else [MAIN_GROUP]
-+    # names installed by default groups — always present at runtime, safe to prune against
-+    default_names: Set[str] = set()
-+    for name in resolved_default_groups:
-+        default_names.update(_collect_package_names(groups.get(name, [])))
-+    _expand_implied_names(default_names)
-+
-+    groups[DASHBOARD_JOB_REF] = _prune_specs(build_dashboard_group(), default_names)
- 
-     launcher_requirements = build_launcher_requirements()
-+    for launcher, specs in launcher_requirements.items():
-+        launcher_requirements[launcher] = _prune_specs(specs, default_names)
-     # inject dlt into every launcher entry unless a default group already names it
--    default_has_dlt = any(
--        _contains_package(groups.get(name, []), DLT_PKG_NAME) for name in resolved_default_groups
--    )
--    if not default_has_dlt:
-+    if _normalize_name(DLT_PKG_NAME) not in default_names:
-         _inject_dlt_into_launchers(launcher_requirements)
- 
-     return {
-@@ -516,8 +510,8 @@ def _parse_uv_output(text: str) -> List[str]:
-     )
- 
- 
--# PEP 508 leading identifier: first letter/digit then letters/digits/_/-/.
--_LEADING_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9_.\-]*)")
-+# PEP 508 leading identifier: first letter/digit then letters/digits/_/-/., optional extras
-+_LEADING_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9_.\-]*)\s*(?:\[([^\]]*)\])?")
- # PEP 503 normalization: lowercase, runs of `-_.` collapsed to single `-`
- _PEP503_SEP_RE = re.compile(r"[-_.]+")
- 
-@@ -536,6 +530,53 @@ def _contains_package(specs: Sequence[str], pkg_name: str) -> bool:
-     return False
- 
- 
-+_IMPLIED_NAMES: Dict[str, List[str]] = {
-+    f"{DLT_PKG_NAME}[hub]": [DLTHUB_PKG_NAME, "croniter"],
-+    DLTHUB_PKG_NAME: ["croniter"],
-+    DLTHUB_CLIENT_PKG_NAME: ["croniter"],
-+    "s3fs": ["botocore"],
-+    "marimo": ["uvicorn"],
-+    "fastmcp": ["uvicorn"],
-+}
-+"""Launcher specs pulled in transitively when the key package (or extra) is installed."""
-+
-+
-+def _collect_package_names(specs: Sequence[str]) -> Set[str]:
-+    """PEP 503 normalized names of `specs`; extras add one `name[extra]` token each."""
-+    names: Set[str] = set()
-+    for s in specs:
-+        m = _LEADING_NAME_RE.match(s)
-+        if not m:
-+            continue
-+        name = _normalize_name(m.group(1))
-+        names.add(name)
-+        extras = m.group(2)
-+        if extras:
-+            for extra in extras.split(","):
-+                extra = extra.strip()
-+                if extra:
-+                    names.add(f"{name}[{_normalize_name(extra)}]")
-+    return names
-+
-+
-+def _expand_implied_names(names: Set[str]) -> None:
-+    """Add names pulled in transitively by meta-packages in `names`."""
-+    for implying, implied in _IMPLIED_NAMES.items():
-+        if implying in names:
-+            names.update(implied)
-+
-+
-+def _prune_specs(specs: List[str], names: Set[str]) -> List[str]:
-+    """Drop specs whose PEP 503 normalized name is in `names`, preserving order."""
-+    pruned: List[str] = []
-+    for s in specs:
-+        m = _LEADING_NAME_RE.match(s)
-+        if m and _normalize_name(m.group(1)) in names:
-+            continue
-+        pruned.append(s)
-+    return pruned
-+
-+
- def _parse_dep_list(entries: Sequence[Any]) -> List[str]:
-     """Normalize a `[project.dependencies]` / `[dependency-groups].<name>` list.
- 
-diff --git a/dlt/common/libs/pyarrow.py b/dlt/common/libs/pyarrow.py
-index 7988bf45d..a8aa084bf 100644
---- a/dlt/common/libs/pyarrow.py
-+++ b/dlt/common/libs/pyarrow.py
-@@ -954,32 +954,12 @@ def concat_batches_and_tables_in_order(
- 
- def transpose_rows_to_columns(
-     rows: TDataItems, column_names: Iterable[str]
--) -> dict[str, Any]:  # dict[str, np.ndarray]
--    """Transpose rows (data items) into columns (numpy arrays). Returns a dictionary of {column_name: column_data}
--
--    Uses pandas if available. Otherwise, use numpy, which is slower
--    """
--    try:
--        from dlt.common.libs.numpy import numpy as np
--    except MissingDependencyException:
--        raise MissingDependencyException(
--            "dlt pyarrow helpers", ["numpy"], "Numpy is required for this pyarrow operation"
--        )
--
--    try:
--        from pandas._libs import lib
--
--        # NOTE: this is part of public interface now via DataFrame.from_records()
--        pivoted_rows = lib.to_object_array_tuples(rows).T
--    except ImportError:
--        logger.info(
--            "Pandas not installed, reverting to numpy.asarray to create a table which is slower"
--        )
--        pivoted_rows = np.asarray(rows, dtype="object", order="K").T
--    return {
--        column_name: data.ravel()
--        for column_name, data in zip(column_names, np.vsplit(pivoted_rows, len(pivoted_rows)))
--    }
-+) -> dict[str, Any]:  # dict[str, Sequence[Any]]
-+    """Transpose rows (data items) into columns. Returns a dictionary of {column_name: column_data}"""
-+    if not rows:
-+        return {column_name: () for column_name in column_names}
-+    # plain zip benchmarked faster than numpy/pandas object-array pivoting
-+    return dict(zip(column_names, zip(*rows)))
- 
- 
- def uuid_to_string(arr: Any) -> Any:  # pyarrow.Array -> pyarrow.Array
-@@ -1039,22 +1019,24 @@ def uuid_to_string(arr: Any) -> Any:  # pyarrow.Array -> pyarrow.Array
-     return fsb36.cast(pa.string())
- 
- 
--def convert_numpy_to_arrow(
--    column_data: Any,  # 1-dimensional np.ndarray
-+def convert_array_to_arrow(
-+    column_data: Any,  # 1-dimensional sequence of column values
-     caps: DestinationCapabilitiesContext,
-     column_schema: TColumnSchema,
-     tz: str,
-     safe_arrow_conversion: bool,
-+    arrow_type: Optional[Any] = None,
- ) -> Any:  # pyarrow.Array
--    """Convert a numpy array to a pyarrow array.
-+    """Convert a sequence of column values to a pyarrow array.
- 
-     Args:
--        rows: data items
-+        column_data: column values
-         caps: capabilities of the storage backend
--        columns: dlt hints about the table columns (e.g., data type, nullabe)
-+        column_schema: dlt hints about the column (e.g., data type, nullable)
-         tz: time zone identifier
-         safe_arrow_conversion: if False, truncation and loss of precision is allowed
-             ref: https://arrow.apache.org/docs/python/generated/pyarrow.compute.CastOptions.html#pyarrow.compute.CastOptions
-+        arrow_type: precomputed target arrow type, derived from `column_schema` when None
- 
-     Returns:
-         an arrow Array
-@@ -1063,7 +1045,9 @@ def convert_numpy_to_arrow(
- 
-     dlt_data_type = column_schema.get("data_type")
-     inferred_arrow_type = (
--        get_py_arrow_datatype(column_schema, caps, tz) if dlt_data_type is not None else None
-+        arrow_type
-+        if arrow_type is not None
-+        else (get_py_arrow_datatype(column_schema, caps, tz) if dlt_data_type is not None else None)
-     )
-     inferred_array = None
- 
-@@ -1402,6 +1386,36 @@ def cast_arrow_as_columns_schema(
-     return item.__class__.from_arrays(arrays_out, schema=new_schema)
- 
- 
-+def _row_tuples_to_arrow_struct(
-+    rows: TDataItems,
-+    columns: TTableSchemaColumns,
-+    arrow_types: Dict[str, Optional[Any]],
-+) -> Optional[Any]:  # Optional[pyarrow.Table]
-+    """Converts row tuples to an arrow table in a single pass via a `StructArray`."""
-+    from dlt.common.libs.pyarrow import pyarrow as pa
-+
-+    # json values typically need serialization fallbacks which fail the whole struct
-+    if any(
-+        arrow_types[name] is None or column.get("data_type") == "json"
-+        for name, column in columns.items()
-+    ):
-+        return None
-+    try:
-+        struct_fields = [pa.field(name, arrow_types[name]) for name in columns]
-+        arrays = pa.array(rows, type=pa.struct(struct_fields)).flatten()
-+    except Exception as e:
-+        logger.debug(
-+            "Single-pass arrow conversion not possible, using per-column fallbacks:"
-+            f" {type(e).__name__}: {e}"
-+        )
-+        return None
-+    schema = pa.schema(
-+        pa.field(field.name, field.type, nullable=columns[field.name].get("nullable", True))
-+        for field in struct_fields
-+    )
-+    return pa.Table.from_arrays(arrays, schema=schema)
-+
-+
- def row_tuples_to_arrow(
-     rows: TDataItems,
-     caps: DestinationCapabilitiesContext,
-@@ -1428,16 +1442,35 @@ def row_tuples_to_arrow(
-     """
-     from dlt.common.libs.pyarrow import pyarrow as pa
- 
--    columnar = transpose_rows_to_columns(rows, column_names=columns.keys())
-+    # pyarrow struct conversion accepts only tuples and dicts, and tuple iteration is
-+    # ~3x faster than driver row objects (e.g. sqlalchemy Row) in the transpose below
-+    if rows and not isinstance(rows[0], (tuple, dict)):
-+        rows = [tuple(row) for row in rows]
-+
-+    # compute target arrow types once; None when the type must be inferred from data
-+    arrow_types: Dict[str, Optional[Any]] = {
-+        name: get_py_arrow_datatype(column, caps, tz) if column.get("data_type") else None
-+        for name, column in columns.items()
-+    }
-+
-+    if (arrow_table := _row_tuples_to_arrow_struct(rows, columns, arrow_types)) is not None:
-+        return arrow_table
-+
-+    transposed_rows = transpose_rows_to_columns(rows, column_names=columns.keys())
- 
-     arrow_arrays = []
-     arrow_fields = []
--    for column_name, column_data in columnar.items():
-+    for column_name, column_data in transposed_rows.items():
-         column_schema = columns[column_name]
- 
-         try:
--            arrow_array = convert_numpy_to_arrow(
--                column_data, caps, column_schema, tz, safe_arrow_conversion
-+            arrow_array = convert_array_to_arrow(
-+                column_data,
-+                caps,
-+                column_schema,
-+                tz,
-+                safe_arrow_conversion,
-+                arrow_types[column_name],
-             )
-         # TODO if converting to arrow fail, should we raise or skip column?
-         except PyToArrowConversionException as e:
-diff --git a/dlt/sources/sql_database/helpers.py b/dlt/sources/sql_database/helpers.py
-index a0eb4f2c6..3a0af4db2 100644
---- a/dlt/sources/sql_database/helpers.py
-+++ b/dlt/sources/sql_database/helpers.py
-@@ -332,8 +332,9 @@ class TableLoader(BaseTableLoader):
-                 # positional mapping (self.columns may be in schema order
-                 # after merge_columns reordering)
-                 cursor_columns = {c: self.columns[c] for c in columns}
-+                # extract tuples to speed up arrow conversion
-                 table = row_tuples_to_arrow(
--                    partition,
-+                    [row._data for row in partition],
-                     columns=cursor_columns,
-                     tz=backend_kwargs.get("tz", "UTC"),
-                 )
-diff --git a/pyproject.toml b/pyproject.toml
-index a283411d8..eef1aea7d 100644
---- a/pyproject.toml
-+++ b/pyproject.toml
-@@ -342,6 +342,7 @@ workspace-deps = [
-     "pathspec>=0.11.2",
-     "pydbml>=1.2.0",
-     "croniter>=6.0.0",
-+    "s3fs>=2022.4.0",
- ]
- 
- [project.entry-points.dlt]
-diff --git a/tests/libs/pyarrow/test_row_tuples_to_arrow.py b/tests/libs/pyarrow/test_row_tuples_to_arrow.py
-index 5d5639ac7..fb4b564f4 100644
---- a/tests/libs/pyarrow/test_row_tuples_to_arrow.py
-+++ b/tests/libs/pyarrow/test_row_tuples_to_arrow.py
-@@ -16,7 +16,7 @@ from dlt.common.destination import DestinationCapabilitiesContext
- from dlt.common.libs.pyarrow import (
-     PyToArrowConversionException,
-     transpose_rows_to_columns,
--    convert_numpy_to_arrow,
-+    convert_array_to_arrow,
-     row_tuples_to_arrow,
-     serialize_type,
-     uuid_to_string,
-@@ -139,7 +139,7 @@ def test_row_tuples_to_arrow_unknown_types(all_unknown: bool, leading_nulls: boo
- 
- 
- def test_convert_to_arrow_json_is_string():
--    """json data_type should be serialized to string by row_tuples_to_arrow and convert_numpy_to_arrow."""
-+    """json data_type should be serialized to string by row_tuples_to_arrow and convert_array_to_arrow."""
-     column_name = "json_col"
-     columns_schema: TTableSchemaColumns = {column_name: {"name": column_name, "data_type": "json"}}
-     value1 = {"foo": "bar"}
-@@ -154,7 +154,7 @@ def test_convert_to_arrow_json_is_string():
-     column = columns[column_name]
-     assert_equal(columns[column_name], (expected_column))
- 
--    arrow_array = convert_numpy_to_arrow(
-+    arrow_array = convert_array_to_arrow(
-         column,
-         DestinationCapabilitiesContext().generic_capabilities(),
-         columns_schema[column_name],
-@@ -257,14 +257,14 @@ def test_uuid_to_string_python_fallback_matches_numpy(monkeypatch: pytest.Monkey
- 
- 
- def test_convert_uuid_is_string() -> None:
--    """convert_numpy_to_arrow yields a string array for UUID columns regardless of pyarrow version."""
-+    """convert_array_to_arrow yields a string array for UUID columns regardless of pyarrow version."""
-     column_name = "uuid_col"
-     columns_schema: TTableSchemaColumns = {column_name: {"name": column_name}}
-     uuids = [uuid4(), uuid4(), uuid4()]
-     rows = [(u,) for u in uuids]
- 
-     columns = transpose_rows_to_columns(rows, columns_schema)
--    arrow_array = convert_numpy_to_arrow(
-+    arrow_array = convert_array_to_arrow(
-         columns[column_name],
-         DestinationCapabilitiesContext().generic_capabilities(),
-         columns_schema[column_name],
-@@ -290,7 +290,7 @@ def test_convert_to_arrow_null_column_is_not_removed():
-     rows = [(1, None), (2, None)]
- 
-     columns = transpose_rows_to_columns(rows, columns_schema)
--    arrow_array = convert_numpy_to_arrow(
-+    arrow_array = convert_array_to_arrow(
-         columns[column_name],
-         DestinationCapabilitiesContext().generic_capabilities(),
-         columns_schema[column_name],
-@@ -313,7 +313,7 @@ def test_convert_to_arrow_null_column_with_data_type_is_not_removed():
-     rows = [(1, None), (2, None)]
- 
-     columns = transpose_rows_to_columns(rows, columns_schema)
--    arrow_array = convert_numpy_to_arrow(
-+    arrow_array = convert_array_to_arrow(
-         columns[column_name],
-         DestinationCapabilitiesContext().generic_capabilities(),
-         columns_schema[column_name],
-@@ -336,7 +336,7 @@ def test_convert_to_arrow_cast_string_to_decimal():
-     rows = [("2.00001",), (None,), ("3.00001",)]
- 
-     columns = transpose_rows_to_columns(rows, columns_schema)
--    arrow_array = convert_numpy_to_arrow(
-+    arrow_array = convert_array_to_arrow(
-         columns[column_name],
-         DestinationCapabilitiesContext().generic_capabilities(),
-         columns_schema[column_name],
-@@ -357,7 +357,7 @@ def test_convert_to_arrow_cast_float_to_decimal():
-     rows = [(2.00001,), (None,), (3.00001,)]
- 
-     columns = transpose_rows_to_columns(rows, columns_schema)
--    arrow_array = convert_numpy_to_arrow(
-+    arrow_array = convert_array_to_arrow(
-         columns[column_name],
-         DestinationCapabilitiesContext().generic_capabilities(),
-         columns_schema[column_name],
-@@ -679,7 +679,7 @@ def test_row_tuples_to_arrow_detects_range_type() -> None:
- def test_json_fallback_to_string_for_non_coercible_nested_objects() -> None:
-     """ensure json columns fall back to string when nested values cannot be coerced to a uniform nested type.
- 
--    this exercises convert_numpy_to_arrow fallback case 2: values are encoded to json strings.
-+    this exercises convert_array_to_arrow fallback case 2: values are encoded to json strings.
-     """
-     # mix incompatible python container types across rows: list in one row, dict in another
-     rows = [([1, 2, 3],), (None,), ({"a": 1},)]
-@@ -728,3 +728,132 @@ def test_json_with_nested_type_hint_produces_real_nested_type() -> None:
-     assert pa.types.is_struct(col_type)
-     # ensure it is exactly the hinted type
-     assert col_type == hinted_type
-+
-+
-+def test_row_tuples_to_arrow_struct_fast_path(monkeypatch: pytest.MonkeyPatch) -> None:
-+    """Fully typed schemas use the single-pass struct conversion and produce
-+    the same table as the per-column path."""
-+    import dlt.common.libs.pyarrow as pyarrow_libs
-+
-+    columns: TTableSchemaColumns = {
-+        "int_col": {"name": "int_col", "data_type": "bigint"},
-+        "float_col": {"name": "float_col", "data_type": "double"},
-+        "text_col": {"name": "text_col", "data_type": "text"},
-+        "bool_col": {"name": "bool_col", "data_type": "bool", "nullable": False},
-+        "ts_col": {"name": "ts_col", "data_type": "timestamp"},
-+        "date_col": {"name": "date_col", "data_type": "date"},
-+        "dec_col": {"name": "dec_col", "data_type": "decimal", "precision": 10, "scale": 2},
-+    }
-+    rows = [
-+        (
-+            1,
-+            1.5,
-+            "a",
-+            True,
-+            datetime(2024, 1, 1, tzinfo=timezone.utc),
-+            date(2024, 1, 1),
-+            Decimal("1.23"),
-+        ),
-+        (None, None, None, True, None, None, None),
-+    ]
-+
-+    # reference result from the per-column path
-+    with monkeypatch.context() as m:
-+        m.setattr(pyarrow_libs, "_row_tuples_to_arrow_struct", lambda *args: None)
-+        expected = row_tuples_to_arrow(rows, _caps(), columns, "UTC")
-+
-+    # fast path must not transpose
-+    def _no_transpose(*args: Any, **kwargs: Any) -> None:
-+        raise AssertionError("per-column path used")
-+
-+    with monkeypatch.context() as m:
-+        m.setattr(pyarrow_libs, "transpose_rows_to_columns", _no_transpose)
-+        tbl = row_tuples_to_arrow(rows, _caps(), columns, "UTC")
-+
-+    assert tbl.schema == expected.schema
-+    assert tbl.equals(expected)
-+
-+
-+def test_row_tuples_to_arrow_struct_fallback_to_per_column() -> None:
-+    """json columns (struct path ineligible) and values failing the fused
-+    conversion (struct path aborts) use per-column strategies."""
-+    # json columns skip the struct path
-+    columns: TTableSchemaColumns = {
-+        "int_col": {"name": "int_col", "data_type": "bigint"},
-+        "json_col": {"name": "json_col", "data_type": "json"},
-+    }
-+    rows = [(1, {"k": 1}), (2, {"k": 2})]
-+    tbl = row_tuples_to_arrow(rows, _caps(), columns, "UTC")
-+    assert tbl["int_col"].to_pylist() == [1, 2]
-+    assert pa.types.is_string(tbl["json_col"].type)
-+    assert tbl["json_col"].to_pylist() == [json_to_str({"k": 1}), json_to_str({"k": 2})]
-+
-+    # numeric strings fail the fused conversion to double, per-column infer+cast converts them
-+    columns = {"float_col": {"name": "float_col", "data_type": "double"}}
-+    tbl = row_tuples_to_arrow([("1.5",), ("2.5",)], _caps(), columns, "UTC")
-+    assert tbl["float_col"].type == pa.float64()
-+    assert tbl["float_col"].to_pylist() == [1.5, 2.5]
-+
-+
-+class _DriverRow:
-+    """Mimics a non-tuple driver row (e.g. sqlalchemy Row): sequence protocol only."""
-+
-+    def __init__(self, *values: Any) -> None:
-+        self._values = values
-+
-+    def __iter__(self) -> Any:
-+        return iter(self._values)
-+
-+    def __len__(self) -> int:
-+        return len(self._values)
-+
-+    def __getitem__(self, idx: int) -> Any:
-+        return self._values[idx]
-+
-+
-+@pytest.mark.parametrize("row_shape", ["list", "driver_row"], ids=["list-rows", "driver-rows"])
-+def test_row_tuples_to_arrow_non_tuple_rows_use_struct_path(
-+    row_shape: str, monkeypatch: pytest.MonkeyPatch
-+) -> None:
-+    """Non-tuple row shapes are normalized to tuples and take the single-pass
-+    struct conversion, producing the same table as plain tuple rows."""
-+    import dlt.common.libs.pyarrow as pyarrow_libs
-+
-+    columns: TTableSchemaColumns = {
-+        "int_col": {"name": "int_col", "data_type": "bigint"},
-+        "text_col": {"name": "text_col", "data_type": "text"},
-+    }
-+    base_rows = [(1, "a"), (2, None)]
-+    rows: List[Any] = (
-+        [list(r) for r in base_rows] if row_shape == "list" else [_DriverRow(*r) for r in base_rows]
-+    )
-+
-+    expected = row_tuples_to_arrow(base_rows, _caps(), columns, "UTC")
-+
-+    # normalized rows must take the struct path, not the transpose
-+    def _no_transpose(*args: Any, **kwargs: Any) -> None:
-+        raise AssertionError("per-column path used")
-+
-+    with monkeypatch.context() as m:
-+        m.setattr(pyarrow_libs, "transpose_rows_to_columns", _no_transpose)
-+        tbl = row_tuples_to_arrow(rows, _caps(), columns, "UTC")
-+
-+    assert tbl.schema == expected.schema
-+    assert tbl.equals(expected)
-+
-+
-+@pytest.mark.parametrize("typed", [True, False], ids=["typed_schema", "untyped_schema"])
-+def test_row_tuples_to_arrow_empty_rows(typed: bool) -> None:
-+    """Empty result sets produce an empty table with all schema columns present."""
-+    columns: TTableSchemaColumns = {
-+        "a": {"name": "a", "data_type": "bigint"} if typed else {"name": "a"},
-+        "b": {"name": "b", "data_type": "text"} if typed else {"name": "b"},
-+    }
-+
-+    tbl = row_tuples_to_arrow([], _caps(), columns, "UTC")
-+
-+    assert tbl.num_rows == 0
-+    assert tbl.column_names == ["a", "b"]
-+    if typed:
-+        assert tbl.schema.field("a").type == pa.int64()
-+        assert tbl.schema.field("b").type == pa.string()
-diff --git a/tests/workspace/deployment/test_requirements.py b/tests/workspace/deployment/test_requirements.py
-index 399d77d99..c93159a0e 100644
---- a/tests/workspace/deployment/test_requirements.py
-+++ b/tests/workspace/deployment/test_requirements.py
-@@ -18,6 +18,8 @@ from dlt._workspace.deployment.launchers import (
-     LAUNCHER_MODULE,
-     LAUNCHER_STREAMLIT,
- )
-+from dlt._workspace.cli.dlthub._init_command import init_dlthub_workspace
-+from dlt._workspace.cli.dlthub.utils import fetch_init_plan
- from dlt._workspace.deployment.manifest import default_dashboard_job
- from dlt._workspace.deployment.requirements import (
-     MAIN_GROUP,
-@@ -33,6 +35,7 @@ from dlt._workspace.deployment.requirements import (
-     migrate_requirements,
-     python_version,
-     save_requirements,
-+    _collect_package_names,
- )
- from dlt._workspace.deployment.typing import DASHBOARD_JOB_REF
- 
-@@ -328,22 +331,8 @@ def test_export_skips_dlt_injection_when_present_in_default_group() -> None:
- 
- def test_dashboard_group_always_present() -> None:
-     dashboard_specs = build_dashboard_group()
--    expected = sorted(
--        set(
--            _BASE_LAUNCHER_SPECS
--            + [
--                "botocore",
--                "ibis-framework",
--                "marimo",
--                "numpy",
--                "pandas",
--                "pyarrow",
--                "s3fs",
--                "uvicorn",
--            ]
--        )
--    )
--    assert dashboard_specs == expected
-+    # dashboard runner gate (marimo, pyarrow, ibis-framework) + s3fs for artifacts
-+    assert dashboard_specs == sorted(["ibis-framework", "marimo", "pyarrow", "s3fs"])
- 
-     # present in every export path
-     with isolated_workspace("deps_none") as ctx:
-@@ -436,6 +425,169 @@ def test_contains_package_name_normalization(spec: str, needle: str, expected: b
-     assert _contains_package([spec], needle) is expected
- 
- 
-+@pytest.mark.parametrize(
-+    "spec, names, kept",
-+    [
-+        ("s3fs", {"s3fs"}, False),
-+        ("s3fs==2024.1", {"s3fs"}, False),
-+        ("ibis-framework[duckdb]", {"ibis-framework"}, False),
-+        ("ibis_framework>=12", {"ibis-framework"}, False),
-+        ('s3fs ; python_version > "3.8"', {"s3fs"}, False),
-+        ("Pandas", {"pandas"}, False),
-+        ("marimo", {"s3fs"}, True),
-+        ("croniter", set(), True),
-+        ("", {"s3fs"}, True),
-+        ("# comment", {"s3fs"}, True),
-+    ],
-+    ids=[
-+        "bare-name",
-+        "pinned",
-+        "extras",
-+        "underscore-separator",
-+        "marker",
-+        "case-insensitive",
-+        "no-match",
-+        "empty-set",
-+        "empty-line",
-+        "comment-line",
-+    ],
-+)
-+def test_prune_specs_normalization(spec: str, names: Set[str], kept: bool) -> None:
-+    from dlt._workspace.deployment.requirements import _prune_specs
-+
-+    assert _prune_specs([spec], names) == ([spec] if kept else [])
-+
-+
-+def test_export_prunes_launcher_specs_against_default_group() -> None:
-+    # deps_requirements_in declares dlt + s3fs in main
-+    with isolated_workspace("deps_requirements_in") as ctx:
-+        with patch(_SHUTIL_WHICH, return_value=None):
-+            result = export_workspace_requirements(Path(ctx.run_dir))
-+    lreq = result["launcher_requirements"]
-+    for launcher in (LAUNCHER_JOB, LAUNCHER_MODULE):
-+        assert "s3fs" not in lreq[launcher]
-+        # botocore is implied by s3fs and pruned with it
-+        assert "botocore" not in lreq[launcher]
-+    # dlt in main — no dlt spec injected anywhere
-+    for specs in lreq.values():
-+        assert not any(Requirement(s).name == "dlt" for s in specs)
-+        assert specs == sorted(specs)
-+    # dashboard group pruned against main too
-+    dashboard = result["groups"][DASHBOARD_JOB_REF]
-+    assert "s3fs" not in dashboard
-+    assert "marimo" in dashboard
-+    assert "pyarrow" in dashboard
-+
-+
-+def test_export_prunes_dashboard_group_with_normalized_names() -> None:
-+    with isolated_workspace("deps_none") as ctx:
-+        Path(ctx.run_dir, "requirements.txt").write_text(
-+            "ibis_framework>=12\nPandas\nnumpy>=1.24\n"
-+        )
-+        with patch(_SHUTIL_WHICH, return_value=None):
-+            result = export_workspace_requirements(Path(ctx.run_dir))
-+    dashboard = result["groups"][DASHBOARD_JOB_REF]
-+    assert "ibis-framework" not in dashboard
-+    # rest of the synthesized group survives
-+    for kept in ("marimo", "pyarrow", "s3fs"):
-+        assert kept in dashboard
-+    # launcher lists share none of these names — untouched except dlt injection
-+    dlt_spec = get_dlt_requirement_spec()
-+    assert result["launcher_requirements"][LAUNCHER_JOB] == sorted(
-+        set(["botocore", "s3fs", dlt_spec] + _BASE_LAUNCHER_SPECS)
-+    )
-+
-+
-+@pytest.mark.parametrize(
-+    "default_groups, pyarrow_pruned",
-+    [(None, False), (["main", "extras"], True)],
-+    ids=["main-only", "main-and-extras"],
-+)
-+def test_export_prunes_only_against_default_groups(
-+    default_groups: List[str], pyarrow_pruned: bool
-+) -> None:
-+    with isolated_workspace("deps_none") as ctx:
-+        Path(ctx.run_dir, "pyproject.toml").write_text(
-+            "[project]\n"
-+            'name = "deps-groups"\n'
-+            'version = "0.0.1"\n'
-+            'dependencies = ["requests>=2.0"]\n'
-+            "\n"
-+            "[dependency-groups]\n"
-+            'extras = ["pyarrow>=16.0.0"]\n'
-+        )
-+        result = export_workspace_requirements(Path(ctx.run_dir), default_groups=default_groups)
-+    dashboard = result["groups"][DASHBOARD_JOB_REF]
-+    assert ("pyarrow" not in dashboard) is pyarrow_pruned
-+    # user groups are never modified by pruning
-+    assert result["groups"]["extras"] == ["pyarrow>=16.0.0"]
-+
-+
-+@pytest.mark.parametrize(
-+    "spec, expected",
-+    [
-+        ("dlt>=1.0", {"dlt"}),
-+        ("dlt[hub]==1.2", {"dlt", "dlt[hub]"}),
-+        ("dlt[Hub , providers]>=1.0", {"dlt", "dlt[hub]", "dlt[providers]"}),
-+        ("dlt[hub] @ https://example.com/dlt.zip", {"dlt", "dlt[hub]"}),
-+    ],
-+    ids=["no-extras", "single-extra", "multiple-extras-normalized", "extras-with-direct-ref"],
-+)
-+def test_collect_package_names_extras_tokens(spec: str, expected: Set[str]) -> None:
-+    assert _collect_package_names([spec]) == expected
-+
-+
-+@pytest.mark.parametrize(
-+    "spec, pruned, kept, dlt_injected",
-+    [
-+        ("dlt[hub]>=1.0", {"dlthub", "croniter"}, set(), False),
-+        ("dlthub>=0.1", {"dlthub", "croniter"}, set(), True),
-+        ("dlthub-client", {"croniter"}, {"dlthub"}, True),
-+        ("dlt>=1.0", set(), {"dlthub", "croniter"}, False),
-+    ],
-+    ids=["dlt-hub-extra", "dlthub", "dlthub-client", "plain-dlt"],
-+)
-+def test_export_prunes_implied_packages(
-+    spec: str, pruned: Set[str], kept: Set[str], dlt_injected: bool
-+) -> None:
-+    """`dlt[hub]` pulls dlthub + croniter; dlthub / dlthub-client pull croniter."""
-+    with isolated_workspace("deps_none") as ctx:
-+        Path(ctx.run_dir, "requirements.txt").write_text(f"{spec}\n")
-+        with patch(_SHUTIL_WHICH, return_value=None):
-+            result = export_workspace_requirements(Path(ctx.run_dir))
-+    job_specs = result["launcher_requirements"][LAUNCHER_JOB]
-+    for name in pruned:
-+        assert name not in job_specs
-+    for name in kept:
-+        assert name in job_specs
-+    has_dlt = any(Requirement(s).name == "dlt" for s in job_specs)
-+    assert has_dlt is dlt_injected
-+
-+
-+def test_export_scaffolded_workspace_prunes_all_launcher_specs() -> None:
-+    """A `dlthub init` workspace declares every launcher dep except streamlit."""
-+    with isolated_workspace("deps_none") as ctx:
-+        plan = fetch_init_plan(ctx.run_dir, dependencies="pyproject")
-+        init_dlthub_workspace(plan)
-+        result = export_workspace_requirements(Path(ctx.run_dir))
-+    for launcher, specs in result["launcher_requirements"].items():
-+        if launcher == LAUNCHER_STREAMLIT:
-+            assert specs == ["streamlit"]
-+        else:
-+            assert specs == [], f"{launcher!r} not fully pruned: {specs}"
-+    assert result["groups"][DASHBOARD_JOB_REF] == []
-+
-+
-+def test_export_prunes_marker_guarded_specs() -> None:
-+    """Marker-guarded user specs count toward the prune set — name-level only."""
-+    with isolated_workspace("deps_none") as ctx:
-+        Path(ctx.run_dir, "requirements.txt").write_text('s3fs ; python_version >= "3.8"\n')
-+        with patch(_SHUTIL_WHICH, return_value=None):
-+            result = export_workspace_requirements(Path(ctx.run_dir))
-+    assert "s3fs" not in result["launcher_requirements"][LAUNCHER_JOB]
-+    assert "s3fs" not in result["groups"][DASHBOARD_JOB_REF]
-+
-+
- def test_python_version_shape() -> None:
-     version = python_version()
-     assert re.fullmatch(r"\d+\.\d+", version)
-diff --git a/uv.lock b/uv.lock
-index 76e2babaa..a114388a1 100644
---- a/uv.lock
-+++ b/uv.lock
-@@ -2917,6 +2917,7 @@ workspace-deps = [
-     { name = "pyarrow", version = "21.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-     { name = "pyarrow", version = "23.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
-     { name = "pydbml" },
-+    { name = "s3fs" },
- ]
- 
- [package.metadata]
-@@ -3140,6 +3141,7 @@ workspace-deps = [
-     { name = "pathspec", specifier = ">=0.11.2" },
-     { name = "pyarrow", specifier = ">=16.0.0" },
-     { name = "pydbml", specifier = ">=1.2.0" },
-+    { name = "s3fs", specifier = ">=2022.4.0" },
- ]
- 
- [[package]]
-
-
-===== COMMIT e09c1b7d =====
-
-
-commit e09c1b7d4
-Author: Alberto
-Date: 2026-06-11
-
-    Feat/add cdn marimo launcher (#4049)
-
-diff --git a/dlt/_workspace/deployment/configuration.py b/dlt/_workspace/deployment/configuration.py
-index faa998c88..a61258e5f 100644
---- a/dlt/_workspace/deployment/configuration.py
-+++ b/dlt/_workspace/deployment/configuration.py
-@@ -23,6 +23,10 @@ class MarimoConfiguration(BaseConfiguration):
-     session_ttl: int = 120
-     """Seconds before closing an idle session."""
-     command: Literal["run", "edit"] = "run"
-+    asset_url: Optional[str] = (
-+        "https://cdn.jsdelivr.net/npm/@marimo-team/frontend@{version}/dist"
-+    )
-+    """CDN URL for marimo frontend assets. Marimo substitutes `{version}` from the installed package. Set to empty string to disable and serve assets from the app origin."""
- 
- 
- @configspec
-diff --git a/dlt/_workspace/deployment/launchers/_launcher.py b/dlt/_workspace/deployment/launchers/_launcher.py
-index 122b36e1e..bbbfc2044 100644
---- a/dlt/_workspace/deployment/launchers/_launcher.py
-+++ b/dlt/_workspace/deployment/launchers/_launcher.py
-@@ -1,7 +1,7 @@
- import argparse
-+import importlib.util
- import os
- import subprocess
--from importlib import import_module
- from typing import Any, Dict, List, Optional, Tuple
- 
- from dlt.common import json
-@@ -61,11 +61,14 @@ def get_run_args_base_path(entry_point: TRuntimeEntryPoint) -> str:
- 
- 
- def resolve_module_path(module_name: str) -> str:
--    """Resolve a Python module name to its file path."""
--    mod = import_module(module_name)
--    file_path: Optional[str] = getattr(mod, "__file__", None)
-+    """Resolve a Python module name to its file path without importing it."""
-+    spec = importlib.util.find_spec(module_name)
-+    if spec is None:
-+        raise ValueError(f"module {module_name!r} could not be resolved")
-+
-+    file_path: Optional[str] = spec.origin
-     if file_path is None:
--        raise ValueError(f"module {module_name!r} has no __file__")
-+        raise ValueError(f"module {module_name!r} has no origin")
-     return file_path
- 
- 
-diff --git a/dlt/_workspace/deployment/launchers/marimo.py b/dlt/_workspace/deployment/launchers/marimo.py
-index 9cb2ae1c5..b85485645 100644
---- a/dlt/_workspace/deployment/launchers/marimo.py
-+++ b/dlt/_workspace/deployment/launchers/marimo.py
-@@ -40,6 +40,8 @@ def run(entry_point: TRuntimeEntryPoint) -> None:
-     args.extend(["--session-ttl", str(mc.session_ttl)])
-     if base_path:
-         args.extend(["--base-url", base_path])
-+    if mc.asset_url:
-+        args.extend(["--asset-url", mc.asset_url])
- 
-     exec_process(args)
- 
-diff --git a/tests/workspace/deployment/test_launchers.py b/tests/workspace/deployment/test_launchers.py
-index 106a6633d..f1af4df81 100644
---- a/tests/workspace/deployment/test_launchers.py
-+++ b/tests/workspace/deployment/test_launchers.py
-@@ -1,5 +1,6 @@
- """Tests for job launchers."""
- 
-+import importlib.util
- import json
- import os
- import signal
-@@ -278,6 +279,25 @@ def test_job_launcher_mcp_fallback() -> None:
-         mock_run_mcp.assert_called_once()
- 
- 
-+def test_resolve_module_path_returns_file_without_importing() -> None:
-+    """resolve_module_path must not execute the target module."""
-+    module_name = f"{WORKSPACE}.marimo_notebook"
-+    expected = importlib.util.find_spec(module_name).origin
-+    sys.modules.pop(module_name, None)
-+
-+    from dlt._workspace.deployment.launchers._launcher import resolve_module_path
-+
-+    assert resolve_module_path(module_name) == expected
-+    assert module_name not in sys.modules
-+
-+
-+def test_resolve_module_path_unknown_module() -> None:
-+    from dlt._workspace.deployment.launchers._launcher import resolve_module_path
-+
-+    with pytest.raises(ValueError, match="could not be resolved"):
-+        resolve_module_path("totally_fake_module_abc123")
-+
-+
- def test_module_launcher_builds_correct_args() -> None:
-     """Module launcher passes [sys.executable, '-m', <module>] to exec_process."""
-     with patch("dlt._workspace.deployment.launchers.module.exec_process") as mock_exec:
-@@ -312,6 +332,11 @@ def test_marimo_launcher_builds_correct_args() -> None:
-         assert "0.0.0.0" in cmd
-         assert "--headless" in cmd
-         assert "--no-token" in cmd
-+        assert "--asset-url" in cmd
-+        assert (
-+            "https://cdn.jsdelivr.net/npm/@marimo-team/frontend@{version}/dist"
-+            in cmd
-+        )
- 
- 
- def test_marimo_launcher_with_token() -> None:
-
-
-===== COMMIT 1e7366b2 =====
-
-
-commit 1e7366b2b
-Author: Alena Astrakhantseva
-Date: 2026-06-10
-
-    Fix retry after zero (#4043)
-
-diff --git a/dlt/sources/helpers/requests/retry.py b/dlt/sources/helpers/requests/retry.py
-index 07c575c9f..bd3d96f26 100644
---- a/dlt/sources/helpers/requests/retry.py
-+++ b/dlt/sources/helpers/requests/retry.py
-@@ -89,6 +89,8 @@ class wait_exponential_retry_after(wait_exponential):
-                 return None
-             retry_date = mktime_tz(retry_date_tuple)
-             seconds = retry_date - time.time()
-+        if seconds <= 0:
-+            return None
-         return max(self.min, min(self.max, seconds))
- 
-     def _get_retry_after(self, retry_state: RetryCallState) -> Optional[float]:
-diff --git a/tests/sources/helpers/test_requests.py b/tests/sources/helpers/test_requests.py
-index db6a62545..5686eb715 100644
---- a/tests/sources/helpers/test_requests.py
-+++ b/tests/sources/helpers/test_requests.py
-@@ -198,6 +198,49 @@ def test_wait_retry_after_int(mock_sleep: mock.MagicMock) -> None:
-     assert 4 <= mock_sleep.call_args[0][0] <= 5  # Adds jitter up to 1s
- 
- 
-+@pytest.mark.parametrize(
-+    "retry_after_value",
-+    ["0", "Tue, 10 Jun 2025 00:00:00 GMT", "  0  "],
-+)
-+def test_wait_retry_after_zero_falls_through_to_backoff(
-+    mock_sleep: mock.MagicMock, retry_after_value: str
-+) -> None:
-+    """Retry-After: 0 (or negative) must fall through to exponential backoff, not retry instantly."""
-+    session = Client(request_backoff_factor=1, request_max_attempts=3).session
-+    url = "https://example.com/data"
-+    m = requests_mock.Adapter()
-+    session.mount("https://", m)
-+    responses: List[Dict[str, Any]] = [
-+        dict(text="error", headers={"retry-after": retry_after_value}, status_code=429),
-+        dict(text="success"),
-+    ]
-+    m.register_uri("GET", url, responses)
-+    session.get(url)
-+
-+    # exponential backoff must have fired — sleep called with a positive value
-+    mock_sleep.assert_called_once()
-+    assert mock_sleep.call_args[0][0] > 0
-+
-+
-+def test_wait_retry_after_zero_then_nonzero_uses_header(mock_sleep: mock.MagicMock) -> None:
-+    """After falling back to backoff on Retry-After: 0, a subsequent non-zero header is respected."""
-+    session = Client(request_backoff_factor=0, request_max_attempts=4).session
-+    url = "https://example.com/data"
-+    m = requests_mock.Adapter()
-+    session.mount("https://", m)
-+    responses: List[Dict[str, Any]] = [
-+        dict(text="error", headers={"retry-after": "0"}, status_code=429),
-+        dict(text="error", headers={"retry-after": "10"}, status_code=429),
-+        dict(text="success"),
-+    ]
-+    m.register_uri("GET", url, responses)
-+    session.get(url)
-+
-+    assert mock_sleep.call_count == 2
-+    assert mock_sleep.call_args_list[0][0][0] == 0  # Retry-After: 0 → backoff, but backoff_factor=0
-+    assert 10 <= mock_sleep.call_args_list[1][0][0] <= 11 # Retry-After: 10 → wait for 10
-+
-+
- def test_init_default_client() -> None:
-     """Test that the default client config is updated from runtime configuration.
-     Run twice. 1. Clean start with no existing session attached.
-
-
-===== COMMIT d373abc8 =====
-
-
-commit d373abc8d
-Author: Thierry Jean
-Date: 2026-06-10
-
-    docs: high contrast dltHub docs button (#4040)
-
-diff --git a/docs/website/docusaurus.config.js b/docs/website/docusaurus.config.js
-index b35acc8af..ed957a0c4 100644
---- a/docs/website/docusaurus.config.js
-+++ b/docs/website/docusaurus.config.js
-@@ -165,6 +165,7 @@ const config = {
-             sidebarId: "hubSidebar",
-             position: "left",
-             label: "dltHub",
-+            className: "navbar-cta",
-           },
-           {
-             type: "docSidebar",
-diff --git a/docs/website/src/css/custom.css b/docs/website/src/css/custom.css
-index 7ae4f07ec..86d81a2ac 100644
---- a/docs/website/src/css/custom.css
-+++ b/docs/website/src/css/custom.css
-@@ -455,6 +455,14 @@ html[data-theme='dark'] .slack-navbar::after {
-   background-size: 32px 32px;
- }
- 
-+.navbar-cta.navbar__link {
-+  background: var(--ifm-color-primary);
-+  color: white;
-+  border-radius: 999px;
-+  padding: 0.5rem 1rem;
-+  font-weight: 600;
-+}
-+
- /* siderbar-icons */
- 
- 
-
-
-===== COMMIT 92ad4541 =====
-
-
-commit 92ad45410
-Author: Travior
-Date: 2026-06-05
-
-    Fix Arrow string-width assumptions in pandas 3 CI (#4025)
-
-diff --git a/tests/libs/test_deltalake.py b/tests/libs/test_deltalake.py
-index ddff90099..f7aa46917 100644
---- a/tests/libs/test_deltalake.py
-+++ b/tests/libs/test_deltalake.py
-@@ -24,6 +24,25 @@ if Version(pa.__version__) < Version("17.0.0"):
-     pytest.skip("Tests disabled for pyarrow < 17.0.0", allow_module_level=True)
- 
- 
-+DELTA_ROUNDTRIP_NON_COMPARABLE_COLUMNS = ("null", "time", "decimal_arrow_max_precision")
-+
-+
-+def _canonicalize_delta_roundtrip_table(table: pa.Table) -> pa.Table:
-+    table = table.drop_columns(DELTA_ROUNDTRIP_NON_COMPARABLE_COLUMNS)
-+
-+    # Delta's logical string type does not preserve Arrow string offset width.
-+    # e.g. arrows `large_string` is converted to `string` in Delta table.
-+    fields = [
-+        (
-+            field.with_type(pa.string())
-+            if pa.types.is_string(field.type) or pa.types.is_large_string(field.type)
-+            else field
-+        )
-+        for field in table.schema
-+    ]
-+    return table.cast(pa.schema(fields, metadata=table.schema.metadata))
-+
-+
- @pytest.fixture()
- def filesystem_client() -> Iterator[Tuple[FilesystemClient, str]]:
-     """Returns tuple of local `FilesystemClient` instance and remote directory string.
-@@ -123,8 +142,9 @@ def test_write_delta_table(
-     # table contents should be different because "time" column has type `string`
-     # in Delta table, but type `time` in Arrow source table
-     assert not dt_arrow_table.equals(arrow_table)
--    casted_cols = ("null", "time", "decimal_arrow_max_precision")
--    assert dt_arrow_table.drop_columns(casted_cols).equals(arrow_table.drop_columns(casted_cols))
-+    assert _canonicalize_delta_roundtrip_table(dt_arrow_table).equals(
-+        _canonicalize_delta_roundtrip_table(arrow_table)
-+    )
- 
-     # another `append` should create a new table version with twice the number of rows
-     write_delta_table(
-diff --git a/tests/sources/filesystem/test_readers.py b/tests/sources/filesystem/test_readers.py
-index dcc78030d..bf2ca7151 100644
---- a/tests/sources/filesystem/test_readers.py
-+++ b/tests/sources/filesystem/test_readers.py
-@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterator
- import pytest
- import pandas as pd
- import pyarrow
-+import pyarrow.parquet
- from fsspec import AbstractFileSystem
- 
- from dlt.common import pendulum, json
-@@ -36,8 +37,8 @@ def _create_parquet_file(data: list[dict[str, Any]], tmp_path: pathlib.Path) ->
-     file_name = "data.parquet"
-     full_file_path = tmp_path / file_name
- 
--    df = pd.DataFrame(data)
--    df.to_parquet(full_file_path, engine="pyarrow")
-+    table = pyarrow.Table.from_pylist(data)
-+    pyarrow.parquet.write_table(table, full_file_path)
- 
-     file_item = FileItem(
-         file_name=file_name,
-
-
-===== COMMIT 861f5c7e =====
-
-
-commit 861f5c7ee
-Author: rudolfix
-Date: 2026-06-03
-
-    master to devel merge after hotfixes (#4019)
-
-diff --git a/pyproject.toml b/pyproject.toml
-index 993bb6eea..a34f24503 100644
---- a/pyproject.toml
-+++ b/pyproject.toml
-@@ -1,6 +1,6 @@
- [project]
- name = "dlt"
--version = "1.27.1"
-+version = "1.27.2"
- description = "dlt is an open-source python-first scalable data loading library that does not require any backend to run."
- authors = [{ name = "dltHub Inc.", email = "services@dlthub.com" }]
- requires-python = ">=3.9.2, <3.15"
-diff --git a/uv.lock b/uv.lock
-index 95c234818..ee0f46e6e 100644
---- a/uv.lock
-+++ b/uv.lock
-@@ -2464,7 +2464,7 @@ wheels = [
- 
- [[package]]
- name = "dlt"
--version = "1.27.1"
-+version = "1.27.2"
- source = { editable = "." }
- dependencies = [
-     { name = "click" },
-
-
-===== COMMIT d4534b6e =====
-
-
-commit d4534b6ee
-Author: Anton Burnashev
-Date: 2026-06-03
-
-    fix: incremental merge truncates destination on no-data runs (#4000)
-
 diff --git a/dlt/extract/extract.py b/dlt/extract/extract.py
 index 11267e7b7..9628e4aa9 100644
 --- a/dlt/extract/extract.py
@@ -2936,4 +1777,1085 @@ Author: Syed Annas
 Date: 2026-05-27
 
     fix: coerce double to decimal via str() to avoid IEEE 754 expansion (#3928)
+
+diff --git a/dlt/common/data_types/type_helpers.py b/dlt/common/data_types/type_helpers.py
+index 24619ee35..62ab47bf2 100644
+--- a/dlt/common/data_types/type_helpers.py
++++ b/dlt/common/data_types/type_helpers.py
+@@ -156,6 +156,15 @@ def _text_to_wei(value: str) -> Wei:
+         raise ValueError(trim_value)
+ 
+ 
++def _float_to_decimal(value: float) -> Decimal:
++    """Uses `str` that produces most precise stable decimal representaion of given `value`"""
++    return Decimal(str(value))
++
++
++def _float_to_wei(value: float) -> Wei:
++    return Wei(str(value))
++
++
+ def _numeric_to_bigint(value: Any) -> int:
+     if value % 1 != 0:
+         raise ValueError(value)
+@@ -206,12 +215,12 @@ _COERCE_DISPATCH: Dict[Tuple[TDataType, TDataType], Callable[[Any], Any]] = {
+     # to decimal
+     ("decimal", "text"): _text_to_decimal,
+     ("decimal", "bigint"): Decimal,
+-    ("decimal", "double"): Decimal,
++    ("decimal", "double"): _float_to_decimal,
+     ("decimal", "wei"): Decimal,
+     # to wei
+     ("wei", "text"): _text_to_wei,
+     ("wei", "bigint"): Wei,
+-    ("wei", "double"): Wei,
++    ("wei", "double"): _float_to_wei,
+     ("wei", "decimal"): Wei,
+     # to bool
+     ("bool", "text"): str2bool,
+diff --git a/docs/website/docs/general-usage/schema.md b/docs/website/docs/general-usage/schema.md
+index c47de0566..38d3c54e0 100644
+--- a/docs/website/docs/general-usage/schema.md
++++ b/docs/website/docs/general-usage/schema.md
+@@ -200,6 +200,12 @@ On the other hand, if the `id` field was already a string, then introducing new
+ 
+ Now go ahead and try to add a new record where `id` is a float number; you should see a new field `id__v_double` in the schema.
+ 
++#### Float to decimal coercion
++
++When coercing a Python `float` (IEEE 754 double-precision binary) to `decimal` or `wei`, `dlt` converts via `str()` first to avoid binary expansion artifacts. For example, `34.7` as a float would expand to `34.700000000000002842...` if passed directly to `Decimal()`, so `dlt` uses `Decimal(str(34.7))` which preserves `34.7`.
++
++This follows user intent when a decimal type is explicitly chosen over float, but it is **not mathematically precise** — the `str()` conversion finds the first stable decimal representation and discards the unstable binary tail. If your decimals represent currency or require exact precision, avoid storing them as floats in the source data. Use `Decimal('34.70')` or strings instead.
++
+ #### No-coercion normalizer
+ 
+ If you use `relational_no_coercion` (see [Data normalizer](#data-normalizer)), **every** type mismatch produces a variant column. No cross-type conversion is attempted. For example, sending `"200"` to a `bigint` column creates `col__v_text` instead of parsing it as an integer. This gives you stricter schema control: the original values are always preserved exactly as received, and mismatches are immediately visible as separate columns.
+diff --git a/tests/common/schema/test_coercion.py b/tests/common/schema/test_coercion.py
+index d0f67fd6d..a8e7a1efe 100644
+--- a/tests/common/schema/test_coercion.py
++++ b/tests/common/schema/test_coercion.py
+@@ -138,7 +138,7 @@ def test_coerce_to_numeric(dec_cls: Type[Any], data_type: TDataType) -> None:
+     # mind that 1276.37 does not have binary representation as used in float
+     v = coerce_value(data_type, "double", 1276.37)
+     assert type(v) is dec_cls
+-    assert v.quantize(Decimal("1.00")) == dec_cls("1276.37")
++    assert v == dec_cls("1276.37")
+ 
+     # wei to decimal and reverse
+     v = coerce_value(data_type, "decimal", Decimal("1276.37"))
+@@ -153,6 +153,25 @@ def test_coerce_to_numeric(dec_cls: Type[Any], data_type: TDataType) -> None:
+         coerce_value(data_type, "text", "p912.12")
+ 
+ 
++def test_coerce_double_to_decimal_no_float_expansion() -> None:
++    """Decimal(str(float)) should not exhibit IEEE 754 double-precision expansion."""
++    # 34.7 as float would expand to 34.70000000000000284... with Decimal(34.7)
++    # using Decimal(str(34.7)) preserves "34.7"
++    result = coerce_value("decimal", "double", 34.7)
++    assert result == Decimal("34.7")
++    assert str(result) == "34.7"
++
++    # same issue applies to Wei which extends Decimal
++    result = coerce_value("wei", "double", 34.7)
++    assert result == Wei("34.7")
++    assert str(result) == "34.7"
++
++    # get the "binary" float by quantizing properly and avoid casting
++    qd = Decimal.from_float(34.70000000000000284).quantize(Decimal("1." + "0" * 15))
++    # 15 digits scale, round up
++    assert qd == Decimal("34.700000000000003")
++
++
+ def test_coerce_type_from_hex_text() -> None:
+     # hex text into various types
+     assert coerce_value("wei", "text", " 0xff") == 255
+
+
+===== COMMIT 00e5ca61 =====
+
+
+commit 00e5ca613
+Author: rudolfix
+Date: 2026-05-27
+
+    documents the order of PipelineTasksGroup and dlt.pipeline creation (#3982)
+
+diff --git a/dlt/helpers/airflow_helper.py b/dlt/helpers/airflow_helper.py
+index f62ac0b03..a74d5ce93 100644
+--- a/dlt/helpers/airflow_helper.py
++++ b/dlt/helpers/airflow_helper.py
+@@ -414,12 +414,14 @@ class PipelineTasksGroup(TaskGroup):
+             Any: Airflow tasks created in order of creation.
+         """
+ 
+-        # make sure that pipeline was created after dag was initialized
++        # make sure that pipeline was created after PipelineTasksGroup was instantiated
+         if not pipeline.pipelines_dir.startswith(os.environ[DLT_DATA_DIR]):
+             raise ValueError(
+-                "Please create your Pipeline instance after AirflowTasks are created. The dlt"
+-                f" pipelines directory {pipeline.pipelines_dir} is not set correctly"
+-                f" ({os.environ[DLT_DATA_DIR]} expected)."
++                f"Pipeline {pipeline.pipeline_name} has pipelines_dir set to"
++                f" '{pipeline.pipelines_dir}' but a fresh random working directory under"
++                f" '{os.environ[DLT_DATA_DIR]}' is expected. Instantiate PipelineTasksGroup"
++                " BEFORE creating the Pipeline so dlt.pipeline() picks up the per-worker"
++                f" random working directory set by PipelineTasksGroup in {DLT_DATA_DIR}."
+             )
+ 
+         with self:
+diff --git a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
+index 92b9f6d3c..2fb242a6c 100644
+--- a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
++++ b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
+@@ -152,7 +152,7 @@ def load_data():
+     # Import your source from the pipeline script
+     from pipeline_or_source_script import source
+ 
+-    # Modify the pipeline parameters
++    # Create the pipeline after instance of `PipelineTasksGroup` is created
+     pipeline = dlt.pipeline(
+         pipeline_name='pipeline_name',
+         dataset_name='dataset_name',
+@@ -226,6 +226,10 @@ load_data()
+ When you run the `load_data` DAG above, Airflow will call the `source` function every 30 seconds (by default) to be able to monitor the tasks. Make sure that your source function does not perform any long-lasting operations, e.g., reflecting the source database. In the case of [sql_database](../../dlt-ecosystem/verified-sources/sql_database/index.md), we added an option to delay database reflection until data is accessed by a resource.
+ :::
+ 
++:::caution
++Always instantiate `PipelineTasksGroup` **before** creating the `dlt.pipeline`. The constructor of `PipelineTasksGroup` overrides the `DLT_DATA_DIR` environment variable to a fresh random per-worker directory so that Airflow workers, which are reused across DAG runs, do not leak pipeline state between runs.
++:::
++
+ ### 3. Import sources and move the relevant code from the pipeline script
+ 
+ You should now move your working code from the pipeline script you previously ran to the newly created DAG script.
+diff --git a/tests/helpers/airflow_tests/test_airflow_wrapper.py b/tests/helpers/airflow_tests/test_airflow_wrapper.py
+index b92195df5..a74891164 100644
+--- a/tests/helpers/airflow_tests/test_airflow_wrapper.py
++++ b/tests/helpers/airflow_tests/test_airflow_wrapper.py
+@@ -1016,3 +1016,36 @@ def test_on_before_run() -> None:
+                 mock.call(f'on_before_run test: {pendulum.tomorrow().format("YYYY-MM-DD")}'),
+             ]
+         )
++
++
++def test_pipeline_created_before_task_group_raises() -> None:
++    # creating dlt.pipeline before PipelineTasksGroup uses a pipelines_dir that does not
++    # match the per-worker random dir set by PipelineTasksGroup. add_run must surface a
++    # clear error pointing at the ordering and the workaround.
++    @dag(schedule=None, start_date=DEFAULT_DATE, catchup=False, default_args=default_args)
++    def dag_wrong_order():
++        early_pipeline = dlt.pipeline(
++            pipeline_name="pipeline_wrong_order",
++            dataset_name="mock_data_" + uniq_id(),
++            destination=dlt.destinations.duckdb(credentials=":pipeline:"),
++        )
++        tasks = PipelineTasksGroup(
++            "pipeline_wrong_order",
++            local_data_folder=get_test_storage_root(),
++            wipe_local_data=False,
++        )
++        with pytest.raises(ValueError) as exc_info:
++            tasks.add_run(
++                early_pipeline,
++                mock_data_source(),
++                decompose="none",
++                trigger_rule="all_done",
++                retries=0,
++            )
++        message = str(exc_info.value)
++        assert "PipelineTasksGroup" in message
++        assert "BEFORE creating the Pipeline" in message
++        assert "DLT_DATA_DIR" in message
++        assert "pipelines_dir" in message
++
++    dag_wrong_order()
+
+
+===== COMMIT 38a0a24d =====
+
+
+commit 38a0a24d9
+Author: elvis kahoro
+Date: 2026-05-26
+
+    Update README.md (#3971)
+
+diff --git a/README.md b/README.md
+index 1948779dc..ff3cd5c37 100644
+--- a/README.md
++++ b/README.md
+@@ -124,7 +124,7 @@ Please read [CONTRIBUTING](CONTRIBUTING.md) before you make a PR.
+   </a>
+ </p>
+ 
+-[Blacksmith](https://blacksmith.sh/?utm_source=dlt&utm_medium=readme&utm_campaign=sponsorship) is a CI/CD platform that accelerates GitHub Actions by reducing queue times and improving build performance. It helps teams run workflows faster and more efficiently, making it easier to maintain a smooth development pipeline. We're grateful to Blacksmith for sponsoring dlt with free CI/CD minutes, which helps us keep builds fast and our costs lower.
++[Blacksmith](https://blacksmith.sh/?utm_source=dlt&utm_medium=readme&utm_campaign=sponsorship) is a drop-in replacement for GitHub-hosted runners that speed up our CI/CD pipelines by 2x and up to 75% cheaper. We're grateful to Blacksmith for sponsoring us with free CI/CD minutes--which helps us keep builds fast and our costs lower.
+ 
+ ## License
+ 
+
+
+===== COMMIT a0114a2c =====
+
+
+commit a0114a2c7
+Author: Jsu
+Date: 2026-05-26
+
+    typos: wether -> whether, invididual -> individual (#3973)
+
+diff --git a/dlt/dataset/dataset.py b/dlt/dataset/dataset.py
+index 087d91e4d..607c917d3 100644
+--- a/dlt/dataset/dataset.py
++++ b/dlt/dataset/dataset.py
+@@ -163,7 +163,7 @@ class Dataset:
+     def sqlglot_schema(self) -> SQLGlotSchema:
+         """SQLGlot schema of the dataset derived from all dlt schemas."""
+         # NOTE: no cache for now, it is probably more expensive to compute the current schema hash
+-        # to see wether this is stale than to compute a new sqlglot schema
++        # to see whether this is stale than to compute a new sqlglot schema
+         return lineage.create_sqlglot_schema(
+             {self.dataset_name: list(self.schemas)}, dialect=self.destination_dialect
+         )
+diff --git a/dlt/destinations/impl/dremio/sql_client.py b/dlt/destinations/impl/dremio/sql_client.py
+index c9299df95..9354020f1 100644
+--- a/dlt/destinations/impl/dremio/sql_client.py
++++ b/dlt/destinations/impl/dremio/sql_client.py
+@@ -158,7 +158,7 @@ class DremioSqlClient(SqlClientBase[pydremio.DremioConnection]):
+         return isinstance(ex, (pyarrow.lib.ArrowInvalid, pydremio.MalformedQueryError))
+ 
+     def create_dataset(self) -> None:
+-        # We create a sentinel table which defines wether we consider the dataset created
++        # We create a sentinel table which defines whether we consider the dataset created
+         sentinel_table_name = self.make_qualified_table_name(self.SENTINEL_TABLE_NAME)
+         self.execute_sql(f"CREATE TABLE {sentinel_table_name} (_dlt_id BIGINT)")
+ 
+diff --git a/dlt/extract/hints.py b/dlt/extract/hints.py
+index efff31d3e..e90346efc 100644
+--- a/dlt/extract/hints.py
++++ b/dlt/extract/hints.py
+@@ -212,12 +212,12 @@ class DltResourceHints:
+ 
+     @property
+     def has_dynamic_table_name(self) -> bool:
+-        """Tells the extractor wether computed table name may change based on invididual data items"""
++        """Tells the extractor whether computed table name may change based on individual data items"""
+         return self._table_name_hint_fun is not None
+ 
+     @property
+     def has_other_dynamic_hints(self) -> bool:
+-        """Tells the extractor wether computed hints may change based on invididual data items"""
++        """Tells the extractor whether computed hints may change based on individual data items"""
+         return self._table_has_other_dynamic_hints
+ 
+     @property
+
+
+===== COMMIT 2b92d086 =====
+
+
+commit 2b92d0864
+Author: Jorrit Sandbrink
+Date: 2026-05-26
+
+    add spn fabric token refresh automation (#3925)
+
+diff --git a/.github/workflows/test_destinations_remote.yml b/.github/workflows/test_destinations_remote.yml
+index 5931b11dd..523281b10 100644
+--- a/.github/workflows/test_destinations_remote.yml
++++ b/.github/workflows/test_destinations_remote.yml
+@@ -158,6 +158,7 @@ jobs:
+               filesystem_drivers: "[\"memory\"]"
+               extras: "--extra fabric"
+               pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
++              post_secrets_commands: "uv run python tests/load/fabric/refresh_spn_fabric_token.py"
+ 
+             # Postgres and Redshift (used to be test_destinations.yml)
+             - name: redshift
+@@ -245,6 +246,10 @@ jobs:
+       - name: create secrets.toml
+         run: pwd && echo "$DLT_SECRETS_TOML" > tests/.dlt/secrets.toml
+ 
++      - name: Run post secrets commands
++        run: ${{ matrix.post_secrets_commands }}
++        if: ${{ matrix.post_secrets_commands }}
++
+       # NOTE: essential tests are always run
+       - name: Run essential tests Linux
+         run: make test-dest-remote-essential
+diff --git a/tests/load/fabric/refresh_spn_fabric_token.py b/tests/load/fabric/refresh_spn_fabric_token.py
+new file mode 100644
+index 000000000..5d1126c04
+--- /dev/null
++++ b/tests/load/fabric/refresh_spn_fabric_token.py
+@@ -0,0 +1,42 @@
++# https://learn.microsoft.com/en-us/fabric/data-warehouse/service-principals#token-renewal-and-initialization-requirements
++
++import os
++
++import requests
++
++from azure.identity import ClientSecretCredential
++
++import dlt
++from dlt.destinations.impl.fabric.configuration import FabricCredentials
++
++
++def main() -> None:
++    # get SPN credentials
++    os.environ["DLT_PROJECT_DIR"] = "tests"
++    credentials = dlt.secrets.get("destination.fabric.credentials", FabricCredentials)
++    if credentials is None:
++        raise RuntimeError("`destination.fabric.credentials` is not configured.")
++
++    # get bearer token
++    token = (
++        ClientSecretCredential(
++            tenant_id=credentials.azure_tenant_id,
++            client_id=credentials.azure_client_id,
++            client_secret=credentials.azure_client_secret,
++        )
++        .get_token("https://api.fabric.microsoft.com/.default")
++        .token
++    )
++
++    # call public Fabric API endpoint to refresh token (any endpoint will do)
++    response = requests.get(
++        "https://api.fabric.microsoft.com/v1/workspaces",
++        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
++        timeout=30,
++    )
++    response.raise_for_status()
++    print("Refreshed Fabric SPN token successfully.")
++
++
++if __name__ == "__main__":
++    main()
+
+
+===== COMMIT 86d7dbdd =====
+
+
+commit 86d7dbdd3
+Author: Alberto
+Date: 2026-05-26
+
+    feat (dlthub pro): static_egress_ips (#3961)
+
+diff --git a/dlt/_workspace/deployment/decorators.py b/dlt/_workspace/deployment/decorators.py
+index 943985d45..c26bd6842 100644
+--- a/dlt/_workspace/deployment/decorators.py
++++ b/dlt/_workspace/deployment/decorators.py
+@@ -371,7 +371,8 @@ def job(
+ 
+         require: Runtime resource requirements. Accepts `TRequireSpec` with:
+             `dependency_groups`, `profile` (workspace profile), `machine`
+-            (machine spec), `region` (runner placement).
++            (machine spec), `region` (runner placement), `static_egress_ips`
++            (static outbound IPs for third-party allowlists).
+ 
+         deliver: A `@dlt.source`, standalone `@dlt.resource`, or called source
+             instance for delivery association.
+@@ -472,7 +473,7 @@ def interactive(
+             `tags`, `starred`, `manual`. The `interface` argument is merged
+             into expose automatically.
+         require: Runtime resource requirements. Accepts `TRequireSpec` with:
+-            `dependency_groups`, `profile`, `machine`, `region`.
++            `dependency_groups`, `profile`, `machine`, `region`, `static_egress_ips`.
+         spec: Optional configuration spec class.
+ 
+     Returns:
+@@ -539,7 +540,7 @@ def pipeline_run(
+         expose: UI presentation (`TJobExposeSpec`): `tags`, `starred`, `manual`.
+ 
+         require: Resource requirements (`TRequireSpec`): `dependency_groups`,
+-            `profile`, `machine`, `region`.
++            `profile`, `machine`, `region`, `static_egress_ips`.
+ 
+         interval: Overall time range for interval-based scheduling.
+ 
+diff --git a/dlt/_workspace/deployment/typing.py b/dlt/_workspace/deployment/typing.py
+index 61091f732..f34a15de5 100644
+--- a/dlt/_workspace/deployment/typing.py
++++ b/dlt/_workspace/deployment/typing.py
+@@ -106,6 +106,8 @@ class TRequireSpec(TypedDict, total=False):
+     """Runner region for placement (e.g. `"us-east-1"`, `"eu-west"`)."""
+     timezone: str
+     """IANA timezone for cron ticks and intervals (e.g. `"America/New_York"`). Default: UTC."""
++    static_egress_ips: bool
++    """When `True`, route outbound traffic through the workspace static egress IPs."""
+ 
+ 
+ class TEntryPoint(TypedDict):
+diff --git a/docs/website/docs/hub/runtime/job-configuration.md b/docs/website/docs/hub/runtime/job-configuration.md
+index 21397c7b4..e9f248493 100644
+--- a/docs/website/docs/hub/runtime/job-configuration.md
++++ b/docs/website/docs/hub/runtime/job-configuration.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Job configuration
+ description: Per-job options on the dltHub platform — execution timeouts, dependency groups, and TOML configuration sections
+-keywords: [dlthub platform, job configuration, timeout, dependency groups, execute, require, expose, section]
++keywords: [dlthub platform, job configuration, timeout, dependency groups, static egress, execute, require, expose, section]
+ ---
+ 
+ # Job configuration
+@@ -44,6 +44,25 @@ def transform(run_context: TJobRunContext):
+ 
+ The dltHub platform composes the execution environment from the workspace's base dependencies plus the job's declared groups.
+ 
++## Static egress IPs
++
++Use this when you must whitelist outbound IP addresses so external systems can grant your jobs access to private resources. Opt in per job so outbound requests use your workspace's static egress IPs:
++
++```py
++@run.pipeline(my_pipeline, require={"static_egress_ips": True})
++def sync_from_vendor():
++    ...
++```
++
++Static egress routing forces job traffic through the US region. See [Regions and data residency](regions.md) for how regional data planes relate to your organization.
++
++The static egress IPs are:
++- 4.205.113.62
++- 44.221.24.144
++- 34.193.87.36
++- 98.80.106.70
++- 54.81.217.233
++
+ ## Job configuration via TOML
+ 
+ Jobs read configuration through dlt's standard config system. The default section is the containing module name:
+diff --git a/tests/workspace/deployment/test_decorators.py b/tests/workspace/deployment/test_decorators.py
+index 0c16b9d30..b6b1f948b 100644
+--- a/tests/workspace/deployment/test_decorators.py
++++ b/tests/workspace/deployment/test_decorators.py
+@@ -368,9 +368,21 @@ def test_job_definition_omits_unset_fields() -> None:
+     assert "tags" not in job_def
+     assert "deliver" not in job_def
+     assert "expose" not in job_def
++    assert "require" not in job_def
+     assert job_def["triggers"] == []
+ 
+ 
++def test_require_static_egress_ips_stored_on_job_definition() -> None:
++    """`require.static_egress_ips` is passed through to the job definition."""
++
++    @job(require={"static_egress_ips": True})
++    def vendor_sync():
++        pass
++
++    job_def = vendor_sync.to_job_definition()
++    assert job_def["require"]["static_egress_ips"] is True
++
++
+ def test_config_key_discovery() -> None:
+     """Config keys from dlt.config.value defaults are discovered in job definition."""
+ 
+
+
+===== COMMIT 67266602 =====
+
+
+commit 672666028
+Author: Elisabeth Reitmayr
+Date: 2026-05-26
+
+    docs CI: smarter verify-redirects and dedicated CI step (#3970)
+
+diff --git a/.github/workflows/build_docs.yml b/.github/workflows/build_docs.yml
+index fbbb040dd..baf963d12 100644
+--- a/.github/workflows/build_docs.yml
++++ b/.github/workflows/build_docs.yml
+@@ -32,3 +32,6 @@ jobs:
+ 
+       - name: Install python dependencies
+         run: cd docs/website && npm run build
++
++      - name: Verify redirects
++        run: cd docs/website && npm run verify-redirects
+diff --git a/docs/website/README.md b/docs/website/README.md
+index aff106c60..a196c6d8d 100644
+--- a/docs/website/README.md
++++ b/docs/website/README.md
+@@ -64,7 +64,34 @@ For most authoring purposes, once you are happy with your changes running locall
+ $ npm run build
+ ```
+ 
+-That command generates static content into the `build` directory, which can be served using any static contents hosting service, for example, `npm run serve`
++That command generates static content into the `build` directory, which can be served using `npm run serve`.
++
++### What `npm run build` does
++
++The full build runs these steps in order:
++
++1. **`npm run update-versions`** — clones `dlt`, checks out the `master` branch, freezes the content into `versioned_docs/version-master/`. This is the **master snapshot** (served at `/docs/`); your branch is served at `/docs/devel/`. See [Docs versions](#docs-versions) below.
++2. **`make preprocess-docs`** (from `docs/`) — Python preprocessor: expands `<!--@@@DLT_SNIPPET-->` markers, generates the API reference, etc.
++3. **`docusaurus build --out-dir build/docs`** — the static site build itself. Fails on broken internal markdown links.
++4. **`node scripts/verify-llms-txt.js`** — checks the generated `llms.txt` index against the sidebar.
++
++### Running individual checks
++
++After a full build, you can re-run the verifiers standalone — useful when iterating on one concern without rebuilding everything:
++
++```
++$ npm run verify-llms          # llms.txt index check
++$ npm run verify-redirects     # redirect targets check
++```
++
++**`verify-redirects` is no longer part of `npm run build` — CI runs it as a dedicated `Verify redirects` step in `.github/workflows/build_docs.yml`.** To reproduce CI locally:
++
++```
++$ npm run build
++$ npm run verify-redirects
++```
++
++Run this whenever you add or change entries in `redirects.js`. See [Redirects](#redirects) below for how to interpret the output (errors vs. devel-only warnings)
+ 
+ ## Deployment
+ 
+@@ -78,7 +105,14 @@ This will build the project fully and serve via a local wrangler webserver which
+ 
+ ## Redirects
+ 
+-Simple redirects are managed with the cloudflare worker in `worker.js`. 
++Redirects are defined in [`redirects.js`](redirects.js) as one shared list, consumed in two places:
++
++- **Cloudflare worker (`worker.ts`)** — serves the redirects in production.
++- **`scripts/verify-redirects.js`** — runs in CI to check every `to` target resolves to an HTML page in `build/docs/`.
++
++The docs site builds two snapshots: `master` (frozen at the last `dlt` release, mounted at `/docs/`) and `devel` (your current branch, mounted at `/docs/devel/`). Verification checks targets against master first. If a target only resolves under `build/docs/devel/<path>` it emits a **warning** ("devel-only — awaits next release") instead of an error. This is the expected state during a docs restructure: once the next `dlt` release refreshes master, the warning auto-clears. Targets that resolve in neither snapshot still error and block CI.
++
++Verification runs as a dedicated `Verify redirects` step in `.github/workflows/build_docs.yml`, after the docs build.
+ 
+ ## Docs versions
+ 
+@@ -152,7 +186,7 @@ Hub pages receive special treatment in swizzled theme components:
+ - **`src/theme/DocBreadcrumbs`** — When the current URL contains `/hub/`, a dltHub logo is rendered next to the breadcrumb trail (via the `breadcrumbsContainerPlus` CSS class and an `<img>` tag).
+ - **`src/components/DltHubFeatureAdmonition.js`** — A reusable admonition component imported by hub pages to display licensing/feature notices.
+ 
+-In production, the Cloudflare worker (`worker.js`) redirects the legacy `/plus/` URL prefix to `/hub/`.
++In production, the Cloudflare worker (`worker.ts`) redirects the legacy `/plus/` URL prefix to `/hub/`.
+ 
+ ## Page overlays (Root.js)
+ 
+diff --git a/docs/website/docs/hub/getting-started/runtime-tutorial.md b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+index d2e49bd09..fe03693af 100644
+--- a/docs/website/docs/hub/getting-started/runtime-tutorial.md
++++ b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+@@ -219,7 +219,7 @@ To stop a schedule, remove the trigger from the decorator (or remove the job fro
+ ## Review and manage jobs in the UI
+ 
+ The command line is great for development, but the dltHub web UI gives you a bird's-eye view of everything running in the cloud.
+-Visit [dlthub.app](https://dlthub.app)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
++Visit [app.dlthub.com](https://app.dlthub.com)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
+ 
+ 1. A list of existing jobs.
+ 2. An overview of scheduled runs.
+diff --git a/docs/website/package.json b/docs/website/package.json
+index 10ada4f97..17f0cc241 100644
+--- a/docs/website/package.json
++++ b/docs/website/package.json
+@@ -4,7 +4,7 @@
+   "private": true,
+   "scripts": {
+     "start": "cd .. && make preprocess-docs && concurrently --kill-others \"make preprocess-docs-watch \" \"cd website && docusaurus start\"",
+-    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js && node scripts/verify-redirects.js",
++    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js",
+     "clear": "docusaurus clear",
+     "serve": "docusaurus serve --dir build/docs",
+     "clear-versions": "node tools/clear_versions.js",
+diff --git a/docs/website/scripts/verify-redirects.js b/docs/website/scripts/verify-redirects.js
+index 663802d2f..6632bae14 100644
+--- a/docs/website/scripts/verify-redirects.js
++++ b/docs/website/scripts/verify-redirects.js
+@@ -21,6 +21,7 @@ const redirects = require('../redirects.js');
+ // ---------------------------------------------------------------------------
+ let errors = 0;
+ let warnings = 0;
++let develOnlyWarnings = 0;
+ 
+ function error(msg) {
+   console.error(`  ERROR: ${msg}`);
+@@ -44,6 +45,14 @@ function targetExists(rel) {
+   return candidates.some((c) => fs.existsSync(c));
+ }
+ 
++function targetExistsOnDevel(rel) {
++  const candidates = [
++    path.join(BUILD_DIR, 'devel', rel + '.html'),
++    path.join(BUILD_DIR, 'devel', rel, 'index.html'),
++  ];
++  return candidates.some((c) => fs.existsSync(c));
++}
++
+ // ---------------------------------------------------------------------------
+ // Main
+ // ---------------------------------------------------------------------------
+@@ -92,9 +101,15 @@ for (const r of redirects) {
+ 
+   checked++;
+   const rel = r.to.replace(/^\/docs\//, '').replace(/\/$/, '');
+-  if (!targetExists(rel)) {
+-    error(`redirect target ${r.to} has no HTML page (from: ${r.from}, checked ${rel}.html and ${rel}/index.html)`);
++  if (targetExists(rel)) {
++    continue;
++  }
++  if (targetExistsOnDevel(rel)) {
++    warn(`(devel-only): ${r.to} — resolves on devel, awaits next release (from: ${r.from})`);
++    develOnlyWarnings++;
++    continue;
+   }
++  error(`redirect target ${r.to} has no HTML page (from: ${r.from}, checked ${rel}.html and ${rel}/index.html)`);
+ }
+ 
+ if (skipped > 0) {
+@@ -102,7 +117,12 @@ if (skipped > 0) {
+ }
+ 
+ if (errors === 0) {
+-  ok(`all ${checked} checked redirect targets resolve to existing pages`);
++  if (develOnlyWarnings === 0) {
++    ok(`all ${checked} checked redirect targets resolve to existing pages`);
++  } else {
++    const masterResolved = checked - develOnlyWarnings;
++    ok(`${masterResolved}/${checked} checked redirect targets resolve in master; ${develOnlyWarnings} resolve only on devel (await next release)`);
++  }
+ }
+ 
+ // Summary
+
+
+===== COMMIT ecb61edf =====
+
+
+commit ecb61edf3
+Author: Jean-Baptiste Braun
+Date: 2026-05-22
+
+    fix(sftp): cap paramiko<5 in sftp extra (#3931) (#3966)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index c0d6b9bc8..63b077c75 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -118,7 +118,8 @@ hf = [
+     "pyarrow>=21.0.0",  # minimum version that supports CDC (https://huggingface.co/blog/parquet-cdc)
+ ]
+ sftp = [
+-    "paramiko>=3.3.0"
++    # paramiko 5.0.0 dropped GSSAPI support and broke SFTP filesystem (#3931). cap until upgrade evaluated.
++    "paramiko>=3.3.0,<5"
+ ]
+ http = [
+     "aiohttp>3.9.0"
+diff --git a/uv.lock b/uv.lock
+index 994f11e5c..a72952fa6 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2855,7 +2855,7 @@ requires-dist = [
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.6.7,!=3.9.11,!=3.9.12,!=3.9.13,!=3.9.14,!=3.10.1,<4" },
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.10.1" },
+     { name = "packaging", specifier = ">=21.1" },
+-    { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.3.0" },
++    { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.3.0,<5" },
+     { name = "pathvalidate", specifier = ">=2.5.2" },
+     { name = "pendulum", specifier = ">=2.1.2" },
+     { name = "pendulum", marker = "python_full_version >= '3.14'", specifier = ">=3.0.0" },
+
+
+===== COMMIT 6f10e633 =====
+
+
+commit 6f10e633e
+Author: Alberto
+Date: 2026-05-22
+
+    Change workers to blacksmith (#3873)
+
+diff --git a/.github/workflows/build_docs.yml b/.github/workflows/build_docs.yml
+index b4f35c9fe..fbbb040dd 100644
+--- a/.github/workflows/build_docs.yml
++++ b/.github/workflows/build_docs.yml
+@@ -7,7 +7,7 @@ on:
+ jobs:
+   build_docs:
+     name: docs | build docs
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+       - name: Check out
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 6380a3121..39beef10a 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -13,7 +13,7 @@ jobs:
+       fail-fast: true
+       matrix:
+         os:
+-          - ubuntu-latest
++          - blacksmith-8vcpu-ubuntu-2404
+         python-version: ["3.10", "3.11", "3.12", "3.13"]
+ 
+     defaults:
+@@ -64,7 +64,7 @@ jobs:
+   matrix_job_required_check:
+     name: lint | code & tests
+     needs: run_lint
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-2vcpu-ubuntu-2404
+     if: always()
+     steps:
+       - name: Check matrix job results
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 629a9f288..189c16940 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -21,7 +21,7 @@ jobs:
+   authorize_secrets:
+     name: secrets available (internal PRs only)
+     if: ${{ github.event.pull_request.head.repo.full_name == github.repository && (github.event.action == 'opened' || github.event.action == 'synchronize') }}
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-2vcpu-ubuntu-2404
+     steps:
+       - run: true
+ 
+diff --git a/.github/workflows/test_common.yml b/.github/workflows/test_common.yml
+index 6dc7839e1..753bb930b 100644
+--- a/.github/workflows/test_common.yml
++++ b/.github/workflows/test_common.yml
+@@ -21,45 +21,45 @@ jobs:
+         include:
+ 
+           # macos tests
+-          - os: macos-latest
++          - os: blacksmith-12vcpu-macos-latest
+             python-version: "3.11"
+             shell: bash
+ 
+           # linux tests
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.10"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.12"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.13"
+             shell: bash
+ 
+-          - os: "macos-14"
++          - os: blacksmith-12vcpu-macos-latest
+             python-version: "3.14"
+             shell: bash
+ 
+           # linux test with minimal dependencies
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+             uv_sync_args: '--resolution lowest-direct' # could also be 'direct'
+ 
+           # linux test with newest available allowed packages (will update lockfile, should not be committed if run locally)
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+             uv_sync_args: '--upgrade' # could also be 'direct'
+ 
+           # windows tests
+-          - os: windows-latest
++          - os: blacksmith-8vcpu-windows-2025
+             python-version: "3.11"
+             shell: cmd
+-          - os: windows-latest
++          - os: blacksmith-8vcpu-windows-2025
+             python-version: "3.13"
+             shell: cmd
+ 
+diff --git a/.github/workflows/test_destinations_local.yml b/.github/workflows/test_destinations_local.yml
+index cc9281f0f..89e79a043 100644
+--- a/.github/workflows/test_destinations_local.yml
++++ b/.github/workflows/test_destinations_local.yml
+@@ -89,7 +89,7 @@ jobs:
+     defaults:
+       run:
+         shell: bash
+-    runs-on: "ubuntu-latest"
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     # Service containers to run with `container-job`
+     services:
+diff --git a/.github/workflows/test_sources_local.yml b/.github/workflows/test_sources_local.yml
+index 18dbf155d..d4ed62253 100644
+--- a/.github/workflows/test_sources_local.yml
++++ b/.github/workflows/test_sources_local.yml
+@@ -39,7 +39,7 @@ jobs:
+     defaults:
+       run:
+         shell: bash
+-    runs-on: "ubuntu-latest"
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+       - name: Check out
+diff --git a/.github/workflows/test_tools_airflow.yml b/.github/workflows/test_tools_airflow.yml
+index a4721fbfe..2ad85a6f7 100644
+--- a/.github/workflows/test_tools_airflow.yml
++++ b/.github/workflows/test_tools_airflow.yml
+@@ -7,7 +7,7 @@ on:
+ jobs:
+   run_airflow:
+     name: tools | airflow ${{ matrix.airflow-version }} tests
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+     strategy:
+       fail-fast: false
+       matrix:
+diff --git a/.github/workflows/test_tools_build_images.yml b/.github/workflows/test_tools_build_images.yml
+index 124687ef9..79cf25b1c 100644
+--- a/.github/workflows/test_tools_build_images.yml
++++ b/.github/workflows/test_tools_build_images.yml
+@@ -7,7 +7,7 @@ on:
+ jobs:
+   run_airflow:
+     name: tools | docker images build
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+       - name: Check out
+diff --git a/.github/workflows/test_tools_dashboard.yml b/.github/workflows/test_tools_dashboard.yml
+index c5c101935..25cb8a896 100644
+--- a/.github/workflows/test_tools_dashboard.yml
++++ b/.github/workflows/test_tools_dashboard.yml
+@@ -22,40 +22,40 @@ jobs:
+         include:
+ 
+           # macos tests
+-          - os: "macos-14"
++          - os: blacksmith-12vcpu-macos-latest
+             python-version: "3.12"
+             shell: bash
+ 
+           # linux tests
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.10"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.12"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.13"
+             shell: bash
+ 
+           # linux test with minimal dependencies
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+             uv_sync_args: '--resolution lowest-direct' # could also be 'direct'
+ 
+           # mac test with newest available allowed packages (will update lockfile, should not be committed if run locally)
+           # TODO: revert to linux
+-          - os: "macos-14"
++          - os: blacksmith-12vcpu-macos-latest
+             python-version: "3.11"
+             shell: bash
+             uv_sync_args: '--upgrade' # could also be 'direct'
+ 
+ 
+           # windows tests
+-          - os: windows-latest
++          - os: blacksmith-8vcpu-windows-2025
+             python-version: "3.12"
+             shell: cmd
+ 
+@@ -113,7 +113,7 @@ jobs:
+   matrix_job_required_check:
+     name: common | common tests
+     needs: run_common
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-2vcpu-ubuntu-2404
+     if: always()
+     steps:
+       - name: Check matrix job results
+diff --git a/.github/workflows/test_tools_dbt_cloud.yml b/.github/workflows/test_tools_dbt_cloud.yml
+index 8a45f89fc..0f83b1afc 100644
+--- a/.github/workflows/test_tools_dbt_cloud.yml
++++ b/.github/workflows/test_tools_dbt_cloud.yml
+@@ -19,7 +19,7 @@ jobs:
+     defaults:
+       run:
+         shell: bash
+-    runs-on: "ubuntu-latest"
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+ 
+diff --git a/.github/workflows/test_tools_dbt_runner.yml b/.github/workflows/test_tools_dbt_runner.yml
+index 9f1cae2c1..d1377a1a1 100644
+--- a/.github/workflows/test_tools_dbt_runner.yml
++++ b/.github/workflows/test_tools_dbt_runner.yml
+@@ -16,7 +16,7 @@ jobs:
+     defaults:
+       run:
+         shell: bash
+-    runs-on: "ubuntu-latest"
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+ 
+
+
+===== COMMIT ead29e31 =====
+
+
+commit ead29e315
+Author: Anton Burnashev
+Date: 2026-05-20
+
+    Rename dlthub-runtime to dlthub-platform (#3957)
+
+diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md b/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md
+index 66aaafa9d..6cba60c89 100644
+--- a/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md
++++ b/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md
+@@ -170,5 +170,5 @@ By the end of this guide you should have:
+ - A working `@dlt.hub.transformation` script that populates the CDM
+ 
+ Next steps:
+-- [Deploy and schedule your pipeline](llm-native-workflow.md#handover-to-other-toolkits) with the `dlthub-runtime` toolkit
++- [Deploy and schedule your pipeline](llm-native-workflow.md#handover-to-other-toolkits) with the `dlthub-platform` toolkit
+ - [Replace the local destination with your data warehouse](../../walkthroughs/share-a-dataset.md)
+\ No newline at end of file
+diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+index 7ba63c1b5..3b1e56d3d 100644
+--- a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
++++ b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+@@ -299,11 +299,11 @@ Once your pipeline is validated, you can continue to the next phase of the data
+   Two skills drive the workflow: `/explore-data` (entry point skill) connects to your data, profiles it by mapping the intent to the available data and identifying potential gaps, while `/build-notebook` assembles the charts into a marimo dashboard and launches it in your browser.
+   The toolkit is designed for iterative development: create one chart and launch the notebook, then iterate — add or refine charts and re-launch.
+ 
+-- **`dlthub-runtime`** — deploy, schedule, and monitor your pipeline in production
++- **`dlthub-platform`** — deploy, schedule, and monitor your pipeline in production
+ 
+ ```sh
+ uv run dlthub ai toolkit install data-exploration
+-uv run dlthub ai toolkit install dlthub-runtime
++uv run dlthub ai toolkit install dlthub-platform
+ ```
+ 
+ ## Results
+diff --git a/docs/website/docs/hub/getting-started/installation.md b/docs/website/docs/hub/getting-started/installation.md
+index b058b41a0..76fe0010b 100644
+--- a/docs/website/docs/hub/getting-started/installation.md
++++ b/docs/website/docs/hub/getting-started/installation.md
+@@ -62,7 +62,7 @@ If you don't have `uv` yet, either [install it first](#configuration-of-the-pyth
+ pipx run dlthub-start
+ ```
+ 
+-Either way, it prompts for a workspace name, scaffold, and which AI agents to wire up (Claude / Cursor / Codex), scaffolds a workspace with `.dlt/.workspace` already set, vendors the AI toolkits (`rest-api-pipeline`, `transformations`, `dlthub-runtime`, `data-exploration`), and runs `uv sync` so `dlt[hub]` and all workspace dependencies are installed.
++Either way, it prompts for a workspace name, scaffold, and which AI agents to wire up (Claude / Cursor / Codex), scaffolds a workspace with `.dlt/.workspace` already set, vendors the AI toolkits (`rest-api-pipeline`, `transformations`, `dlthub-platform`, `data-exploration`), and runs `uv sync` so `dlt[hub]` and all workspace dependencies are installed.
+ 
+ For the recommended defaults non-interactively, pass a name explicitly:
+ 
+diff --git a/tests/workspace/cli/dlthub/ai/utils.py b/tests/workspace/cli/dlthub/ai/utils.py
+index 779f25bc5..79a0d879a 100644
+--- a/tests/workspace/cli/dlthub/ai/utils.py
++++ b/tests/workspace/cli/dlthub/ai/utils.py
+@@ -19,7 +19,7 @@ from dlt._workspace.cli.dlthub.ai.utils import (
+ from dlt._workspace.cli.dlthub.ai.typing import TToolkitIndexEntry, TToolkitInfo
+ 
+ # known toolkits in the repo (init is now visible)
+-KNOWN_TOOLKITS = ["data-exploration", "init", "rest-api-pipeline", "dlthub-runtime"]
++KNOWN_TOOLKITS = ["data-exploration", "init", "rest-api-pipeline", "dlthub-platform"]
+ INSTALLABLE_TOOLKITS = [t for t in KNOWN_TOOLKITS if t != "init"]
+ AGENT_NAMES = ["claude", "cursor", "codex"]
+ 
+
+
+===== COMMIT af227334 =====
+
+
+commit af227334a
+Author: Alena Astrakhantseva
+Date: 2026-05-20
+
+    Update the app link in runtime-tutorial.md (#3959)
+
+diff --git a/docs/website/docs/hub/getting-started/runtime-tutorial.md b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+index d2e49bd09..fe03693af 100644
+--- a/docs/website/docs/hub/getting-started/runtime-tutorial.md
++++ b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+@@ -219,7 +219,7 @@ To stop a schedule, remove the trigger from the decorator (or remove the job fro
+ ## Review and manage jobs in the UI
+ 
+ The command line is great for development, but the dltHub web UI gives you a bird's-eye view of everything running in the cloud.
+-Visit [dlthub.app](https://dlthub.app)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
++Visit [app.dlthub.com](https://app.dlthub.com)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
+ 
+ 1. A list of existing jobs.
+ 2. An overview of scheduled runs.
+
+
+===== COMMIT 0b3cd347 =====
+
+
+commit 0b3cd3474
+Author: Anton Burnashev
+Date: 2026-05-20
+
+    fix: update redirect paths for hub introduction (#3958)
+
+diff --git a/docs/website/redirects.js b/docs/website/redirects.js
+index 36047e00f..c8d6ae18a 100644
+--- a/docs/website/redirects.js
++++ b/docs/website/redirects.js
+@@ -19,7 +19,7 @@ const REDIRECTS = [
+     },
+     {
+         from: "/docs/hub",
+-        to: "/docs/hub/intro"
++        to: "/docs/hub/introduction"
+     },
+ 
+     // docs section redirects
+@@ -130,7 +130,11 @@ const REDIRECTS = [
+     },
+     {
+         from: "/docs/hub/reference",
+-        to: "/docs/hub/intro"
++        to: "/docs/hub/introduction"
++    },
++    {
++        from: "/docs/hub/intro",
++        to: "/docs/hub/introduction"
+     },
+     {
+         from: "/docs/general-usage/connectors",
+
+
+===== COMMIT 68b6276c =====
+
+
+commit 68b6276c0
+Author: rudolfix
+Date: 2026-05-20
+
+    fixes docs redirects
 

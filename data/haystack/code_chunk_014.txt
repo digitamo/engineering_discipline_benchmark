@@ -1,2169 +1,3 @@
-diff --git a/dlt/_workspace/helpers/dashboard/utils/pipeline.py b/dlt/_workspace/helpers/dashboard/utils/pipeline.py
-index 7b934f692..986107467 100644
---- a/dlt/_workspace/helpers/dashboard/utils/pipeline.py
-+++ b/dlt/_workspace/helpers/dashboard/utils/pipeline.py
-@@ -15,7 +15,10 @@ from dlt.common.configuration import resolve_configuration
- from dlt.common.configuration.specs import known_sections
- from dlt.common.destination.client import DestinationClientConfiguration
- from dlt.common.storages.configuration import WithLocalFiles
--from dlt.common.configuration.exceptions import ConfigFieldMissingException
-+from dlt.common.configuration.exceptions import (
-+    ConfigFieldMissingException,
-+    ConfigurationValueError,
-+)
- from dlt.common.utils import map_nested_keys_in_place
- 
- from dlt._workspace.cli import utils as cli_utils
-@@ -136,7 +139,7 @@ def get_local_data_path(pipeline: dlt.Pipeline) -> str:
-         config = pipeline._get_destination_clients(dlt.Schema("temp"))[0].config
-         if isinstance(config, WithLocalFiles):
-             return config.local_dir
--    except (PipelineConfigMissing, ConfigFieldMissingException):
-+    except (PipelineConfigMissing, ConfigFieldMissingException, ConfigurationValueError):
-         pass
-     return None
- 
-diff --git a/dlt/destinations/impl/destination/configuration.py b/dlt/destinations/impl/destination/configuration.py
-index 84c399bc2..e78bc8bbb 100644
---- a/dlt/destinations/impl/destination/configuration.py
-+++ b/dlt/destinations/impl/destination/configuration.py
-@@ -35,6 +35,9 @@ class CustomDestinationClientConfiguration(DestinationClientConfiguration):
-             or self.destination_callable is dummy_custom_destination
-         ):
-             raise ConfigurationValueError(
--                f"A valid callable was not provided to `{self.__class__.__name__}`. Did you"
--                " properly decorate the function with `@dlt.destination`?"
-+                f"A valid callable was not provided to `{self.__class__.__name__}`. Note that"
-+                " custom destination callables cannot be resolved from a process different than"
-+                " the one that originally ran the pipeline, such as processes started by CLI"
-+                " commands. If you are running in the same process, make sure a valid callable"
-+                " is provided."
-             )
-diff --git a/dlt/destinations/impl/destination/factory.py b/dlt/destinations/impl/destination/factory.py
-index 6264b7646..59a37e1c9 100644
---- a/dlt/destinations/impl/destination/factory.py
-+++ b/dlt/destinations/impl/destination/factory.py
-@@ -8,7 +8,12 @@ from dlt.common.normalizers.naming.naming import NamingConvention
- from dlt.common.reflection.exceptions import ReferenceImportError
- from dlt.common.reflection.ref import ImportTrace, callable_typechecker, object_from_ref
- from dlt.common.typing import AnyFun
--from dlt.common.destination import Destination, DestinationCapabilitiesContext, TLoaderFileFormat
-+from dlt.common.destination import (
-+    Destination,
-+    DestinationCapabilitiesContext,
-+    DestinationReference,
-+    TLoaderFileFormat,
-+)
- from dlt.common.configuration import known_sections, with_config, get_fun_spec
- from dlt.common.configuration.exceptions import ConfigurationValueError
- from dlt.common.utils import get_callable_name, is_inner_callable
-@@ -59,6 +64,16 @@ class destination(Destination[CustomDestinationClientConfiguration, "Destination
-         caps.loader_parallelism_strategy = None
-         return caps
- 
-+    @property
-+    def destination_type(self) -> str:
-+        cls = self.__class__
-+        # synthesized classes from @dlt.destination in __main__ have non-importable paths;
-+        # fall back to __orig_base__ (the factory class) for a portable destination_type
-+        if cls.__module__ == "__main__" and (orig := getattr(cls, "__orig_base__", None)):
-+            cls = orig
-+        full_path = cls.__module__ + "." + cls.__qualname__
-+        return DestinationReference.normalize_type(full_path)
-+
-     @property
-     def spec(self) -> Type[CustomDestinationClientConfiguration]:
-         """A spec of destination configuration resolved from the sink function signature"""
-@@ -117,8 +132,10 @@ class destination(Destination[CustomDestinationClientConfiguration, "Destination
-         # this is needed for cli commands to work
-         if not destination_callable:
-             logger.warning(
--                "No destination callable provided, providing dummy callable which will fail on"
--                " load."
-+                "Custom destination callable not provided. Note that custom destination"
-+                " callables cannot be resolved from a process different than the one that"
-+                " originally ran the pipeline, such as processes started by CLI commands."
-+                " Providing a dummy callable that doesn't allow loading for this process."
-             )
-             destination_callable = dummy_custom_destination
-         elif not callable(destination_callable):
-diff --git a/docs/website/docs/dlt-ecosystem/destinations/destination.md b/docs/website/docs/dlt-ecosystem/destinations/destination.md
-index 836a3537a..3a3abb7f1 100644
---- a/docs/website/docs/dlt-ecosystem/destinations/destination.md
-+++ b/docs/website/docs/dlt-ecosystem/destinations/destination.md
-@@ -184,6 +184,10 @@ For performance reasons, we recommend keeping the multithreaded approach and mak
- 
- `@dlt.destination` will forward all normalized `DataItems` encountered during a pipeline run to the custom destination function, so there is no notion of "write dispositions."
- 
-+## CLI and dashboard limitations
-+
-+Custom destination callables cannot be resolved from a process different than the one that originally ran the pipeline. This means that CLI commands like `dlt pipeline info` and `dlt pipeline show` will work only partially for custom destinations.
-+
- ## Staging support
- 
- `@dlt.destination` does not support staging files in remote locations before being called at this time. If you need this feature, please let us know.
-diff --git a/tests/destinations/test_custom_destination.py b/tests/destinations/test_custom_destination.py
-index 81b18ae84..6ab8c9a4f 100644
---- a/tests/destinations/test_custom_destination.py
-+++ b/tests/destinations/test_custom_destination.py
-@@ -1,5 +1,7 @@
- from typing import List, Tuple, Dict
- 
-+import contextlib
-+import io
- import dlt
- import pytest
- import os
-@@ -17,6 +19,7 @@ from dlt.common.configuration.specs import ConnectionStringCredentials
- from dlt.common.configuration.inject import get_fun_spec
- from dlt.common.configuration.specs import BaseConfiguration
- 
-+from dlt._workspace.cli import _pipeline_command
- from dlt.destinations.impl.destination.configuration import CustomDestinationClientConfiguration
- from dlt.destinations.impl.destination.factory import UnknownCustomDestinationCallable, destination
- from dlt.pipeline.exceptions import PipelineStepFailed
-@@ -313,6 +316,75 @@ def test_instantiation() -> None:
-     assert len(calls) == 1
- 
- 
-+def test_destination_type_main_module_fallback() -> None:
-+    """destination_type falls back to __orig_base__ for @dlt.destination classes
-+    defined in __main__, but keeps the original module path for importable modules."""
-+
-+    @dlt.destination
-+    def my_sink(items, table):
-+        pass
-+
-+    dest = my_sink()
-+    cls = dest.__class__
-+
-+    # test module is importable — keeps synthesized class path
-+    assert hasattr(cls, "__orig_base__")
-+    assert "test_custom_destination" in dest.destination_type
-+
-+    # simulate __main__ module — falls back to base factory path
-+    original_module = cls.__module__
-+    try:
-+        cls.__module__ = "__main__"
-+        assert dest.destination_type == "dlt.destinations.destination"
-+    finally:
-+        cls.__module__ = original_module
-+
-+    # built-in destinations are unaffected
-+    builtin = Destination.from_reference("duckdb")
-+    assert getattr(builtin.__class__, "__orig_base__", None) is None
-+    assert builtin.destination_type == "dlt.destinations.duckdb"
-+
-+
-+def test_custom_destination_cli_info() -> None:
-+    """Test that `dlt pipeline <name> info` works for all custom destination patterns."""
-+    # pattern 1: @dlt.destination decorator
-+    @dlt.destination
-+    def my_sink(items, table):
-+        pass
-+
-+    p = dlt.pipeline("cli_info_decorator", destination=my_sink, dev_mode=True)
-+    p.run([1, 2, 3], table_name="items")
-+
-+    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
-+        _pipeline_command.pipeline_command("info", "cli_info_decorator", p.pipelines_dir, 0)
-+        info_output = buf.getvalue()
-+    assert "Found pipeline cli_info_decorator" in info_output
-+
-+    # pattern 2: plain callable via destination_callable=func
-+    dest_func = dlt.destination("func_sink", destination_callable=global_sink_func)
-+    p2 = dlt.pipeline("cli_info_func", destination=dest_func, dev_mode=True)
-+    global global_calls
-+    global_calls = []
-+    p2.run([1, 2, 3], table_name="items")
-+
-+    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
-+        _pipeline_command.pipeline_command("info", "cli_info_func", p2.pipelines_dir, 0)
-+        info_output = buf.getvalue()
-+    assert "Found pipeline cli_info_func" in info_output
-+
-+    # pattern 3: string ref via destination_callable="mod.func"
-+    ref = "tests.destinations.test_custom_destination.global_sink_func"
-+    dest_str = dlt.destination("str_sink", destination_callable=ref)
-+    p3 = dlt.pipeline("cli_info_str", destination=dest_str, dev_mode=True)
-+    global_calls = []
-+    p3.run([1, 2, 3], table_name="items")
-+
-+    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
-+        _pipeline_command.pipeline_command("info", "cli_info_str", p3.pipelines_dir, 0)
-+        info_output = buf.getvalue()
-+    assert "Found pipeline cli_info_str" in info_output
-+
-+
- @pytest.mark.parametrize("loader_file_format", SUPPORTED_LOADER_FORMATS)
- @pytest.mark.parametrize("batch_size", [1, 10, 23])
- def test_batched_transactions(loader_file_format: TLoaderFileFormat, batch_size: int) -> None:
-diff --git a/tests/workspace/helpers/dashboard/conftest.py b/tests/workspace/helpers/dashboard/conftest.py
-index e75d173e2..ad8893ef3 100644
---- a/tests/workspace/helpers/dashboard/conftest.py
-+++ b/tests/workspace/helpers/dashboard/conftest.py
-@@ -13,6 +13,9 @@ from tests.workspace.helpers.dashboard.example_pipelines import (
-     create_load_exception_pipeline,
-     create_no_destination_pipeline,
-     create_sync_exception_pipeline,
-+    create_custom_destination_pipeline,
-+    create_custom_dest_callable_pipeline,
-+    create_custom_dest_string_ref_pipeline,
- )
- 
- 
-@@ -104,3 +107,21 @@ def temp_pipelines_dir():
- def sync_exception_pipeline():
-     with tempfile.TemporaryDirectory() as temp_dir:
-         yield create_sync_exception_pipeline(temp_dir)
-+
-+
-+@pytest.fixture
-+def custom_destination_pipeline():
-+    with tempfile.TemporaryDirectory() as temp_dir:
-+        yield create_custom_destination_pipeline(temp_dir)
-+
-+
-+@pytest.fixture
-+def custom_dest_callable_pipeline():
-+    with tempfile.TemporaryDirectory() as temp_dir:
-+        yield create_custom_dest_callable_pipeline(temp_dir)
-+
-+
-+@pytest.fixture
-+def custom_dest_string_ref_pipeline():
-+    with tempfile.TemporaryDirectory() as temp_dir:
-+        yield create_custom_dest_string_ref_pipeline(temp_dir)
-diff --git a/tests/workspace/helpers/dashboard/example_pipelines.py b/tests/workspace/helpers/dashboard/example_pipelines.py
-index 4f13215d7..ec11aae46 100644
---- a/tests/workspace/helpers/dashboard/example_pipelines.py
-+++ b/tests/workspace/helpers/dashboard/example_pipelines.py
-@@ -30,6 +30,9 @@ NEVER_RAN_PIPELINE = "never_ran_pipline"
- LOAD_EXCEPTION_PIPELINE = "load_exception_pipeline"
- NO_DESTINATION_PIPELINE = "no_destination_pipeline"
- SYNC_EXCEPTION_PIPELINE = "sync_exception_pipeline"
-+CUSTOM_DESTINATION_PIPELINE = "custom_destination_pipeline"
-+CUSTOM_DEST_CALLABLE_PIPELINE = "custom_dest_callable_pipeline"
-+CUSTOM_DEST_STRING_REF_PIPELINE = "custom_dest_string_ref_pipeline"
- 
- ALL_PIPELINES = [
-     SUCCESS_PIPELINE_DUCKDB,
-@@ -40,6 +43,15 @@ ALL_PIPELINES = [
-     NO_DESTINATION_PIPELINE,
-     SUCCESS_PIPELINE_FILESYSTEM,
-     SYNC_EXCEPTION_PIPELINE,
-+    CUSTOM_DESTINATION_PIPELINE,
-+    CUSTOM_DEST_CALLABLE_PIPELINE,
-+    CUSTOM_DEST_STRING_REF_PIPELINE,
-+]
-+
-+CUSTOM_DESTINATION_PIPELINES = [
-+    CUSTOM_DESTINATION_PIPELINE,
-+    CUSTOM_DEST_CALLABLE_PIPELINE,
-+    CUSTOM_DEST_STRING_REF_PIPELINE,
- ]
- 
- PIPELINES_WITH_EXCEPTIONS = [
-@@ -281,6 +293,59 @@ def create_sync_exception_pipeline(pipelines_dir: str = None):
-     return pipeline
- 
- 
-+def _dashboard_sink_func(items, table):
-+    """Module-level sink used by plain callable and string ref dashboard pipelines."""
-+    pass
-+
-+
-+@dlt.destination
-+def _dashboard_decorator_sink(items, table):
-+    """Module-level decorated sink used by the decorator dashboard pipeline."""
-+    pass
-+
-+
-+def create_custom_destination_pipeline(pipelines_dir: str = None):
-+    """Create a test pipeline with a @dlt.destination custom sink"""
-+    pipeline = dlt.pipeline(
-+        pipeline_name=CUSTOM_DESTINATION_PIPELINE,
-+        pipelines_dir=pipelines_dir,
-+        destination=_dashboard_decorator_sink,
-+    )
-+
-+    pipeline.run([1, 2, 3], table_name="items", schema=dlt.Schema("fruitshop"))
-+
-+    return pipeline
-+
-+
-+def create_custom_dest_callable_pipeline(pipelines_dir: str = None):
-+    """Create a test pipeline with a plain callable passed via destination_callable=func"""
-+    dest = dlt.destination("callable_sink", destination_callable=_dashboard_sink_func)
-+    pipeline = dlt.pipeline(
-+        pipeline_name=CUSTOM_DEST_CALLABLE_PIPELINE,
-+        pipelines_dir=pipelines_dir,
-+        destination=dest,
-+    )
-+
-+    pipeline.run([1, 2, 3], table_name="items", schema=dlt.Schema("fruitshop"))
-+
-+    return pipeline
-+
-+
-+def create_custom_dest_string_ref_pipeline(pipelines_dir: str = None):
-+    """Create a test pipeline with a string ref passed via destination_callable='mod.func'"""
-+    ref = "tests.workspace.helpers.dashboard.example_pipelines._dashboard_sink_func"
-+    dest = dlt.destination("string_ref_sink", destination_callable=ref)
-+    pipeline = dlt.pipeline(
-+        pipeline_name=CUSTOM_DEST_STRING_REF_PIPELINE,
-+        pipelines_dir=pipelines_dir,
-+        destination=dest,
-+    )
-+
-+    pipeline.run([1, 2, 3], table_name="items", schema=dlt.Schema("fruitshop"))
-+
-+    return pipeline
-+
-+
- # NOTE: this script can be run to create the test pipelines globally for manual testing of the dashboard app and cli
- if __name__ == "__main__":
-     create_success_pipeline_duckdb()
-diff --git a/tests/workspace/helpers/dashboard/test_pipeline_operations.py b/tests/workspace/helpers/dashboard/test_pipeline_operations.py
-index 252474697..eae296ef4 100644
---- a/tests/workspace/helpers/dashboard/test_pipeline_operations.py
-+++ b/tests/workspace/helpers/dashboard/test_pipeline_operations.py
-@@ -19,6 +19,10 @@ from dlt._workspace.helpers.dashboard.utils.visualization import get_steps_data_
- from dlt._workspace.helpers.dashboard.const import TPipelineRunStatus, TVisualPipelineStep
- from tests.workspace.helpers.dashboard.example_pipelines import (
-     ALL_PIPELINES,
-+    CUSTOM_DESTINATION_PIPELINES,
-+    CUSTOM_DESTINATION_PIPELINE,
-+    CUSTOM_DEST_CALLABLE_PIPELINE,
-+    CUSTOM_DEST_STRING_REF_PIPELINE,
-     EXTRACT_EXCEPTION_PIPELINE,
-     LOAD_EXCEPTION_PIPELINE,
-     NO_DESTINATION_PIPELINE,
-@@ -40,7 +44,11 @@ def test_exception_section(pipeline: dlt.Pipeline):
- 
- @pytest.mark.parametrize("pipeline", ALL_PIPELINES, indirect=True)
- def test_get_local_data_path(pipeline: dlt.Pipeline):
--    if pipeline.pipeline_name in [LOAD_EXCEPTION_PIPELINE, NO_DESTINATION_PIPELINE]:
-+    if pipeline.pipeline_name in [
-+        LOAD_EXCEPTION_PIPELINE,
-+        NO_DESTINATION_PIPELINE,
-+        *CUSTOM_DESTINATION_PIPELINES,
-+    ]:
-         # custom destination does not support local data path
-         assert get_local_data_path(pipeline) is None
-     else:
-@@ -83,7 +91,11 @@ def test_pipeline_details(pipeline, temp_pipelines_dir):
-     assert isinstance(result, list)
-     if pipeline.pipeline_name in PIPELINES_WITH_LOAD:
-         assert len(result) == 9
--    elif pipeline.pipeline_name in [LOAD_EXCEPTION_PIPELINE, "normalize_exception_pipeline"]:
-+    elif pipeline.pipeline_name in [
-+        LOAD_EXCEPTION_PIPELINE,
-+        "normalize_exception_pipeline",
-+        *CUSTOM_DESTINATION_PIPELINES,
-+    ]:
-         # custom destination does not support remote data info
-         assert len(result) == 8
-     else:
-@@ -100,6 +112,15 @@ def test_pipeline_details(pipeline, temp_pipelines_dir):
-         assert details_dict["destination"] == "filesystem (dlt.destinations.filesystem)"
-     elif pipeline.pipeline_name == LOAD_EXCEPTION_PIPELINE:
-         assert details_dict["destination"] == "dummy (dlt.destinations.dummy)"
-+    elif pipeline.pipeline_name == CUSTOM_DESTINATION_PIPELINE:
-+        assert details_dict["destination"] == (
-+            "_dashboard_decorator_sink (tests.workspace.helpers.dashboard"
-+            ".example_pipelines.DashboardDecoratorSinkDestination)"
-+        )
-+    elif pipeline.pipeline_name == CUSTOM_DEST_CALLABLE_PIPELINE:
-+        assert details_dict["destination"] == "callable_sink (dlt.destinations.destination)"
-+    elif pipeline.pipeline_name == CUSTOM_DEST_STRING_REF_PIPELINE:
-+        assert details_dict["destination"] == "string_ref_sink (dlt.destinations.destination)"
-     else:
-         assert details_dict["destination"] == "duckdb (dlt.destinations.duckdb)"
-     assert details_dict["dataset_name"] == pipeline.dataset_name
-
-
-===== COMMIT b99d78d6 =====
-
-
-commit b99d78d6f
-Author: prevostc
-Date: 2026-03-13
-
-    Add clickhouse ReplacingMergeTree (#3366)
-
-diff --git a/dlt/destinations/impl/clickhouse/clickhouse.py b/dlt/destinations/impl/clickhouse/clickhouse.py
-index 9419ca655..4920bcac6 100644
---- a/dlt/destinations/impl/clickhouse/clickhouse.py
-+++ b/dlt/destinations/impl/clickhouse/clickhouse.py
-@@ -22,7 +22,13 @@ from dlt.common.destination.client import (
- from dlt.common.schema import Schema, TColumnSchema
- from dlt.common.schema.exceptions import SchemaCorruptedException
- from dlt.common.schema.typing import TColumnType
--from dlt.common.schema.utils import get_columns_names_with_prop, is_nullable_column
-+from dlt.common import logger
-+from dlt.common.schema.utils import (
-+    get_columns_names_with_prop,
-+    get_dedup_sort_tuple,
-+    get_first_column_name_with_prop,
-+    is_nullable_column,
-+)
- from dlt.common.storages import FileStorage
- from dlt.common.storages.configuration import FilesystemConfiguration, ensure_canonical_az_url
- from dlt.common.storages.fsspec_filesystem import AZURE_BLOB_STORAGE_PROTOCOLS
-@@ -388,7 +394,39 @@ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
-                 self.config.table_engine_type,
-             ),
-         )
--        sql[0] = f"{sql[0]}\nENGINE = {TABLE_ENGINE_TYPE_TO_CLICKHOUSE_ATTR.get(table_type)}"
-+        # for ReplacingMergeTree, wire dedup_sort and hard_delete hints as engine params
-+        engine_params = ""
-+        if table_type == "replacing_merge_tree":
-+            if table.get("write_disposition") == "append":
-+                dedup_sort = get_dedup_sort_tuple(table)
-+                hard_delete_col = get_first_column_name_with_prop(table, "hard_delete")
-+                if dedup_sort is not None:
-+                    ver_col = self.sql_client.escape_column_name(dedup_sort[0])
-+                    if hard_delete_col is not None:
-+                        is_deleted = self.sql_client.escape_column_name(hard_delete_col)
-+                        engine_params = f"({ver_col}, {is_deleted})"
-+                    else:
-+                        engine_params = f"({ver_col})"
-+                elif hard_delete_col is not None:
-+                    logger.warning(
-+                        "Table '%s' has hard_delete hint but no dedup_sort column."
-+                        " hard_delete requires dedup_sort (ClickHouse requires a"
-+                        " version column when is_deleted is used). hard_delete"
-+                        " hint will be ignored.",
-+                        table_name,
-+                    )
-+            else:
-+                logger.warning(
-+                    "Table '%s' uses replacing_merge_tree with '%s' write"
-+                    " disposition. ReplacingMergeTree is only supported for"
-+                    " append. Falling back to MergeTree.",
-+                    table_name,
-+                    table.get("write_disposition"),
-+                )
-+                table_type = "merge_tree"
-+
-+        engine_name = TABLE_ENGINE_TYPE_TO_CLICKHOUSE_ATTR.get(table_type)
-+        sql[0] = f"{sql[0]}\nENGINE = {engine_name}{engine_params}"
- 
-         # PRIMARY KEY
-         if primary_key_list := [
-diff --git a/dlt/destinations/impl/clickhouse/typing.py b/dlt/destinations/impl/clickhouse/typing.py
-index 9d9001695..2900cbf20 100644
---- a/dlt/destinations/impl/clickhouse/typing.py
-+++ b/dlt/destinations/impl/clickhouse/typing.py
-@@ -7,6 +7,7 @@ from dlt.common.typing import get_args
- TSecureConnection = Literal[0, 1]
- TTableEngineType = Literal[
-     "merge_tree",
-+    "replacing_merge_tree",
-     "shared_merge_tree",
-     "replicated_merge_tree",
- ]
-@@ -24,6 +25,7 @@ HINT_TO_CLICKHOUSE_ATTR: Dict[TColumnHint, str] = {
- 
- TABLE_ENGINE_TYPE_TO_CLICKHOUSE_ATTR: Dict[TTableEngineType, str] = {
-     "merge_tree": "MergeTree",
-+    "replacing_merge_tree": "ReplacingMergeTree",
-     "shared_merge_tree": "SharedMergeTree",
-     "replicated_merge_tree": "ReplicatedMergeTree",
- }
-diff --git a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
-index 24bea21f8..a586a6605 100644
---- a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
-+++ b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
-@@ -201,10 +201,77 @@ Supported values for `table_engine_type` are:
- - `merge_tree` (default) - creates tables using the `MergeTree` engine, suitable for most use cases. [Learn more about MergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree).
- - `shared_merge_tree` - creates tables using the `SharedMergeTree` engine, optimized for cloud-native environments with shared storage. This table is **only** available on ClickHouse Cloud, and it is the default selection if `merge_tree` is selected. [Learn more about SharedMergeTree](https://clickhouse.com/docs/en/cloud/reference/shared-merge-tree).
- - `replicated_merge_tree` - creates tables using the `ReplicatedMergeTree` engine, which supports data replication across multiple nodes for high availability. [Learn more about ReplicatedMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replication). This defaults to `shared_merge_tree` on ClickHouse Cloud.
-+- `replacing_merge_tree` - creates tables using the `ReplacingMergeTree` engine, which deduplicates rows with the same sorting key during background merges. See [native deduplication with ReplacingMergeTree](#native-deduplication-with-replacingmergetree) below. [Learn more about ReplacingMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replacingmergetree).
- - Experimental support for the `Log` engine family with `stripe_log` and `tiny_log`.
- 
- For local development and testing with ClickHouse running locally, the `MergeTree` engine is recommended.
- 
-+### Native deduplication with ReplacingMergeTree
-+
-+When loading data with `append` write disposition, you can use ClickHouse's `ReplacingMergeTree` engine to handle deduplication and deletes at the storage engine level — without using dlt's `merge` write disposition. This is useful when you want ClickHouse to manage upserts natively, for example when appending CDC events or syncing data from an external source where rows may repeat.
-+
-+To enable this, combine `replacing_merge_tree` with dlt column hints:
-+
-+- **`primary_key`** — defines the dedup key. Rows with the same key are considered duplicates.
-+- **`dedup_sort`** (optional) — specifies the version column. ClickHouse keeps the row with the **highest** value in this column. Must be a non-nullable `UInt*`, `Date`, or `DateTime` type. If omitted, ClickHouse uses last-write-wins semantics (the most recently inserted row survives).
-+- **`hard_delete`** (optional) — specifies a `UInt8` deletion marker column. Rows where this column is `1` are filtered out when querying with `FINAL`. To physically remove deleted rows during background merges, set the `clean_deleted_rows` table setting (see example below). Requires `dedup_sort` to be set (ClickHouse constraint: `is_deleted` requires a version column).
-+
-+dlt automatically wires these hints into the `ReplacingMergeTree` engine parameters.
-+
-+:::note Dedup key and sorting key
-+In ClickHouse, `ReplacingMergeTree` deduplicates based on the `ORDER BY` columns, not `PRIMARY KEY`. When no explicit sorting key is set via `clickhouse_adapter(sort=...)`, ClickHouse defaults `ORDER BY` to `PRIMARY KEY`, so `primary_key` effectively controls deduplication. However, if you set a custom sorting key with `clickhouse_adapter(sort=...)`, that sorting key becomes the dedup key and may override your `primary_key` intent. Avoid combining `sort` with `replacing_merge_tree` unless you want the sorting key to define which rows are duplicates.
-+:::
-+
-+```py
-+import dlt
-+from dlt.destinations.adapters import clickhouse_adapter
-+
-+@dlt.resource(
-+    write_disposition="append",
-+    primary_key="id",
-+    columns={
-+        "version": {"dedup_sort": "desc", "nullable": False},
-+        "is_deleted": {"hard_delete": True, "nullable": False},
-+    },
-+)
-+def events(data):
-+    yield from data
-+
-+clickhouse_adapter(
-+    events,
-+    table_engine_type="replacing_merge_tree",
-+    settings={"clean_deleted_rows": "Always"},
-+)
-+
-+pipeline = dlt.pipeline("my_pipeline", destination="clickhouse")
-+
-+# first load
-+pipeline.run(events([
-+    {"id": 1, "name": "Alice", "version": 1, "is_deleted": False},
-+    {"id": 2, "name": "Bob", "version": 1, "is_deleted": False},
-+]))
-+
-+# second load: update Alice, delete Bob
-+pipeline.run(events([
-+    {"id": 1, "name": "Alice Updated", "version": 2, "is_deleted": False},
-+    {"id": 2, "name": "Bob", "version": 2, "is_deleted": True},
-+]))
-+```
-+
-+This generates `ENGINE = ReplacingMergeTree(version, is_deleted)`, so ClickHouse keeps only the row with the highest `version` per `id`. The `clean_deleted_rows` setting tells ClickHouse to physically remove rows marked as deleted during background merges.
-+
-+:::caution Data consistency
-+`ReplacingMergeTree` deduplicates during **background merges**, which happen asynchronously. Until a merge runs, duplicate rows may be visible in queries. To get consistent (deduplicated) results, use the `FINAL` modifier:
-+
-+```sql
-+SELECT * FROM my_table FINAL
-+```
-+
-+Without `clean_deleted_rows`, rows with `is_deleted=1` are only filtered out by `FINAL` queries but remain physically stored. With `clean_deleted_rows='Always'`, ClickHouse removes them during merges.
-+
-+This is different from dlt's `merge` write disposition, which deduplicates immediately during loading via explicit SQL statements. Choose `ReplacingMergeTree` when eventual consistency is acceptable and you want ClickHouse to manage deduplication natively.
-+:::
-+
- ## Sorting and partitioning
- You can use the `clickhouse_adapter` to specify a [sorting](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree#order_by) and/or [partition](https://clickhouse.com/docs/engines/table-engines/mergetree-family/custom-partitioning-key) key:
- 
-diff --git a/tests/load/clickhouse/test_clickhouse_adapter.py b/tests/load/clickhouse/test_clickhouse_adapter.py
-index 21d4ecd18..c49e85b10 100644
---- a/tests/load/clickhouse/test_clickhouse_adapter.py
-+++ b/tests/load/clickhouse/test_clickhouse_adapter.py
-@@ -1,6 +1,6 @@
- import pytest
- 
--from typing import Generator, Dict, Literal, cast
-+from typing import Generator, Dict, List, Literal, cast
- 
- import dlt
- from dlt.common.schema.exceptions import UnboundColumnException
-@@ -567,3 +567,93 @@ def test_set_column_hints_from_table_hint(table_hint: TSQLExprOrColumnSeq) -> No
-     assert c1.get("nullable") is True  # retained (rule 4)
-     assert c2.get("nullable") is False  # set (rule 2)
-     assert c3.get("nullable") is True  # retained, despite being part of table hint (rule 4)
-+
-+
-+def test_clickhouse_replacing_merge_tree() -> None:
-+    """Test that ReplacingMergeTree is created with dedup_sort and hard_delete params
-+    and that ClickHouse deduplicates rows on append."""
-+
-+    @dlt.resource(
-+        write_disposition="append",
-+        primary_key="id",
-+        columns={
-+            "version": {"dedup_sort": "desc", "nullable": False},
-+            "is_deleted": {"hard_delete": True, "nullable": False},
-+        },
-+    )
-+    def rmt_resource(data: List[Dict[str, object]]) -> Generator[Dict[str, object], None, None]:
-+        yield from data
-+
-+    clickhouse_adapter(
-+        rmt_resource,
-+        table_engine_type="replacing_merge_tree",
-+        settings={"clean_deleted_rows": "Always"},
-+    )
-+
-+    pipe = dlt.pipeline(
-+        pipeline_name="rmt_test",
-+        destination="clickhouse",
-+        dev_mode=True,
-+        dataset_name="rmt_test_ds",
-+    )
-+
-+    # first load: initial data
-+    info = pipe.run(
-+        rmt_resource(
-+            [
-+                {"id": 1, "name": "Alice", "version": 1, "is_deleted": False},
-+                {"id": 2, "name": "Bob", "version": 1, "is_deleted": False},
-+                {"id": 3, "name": "Charlie", "version": 1, "is_deleted": False},
-+            ]
-+        )
-+    )
-+    assert_load_info(info)
-+
-+    # verify engine type and clean_deleted_rows setting
-+    with pipe.sql_client() as client:
-+        qualified = client.make_qualified_table_name("rmt_resource")
-+        table_parts = qualified.replace("`", "").split(".")
-+        with client.execute_query(
-+            "SELECT engine, engine_full, create_table_query FROM system.tables "
-+            f"WHERE database = '{table_parts[0]}' AND name = '{table_parts[1]}';"
-+        ) as cursor:
-+            row = cursor.fetchone()
-+            engine_full = str(row[1])
-+            create_query = str(row[2])
-+            # CH Cloud may remap to SharedMergeTree, but engine_full should
-+            # contain the version column reference
-+            assert "ReplacingMergeTree" in engine_full or "SharedMergeTree" in str(row[0])
-+            # verify clean_deleted_rows setting propagated
-+            assert "clean_deleted_rows" in create_query.lower()
-+
-+    # use dataset() to verify initial data via FINAL query
-+    ds = pipe.dataset()
-+    rows = ds(
-+        f"SELECT id, name, version FROM {qualified} FINAL ORDER BY id",
-+        _execute_raw_query=True,
-+    ).fetchall()
-+    assert len(rows) == 3
-+    assert rows[0] == (1, "Alice", 1)
-+    assert rows[1] == (2, "Bob", 1)
-+    assert rows[2] == (3, "Charlie", 1)
-+
-+    # second load: update id=1 (higher version), delete id=3 via hard_delete
-+    info = pipe.run(
-+        rmt_resource(
-+            [
-+                {"id": 1, "name": "Alice Updated", "version": 2, "is_deleted": False},
-+                {"id": 3, "name": "Charlie", "version": 2, "is_deleted": True},
-+            ]
-+        )
-+    )
-+    assert_load_info(info)
-+
-+    # verify dedup and hard delete via FINAL query
-+    rows = ds(
-+        f"SELECT id, name, version FROM {qualified} FINAL ORDER BY id",
-+        _execute_raw_query=True,
-+    ).fetchall()
-+    # id=1 updated to version 2, id=2 unchanged, id=3 hard-deleted
-+    assert len(rows) == 2
-+    assert rows[0] == (1, "Alice Updated", 2)
-+    assert rows[1] == (2, "Bob", 1)
-diff --git a/tests/load/clickhouse/test_clickhouse_table_builder.py b/tests/load/clickhouse/test_clickhouse_table_builder.py
-index 6d745c999..88b47a946 100644
---- a/tests/load/clickhouse/test_clickhouse_table_builder.py
-+++ b/tests/load/clickhouse/test_clickhouse_table_builder.py
-@@ -10,6 +10,7 @@ from dlt.destinations.impl.clickhouse.configuration import (
-     ClickHouseCredentials,
-     ClickHouseClientConfiguration,
- )
-+from dlt.common.schema.utils import new_table
- from tests.load.clickhouse.utils import clickhouse_client
- from tests.load.utils import TABLE_UPDATE, empty_schema
- 
-@@ -190,3 +191,64 @@ def test_clickhouse_table_engine_configuration() -> None:
-             ClickHouseClientConfiguration(), sections=("destination", "clickhouse")
-         )
-         assert config.table_engine_type == "replicated_merge_tree"
-+
-+
-+@pytest.mark.parametrize(
-+    "has_dedup_sort,hard_delete,expected_engine",
-+    [
-+        (False, False, "ENGINE = ReplacingMergeTree"),
-+        (False, True, "ENGINE = ReplacingMergeTree"),
-+        (True, False, "ENGINE = ReplacingMergeTree(`col2`)"),
-+        (True, True, "ENGINE = ReplacingMergeTree(`col2`, `col3`)"),
-+    ],
-+    ids=[
-+        "no_version",
-+        "hard_delete_without_version",
-+        "dedup_sort_only",
-+        "dedup_sort_and_hard_delete",
-+    ],
-+)
-+def test_clickhouse_replacing_merge_tree(
-+    clickhouse_client: ClickHouseClient,
-+    has_dedup_sort: bool,
-+    hard_delete: bool,
-+    expected_engine: str,
-+) -> None:
-+    columns = deepcopy(TABLE_UPDATE[:3])
-+    columns[0]["primary_key"] = True
-+    if has_dedup_sort:
-+        columns[1]["dedup_sort"] = "desc"
-+    if hard_delete:
-+        columns[2]["hard_delete"] = True
-+
-+    table_name = "rmt_table"
-+    clickhouse_client.schema.update_table(
-+        new_table(table_name, write_disposition="append", columns=columns)
-+    )
-+    clickhouse_client.schema.tables[table_name]["x-table-engine-type"] = (  # type: ignore[typeddict-unknown-key]
-+        "replacing_merge_tree"
-+    )
-+
-+    sql = clickhouse_client._get_table_update_sql(table_name, columns, False)[0]
-+    assert expected_engine in sql
-+    assert "PRIMARY KEY (`col1`)" in sql
-+
-+
-+def test_clickhouse_replacing_merge_tree_fallback_non_append(
-+    clickhouse_client: ClickHouseClient,
-+) -> None:
-+    columns = deepcopy(TABLE_UPDATE[:3])
-+    columns[0]["primary_key"] = True
-+    columns[1]["dedup_sort"] = "desc"
-+
-+    table_name = "rmt_fallback_table"
-+    clickhouse_client.schema.update_table(
-+        new_table(table_name, write_disposition="replace", columns=columns)
-+    )
-+    clickhouse_client.schema.tables[table_name]["x-table-engine-type"] = (  # type: ignore[typeddict-unknown-key]
-+        "replacing_merge_tree"
-+    )
-+
-+    sql = clickhouse_client._get_table_update_sql(table_name, columns, False)[0]
-+    assert "ENGINE = MergeTree" in sql
-+    assert "ReplacingMergeTree" not in sql
-
-
-===== COMMIT 8e4c4486 =====
-
-
-commit 8e4c44861
-Author: rudolfix
-Date: 2026-03-13
-
-    (chore) moves render cli docs command to a separate tool (#3740)
-
-diff --git a/.github/workflows/test_docs.yml b/.github/workflows/test_docs.yml
-index 46ffacaf4..156a78bcd 100644
---- a/.github/workflows/test_docs.yml
-+++ b/.github/workflows/test_docs.yml
-@@ -80,7 +80,7 @@ jobs:
- 
- 
-       - name: Install root project for CLI docs check
--        run: uv sync --extra cli
-+        run: uv sync --extra cli --extra workspace
- 
-       - name: Check that CLI docs are up to date
-         run: make check-cli-docs
-diff --git a/Makefile b/Makefile
-index 493e87aa8..adc9ae68a 100644
---- a/Makefile
-+++ b/Makefile
-@@ -419,10 +419,10 @@ start-test-containers: ## Starts docker containers for local testing (postgres,
- 	docker compose -f "tests/load/clickhouse/docker-compose.yml" up -d
- 
- update-cli-docs: ## Regenerates CLI reference docs
--	uv run dlt --debug render-docs docs/website/docs/reference/command-line-interface.md
-+	uv run python docs/tools/check_cli_docs.py docs/website/docs/reference/command-line-interface.md
- 
- check-cli-docs: ## Checks CLI reference docs are up to date (CI)
--	uv run dlt --debug render-docs docs/website/docs/reference/command-line-interface.md --compare
-+	uv run python docs/tools/check_cli_docs.py docs/website/docs/reference/command-line-interface.md --compare
- 
- test-e2e-dashboard: ## Runs dashboard e2e tests with headless chromium
- 	uv run pytest --browser chromium tests/e2e
-diff --git a/dlt/_workspace/cli/_plugins.py b/dlt/_workspace/cli/_plugins.py
-index 6cdcda801..2e84fa495 100644
---- a/dlt/_workspace/cli/_plugins.py
-+++ b/dlt/_workspace/cli/_plugins.py
-@@ -20,7 +20,6 @@ __all__ = [
-     "plug_cli_dashboard",
-     "plug_cli_telemetry",
-     "plug_cli_deploy",
--    "plug_cli_docs",
-     "plug_cli_ai",
-     "plug_cli_profile",
-     "plug_cli_workspace",
-@@ -76,13 +75,6 @@ def plug_cli_deploy() -> Type[plugins.SupportsCliCommand]:
-     return DeployCommand
- 
- 
--@plugins.hookimpl(specname="plug_cli")
--def plug_cli_docs() -> Type[plugins.SupportsCliCommand]:
--    from dlt._workspace.cli.commands import CliDocsCommand
--
--    return CliDocsCommand
--
--
- @plugins.hookimpl(specname="plug_cli")
- def plug_cli_ai() -> Type[plugins.SupportsCliCommand]:
-     from dlt._workspace.cli.commands import AiCommand
-diff --git a/dlt/_workspace/cli/commands.py b/dlt/_workspace/cli/commands.py
-index 6cad6a1b5..b8b765239 100644
---- a/dlt/_workspace/cli/commands.py
-+++ b/dlt/_workspace/cli/commands.py
-@@ -685,58 +685,6 @@ the `dlt` Airflow wrapper (https://github.com/dlt-hub/dlt/blob/devel/dlt/helpers
-             )
- 
- 
--# NOTE: we should port this as a command or as a tool to the core repo
--class CliDocsCommand(SupportsCliCommand):
--    command = "render-docs"
--    help_string = "Renders markdown version of cli docs"
--    description = """
--The `dlt render-docs` command renders markdown version of cli docs by parsing the argparse help output and generating a markdown file.
--If you are reading this on the docs website, you are looking at the rendered version of the cli docs generated by this command.
--    """
--
--    def configure_parser(self, parser: argparse.ArgumentParser) -> None:
--        self.parser = parser
--
--        self.parser.add_argument("file_name", nargs=1, help="Output file name")
--
--        self.parser.add_argument(
--            "--commands",
--            nargs="*",
--            help="List of command names to render (optional)",
--            default=None,
--        )
--
--        self.parser.add_argument(
--            "--compare",
--            default=False,
--            action="store_true",
--            help="Compare the changes and raise if output would be updated",
--        )
--
--    def execute(self, args: argparse.Namespace) -> None:
--        from dlt._workspace.cli._dlt import _create_parser
--        from dlt._workspace.cli._docs_command import render_argparse_markdown
--
--        parser, _ = _create_parser()
--
--        result = render_argparse_markdown("dlt", parser, commands=args.commands)
--
--        if args.compare:
--            with open(args.file_name[0], "r", encoding="utf-8") as f:
--                if result != f.read():
--                    fmt.error(
--                        "Cli Docs out of date, please update, please run "
--                        "update-cli-docs from the main Makefile and commit your changes. "
--                    )
--                    raise CliCommandException()
--
--            fmt.note("Docs page up to date.")
--        else:
--            with open(args.file_name[0], "w", encoding="utf-8") as f:
--                f.write(result)
--            fmt.note("Docs page updated.")
--
--
- class AiCommand(SupportsCliCommand):
-     command = "ai"
-     help_string = "Use AI-powered development tools and utilities"
-@@ -798,7 +746,7 @@ class AiCommand(SupportsCliCommand):
-             description="List, view (redacted), or update secret files used by dlt providers.",
-         )
-         secrets_subparsers = secrets_cmd.add_subparsers(
--            title="Secrets subcommands", dest="secrets_operation", required=False
-+            title="Available subcommands", dest="secrets_operation", required=False
-         )
-         secrets_subparsers.add_parser(
-             "list",
-diff --git a/dlt/_workspace/cli/_docs_command.py b/docs/tools/check_cli_docs.py
-similarity index 69%
-rename from dlt/_workspace/cli/_docs_command.py
-rename to docs/tools/check_cli_docs.py
-index 37b233e21..8d689e1c9 100644
---- a/dlt/_workspace/cli/_docs_command.py
-+++ b/docs/tools/check_cli_docs.py
-@@ -1,12 +1,18 @@
--"""Cli for rendering markdown docs"""
-+# ruff: noqa: T201
-+# flake8: noqa: T201
-+"""Standalone tool for generating and checking CLI reference docs.
-+
-+Usage:
-+    uv run python tools/check_cli_docs.py <file_name> [--commands CMD ...] [--compare]
-+"""
- 
- import argparse
--import textwrap
-+import difflib
- import os
- import re
--from typing import List
--
--import dlt._workspace.cli.echo as fmt
-+import sys
-+import textwrap
-+from typing import List, Optional
- 
- HEADER = """---
- title: Command Line Interface
-@@ -46,25 +52,36 @@ class _WidthFormatter(argparse.RawTextHelpFormatter):
-         super().__init__(prog, width=99999, max_help_position=99999)
- 
- 
-+def _set_prog_recursive(
-+    parser: argparse.ArgumentParser, old_prog: str, new_prog: str
-+) -> None:
-+    """Propagates prog to a parser and all nested subparsers."""
-+    parser.prog = parser.prog.replace(old_prog, new_prog, 1)
-+    for action in parser._actions:
-+        if isinstance(action, argparse._SubParsersAction):
-+            for subparser in action._name_parser_map.values():
-+                _set_prog_recursive(subparser, old_prog, new_prog)
-+
-+
- def render_argparse_markdown(
-     name: str,
-     parser: argparse.ArgumentParser,
-     /,
-     *,
-     header: str = HEADER,
--    commands: List[str] = None,
-+    commands: Optional[List[str]] = None,
- ) -> str:
-     def get_parser_help_recursive(
-         parser: argparse.ArgumentParser,
-         cmd: str = "",
-         parent: str = "",
-         nesting: int = 0,
--        help_string: str = None,
--        commands: List[str] = None,
-+        help_string: Optional[str] = None,
-+        commands: Optional[List[str]] = None,
-     ) -> str:
-         markdown = ""
- 
--        # Prevent wrapping in help output for better parseability
-+        # prevent wrapping in help output for better parseability
-         parser.formatter_class = _WidthFormatter
-         if parser.description:
-             # remove markdown from description
-@@ -99,7 +116,10 @@ def render_argparse_markdown(
-             description = None
- 
-         if not parser.description:
--            fmt.warning(f"No description found for {cmd}, please consider providing one.")
-+            print(
-+                f"WARNING: No description found for {cmd}, please consider providing one.",
-+                file=sys.stderr,
-+            )
- 
-         inherits_from = ""
-         if parent:
-@@ -124,7 +144,10 @@ def render_argparse_markdown(
-             header = section_lines[0].replace(":", "")
- 
-             if header.lower() not in ["available subcommands", "positional arguments", "options"]:
--                fmt.warning(f"Skipping unknown section {header} of {cmd}.")
-+                print(
-+                    f"WARNING: Skipping unknown section {header} of {cmd}.",
-+                    file=sys.stderr,
-+                )
-                 continue
- 
-             section_lines = section_lines[1:]
-@@ -146,9 +169,10 @@ def render_argparse_markdown(
-                 arg_title = line_elements[0]
-                 arg_help = line_elements[1] if len(line_elements) > 1 else ""
-                 if not arg_help:
--                    fmt.warning(
--                        f"Missing helpstring for argument '{arg_title}' in section '{header}' of"
--                        f" command '{cmd}'."
-+                    print(
-+                        f"WARNING: Missing helpstring for argument '{arg_title}' in section"
-+                        f" '{header}' of command '{cmd}'.",
-+                        file=sys.stderr,
-                     )
- 
-                 quoted_title = ""
-@@ -223,3 +247,60 @@ def render_argparse_markdown(
-     markdown = get_parser_help_recursive(parser, name, commands=commands)
- 
-     return header + markdown
-+
-+
-+def main() -> None:
-+    parser = argparse.ArgumentParser(description="Generate or check CLI reference docs.")
-+    parser.add_argument("file_name", help="Output file name")
-+    parser.add_argument(
-+        "--commands",
-+        nargs="*",
-+        help="List of command names to render (optional)",
-+        default=None,
-+    )
-+    parser.add_argument(
-+        "--compare",
-+        default=False,
-+        action="store_true",
-+        help="Compare and raise if output would be updated",
-+    )
-+    parser.add_argument(
-+        "--executable-name",
-+        default="dlt",
-+        help="Name of the executable shown in generated docs (default: dlt)",
-+    )
-+    args = parser.parse_args()
-+
-+    from dlt._workspace.cli._dlt import _create_parser
-+
-+    cli_parser, _ = _create_parser()
-+    _set_prog_recursive(cli_parser, cli_parser.prog, args.executable_name)
-+    result = render_argparse_markdown(args.executable_name, cli_parser, commands=args.commands)
-+
-+    if args.compare:
-+        with open(args.file_name, "r", encoding="utf-8") as f:
-+            existing = f.read()
-+            if result != existing:
-+                diff = difflib.unified_diff(
-+                    existing.splitlines(keepends=True),
-+                    result.splitlines(keepends=True),
-+                    fromfile=args.file_name,
-+                    tofile=args.file_name + " (generated)",
-+                )
-+                print(
-+                    "ERROR: CLI docs out of date, please run"
-+                    " update-cli-docs from the main Makefile and commit your changes.\n"
-+                    "Diff:\n" + "".join(diff),
-+                    file=sys.stderr,
-+                )
-+                sys.exit(1)
-+
-+        print("Docs page up to date.")
-+    else:
-+        with open(args.file_name, "w", encoding="utf-8") as f:
-+            f.write(result)
-+        print("Docs page updated.")
-+
-+
-+if __name__ == "__main__":
-+    main()
-diff --git a/docs/tools/dlthub_cli/Makefile b/docs/tools/dlthub_cli/Makefile
-index 64545f8e2..ffc654e38 100644
---- a/docs/tools/dlthub_cli/Makefile
-+++ b/docs/tools/dlthub_cli/Makefile
-@@ -7,8 +7,8 @@ dev:
- 
- update-cli-docs: dev
- 	# generate as there's no license
--	RUNTIME__LICENSE="" uv run dlt --debug render-docs ../../website/docs/hub/command-line-interface.md --commands license workspace profile runtime
-+	RUNTIME__LICENSE="" uv run python ../check_cli_docs.py ../../website/docs/hub/command-line-interface.md --commands license workspace profile runtime
- 
- check-cli-docs: dev
- 	# generate as there's no license
--	RUNTIME__LICENSE="" uv run dlt --debug render-docs ../../website/docs/hub/command-line-interface.md --compare --commands license workspace profile runtime
-+	RUNTIME__LICENSE="" uv run python ../check_cli_docs.py ../../website/docs/hub/command-line-interface.md --compare --commands license workspace profile runtime
-diff --git a/docs/uv.lock b/docs/uv.lock
-index 8b55a8bc8..53199731d 100644
---- a/docs/uv.lock
-+++ b/docs/uv.lock
-@@ -1053,7 +1053,7 @@ dev = [
-     { name = "graphviz", specifier = ">=0.21" },
-     { name = "griffe", specifier = ">=1.10.0" },
-     { name = "isort", specifier = ">=5.12.0,<6" },
--    { name = "mypy", specifier = ">=1.11.0,<1.13.0" },
-+    { name = "mypy", specifier = ">=1.11.0" },
-     { name = "pip", specifier = ">=24.0.0" },
-     { name = "pydoclint", specifier = ">=0.6.5,<0.7" },
-     { name = "pyjwt", specifier = ">=2.8.0,<3" },
-diff --git a/docs/website/docs/hub/command-line-interface.md b/docs/website/docs/hub/command-line-interface.md
-index 4f962d098..363c22626 100644
---- a/docs/website/docs/hub/command-line-interface.md
-+++ b/docs/website/docs/hub/command-line-interface.md
-@@ -31,7 +31,7 @@ Creates, adds, inspects and deploys dlt pipelines. Further help is available at
- ```sh
- dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
-     [--non-interactive] [--debug] [--no-pwd]
--    {workspace,telemetry,schema,profile,pipeline,init,render-docs,deploy,dashboard,ai,license,runtime}
-+    {workspace,telemetry,schema,profile,pipeline,init,deploy,dashboard,ai,runtime,license}
-     ...
- ```
- 
-@@ -51,8 +51,8 @@ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
- **Available subcommands**
- * [`workspace`](#dlt-workspace) - Manage current workspace
- * [`profile`](#dlt-profile) - Manage workspace built-in profiles
--* [`license`](#dlt-license) - View dlthub license status
- * [`runtime`](#dlt-runtime) - Connect to dlthub runtime and run your code remotely
-+* [`license`](#dlt-license) - View dlthub license status
- 
- </details>
- 
-@@ -62,7 +62,7 @@ Manage current Workspace.
- 
- **Usage**
- ```sh
--dlt workspace [-h] [--verbose] {clean,info,mcp,show} ...
-+dlt workspace [-h] [--verbose] {clean,info,show} ...
- ```
- 
- **Description**
-@@ -83,7 +83,6 @@ Inherits arguments from [`dlt`](#dlt).
- **Available subcommands**
- * [`clean`](#dlt-workspace-clean) - Cleans local data for the selected profile. locally loaded data will be deleted. pipelines working directories are also deleted by default. data in remote destinations is not affected.
- * [`info`](#dlt-workspace-info) - Displays workspace info.
--* [`mcp`](#dlt-workspace-mcp) - Launch dlt mcp server in current python environment and workspace in sse transport mode by default.
- * [`show`](#dlt-workspace-show) - Shows workspace dashboard for the pipelines and data in this workspace.
- 
- </details>
-@@ -137,32 +136,6 @@ Inherits arguments from [`dlt workspace`](#dlt-workspace).
- 
- </details>
- 
--### `dlt workspace mcp`
--
--Launch dlt MCP server in current Python environment and Workspace in SSE transport mode by default.
--
--**Usage**
--```sh
--dlt workspace mcp [-h] [--stdio] [--port PORT]
--```
--
--**Description**
--
--This MCP allows you to attach to any pipeline that was previously run in this workspace and then facilitates schema and data exploration in the pipeline's dataset.
--
--<details>
--
--<summary>Show Arguments and Options</summary>
--
--Inherits arguments from [`dlt workspace`](#dlt-workspace).
--
--**Options**
--* `-h, --help` - Show this help message and exit
--* `--stdio` - Use stdio transport mode
--* `--port PORT` - Sse port to use (default: 43654)
--
--</details>
--
- ### `dlt workspace show`
- 
- Shows Workspace Dashboard for the pipelines and data in this workspace.
-@@ -294,110 +267,6 @@ Inherits arguments from [`dlt profile`](#dlt-profile).
- 
- </details>
- 
--## `dlt license`
--
--View dlthub license status.
--
--**Usage**
--```sh
--dlt license [-h] {info,scopes,issue} ...
--```
--
--**Description**
--
--View dlthub license status.
--
--<details>
--
--<summary>Show Arguments and Options</summary>
--
--Inherits arguments from [`dlt`](#dlt).
--
--**Options**
--* `-h, --help` - Show this help message and exit
--
--**Available subcommands**
--* [`info`](#dlt-license-info) - Show the installed license
--* [`scopes`](#dlt-license-scopes) - Show available scopes
--* [`issue`](#dlt-license-issue) - Issues a self-signed trial license that may be used for development, testing and for ci ops.
--
--</details>
--
--### `dlt license info`
--
--Show the installed license.
--
--**Usage**
--```sh
--dlt license info [-h]
--```
--
--**Description**
--
--Show the installed license.
--
--<details>
--
--<summary>Show Arguments and Options</summary>
--
--Inherits arguments from [`dlt license`](#dlt-license).
--
--**Options**
--* `-h, --help` - Show this help message and exit
--
--</details>
--
--### `dlt license scopes`
--
--Show available scopes.
--
--**Usage**
--```sh
--dlt license scopes [-h]
--```
--
--**Description**
--
--Show available scopes.
--
--<details>
--
--<summary>Show Arguments and Options</summary>
--
--Inherits arguments from [`dlt license`](#dlt-license).
--
--**Options**
--* `-h, --help` - Show this help message and exit
--
--</details>
--
--### `dlt license issue`
--
--Issues a self-signed trial license that may be used for development, testing and for ci ops.
--
--**Usage**
--```sh
--dlt license issue [-h] scope
--```
--
--**Description**
--
--Issue a new self-signed trial license.
--
--<details>
--
--<summary>Show Arguments and Options</summary>
--
--Inherits arguments from [`dlt license`](#dlt-license).
--
--**Positional arguments**
--* `scope` - Scope of the license, a comma separated list of the scopes: ['dlthub.dbt_generator', 'dlthub.sources.mssql', 'dlthub.project', 'dlthub.transformation', 'dlthub.data_quality', 'dlthub.destinations.iceberg', 'dlthub.destinations.snowflake_plus', 'dlthub.runner']
--
--**Options**
--* `-h, --help` - Show this help message and exit
--
--</details>
--
- ## `dlt runtime`
- 
- Connect to dltHub Runtime and run your code remotely.
-@@ -411,7 +280,7 @@ dlt runtime [-h]
- 
- **Description**
- 
--Allows to connect to the dltHub Runtime, deploy and run local workspaces there. Requires dltHub license.
-+Allows you to connect to the dltHub Runtime, deploy and run local workspaces there. Requires dltHub license.
- 
- <details>
- 
-@@ -423,8 +292,8 @@ Inherits arguments from [`dlt`](#dlt).
- * `-h, --help` - Show this help message and exit
- 
- **Available subcommands**
--* [`login`](#dlt-runtime-login) - Login to dlthub runtime using github oauth and connect current workspace to the remote one
--* [`logout`](#dlt-runtime-logout) - Logout from dlthub runtime
-+* [`login`](#dlt-runtime-login) - Log in to dlthub runtime and connect the current workspace to the remote one
-+* [`logout`](#dlt-runtime-logout) - Log out from dlthub runtime
- * [`launch`](#dlt-runtime-launch) - Deploy code/config and run a script (follow status and logs by default)
- * [`serve`](#dlt-runtime-serve) - Deploy and serve an interactive notebook/app (read-only) and follow until ready
- * [`publish`](#dlt-runtime-publish) - Generate or revoke a public link for an interactive notebook/app
-@@ -434,18 +303,18 @@ Inherits arguments from [`dlt`](#dlt).
- * [`dashboard`](#dlt-runtime-dashboard) - Open the runtime dashboard for this workspace
- * [`deploy`](#dlt-runtime-deploy) - Sync code and configuration to runtime without running anything
- * [`info`](#dlt-runtime-info) - Show overview of current runtime workspace
--* [`deployment`](#dlt-runtime-deployment) - Manipulate deployments in workspace
-+* [`deployment`](#dlt-runtime-deployment) - Manipulate deployments in the workspace
- * [`job`](#dlt-runtime-job) - List, create and inspect jobs
- * [`jobs`](#dlt-runtime-jobs) - List, create and inspect jobs
- * [`job-run`](#dlt-runtime-job-run) - List, create and inspect job runs
- * [`job-runs`](#dlt-runtime-job-runs) - List, create and inspect job runs
--* [`configuration`](#dlt-runtime-configuration) - Manipulate configurations in workspace
-+* [`configuration`](#dlt-runtime-configuration) - Manipulate configurations in the workspace
- 
- </details>
- 
- ### `dlt runtime login`
- 
--Login to dltHub Runtime using Github OAuth and connect current workspace to the remote one.
-+Log in to dltHub Runtime and connect the current workspace to the remote one.
- 
- **Usage**
- ```sh
-@@ -454,7 +323,7 @@ dlt runtime login [-h]
- 
- **Description**
- 
--Login to dltHub Runtime using Github OAuth.
-+Log in to dltHub Runtime.
- 
- <details>
- 
-@@ -469,7 +338,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
- 
- ### `dlt runtime logout`
- 
--Logout from dltHub Runtime.
-+Log out from dltHub Runtime.
- 
- **Usage**
- ```sh
-@@ -478,7 +347,7 @@ dlt runtime logout [-h]
- 
- **Description**
- 
--Logout from dltHub Runtime.
-+Log out from dltHub Runtime.
- 
- <details>
- 
-@@ -525,7 +394,7 @@ Deploy and serve an interactive notebook/app (read-only) and follow until ready.
- 
- **Usage**
- ```sh
--dlt runtime serve [-h] script_path
-+dlt runtime serve [-h] [--app-type {marimo,mcp,streamlit}] script_path
- ```
- 
- **Description**
-@@ -543,6 +412,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
- 
- **Options**
- * `-h, --help` - Show this help message and exit
-+* `--app-type {marimo,mcp,streamlit}` - Specify if the interactive job is a marimo notebook, streamlit app, or mcp server
- 
- </details>
- 
-@@ -609,7 +479,7 @@ Show logs for latest or selected job run.
- 
- **Usage**
- ```sh
--dlt runtime logs [-h] [-f] script_path_or_job_name [run_number]
-+dlt runtime logs [-h] script_path_or_job_name [run_number]
- ```
- 
- **Description**
-@@ -628,7 +498,6 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
- 
- **Options**
- * `-h, --help` - Show this help message and exit
--* `-f, --follow` - Follow the logs of the run in tailing mode
- 
- </details>
- 
-@@ -719,7 +588,7 @@ dlt runtime info [-h]
- 
- **Description**
- 
--Show workspace id and summary of deployments, configurations and jobs.
-+Show workspace ID and summary of deployments, configurations and jobs.
- 
- <details>
- 
-@@ -734,7 +603,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
- 
- ### `dlt runtime deployment`
- 
--Manipulate deployments in workspace.
-+Manipulate deployments in the workspace.
- 
- **Usage**
- ```sh
-@@ -743,7 +612,7 @@ dlt runtime deployment [-h] [deployment_version_no] {list,info,sync} ...
- 
- **Description**
- 
--Manipulate deployments in workspace.
-+Manipulate deployments in the workspace.
- 
- <details>
- 
-@@ -923,7 +792,8 @@ Create a job without running it.
- **Usage**
- ```sh
- dlt runtime job [script_path_or_job_name] create [-h] [--name [NAME]]
--    [--schedule [SCHEDULE]] [--interactive] [--description [DESCRIPTION]]
-+    [--schedule [SCHEDULE]] [--interactive] [--app-type {marimo,mcp,streamlit}]
-+    [--description [DESCRIPTION]]
- ```
- 
- **Description**
-@@ -941,6 +811,7 @@ Inherits arguments from [`dlt runtime job`](#dlt-runtime-job).
- * `--name [NAME]` - Job name to create
- * `--schedule [SCHEDULE]` - Cron schedule for the job if it's a scheduled one
- * `--interactive` - Run the job interactively, e.g. for a notebook
-+* `--app-type {marimo,mcp,streamlit}` - Specify if the interactive app is a marimo notebook, streamlit app, or mcp server.
- * `--description [DESCRIPTION]` - Job description
- 
- </details>
-@@ -1032,7 +903,8 @@ Create a job without running it.
- **Usage**
- ```sh
- dlt runtime jobs [script_path_or_job_name] create [-h] [--name [NAME]]
--    [--schedule [SCHEDULE]] [--interactive] [--description [DESCRIPTION]]
-+    [--schedule [SCHEDULE]] [--interactive] [--app-type {marimo,mcp,streamlit}]
-+    [--description [DESCRIPTION]]
- ```
- 
- **Description**
-@@ -1050,6 +922,7 @@ Inherits arguments from [`dlt runtime jobs`](#dlt-runtime-jobs).
- * `--name [NAME]` - Job name to create
- * `--schedule [SCHEDULE]` - Cron schedule for the job if it's a scheduled one
- * `--interactive` - Run the job interactively, e.g. for a notebook
-+* `--app-type {marimo,mcp,streamlit}` - Specify if the interactive app is a marimo notebook, streamlit app, or mcp server.
- * `--description [DESCRIPTION]` - Job description
- 
- </details>
-@@ -1076,7 +949,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
- 
- **Positional arguments**
- * `script_path_or_job_name` - Local script path or job name. required for all commands except `list`
--* `run_number` - Run number. used in all commands except `list` and `create` as optional argument. if not specified, the latest run of given script be used.
-+* `run_number` - Run number. used in all commands except `list` and `create` as optional argument. if not specified, the latest run of the given script will be used.
- 
- **Options**
- * `-h, --help` - Show this help message and exit
-@@ -1168,12 +1041,12 @@ Show logs for the latest or selected job run.
- 
- **Usage**
- ```sh
--dlt runtime job-run [script_path_or_job_name] [run_number] logs [-h] [-f]
-+dlt runtime job-run [script_path_or_job_name] [run_number] logs [-h]
- ```
- 
- **Description**
- 
--Show logs for the latest or selected job run. Use --follow to follow the logs in tailing mode.
-+Show logs for the latest or selected job run. Will follow logs if the run is not in a terminal state.
- 
- <details>
- 
-@@ -1183,7 +1056,6 @@ Inherits arguments from [`dlt runtime job-run`](#dlt-runtime-job-run).
- 
- **Options**
- * `-h, --help` - Show this help message and exit
--* `-f, --follow` - Follow the logs of the run in tailing mode
- 
- </details>
- 
-@@ -1233,7 +1105,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
- 
- **Positional arguments**
- * `script_path_or_job_name` - Local script path or job name. required for all commands except `list`
--* `run_number` - Run number. used in all commands except `list` and `create` as optional argument. if not specified, the latest run of given script be used.
-+* `run_number` - Run number. used in all commands except `list` and `create` as optional argument. if not specified, the latest run of the given script will be used.
- 
- **Options**
- * `-h, --help` - Show this help message and exit
-@@ -1325,12 +1197,12 @@ Show logs for the latest or selected job run.
- 
- **Usage**
- ```sh
--dlt runtime job-runs [script_path_or_job_name] [run_number] logs [-h] [-f]
-+dlt runtime job-runs [script_path_or_job_name] [run_number] logs [-h]
- ```
- 
- **Description**
- 
--Show logs for the latest or selected job run. Use --follow to follow the logs in tailing mode.
-+Show logs for the latest or selected job run. Will follow logs if the run is not in a terminal state.
- 
- <details>
- 
-@@ -1340,7 +1212,6 @@ Inherits arguments from [`dlt runtime job-runs`](#dlt-runtime-job-runs).
- 
- **Options**
- * `-h, --help` - Show this help message and exit
--* `-f, --follow` - Follow the logs of the run in tailing mode
- 
- </details>
- 
-@@ -1370,7 +1241,7 @@ Inherits arguments from [`dlt runtime job-runs`](#dlt-runtime-job-runs).
- 
- ### `dlt runtime configuration`
- 
--Manipulate configurations in workspace.
-+Manipulate configurations in the workspace.
- 
- **Usage**
- ```sh
-@@ -1379,7 +1250,7 @@ dlt runtime configuration [-h] [configuration_version_no] {list,info,sync} ...
- 
- **Description**
- 
--Manipulate configurations in workspace.
-+Manipulate configurations in the workspace.
- 
- <details>
- 
-@@ -1472,3 +1343,107 @@ Inherits arguments from [`dlt runtime configuration`](#dlt-runtime-configuration
- 
- </details>
- 
-+## `dlt license`
-+
-+View dlthub license status.
-+
-+**Usage**
-+```sh
-+dlt license [-h] {info,scopes,issue} ...
-+```
-+
-+**Description**
-+
-+View dlthub license status.
-+
-+<details>
-+
-+<summary>Show Arguments and Options</summary>
-+
-+Inherits arguments from [`dlt`](#dlt).
-+
-+**Options**
-+* `-h, --help` - Show this help message and exit
-+
-+**Available subcommands**
-+* [`info`](#dlt-license-info) - Show the installed license
-+* [`scopes`](#dlt-license-scopes) - Show available scopes
-+* [`issue`](#dlt-license-issue) - Issues a self-signed trial license that may be used for development, testing and for ci ops.
-+
-+</details>
-+
-+### `dlt license info`
-+
-+Show the installed license.
-+
-+**Usage**
-+```sh
-+dlt license info [-h]
-+```
-+
-+**Description**
-+
-+Show the installed license.
-+
-+<details>
-+
-+<summary>Show Arguments and Options</summary>
-+
-+Inherits arguments from [`dlt license`](#dlt-license).
-+
-+**Options**
-+* `-h, --help` - Show this help message and exit
-+
-+</details>
-+
-+### `dlt license scopes`
-+
-+Show available scopes.
-+
-+**Usage**
-+```sh
-+dlt license scopes [-h]
-+```
-+
-+**Description**
-+
-+Show available scopes.
-+
-+<details>
-+
-+<summary>Show Arguments and Options</summary>
-+
-+Inherits arguments from [`dlt license`](#dlt-license).
-+
-+**Options**
-+* `-h, --help` - Show this help message and exit
-+
-+</details>
-+
-+### `dlt license issue`
-+
-+Issues a self-signed trial license that may be used for development, testing and for ci ops.
-+
-+**Usage**
-+```sh
-+dlt license issue [-h] scope
-+```
-+
-+**Description**
-+
-+Issue a new self-signed trial license.
-+
-+<details>
-+
-+<summary>Show Arguments and Options</summary>
-+
-+Inherits arguments from [`dlt license`](#dlt-license).
-+
-+**Positional arguments**
-+* `scope` - Scope of the license, a comma separated list of the scopes: ['dlthub.dbt_generator', 'dlthub.sources.mssql', 'dlthub.project', 'dlthub.transformation', 'dlthub.data_quality', 'dlthub.destinations.iceberg', 'dlthub.destinations.snowflake_plus', 'dlthub.runner']
-+
-+**Options**
-+* `-h, --help` - Show this help message and exit
-+
-+</details>
-+
-diff --git a/docs/website/docs/reference/command-line-interface.md b/docs/website/docs/reference/command-line-interface.md
-index d47a97949..837499135 100644
---- a/docs/website/docs/reference/command-line-interface.md
-+++ b/docs/website/docs/reference/command-line-interface.md
-@@ -31,7 +31,7 @@ Creates, adds, inspects and deploys dlt pipelines. Further help is available at
- ```sh
- dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
-     [--non-interactive] [--debug] [--no-pwd]
--    {telemetry,schema,pipeline,init,render-docs,deploy,dashboard,ai} ...
-+    {telemetry,schema,pipeline,init,deploy,dashboard,ai} ...
- ```
- 
- <details>
-@@ -52,7 +52,6 @@ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
- * [`schema`](#dlt-schema) - Shows, converts and upgrades schemas
- * [`pipeline`](#dlt-pipeline) - Operations on pipelines that were ran locally
- * [`init`](#dlt-init) - Creates a pipeline project in the current folder by adding existing verified source or creating a new one from template.
--* [`render-docs`](#dlt-render-docs) - Renders markdown version of cli docs
- * [`deploy`](#dlt-deploy) - Creates a deployment package for a selected pipeline script
- * [`dashboard`](#dlt-dashboard) - Starts the dlt workspace dashboard
- * [`ai`](#dlt-ai) - Use ai-powered development tools and utilities
-@@ -564,36 +563,6 @@ Inherits arguments from [`dlt`](#dlt).
- 
- </details>
- 
--## `dlt render-docs`
--
--Renders markdown version of cli docs.
--
--**Usage**
--```sh
--dlt render-docs [-h] [--commands [COMMANDS ...]] [--compare] file_name
--```
--
--**Description**
--
--The `dlt render-docs` command renders markdown version of cli docs by parsing the argparse help output and generating a markdown file.
--If you are reading this on the docs website, you are looking at the rendered version of the cli docs generated by this command.
--
--<details>
--
--<summary>Show Arguments and Options</summary>
--
--Inherits arguments from [`dlt`](#dlt).
--
--**Positional arguments**
--* `file_name` - Output file name
--
--**Options**
--* `-h, --help` - Show this help message and exit
--* `--commands [COMMANDS ...]` - List of command names to render (optional)
--* `--compare` - Compare the changes and raise if output would be updated
--
--</details>
--
- ## `dlt deploy`
- 
- Creates a deployment package for a selected pipeline script.
-@@ -838,6 +807,11 @@ Inherits arguments from [`dlt ai`](#dlt-ai).
- **Options**
- * `-h, --help` - Show this help message and exit
- 
-+**Available subcommands**
-+* [`list`](#dlt-ai-secrets-list) - List secret file locations from providers
-+* [`view-redacted`](#dlt-ai-secrets-view-redacted) - Print secrets toml with all values replaced by '***'
-+* [`update-fragment`](#dlt-ai-secrets-update-fragment) - Merge a toml fragment into the secrets file
-+
- </details>
- 
- ### `dlt ai secrets list`
-
-
-===== COMMIT 2e1cf969 =====
-
-
-commit 2e1cf9694
-Author: YuF-9468
-Date: 2026-03-13
-
-    fix: validate missing MotherDuck catalog (#3723)
-
-diff --git a/dlt/destinations/impl/motherduck/configuration.py b/dlt/destinations/impl/motherduck/configuration.py
-index b659e75d2..cf91483c1 100644
---- a/dlt/destinations/impl/motherduck/configuration.py
-+++ b/dlt/destinations/impl/motherduck/configuration.py
-@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Dict, Final, List, TYPE_CHECKING
- from dlt.common.configuration.specs.connection_string_credentials import ConnectionStringCredentials
- from dlt.version import __version__
- from dlt.common.configuration import configspec
-+from dlt.common.configuration.specs.exceptions import NativeValueError
- from dlt.common.destination.client import DestinationClientDwhWithStagingConfiguration
- from dlt.common.destination.exceptions import DestinationTerminalException
- from dlt.common.typing import TSecretStrValue
-@@ -91,6 +92,13 @@ class MotherDuckCredentials(DuckDbBaseCredentials, ConnectionStringCredentials):
- 
-     def on_resolved(self) -> None:
-         """Adds custom agent to global config"""
-+        if self.database == "":
-+            raise MotherDuckCatalogMissing(
-+                self.__class__,
-+                "md:",
-+                "MotherDuck connection string must include a catalog/database name, for example"
-+                " `md:my_db`.",
-+            )
-         if self.global_config is None:
-             self.global_config = {}
-         self.global_config["custom_user_agent"] = self.custom_user_agent or MOTHERDUCK_USER_AGENT
-@@ -122,6 +130,10 @@ class MotherDuckClientConfiguration(DestinationClientDwhWithStagingConfiguration
-         return ""
- 
- 
-+class MotherDuckCatalogMissing(NativeValueError):
-+    pass
-+
-+
- class MotherduckLocalVersionNotSupported(DestinationTerminalException):
-     def __init__(self, duckdb_version: str) -> None:
-         self.duckdb_version = duckdb_version
-diff --git a/tests/load/motherduck/test_motherduck_client.py b/tests/load/motherduck/test_motherduck_client.py
-index eacaa88aa..946a13185 100644
---- a/tests/load/motherduck/test_motherduck_client.py
-+++ b/tests/load/motherduck/test_motherduck_client.py
-@@ -10,6 +10,7 @@ from dlt.destinations.impl.motherduck.configuration import (
-     MOTHERDUCK_USER_AGENT,
-     MotherDuckCredentials,
-     MotherDuckClientConfiguration,
-+    MotherDuckCatalogMissing,
- )
- 
- # mark all tests as essential, do not remove
-@@ -31,6 +32,9 @@ def test_motherduck_configuration() -> None:
-     assert cred.is_partial() is False
-     assert cred.is_resolved() is False
- 
-+    with pytest.raises(MotherDuckCatalogMissing):
-+        resolve_configuration(MotherDuckCredentials("md:?motherduck_token=TOKEN"))
-+
-     cred = MotherDuckCredentials()
-     cred.parse_native_representation("md:xdb?motherduck_token=TOKEN2")
-     assert cred.password == "TOKEN2"
-
-
-===== COMMIT 4b1cc416 =====
-
-
-commit 4b1cc4166
-Author: djudjuu
-Date: 2026-03-13
-
-    docs: redirects for removed pages (#3688)
-
-diff --git a/docs/website/package.json b/docs/website/package.json
-index dbfd0409c..0158bc300 100644
---- a/docs/website/package.json
-+++ b/docs/website/package.json
-@@ -4,7 +4,7 @@
-   "private": true,
-   "scripts": {
-     "start": "cd .. && make preprocess-docs && concurrently --kill-others \"make preprocess-docs-watch \" \"cd website && docusaurus start\"",
--    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js",
-+    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js && node scripts/verify-redirects.js",
-     "clear": "docusaurus clear",
-     "serve": "docusaurus serve --dir build/docs",
-     "clear-versions": "node tools/clear_versions.js",
-@@ -13,7 +13,8 @@
-     "serve:cloudflare": "wrangler dev --port 3001 --local",
-     "preview:cloudflare": "npm run build && npm run serve:cloudflare",
-     "deploy:cloudflare": "npm run build && wrangler deploy",
--    "verify-llms": "node scripts/verify-llms-txt.js"
-+    "verify-llms": "node scripts/verify-llms-txt.js",
-+    "verify-redirects": "node scripts/verify-redirects.js"
-   },
-   "dependencies": {
-     "@docusaurus/core": "^3.9.2",
-diff --git a/docs/website/redirects.js b/docs/website/redirects.js
-new file mode 100644
-index 000000000..8bea66368
---- /dev/null
-+++ b/docs/website/redirects.js
-@@ -0,0 +1,154 @@
-+// Redirect rules shared between the Cloudflare worker (worker.ts) and the
-+// post-build verification script (scripts/verify-redirects.js).
-+
-+/** @type {Array<{from: string, to: string}>} */
-+const REDIRECTS = [
-+    // basic root redirects
-+    {
-+        // NOTE: We only ever hit the root path on dev previews, so we can redirect to the devel version
-+        from: "/",
-+        to: "/docs/devel/intro"
-+    },
-+    {
-+        from: "/docs",
-+        to: "/docs/intro"
-+    },
-+    {
-+        from: "/docs/",
-+        to: "/docs/intro"
-+    },
-+    {
-+        from: "/docs/hub",
-+        to: "/docs/hub/intro"
-+    },
-+
-+    // docs section redirects
-+    {
-+        from: "/docs/getting-started",
-+        to: "/docs/intro/"
-+    },
-+    {
-+        from: "/docs/dlt-ecosystem",
-+        to: "/docs/dlt-ecosystem/verified-sources/"
-+    },
-+    {
-+        from: "/docs/general-usage/credentials/config_providers",
-+        to: "/docs/general-usage/credentials/setup/"
-+    },
-+    {
-+        from: "/docs/general-usage/credentials/configuration",
-+        to: "/docs/general-usage/credentials/setup/"
-+    },
-+    {
-+        from: "/docs/general-usage/credentials/config_specs",
-+        to: "/docs/general-usage/credentials/complex_types/"
-+    },
-+
-+    // tutorial redirects
-+    {
-+        from: "/docs/tutorial/intro",
-+        to: "/docs/tutorial/load-data-from-an-api/"
-+    },
-+    {
-+        from: "/docs/tutorial/grouping-resources",
-+        to: "/docs/tutorial/load-data-from-an-api/"
-+    },
-+
-+    // reference + misc redirects
-+    {
-+        from: "/docs/telemetry",
-+        to: "/docs/reference/telemetry/"
-+    },
-+    {
-+        from: "/docs/walkthroughs",
-+        to: "/docs/intro/"
-+    },
-+    {
-+        from: "/docs/visualizations",
-+        to: "/docs/general-usage/dataset-access/"
-+    },
-+
-+    // top-404 redirects
-+    {
-+        from: "/docs/dlt-ecosystem/llm-tooling/cursor-restapi",
-+        to: "/docs/dlt-ecosystem/llm-tooling/llm-native-workflow"
-+    },
-+    {
-+        from: "/docs/general-usage/filesystem",
-+        to: "/docs/dlt-ecosystem/verified-sources/filesystem/"
-+    },
-+    {
-+        from: "/docs/walkthroughs/",
-+        to: "/docs/intro/"
-+    },
-+    {
-+        from: "/docs/dlt-ecosystem/verified-sources/rest_api/reference",
-+        to: "/docs/dlt-ecosystem/verified-sources/rest_api"
-+    },
-+
-+    // renamed / relocated pages
-+    {
-+        from: "/docs/walkthroughs/load-data-from-an-api",
-+        to: "/docs/tutorial/load-data-from-an-api"
-+    },
-+    {
-+        from: "/docs/load-data-from-an-api",
-+        to: "/docs/tutorial/load-data-from-an-api"
-+    },
-+    {
-+        from: "/docs/destinations/snowflake",
-+        to: "/docs/dlt-ecosystem/destinations/snowflake"
-+    },
-+    {
-+        from: "/docs/destinations/duckdb",
-+        to: "/docs/dlt-ecosystem/destinations/duckdb"
-+    },
-+    {
-+        from: "/docs/pipelines/salesforce",
-+        to: "/docs/dlt-ecosystem/verified-sources/salesforce"
-+    },
-+    {
-+        from: "/docs/dlt-ecosystem/verified-sources/stripe_analytics",
-+        to: "/docs/dlt-ecosystem/verified-sources/stripe"
-+    },
-+    {
-+        from: "/docs/dlt-ecosystem/transformations/pandas",
-+        to: "/docs/dlt-ecosystem/transformations/python"
-+    },
-+    {
-+        from: "/docs/getting-started/build-a-data-pipeline",
-+        to: "/docs/build-a-pipeline-tutorial"
-+    },
-+
-+    // api_reference paths gained a /dlt/ prefix
-+    {
-+        from: "/docs/api_reference/extract/resource",
-+        to: "/docs/api_reference/dlt/extract/resource"
-+    },
-+    {
-+        from: "/docs/api_reference/common/configuration/specs/base_configuration",
-+        to: "/docs/api_reference/dlt/common/configuration/specs/base_configuration"
-+    },
-+    {
-+        from: "/docs/hub/reference",
-+        to: "/docs/hub/intro"
-+    },
-+    {
-+        from: "/docs/general-usage/connectors",
-+        to: "/docs/dlt-ecosystem/verified-sources/"
-+    },
-+    {
-+        from: "/docs/api_reference/pipeline/configuration",
-+        to: "/docs/general-usage/credentials/"
-+    },
-+    {
-+        from: "/docs/walkthroughs/grouping-resources",
-+        to: "/docs/general-usage/source"
-+    },
-+    {
-+        from: "/docs/general-usage/dlt",
-+        to: "/docs/intro"
-+    },
-+];
-+
-+module.exports = REDIRECTS;
-diff --git a/docs/website/scripts/verify-redirects.js b/docs/website/scripts/verify-redirects.js
-new file mode 100644
-index 000000000..663802d2f
---- /dev/null
-+++ b/docs/website/scripts/verify-redirects.js
-@@ -0,0 +1,112 @@
-+#!/usr/bin/env node
-+/**
-+ * Post-build verification for redirect targets.
-+ *
-+ * Imports the shared REDIRECTS array from redirects.js and checks that every
-+ * `to` target resolves to an existing HTML page in the build output. Run after
-+ * `docusaurus build`:
-+ *
-+ *   node scripts/verify-redirects.js
-+ *
-+ * Exits with code 1 if any errors are found.
-+ */
-+const fs = require('fs');
-+const path = require('path');
-+
-+const BUILD_DIR = path.resolve(__dirname, '..', 'build', 'docs');
-+const redirects = require('../redirects.js');
-+
-+// ---------------------------------------------------------------------------
-+// Helpers
-+// ---------------------------------------------------------------------------
-+let errors = 0;
-+let warnings = 0;
-+
-+function error(msg) {
-+  console.error(`  ERROR: ${msg}`);
-+  errors++;
-+}
-+
-+function warn(msg) {
-+  console.warn(`  WARN:  ${msg}`);
-+  warnings++;
-+}
-+
-+function ok(msg) {
-+  console.log(`  OK:    ${msg}`);
-+}
-+
-+function targetExists(rel) {
-+  const candidates = [
-+    path.join(BUILD_DIR, rel + '.html'),
-+    path.join(BUILD_DIR, rel, 'index.html'),
-+  ];
-+  return candidates.some((c) => fs.existsSync(c));
-+}
-+
-+// ---------------------------------------------------------------------------
-+// Main
-+// ---------------------------------------------------------------------------
-+
-+console.log('\n--- redirect targets (redirects.js) ---');
-+
-+if (!fs.existsSync(BUILD_DIR)) {
-+  console.error(`Build directory not found: ${BUILD_DIR}`);
-+  console.error('Run "npm run build" first.');
-+  process.exit(1);
-+}
-+
-+ok(`${redirects.length} redirects loaded from redirects.js`);
-+
-+// Check for duplicate `from` entries
-+const fromCounts = {};
-+for (const r of redirects) {
-+  fromCounts[r.from] = (fromCounts[r.from] || 0) + 1;
-+}
-+const dupFroms = Object.entries(fromCounts).filter(([, c]) => c > 1);
-+if (dupFroms.length > 0) {
-+  for (const [from, count] of dupFroms) {
-+    error(`duplicate "from" path: ${from} (appears ${count} times)`);
-+  }
-+} else {
-+  ok('no duplicate "from" paths');
-+}
-+
-+// Check for redirect chains (to → from)
-+const fromSet = new Set(redirects.map((r) => r.from));
-+for (const r of redirects) {
-+  if (fromSet.has(r.to)) {
-+    warn(`redirect chain: ${r.from} → ${r.to} → ... (target is itself a redirect source)`);
-+  }
-+}
-+
-+// Verify each target resolves to an existing page
-+let checked = 0;
-+let skipped = 0;
-+
-+for (const r of redirects) {
-+  if (!r.to.startsWith('/docs/')) {
-+    skipped++;
-+    continue;
-+  }
-+
-+  checked++;
-+  const rel = r.to.replace(/^\/docs\//, '').replace(/\/$/, '');
-+  if (!targetExists(rel)) {
-+    error(`redirect target ${r.to} has no HTML page (from: ${r.from}, checked ${rel}.html and ${rel}/index.html)`);
-+  }
-+}
-+
-+if (skipped > 0) {
-+  ok(`skipped ${skipped} non-/docs/ targets`);
-+}
-+
-+if (errors === 0) {
-+  ok(`all ${checked} checked redirect targets resolve to existing pages`);
-+}
-+
-+// Summary
-+console.log(`\n=== Redirects: ${errors} errors, ${warnings} warnings ===`);
-+if (errors > 0) {
-+  process.exit(1);
-+}
-diff --git a/docs/website/worker.ts b/docs/website/worker.ts
-index 4c40fba36..4192aa2c9 100644
---- a/docs/website/worker.ts
-+++ b/docs/website/worker.ts
-@@ -1,80 +1,7 @@
- // cloudflare worker implementation to serve the website docs
- import { instrument, ResolveConfigFn } from '@microlabs/otel-cf-workers';
- import type { ReadableSpan } from '@opentelemetry/sdk-trace-base'
--
--const REDIRECTS = [
--    // basic root redirects
--    {
--        // NOTE: We only ever hit the root path on dev previews, so we can redirect to the devel version
--        from: "/",
--        to: "/docs/devel/intro"
--    },
--    {
--        from: "/docs",
--        to: "/docs/intro"
--    },
--    {
--        from: "/docs/",
--        to: "/docs/intro"
--    },
--    {
--        from: "/docs/hub",
--        to: "/docs/hub/intro"
--    },
--
--    // docs section redirects
--    {
--        from: "/docs/getting-started",
--        to: "/docs/intro/"
--    },
--    {
--        from: "/docs/dlt-ecosystem",
--        to: "/docs/dlt-ecosystem/verified-sources/"
--    },
--    {
--        from: "/docs/general-usage/credentials/config_providers",
--        to: "/docs/general-usage/credentials/setup/"
--    },
--    {
--        from: "/docs/general-usage/credentials/configuration",
--        to: "/docs/general-usage/credentials/setup/"
--    },
--    {
--        from: "/docs/general-usage/credentials/config_specs",
--        to: "/docs/general-usage/credentials/complex_types/"
--    },
--
--    // tutorial redirects
--    {
--        from: "/docs/tutorial/intro",
--        to: "/docs/tutorial/load-data-from-an-api/"
--    },
--    {
--        from: "/docs/tutorial/grouping-resources",
--        to: "/docs/tutorial/load-data-from-an-api/"
--    },
--
--    // reference + misc redirects
--    {
--        from: "/docs/telemetry",
--        to: "/docs/reference/telemetry/"
--    },
--    {
--        from: "/docs/walkthroughs",
--        to: "/docs/intro/"
--    },
--    {
--        from: "/docs/visualizations",
--        to: "/docs/general-usage/dataset-access/"
--    },
--
--    // dlt+ redirect
--    {
--        from: "/docs/hub",
--        to: "/docs/hub/intro"
--    },
--
--]
-+import REDIRECTS from './redirects.js';
- 
- const ROUTE_404 = "/docs/404";
- 
-
-
-===== COMMIT a607a80d =====
-
-
-commit a607a80d0
-Author: Aditya Panda
-Date: 2026-03-13
-
-    Fix for infinite loop for bigquery job with internal error (#3732)
-
 diff --git a/dlt/destinations/impl/bigquery/bigquery.py b/dlt/destinations/impl/bigquery/bigquery.py
 index ed9858a93..77741a7c5 100644
 --- a/dlt/destinations/impl/bigquery/bigquery.py
@@ -3244,4 +1078,1355 @@ Author: AyushPatel101
 Date: 2026-03-12
 
     feat: make promote_options configurable for Arrow table concatenation… (#3701)
+
+diff --git a/dlt/common/data_writers/writers.py b/dlt/common/data_writers/writers.py
+index 76d9b423f..73679d63b 100644
+--- a/dlt/common/data_writers/writers.py
++++ b/dlt/common/data_writers/writers.py
+@@ -518,7 +518,9 @@ class ArrowToParquetWriter(ParquetDataWriter):
+         # pyarrow writer starts a row group for each item it writes (even with 0 rows)
+         # it also converts batches into tables internally. by creating a single table
+         # we allow the user rudimentary control over row group size via max buffered items
+-        table = concat_batches_and_tables_in_order(items)
++        table = concat_batches_and_tables_in_order(
++            items, promote_options=self.parquet_format.arrow_concat_promote_options
++        )
+         # release batch references - concat is zero-copy so table shares the
+         # underlying buffers via Arrow refcounting. clearing the input list
+         # drops the Python-level RecordBatch/Table references so only the
+diff --git a/dlt/common/destination/configuration.py b/dlt/common/destination/configuration.py
+index 80fa7b685..2deccb4aa 100644
+--- a/dlt/common/destination/configuration.py
++++ b/dlt/common/destination/configuration.py
+@@ -37,6 +37,10 @@ class ParquetFormatConfiguration(BaseConfiguration):
+     """When False, constant columns (like _dlt_load_id) will use regular arrays instead of
+     dictionary-encoded arrays. Set to False for destinations using ADBC drivers that don't
+     support dictionary types (e.g., MSSQL)."""
++    arrow_concat_promote_options: Literal["none", "default", "permissive"] = "none"
++    """PyArrow concat_tables promote_options for Arrow table concatenation. "none" (default)
++    requires identical schemas and enables zero-copy concat. "default" promotes within type
++    families (e.g. int32 to int64). "permissive" promotes across families (e.g. int64 to double)."""
+ 
+     def max_timestamp_precision(self) -> int:
+         if (self.flavor or "").lower() == "spark":
+diff --git a/dlt/common/libs/pyarrow.py b/dlt/common/libs/pyarrow.py
+index 85652ad08..0f91cd420 100644
+--- a/dlt/common/libs/pyarrow.py
++++ b/dlt/common/libs/pyarrow.py
+@@ -910,10 +910,15 @@ def cast_arrow_schema_types(
+ 
+ 
+ def concat_batches_and_tables_in_order(
+-    tables_or_batches: Iterable[Union[pyarrow.Table, pyarrow.RecordBatch]]
++    tables_or_batches: Iterable[Union[pyarrow.Table, pyarrow.RecordBatch]],
++    promote_options: str = "none",
+ ) -> pyarrow.Table:
+-    """Concatenate iterable of tables and batches into a single table, preserving row order. Zero copy is used during
+-    concatenation so schemas must be identical.
++    """Concatenate iterable of tables and batches into a single table, preserving row order.
++
++    Args:
++        promote_options: PyArrow concat_tables promote_options. "none" (default) requires identical
++            schemas and enables zero-copy concat. "default" promotes within type families (e.g.
++            int32→int64). "permissive" promotes across families (e.g. int64→double).
+     """
+     batches = []
+     tables = []
+@@ -929,8 +934,8 @@ def concat_batches_and_tables_in_order(
+             raise ValueError(f"Unsupported type: `{type(item)}`")
+     if batches:
+         tables.append(pyarrow.Table.from_batches(batches))
+-    # "none" option ensures 0 copy concat
+-    return pyarrow.concat_tables(tables, promote_options="none")
++    # "none" ensures 0 copy concat; "default"/"permissive" allow type promotion
++    return pyarrow.concat_tables(tables, promote_options=promote_options)
+ 
+ 
+ def transpose_rows_to_columns(
+diff --git a/docs/website/docs/dlt-ecosystem/file-formats/parquet.md b/docs/website/docs/dlt-ecosystem/file-formats/parquet.md
+index cff46da8e..156f48fb8 100644
+--- a/docs/website/docs/dlt-ecosystem/file-formats/parquet.md
++++ b/docs/website/docs/dlt-ecosystem/file-formats/parquet.md
+@@ -49,6 +49,7 @@ Under the hood, `dlt` uses the [pyarrow parquet writer](https://arrow.apache.org
+ - `allow_truncated_timestamps` - will raise if precision is lost on truncated timestamps.
+ - `write_page_index`: Boolean specifying whether a [page index](https://github.com/apache/parquet-format/blob/master/PageIndex.md) is written. Defaults to `False`.
+ - `use_content_defined_chunking`: Boolean specifying whether [Content-Defined Chunking](https://github.com/apache/arrow/pull/45360) is used. Defaults to `False`. Requires `pyarrow>=21.0.0`, ignored otherwise.
++- `arrow_concat_promote_options`: Controls type promotion when concatenating multiple Arrow tables/DataFrames. Accepts `"none"` (default), `"default"`, or `"permissive"`. See [Handling schema mismatches](../verified-sources/arrow-pandas.md#handling-schema-mismatches-across-batches) for details.
+ 
+ :::tip
+ The default parquet version used by `dlt` is 2.4. It coerces timestamps to microseconds and truncates nanoseconds silently. Such a setting
+@@ -75,6 +76,7 @@ DATA_WRITER__FLAVOR
+ DATA_WRITER__VERSION
+ DATA_WRITER__DATA_PAGE_SIZE
+ DATA_WRITER__TIMESTAMP_TIMEZONE
++DATA_WRITER__ARROW_CONCAT_PROMOTE_OPTIONS
+ ```
+ 
+ :::tip
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md b/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md
+index be7fbdc52..f0719c0b4 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Arrow Table / Pandas
+ description: dlt source for Arrow tables and Pandas dataframes
+-keywords: [arrow, pandas, parquet, source]
++keywords: [arrow, pandas, parquet, source, schema mismatch]
+ ---
+ import Header from './_source-info-header.md';
+ 
+@@ -77,6 +77,31 @@ The output file format is chosen automatically based on the destination's capabi
+ * synapse
+ 
+ 
++## Handling schema mismatches across batches
++
++When a resource yields multiple Arrow tables or DataFrames, `dlt` concatenates them before writing to disk. By default, all batches must have **identical schemas** — any type difference (e.g., `int64` vs `float64`) raises an `ArrowInvalid` error. This is common when reading multiple source files where pandas infers slightly different types per file.
++
++The `arrow_concat_promote_options` setting controls how type differences are resolved:
++
++| Value | Behavior |
++|-------|----------|
++| `"none"` (default) | Requires identical schemas. Zero-copy concatenation. |
++| `"default"` | Fills missing columns with nulls. Promotes `null`-typed columns to concrete types. Rejects cross-family type differences. |
++| `"permissive"` | Full type promotion (e.g., `int64` → `float64`). Fills missing columns with nulls. |
++
++```toml
++[sources.data_writer]
++arrow_concat_promote_options = "permissive"
++```
++
++```sh
++DATA_WRITER__ARROW_CONCAT_PROMOTE_OPTIONS=permissive
++```
++
++:::note
++Setting this to anything other than `"none"` disables zero-copy concatenation, which may increase memory usage for large batches. This maps directly to the `promote_options` parameter of [`pyarrow.concat_tables`](https://arrow.apache.org/docs/python/generated/pyarrow.concat_tables.html).
++:::
++
+ ## Add `_dlt_load_id` and `_dlt_id` to your tables
+ 
+ `dlt` does not add any data lineage columns by default when loading Arrow tables. This is to give the best performance and avoid unnecessary data copying.
+diff --git a/tests/common/data_writers/utils.py b/tests/common/data_writers/utils.py
+index 842038532..c8a33ecef 100644
+--- a/tests/common/data_writers/utils.py
++++ b/tests/common/data_writers/utils.py
+@@ -4,6 +4,7 @@ from typing import Type, Optional
+ from dlt.common.data_writers.buffered import BufferedDataWriter
+ from dlt.common.data_writers.writers import TWriter, ALL_WRITERS
+ from dlt.common.destination import DestinationCapabilitiesContext
++from dlt.common.destination.configuration import ParquetFormatConfiguration
+ 
+ from tests.utils import get_test_storage_root
+ 
+diff --git a/tests/libs/test_parquet_writer.py b/tests/libs/test_parquet_writer.py
+index 42d9051ab..b5595098a 100644
+--- a/tests/libs/test_parquet_writer.py
++++ b/tests/libs/test_parquet_writer.py
+@@ -10,6 +10,7 @@ from dlt.common import pendulum, Decimal, json
+ from dlt.common.configuration import inject_section
+ from dlt.common.data_writers.writers import ArrowToParquetWriter, ParquetDataWriter
+ from dlt.common.destination import DestinationCapabilitiesContext
++from dlt.common.destination.configuration import ParquetFormatConfiguration
+ from dlt.common.schema.utils import new_column
+ from dlt.common.configuration.specs.config_section_context import ConfigSectionContext
+ 
+@@ -388,6 +389,92 @@ def test_arrow_parquet_row_group_size() -> None:
+         assert reader.metadata.row_group(1).num_rows == 0
+ 
+ 
++def _caps_with_promote(promote_options: str) -> DestinationCapabilitiesContext:
++    caps = DestinationCapabilitiesContext.generic_capabilities()
++    caps.parquet_format = ParquetFormatConfiguration(arrow_concat_promote_options=promote_options)  # type: ignore[arg-type]
++    return caps
++
++
++@pytest.mark.parametrize("promote_options", ["none", "default"])
++def test_arrow_concat_promote_options_rejects_mismatched_types(promote_options: str) -> None:
++    """promote_options="none" and "default" both reject int64/float64 schema mismatch."""
++    c1 = {"col1": new_column("col1", "bigint")}
++    table_int = pa.Table.from_pydict({"col1": pa.array([1, 2], type=pa.int64())})
++    table_float = pa.Table.from_pydict({"col1": pa.array([3.0, 4.0], type=pa.float64())})
++
++    with pytest.raises((pa.lib.ArrowInvalid, pa.lib.ArrowTypeError)):
++        with get_writer(
++            ArrowToParquetWriter,
++            buffer_max_items=10,
++            caps=_caps_with_promote(promote_options),
++        ) as writer:
++            writer.write_data_item(table_int, columns=c1)
++            writer.write_data_item(table_float, columns=c1)
++
++
++def test_arrow_concat_promote_options_permissive() -> None:
++    """promote_options="permissive" promotes int64 to double on cross-family mismatch."""
++    c1 = {"col1": new_column("col1", "bigint")}
++    table_int = pa.Table.from_pydict({"col1": pa.array([1, 2], type=pa.int64())})
++    table_float = pa.Table.from_pydict({"col1": pa.array([3.0, 4.0], type=pa.float64())})
++
++    with get_writer(
++        ArrowToParquetWriter,
++        buffer_max_items=10,
++        caps=_caps_with_promote("permissive"),
++    ) as writer:
++        writer.write_data_item(table_int, columns=c1)
++        writer.write_data_item(table_float, columns=c1)
++
++    with pa.parquet.ParquetFile(writer.closed_files[0].file_path) as reader:
++        table = reader.read()
++        assert table.schema.field("col1").type == pa.float64()
++        assert table.column("col1").to_pylist() == [1.0, 2.0, 3.0, 4.0]
++
++
++@pytest.mark.parametrize("promote_options", ["default", "permissive"])
++def test_arrow_concat_promote_options_null_column(promote_options: str) -> None:
++    """Both "default" and "permissive" promote null + string to string."""
++    cols = {"col1": new_column("col1", "text")}
++    table_str = pa.Table.from_pydict({"col1": pa.array(["a", "b"], type=pa.string())})
++    table_null = pa.Table.from_pydict({"col1": pa.array([None, None], type=pa.null())})
++
++    with get_writer(
++        ArrowToParquetWriter,
++        buffer_max_items=10,
++        caps=_caps_with_promote(promote_options),
++    ) as writer:
++        writer.write_data_item(table_str, columns=cols)
++        writer.write_data_item(table_null, columns=cols)
++
++    with pa.parquet.ParquetFile(writer.closed_files[0].file_path) as reader:
++        table = reader.read()
++        assert table.schema.field("col1").type == pa.string()
++        assert table.column("col1").to_pylist() == ["a", "b", None, None]
++
++
++def test_arrow_concat_promote_options_permissive_missing_column() -> None:
++    """promote_options="permissive" fills missing columns with null."""
++    c1 = {"col1": new_column("col1", "bigint")}
++    table_two_cols = pa.Table.from_pydict(
++        {"col1": pa.array([1], type=pa.int64()), "col2": pa.array(["x"], type=pa.string())}
++    )
++    table_one_col = pa.Table.from_pydict({"col1": pa.array([2], type=pa.int64())})
++
++    with get_writer(
++        ArrowToParquetWriter,
++        buffer_max_items=10,
++        caps=_caps_with_promote("permissive"),
++    ) as writer:
++        writer.write_data_item(table_two_cols, columns=c1)
++        writer.write_data_item(table_one_col, columns=c1)
++
++    with pa.parquet.ParquetFile(writer.closed_files[0].file_path) as reader:
++        table = reader.read()
++        assert table.column("col1").to_pylist() == [1, 2]
++        assert table.column("col2").to_pylist() == ["x", None]
++
++
+ def test_empty_tables_get_flushed() -> None:
+     c1 = {"col1": new_column("col1", "bigint")}
+     single_elem_table = pa.Table.from_pylist([{"col1": 1}])
+
+
+===== COMMIT 5ff1651d =====
+
+
+commit 5ff1651dc
+Author: Travior
+Date: 2026-03-12
+
+    switch lancedb example from spotify to podcastindex (#3736)
+
+diff --git a/docs/examples/custom_destination_lancedb/.dlt/config.toml b/docs/examples/custom_destination_lancedb/.dlt/config.toml
+index 4fd35e115..51b642bdd 100644
+--- a/docs/examples/custom_destination_lancedb/.dlt/config.toml
++++ b/docs/examples/custom_destination_lancedb/.dlt/config.toml
+@@ -1,2 +1,2 @@
+ [lancedb]
+-db_path = "spotify.db"
+\ No newline at end of file
++db_path = "podcast.db"
+\ No newline at end of file
+diff --git a/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml b/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml
+index 9c86df320..8711116be 100644
+--- a/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml
++++ b/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml
+@@ -1,7 +1,7 @@
+-[spotify]
+-client_id = ""
+-client_secret = ""
++[sources.podcastindex]
++api_key = ""
++api_secret = ""
+ 
+-# provide the openai api key here
++# provide the OpenAI API key here
+ [destination.lancedb.credentials]
+ embedding_model_provider_api_key = ""
+\ No newline at end of file
+diff --git a/docs/examples/custom_destination_lancedb/.gitignore b/docs/examples/custom_destination_lancedb/.gitignore
+index c73564481..2b143ae4d 100644
+--- a/docs/examples/custom_destination_lancedb/.gitignore
++++ b/docs/examples/custom_destination_lancedb/.gitignore
+@@ -1 +1 @@
+-spotify.db
+\ No newline at end of file
++podcast.db
+\ No newline at end of file
+diff --git a/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py b/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
+index c33630f37..d41f3db88 100644
+--- a/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
++++ b/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
+@@ -8,10 +8,10 @@ keywords: [destination, credentials, example, lancedb, custom destination, vecto
+ This example showcases a Python script that demonstrates the integration of LanceDB, an open-source vector database,
+ as a custom destination within the dlt ecosystem.
+ The script illustrates the implementation of a custom destination as well as the population of the LanceDB vector
+-store with data from various sources.
++store with podcast episode data from Podcast Index.
+ This highlights the seamless interoperability between dlt and LanceDB.
+ 
+-You can get a Spotify client ID and secret from https://developer.spotify.com/.
++You can get a Podcast Index API key and secret from https://api.podcastindex.org/developer_home.
+ 
+ We'll learn how to:
+ - Use the [custom destination](../dlt-ecosystem/destinations/destination.md)
+@@ -19,12 +19,13 @@ We'll learn how to:
+ - Use Pydantic for unified dlt and lancedb schema validation
+ """
+ 
+-__source_name__ = "spotify"
++__source_name__ = "podcastindex"
+ 
+-import datetime  # noqa: I251
+ from dataclasses import dataclass, fields
++import hashlib
+ import os
+ from pathlib import Path
++import time
+ from typing import Any
+ 
+ import lancedb
+@@ -32,11 +33,10 @@ from lancedb.embeddings import get_registry
+ from lancedb.pydantic import LanceModel, Vector
+ 
+ import dlt
++from dlt.common.configuration import configspec
+ from dlt.common.schema import TTableSchema
+ from dlt.common.typing import TDataItems, TSecretStrValue
+-from dlt.sources.helpers import requests
+-from dlt.common.configuration import configspec
+-from dlt.sources.helpers.rest_client import RESTClient, AuthConfigBase
++from dlt.sources.helpers.rest_client import AuthConfigBase, RESTClient
+ 
+ # access secrets to get openai key
+ openai_api_key: str = dlt.secrets.get(
+@@ -62,14 +62,12 @@ os.environ["OPENAI_API_KEY"] = openai_api_key
+ class EpisodeSchema(LanceModel):
+     """Used for dlt and lance schema validation"""
+ 
+-    id: str  # noqa: A003
+-    name: str
++    id: int  # noqa: A003
++    title: str
+     description: str = func.SourceField()
+-    release_date: datetime.date
+-    audio_preview_url: str
+-    duration_ms: int
+-    href: str
+-    uri: str
++    datePublished: int
++    link: str
++    duration: int
+     # there is more data but we are not using it ...
+ 
+ 
+@@ -81,67 +79,61 @@ class EpisodeSchemaVector(EpisodeSchema):
+ 
+ @dataclass(frozen=True)
+ class Shows:
+-    monday_morning_data_chat: str = "3Km3lBNzJpc1nOTJUtbtMh"
+-    superdatascience_podcast: str = "1n8P7ZSgfVLVJ3GegxPat1"
+-    lex_fridman: str = "2MAi0BvDc6GTFvKFPXnkCL"
++    latent_space: str = "6058902"
++    superdatascience_podcast: str = "4299005"
++    lex_fridman: str = "745287"
+ 
+ 
+ @configspec
+-class SpotifyAuth(AuthConfigBase):
+-    client_id: str = None
+-    client_secret: TSecretStrValue = None
++class PodcastIndexAuth(AuthConfigBase):
++    api_key: str = None
++    api_secret: TSecretStrValue = None
+ 
+     def __call__(self, request) -> Any:
+-        if not hasattr(self, "access_token"):
+-            self.access_token = self._get_access_token()
+-        request.headers["Authorization"] = f"Bearer {self.access_token}"
++        epoch_time = int(time.time())
++        signature = hashlib.sha1(
++            f"{self.api_key}{self.api_secret}{str(epoch_time)}".encode()
++        ).hexdigest()
++        headers = {
++            "X-Auth-Date": str(epoch_time),
++            "X-Auth-Key": self.api_key,
++            "Authorization": signature,
++            "User-Agent": "DltPipeline/1.0",
++        }
++        request.headers.update(headers)
+         return request
+ 
+-    def _get_access_token(self) -> Any:
+-        auth_url = "https://accounts.spotify.com/api/token"
+-        auth_response = requests.post(
+-            auth_url,
+-            {
+-                "grant_type": "client_credentials",
+-                "client_id": self.client_id,
+-                "client_secret": self.client_secret,
+-            },
+-        )
+-        return auth_response.json()["access_token"]
+-
+ 
+ @dlt.source
+-def spotify_shows(
+-    client_id: str = dlt.secrets.value,
+-    client_secret: str = dlt.secrets.value,
++def podcast_episodes(
++    api_key: str = dlt.secrets.value,
++    api_secret: str = dlt.secrets.value,
+ ):
+-    spotify_base_api_url = "https://api.spotify.com/v1"
++    podcast_index_base_api_url = "https://api.podcastindex.org/api/1.0"
+     client = RESTClient(
+-        base_url=spotify_base_api_url,
+-        auth=SpotifyAuth(client_id=client_id, client_secret=client_secret),
++        base_url=podcast_index_base_api_url,
++        auth=PodcastIndexAuth(api_key=api_key, api_secret=api_secret),
+     )
+ 
+     for show in fields(Shows):
+         show_name = show.name
+         show_id = show.default
+-        url = f"/shows/{show_id}/episodes"
++        url = f"/episodes/byfeedid?id={show_id}"
+         yield dlt.resource(
+-            client.paginate(url, params={"limit": 50}),
++            client.get(url, params={"limit": 50}).json()["items"] or [],
+             name=show_name,
+             primary_key="id",
+-            parallelized=True,
+             max_table_nesting=0,
+-            # reuse lance model to filter out all non-matching items and extra columns from spotify api
++            # reuse lance model to filter out all non-matching items and extra columns from the Podcast Index API
+             # 1. unknown columns are removed ("columns": "discard_value")
+-            # 2. non validating items (ie. without id or url) are removed ("data_type": "discard_row")
+-            # 3. for some reason None values are returned as well 🤯, add_filter takes care of that
++            # 2. non-validating items (for example missing `id` or `link`) are removed ("data_type": "discard_row")
+             columns=EpisodeSchema,
+             schema_contract={
+                 "tables": "evolve",
+                 "columns": "discard_value",
+                 "data_type": "discard_row",
+             },
+-        ).add_filter(lambda i: i is not None)
++        ).add_filter(lambda i: i["description"] != "")
+ 
+ 
+ @dlt.destination(batch_size=250, name="lancedb")
+@@ -169,13 +161,13 @@ if __name__ == "__main__":
+             pass
+ 
+     pipeline = dlt.pipeline(
+-        pipeline_name="spotify",
++        pipeline_name="podcastindex",
+         destination=lancedb_destination,
+-        dataset_name="spotify_podcast_data",
++        dataset_name="podcastindex_data",
+         progress="log",
+     )
+ 
+-    load_info = pipeline.run(spotify_shows())
++    load_info = pipeline.run(podcast_episodes())
+     print(load_info)
+ 
+     row_counts = pipeline.last_trace.last_normalize_info
+
+
+===== COMMIT 92f885ce =====
+
+
+commit 92f885cee
+Author: rudolfix
+Date: 2026-03-12
+
+    (chore) adds cli docs check to docs ci workflow (#3739)
+
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 69808c87c..bd3278d54 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -49,10 +49,6 @@ jobs:
+           export PATH=$PATH:"/c/Program Files/usr/bin" # needed for Windows
+           make lint
+ 
+-      - name: Check that cli docs are up to date
+-        run: make check-cli-docs
+-        if: ${{ matrix.python-version == '3.11' }}
+-
+       - name: Check filesizes
+         uses: ppremk/lfs-warning@v3.2
+         with:
+diff --git a/.github/workflows/test_docs.yml b/.github/workflows/test_docs.yml
+index 4f7d73d29..46ffacaf4 100644
+--- a/.github/workflows/test_docs.yml
++++ b/.github/workflows/test_docs.yml
+@@ -79,6 +79,12 @@ jobs:
+         run:  docker compose -f "tests/load/weaviate/docker-compose.yml" up -d
+ 
+ 
++      - name: Install root project for CLI docs check
++        run: uv sync --extra cli
++
++      - name: Check that CLI docs are up to date
++        run: make check-cli-docs
++
+       - name: Install dependencies
+         run: cd docs && make dev
+ 
+diff --git a/dlt/_workspace/cli/commands.py b/dlt/_workspace/cli/commands.py
+index 4d01248c7..6cad6a1b5 100644
+--- a/dlt/_workspace/cli/commands.py
++++ b/dlt/_workspace/cli/commands.py
+@@ -69,7 +69,7 @@ version if run again with an existing `source` name. You will be warned if files
+             ),
+         )
+         parser.add_argument(
+-            "destination", nargs="?", help="Name of a destination ie. bigquery or redshift"
++            "destination", nargs="?", help="Name of a destination i.e. bigquery or redshift"
+         )
+         parser.add_argument(
+             "--location",
+
+
+===== COMMIT 988996c0 =====
+
+
+commit 988996c0a
+Author: Elisabeth Reitmayr
+Date: 2026-03-11
+
+    Docs/ai workbench license (#3729)
+
+diff --git a/README.md b/README.md
+index befac0305..810507ef2 100644
+--- a/README.md
++++ b/README.md
+@@ -96,9 +96,7 @@ You can find examples for various use cases in the [examples](docs/examples) fol
+ * `minor` new features, sometimes automatic migrations
+ * `patch` bug fixes
+ 
+-We suggest that you allow only `patch` level updates automatically:
+-* Using the [Compatible Release Specifier](https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release). For example **dlt~=1.0** allows only versions **>=1.0** and less than **<1.1**
+-* Poetry [caret requirements](https://python-poetry.org/docs/dependency-specification/). For example **^1.0** allows only versions **>=1.0** to **<1.0**
++We suggest that you allow only `patch` level updates automatically using the [Compatible Release Specifier](https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release). For example **dlt~=1.23.0** allows only versions **>=1.23.0** and less than **<1.24.0**
+ 
+ Please also see our [release notes](https://github.com/dlt-hub/dlt/releases) for notable changes between versions.
+ 
+diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+index 0b704a0e5..b14434f45 100644
+--- a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
++++ b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+@@ -6,6 +6,10 @@ keywords: [cursor, claude, codex, llm, restapi, ai, workbench, toolkit]
+ 
+ # REST API Source with dltHub AI Workbench
+ 
++:::info
++The dltHub AI Workbench is a part of the dltHub platform. View the license [here](https://github.com/dlt-hub/dlthub-ai-workbench/blob/master/LICENSE). Sign up [here](https://dlthub.com/solutions/for-small-data-teams) for early access to dltHub.
++:::
++
+ ## Overview
+ 
+ Build a custom REST API connector for any of the 8k+ available sources — often in a single session. Instead of generating ad-hoc code, the AI assistant follows a defined sequence of steps from start to finish to help you build production-grade pipelines following the dltHub best practices. 
+@@ -291,7 +295,7 @@ Once your pipeline is validated, you can continue to the next phase of the data
+ - **`data-exploration`** — query loaded data and create marimo notebooks, charts, and dashboards
+ - **`dlthub-runtime`** — deploy, schedule, and monitor your pipeline in production 
+ 
+-[Sign up for dltHub Early Access](https://info.dlthub.com/waiting-list)
++[Sign up for dltHub Early Access](https://dlthub.com/solutions/for-small-data-teams)
+ 
+ ```sh
+ uv run dlt ai toolkit data-exploration install
+diff --git a/docs/website/docs/hub/EULA.md b/docs/website/docs/hub/EULA.md
+index 9930adf1a..fc709519f 100644
+--- a/docs/website/docs/hub/EULA.md
++++ b/docs/website/docs/hub/EULA.md
+@@ -184,4 +184,8 @@ If it turns out that a section of this EULA isn’t enforceable, then that secti
+ 
+ You and we agree that no joint venture, partnership, employment, or agency relationship exists between us.
+ 
+-The EULA, along with any Specific Terms, make up the entire agreement between us in relation to its subject matter and supersede all prior agreements, representations, and understandings.
+\ No newline at end of file
++The EULA, along with any Specific Terms, make up the entire agreement between us in relation to its subject matter and supersede all prior agreements, representations, and understandings.
++
++# EULA for dltHub AI Workbench
++
++The dltHub AI Workbench has a separate license which can be accessed [here](https://github.com/dlt-hub/dlthub-ai-workbench/blob/master/LICENSE).
+\ No newline at end of file
+
+
+===== COMMIT 3809b453 =====
+
+
+commit 3809b4533
+Author: UD
+Date: 2026-03-06
+
+    feat(ducklake): add `override_data_path` option to ATTACH statement (#3709)
+
+diff --git a/dlt/destinations/impl/ducklake/configuration.py b/dlt/destinations/impl/ducklake/configuration.py
+index 46034cb94..5fe33ed6e 100644
+--- a/dlt/destinations/impl/ducklake/configuration.py
++++ b/dlt/destinations/impl/ducklake/configuration.py
+@@ -128,6 +128,7 @@ class DuckLakeClientConfiguration(WithLocalFiles, DestinationClientDwhWithStagin
+     )
+     credentials: DuckLakeCredentials = None
+     create_indexes: bool = False  # does nothing but required
++    override_data_path: bool = False
+ 
+     def fingerprint(self) -> str:
+         """Use fingerprint of underlying storage. This is precise to bucket level"""
+diff --git a/dlt/destinations/impl/ducklake/ducklake.py b/dlt/destinations/impl/ducklake/ducklake.py
+index 1ab2f995c..d90cf70d1 100644
+--- a/dlt/destinations/impl/ducklake/ducklake.py
++++ b/dlt/destinations/impl/ducklake/ducklake.py
+@@ -160,6 +160,7 @@ class DuckLakeClient(DuckDbClient):
+             staging_dataset_name=config.normalize_staging_dataset_name(schema),
+             credentials=config.credentials,
+             capabilities=capabilities,
++            override_data_path=config.override_data_path,
+         )
+ 
+     def initialize_storage(self, truncate_tables: Iterable[str] = None) -> None:
+diff --git a/dlt/destinations/impl/ducklake/sql_client.py b/dlt/destinations/impl/ducklake/sql_client.py
+index ad944382c..44400acc6 100644
+--- a/dlt/destinations/impl/ducklake/sql_client.py
++++ b/dlt/destinations/impl/ducklake/sql_client.py
+@@ -26,10 +26,12 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+         staging_dataset_name: str,
+         credentials: DuckLakeCredentials,
+         capabilities: DestinationCapabilitiesContext,
++        override_data_path: bool = False,
+     ) -> None:
+         super().__init__(dataset_name, staging_dataset_name, credentials, capabilities)
+         self.credentials: DuckLakeCredentials = credentials
+         self._attach_statement: str = None
++        self.override_data_path = override_data_path
+ 
+     def create_dataset(self) -> None:
+         if self.has_dataset():
+@@ -122,6 +124,7 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+         ducklake_name: str,
+         catalog: ConnectionStringCredentials,
+         storage_url: str,
++        override_data_path: bool = False,
+     ) -> str:
+         attach_params = ""
+         if isinstance(catalog, DuckDbCredentials):
+@@ -147,7 +150,8 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+         else:
+             raise NotImplementedError(str(catalog))
+         attach_statement += f" AS {ducklake_name}"
+-        attach_statement += f" (DATA_PATH '{storage_url}'{attach_params})"
++        override_param = ", OVERRIDE_DATA_PATH true" if override_data_path else ""
++        attach_statement += f" (DATA_PATH '{storage_url}'{attach_params}{override_param})"
+         return attach_statement
+ 
+     @property
+@@ -160,4 +164,5 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+                 ducklake_name=self.credentials.ducklake_name,
+                 catalog=self.credentials.catalog,
+                 storage_url=self.credentials.storage_url,
++                override_data_path=self.override_data_path,
+             )
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/ducklake.md b/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
+index 56ce1c090..60879dd40 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
+@@ -126,6 +126,34 @@ You can set additional connection options, pragmas and extensions - `ducklake` c
+ ducklake_max_retry_count=100
+ ```
+ 
++### Override data path
++DuckLake stores file paths in the catalog relative to a base `DATA_PATH` that is set at creation time. When `override_data_path` is set to `True`, the `DATA_PATH` provided in the current connection replaces the stored one for both reads and writes. The stored value in the catalog is not modified.
++
++Typical use cases:
++- Populating a ducklake locally and then uploading the catalog and data files to remote storage together
++- Accessing the same catalog from different environments where the storage is at a different path (e.g., data replicated to another bucket)
++
++```toml
++[destination.ducklake]
++override_data_path=true
++```
++
++Or via environment variable `DESTINATION__DUCKLAKE__OVERRIDE_DATA_PATH=true`, or in code:
++```py
++import dlt
++from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
++
++destination = dlt.destinations.ducklake(
++    credentials=DuckLakeCredentials(
++        catalog="sqlite:///catalog.sqlite",
++        storage="s3://new-bucket/data",
++    ),
++    override_data_path=True,
++)
++```
++
++See the [DuckLake docs on connecting](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details on `OVERRIDE_DATA_PATH`.
++
+ ### Configure in code
+ You can create ducklake destination instance and configure it in code. In most cases you will just set additional options while still using the configuration:
+ ```py
+@@ -237,5 +265,4 @@ This destination fully supports [dlt state sync](../../general-usage/state#synci
+ * open table interface for table maintenance like we have for iceberg and delta.
+ * better partitioning support.
+ * Motherduck as catalog if possible.
+-* support additional `ATTACH` options like `OVERRIDE_DATA_PATH`
+ * implement callbacks that will be called on creation of :memory: database and `ATTACH` command so those can be fully customized.
+diff --git a/tests/load/ducklake/test_ducklake_client.py b/tests/load/ducklake/test_ducklake_client.py
+index e753cba6b..21f1f7583 100644
+--- a/tests/load/ducklake/test_ducklake_client.py
++++ b/tests/load/ducklake/test_ducklake_client.py
+@@ -266,6 +266,39 @@ def test_attach_statement_doesnt_use_postgresql() -> None:
+     assert "postgresql" not in expected_attach_statement
+ 
+ 
++def test_ducklake_attach_statement_with_override_data_path() -> None:
++    expected_attach_statement = (
++        "ATTACH IF NOT EXISTS 'ducklake:postgres:postgres://loader:loader@localhost:5432/dlt_data'"
++        " AS foo (DATA_PATH '/path/to/storage', METADATA_SCHEMA 'foo',"
++        " OVERRIDE_DATA_PATH true)"
++    )
++    attach_statement = DuckLakeSqlClient.build_attach_statement(
++        catalog=ConnectionStringCredentials("postgres://loader:loader@localhost:5432/dlt_data"),
++        ducklake_name="foo",
++        storage_url="/path/to/storage",
++        override_data_path=True,
++    )
++    assert expected_attach_statement == attach_statement
++
++
++def test_ducklake_override_data_path_config() -> None:
++    configuration = resolve_configuration(
++        DuckLakeClientConfiguration(override_data_path=True)._bind_dataset_name(dataset_name="foo")
++    )
++    assert configuration.override_data_path is True
++
++    from dlt.destinations.impl.ducklake.configuration import _get_ducklake_capabilities
++
++    sql_client = DuckLakeSqlClient(
++        dataset_name="foo",
++        staging_dataset_name="foo_staging",
++        credentials=configuration.credentials,
++        capabilities=_get_ducklake_capabilities(),
++        override_data_path=configuration.override_data_path,
++    )
++    assert "OVERRIDE_DATA_PATH true" in sql_client.attach_statement
++
++
+ def test_ducklake_conn_pool_always_open() -> None:
+     # connection pool is embedded in configuration, configuration is a singleton during loading
+     # phase which the pool needs. See DuckDbConnectionPool
+
+
+===== COMMIT ca639756 =====
+
+
+commit ca639756a
+Author: aditypan
+Date: 2026-03-06
+
+    Fetch Databricks Compute Credentials (#3667)
+
+diff --git a/dlt/destinations/impl/databricks/configuration.py b/dlt/destinations/impl/databricks/configuration.py
+index d901d8287..d87f4efb7 100644
+--- a/dlt/destinations/impl/databricks/configuration.py
++++ b/dlt/destinations/impl/databricks/configuration.py
+@@ -1,5 +1,6 @@
+ import dataclasses
+ from typing import ClassVar, Final, Optional, Any, Dict, List, List, Dict, cast, Callable
++from urllib.parse import urlparse
+ 
+ from dlt.common import logger
+ from dlt.common.typing import TSecretStrValue
+@@ -37,30 +38,32 @@ class DatabricksCredentials(CredentialsConfiguration):
+     ]
+ 
+     def on_resolved(self) -> None:
+-        if not ((self.client_id and self.client_secret) or self.access_token):
+-            try:
+-                # attempt context authentication
+-                from databricks.sdk import WorkspaceClient
+-
+-                w = WorkspaceClient()
+-                self.access_token = (
+-                    w.dbutils.notebook.entry_point.getDbutils()
+-                    .notebook()
+-                    .getContext()
+-                    .apiToken()
+-                    .getOrElse(None)
+-                )
+-            except Exception:
+-                self.access_token = None
++        try:
++            from databricks.sdk import WorkspaceClient
+ 
+-            try:
+-                from databricks.sdk import WorkspaceClient
++            w = WorkspaceClient()
++        except Exception:
++            w = None
+ 
+-                w = WorkspaceClient()
+-                self.access_token = w.config.authenticate
+-                logger.info(f"Will attempt to use default auth of type {w.config.auth_type}")
+-            except Exception:
+-                pass
++        if not ((self.client_id and self.client_secret) or self.access_token):
++            if w is not None:
++                try:
++                    # attempt context authentication via notebook token
++                    self.access_token = (
++                        w.dbutils.notebook.entry_point.getDbutils()
++                        .notebook()
++                        .getContext()
++                        .apiToken()
++                        .getOrElse(None)
++                    )
++                except Exception:
++                    self.access_token = None
++
++                try:
++                    self.access_token = w.config.authenticate
++                    logger.info(f"Will attempt to use default auth of type {w.config.auth_type}")
++                except Exception:
++                    pass
+ 
+             if not self.access_token:
+                 raise ConfigurationValueError(
+@@ -70,24 +73,52 @@ class DatabricksCredentials(CredentialsConfiguration):
+                 )
+ 
+         if not self.server_hostname or not self.http_path:
+-            try:
+-                # attempt to fetch warehouse details
+-                from databricks.sdk import WorkspaceClient
+-
+-                w = WorkspaceClient()
+-                # warehouse ID may be present in an env variable
+-                if w.config.warehouse_id:
+-                    warehouse = w.warehouses.get(w.config.warehouse_id)
+-                else:
+-                    # for some reason list of warehouses has different type than a single one 🤯
+-                    warehouse = list(w.warehouses.list())[0]
+-                logger.info(
+-                    f"Will attempt to use warehouse {warehouse.id} to get sql connection params"
+-                )
+-                self.server_hostname = self.server_hostname or warehouse.odbc_params.hostname
+-                self.http_path = self.http_path or warehouse.odbc_params.path
+-            except Exception:
+-                pass
++            if w is not None:
++                # try to get server_hostname from workspace URL
++                if not self.server_hostname:
++                    try:
++                        workspace_url = w.config.host
++                        if workspace_url:
++                            self.server_hostname = urlparse(workspace_url).hostname
++                            logger.info(
++                                f"Using server_hostname from workspace: {self.server_hostname}"
++                            )
++                    except Exception:
++                        pass
++
++                # try to get http_path from notebook cluster context
++                if not self.http_path:
++                    try:
++                        notebook_context = (
++                            w.dbutils.notebook.entry_point.getDbutils().notebook().getContext()
++                        )
++                        cluster_id = notebook_context.clusterId().get()
++                        workspace_id = notebook_context.workspaceId().get()
++                        if cluster_id and workspace_id:
++                            self.http_path = f"/sql/protocolv1/o/{workspace_id}/{cluster_id}"
++                            logger.info(f"Using http_path from cluster context: {self.http_path}")
++                    except Exception:
++                        pass
++
++                # fallback: try to fetch warehouse details
++                if not self.server_hostname or not self.http_path:
++                    try:
++                        if w.config.warehouse_id:
++                            warehouse = w.warehouses.get(w.config.warehouse_id)
++                        else:
++                            # for some reason list of warehouses has different type
++                            # than a single one
++                            warehouse = list(w.warehouses.list())[0]
++                        logger.info(
++                            "Will attempt to use warehouse"
++                            f" {warehouse.id} to get sql connection params"
++                        )
++                        self.server_hostname = (
++                            self.server_hostname or warehouse.odbc_params.hostname
++                        )
++                        self.http_path = self.http_path or warehouse.odbc_params.path
++                    except Exception:
++                        pass
+ 
+         for param in ("catalog", "server_hostname", "http_path"):
+             if not getattr(self, param):
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/databricks.md b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+index 02b3e6f54..7545e75c3 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/databricks.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+@@ -255,8 +255,10 @@ See [Staging support](#staging-support) for authentication options when `dlt` co
+ If none of auth methods above is configured, `dlt` attempts to get authorization from the Databricks workspace context. The context may
+ come, for example, from a Notebook (runtime) or via standard set of env variables that Databricks Python sdk recognizes (ie. **DATABRICKS_TOKEN** or **DATABRICKS_HOST**)
+ 
+-`dlt` is able to set `server_hostname` and `http_path` from available warehouses. We use default warehouse id (**DATABRICKS_WAREHOUSE_ID**)
+-if set (via env variable), or a first one on warehouse's list.
++When `server_hostname` or `http_path` are not provided, `dlt` attempts to derive them automatically:
++
++1. **Notebook cluster context** (tried first): when running inside a Databricks Notebook, `dlt` reads `server_hostname` from the workspace URL and constructs `http_path` from the workspace ID and cluster ID of the compute attached to the notebook. This allows dlt to use the notebook's own cluster without requiring a SQL warehouse.
++2. **SQL warehouse discovery** (fallback): if the cluster context is not available (e.g., running outside a notebook, or on a Shared Access Mode cluster), `dlt` looks for an available SQL warehouse. We use default warehouse id (**DATABRICKS_WAREHOUSE_ID**) if set (via env variable), or the first one on the warehouse's list.
+ 
+ ## Write disposition
+ All write dispositions are supported.
+diff --git a/tests/load/databricks/test_databricks_configuration.py b/tests/load/databricks/test_databricks_configuration.py
+index 7ebd52d1c..1ec84c14e 100644
+--- a/tests/load/databricks/test_databricks_configuration.py
++++ b/tests/load/databricks/test_databricks_configuration.py
+@@ -99,44 +99,266 @@ def test_databricks_abfss_converter() -> None:
+     )
+ 
+ 
+-def test_databricks_auth_invalid() -> None:
+-    with pytest.raises(ConfigurationValueError, match="Authentication failed:*"):
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID"] = ""
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET"] = ""
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = ""
++def _setup_sdk_auth(mock_ws):
++    """Enable SDK default authentication on the mock WorkspaceClient."""
++    mock_ws.config.authenticate = lambda: {"Authorization": "Bearer token"}
++    mock_ws.config.auth_type = "pat"
++
++
++def _setup_notebook_context(
++    mock_ws,
++    mocker,
++    cluster_id="0123-456789-abcdefgh",
++    workspace_id="1234567890123456",
++    api_token="nb-token",
++):
++    """Set up the dbutils notebook context chain on the mock WorkspaceClient."""
++    mock_cluster_id = mocker.MagicMock()
++    mock_cluster_id.get.return_value = cluster_id
++    mock_workspace_id = mocker.MagicMock()
++    mock_workspace_id.get.return_value = workspace_id
++
++    mock_context = mocker.MagicMock()
++    mock_context.clusterId.return_value = mock_cluster_id
++    mock_context.workspaceId.return_value = mock_workspace_id
++
++    mock_option = mocker.MagicMock()
++    mock_option.getOrElse.return_value = api_token
++    mock_context.apiToken.return_value = mock_option
++
++    mock_notebook = mocker.MagicMock()
++    mock_notebook.getContext.return_value = mock_context
++    mock_dbutils = mocker.MagicMock()
++    mock_dbutils.notebook.return_value = mock_notebook
++    mock_entry_point = mocker.MagicMock()
++    mock_entry_point.getDbutils.return_value = mock_dbutils
++    mock_ws.dbutils.notebook.entry_point = mock_entry_point
++
++
++def _setup_warehouse(
++    mock_ws,
++    mocker,
++    warehouse_id="wh-1",
++    hostname="warehouse.databricks.com",
++    path="/sql/1.0/warehouses/wh-1",
++):
++    """Set up warehouse mock. Uses get() if warehouse_id is set on config, list() otherwise."""
++    mock_warehouse = mocker.MagicMock()
++    mock_warehouse.id = warehouse_id
++    mock_warehouse.odbc_params.hostname = hostname
++    mock_warehouse.odbc_params.path = path
++    if mock_ws.config.warehouse_id:
++        mock_ws.warehouses.get.return_value = mock_warehouse
++    else:
++        mock_ws.warehouses.list.return_value = iter([mock_warehouse])
++
++
++@pytest.fixture
++def mock_databricks_env(mocker):
++    """Clears Databricks-related env vars and provides a mock WorkspaceClient.
++
++    Returns a mock WorkspaceClient instance. By default, notebook context and
++    warehouse discovery are disabled (raise exceptions). Tests can override
++    specific attributes on the returned mock as needed.
++    """
++    # clear only DESTINATION__DATABRICKS__ prefixed env vars to avoid
++    # interfering with other destination tests
++    for key in list(os.environ.keys()):
++        if key.startswith("DESTINATION__DATABRICKS__") or key.startswith("DATABRICKS_"):
++            del os.environ[key]
++
++    mock_ws = mocker.MagicMock()
++    mock_ws.dbutils.notebook.entry_point.getDbutils.side_effect = Exception("No notebook context")
++    mock_ws.config.authenticate = None
++    mock_ws.config.warehouse_id = None
++    mock_ws.config.host = None
++    mock_ws.warehouses.list.return_value = iter([])
++    mocker.patch("databricks.sdk.WorkspaceClient", return_value=mock_ws)
++    return mock_ws
++
++
++def test_databricks_auth_invalid(mock_databricks_env) -> None:
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID"] = ""
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET"] = ""
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = ""
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = "test_catalog"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "test.databricks.com"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = "/sql/1.0/test"
++
++    with pytest.raises(ConfigurationValueError, match="Authentication failed:.*"):
+         bricks = databricks()
+         bricks.configuration(None, accept_partial=True)
+ 
+ 
+-def test_databricks_missing_config_catalog() -> None:
++def test_databricks_missing_config_catalog(mock_databricks_env) -> None:
++    mock_databricks_env.warehouses.list.side_effect = Exception("No warehouses")
++
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = "test_token"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "test.databricks.com"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = "/sql/1.0/test"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = ""
++
+     with pytest.raises(
+         ConfigurationValueError, match="Configuration error: Missing required parameter `catalog`"
+     ):
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = ""
+         bricks = databricks()
+         bricks.configuration(None, accept_partial=True)
+ 
+ 
+-def test_databricks_missing_config_http_path() -> None:
++def test_databricks_missing_config_http_path(mock_databricks_env) -> None:
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = "test_token"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "test.databricks.com"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = "test_catalog"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = ""
++
+     with pytest.raises(
+         ConfigurationValueError,
+         match="Configuration error: Missing required parameter `http_path`",
+     ):
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = ""
+         bricks = databricks()
+         bricks.configuration(None, accept_partial=True)
+ 
+ 
+-def test_databricks_missing_config_server_hostname() -> None:
++def test_databricks_missing_config_server_hostname(mock_databricks_env) -> None:
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = "test_token"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = "test_catalog"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = "/sql/1.0/test"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = ""
++
+     with pytest.raises(
+         ConfigurationValueError,
+         match="Configuration error: Missing required parameter `server_hostname`",
+     ):
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = ""
+         bricks = databricks()
+         bricks.configuration(None, accept_partial=True)
+ 
+ 
++def test_shared_cluster_authentication(mock_databricks_env) -> None:
++    """Test that default SDK authentication is used when no explicit credentials
++    are provided and notebook context is unavailable."""
++
++    def mock_authenticator():
++        return {"Authorization": "Bearer mock-token"}
++
++    mock_databricks_env.config.authenticate = mock_authenticator
++    mock_databricks_env.config.auth_type = "azure-cli"
++
++    creds = DatabricksCredentials(
++        catalog="test_catalog",
++        server_hostname="test.databricks.com",
++        http_path="/sql/1.0/test",
++    )
++    creds.on_resolved()
++
++    assert callable(creds.access_token)
++    assert creds.access_token == mock_authenticator
++
++    params = creds.to_connector_params()
++    assert "credentials_provider" in params
++    assert callable(params["credentials_provider"])
++
++
++def test_cluster_context_connection_params(mock_databricks_env, mocker) -> None:
++    """Test that server_hostname and http_path are derived from the notebook
++    cluster context when not explicitly provided."""
++    mock_ws = mock_databricks_env
++    mock_ws.config.host = "https://adb-1234567890123456.12.azuredatabricks.net"
++    _setup_sdk_auth(mock_ws)
++    _setup_notebook_context(mock_ws, mocker)
++
++    creds = DatabricksCredentials(catalog="test_catalog")
++    creds.on_resolved()
++
++    assert creds.server_hostname == "adb-1234567890123456.12.azuredatabricks.net"
++    assert creds.http_path == "/sql/protocolv1/o/1234567890123456/0123-456789-abcdefgh"
++
++
++def test_warehouse_provides_both_params(mock_databricks_env, mocker) -> None:
++    """No workspace URL, no cluster context — both server_hostname and http_path
++    come from the first warehouse on the list."""
++    _setup_sdk_auth(mock_databricks_env)
++    _setup_warehouse(mock_databricks_env, mocker)
++
++    creds = DatabricksCredentials(catalog="test_catalog")
++    creds.on_resolved()
++
++    assert creds.server_hostname == "warehouse.databricks.com"
++    assert creds.http_path == "/sql/1.0/warehouses/wh-1"
++
++
++def test_hostname_from_workspace_http_path_from_warehouse(mock_databricks_env, mocker) -> None:
++    """Workspace URL resolves server_hostname before warehouse fallback, so
++    warehouse only fills in http_path."""
++    mock_databricks_env.config.host = "https://adb-123.azuredatabricks.net"
++    _setup_sdk_auth(mock_databricks_env)
++    _setup_warehouse(mock_databricks_env, mocker)
++
++    creds = DatabricksCredentials(catalog="test_catalog")
++    creds.on_resolved()
++
++    assert creds.server_hostname == "adb-123.azuredatabricks.net"
++    assert creds.http_path == "/sql/1.0/warehouses/wh-1"
++
++
++def test_warehouse_id_selects_specific_warehouse(mock_databricks_env, mocker) -> None:
++    """When DATABRICKS_WAREHOUSE_ID is set, warehouses.get() is used instead
++    of warehouses.list()."""
++    _setup_sdk_auth(mock_databricks_env)
++    mock_databricks_env.config.warehouse_id = "specific-wh"
++    _setup_warehouse(
++        mock_databricks_env,
++        mocker,
++        warehouse_id="specific-wh",
++        path="/sql/1.0/warehouses/specific-wh",
++    )
++
++    creds = DatabricksCredentials(catalog="test_catalog")
++    creds.on_resolved()
++
++    mock_databricks_env.warehouses.get.assert_called_once_with("specific-wh")
++    assert creds.server_hostname == "warehouse.databricks.com"
++    assert creds.http_path == "/sql/1.0/warehouses/specific-wh"
++
++
++def test_explicit_params_skip_auto_resolution(mock_databricks_env) -> None:
++    """Test that explicitly provided server_hostname and http_path are not
++    overwritten by auto-resolution."""
++    mock_databricks_env.config.host = "https://should-not-overwrite.databricks.net"
++    _setup_sdk_auth(mock_databricks_env)
++
++    creds = DatabricksCredentials(
++        catalog="test_catalog",
++        server_hostname="explicit.databricks.com",
++        http_path="/sql/1.0/explicit",
++    )
++    creds.on_resolved()
++
++    assert creds.server_hostname == "explicit.databricks.com"
++    assert creds.http_path == "/sql/1.0/explicit"
++
++
++def test_notebook_token_overwritten_by_sdk_auth(mock_databricks_env, mocker) -> None:
++    """Test that w.config.authenticate always takes precedence over notebook
++    token — matches devel behavior where the second try block overwrites."""
++
++    def sdk_authenticator():
++        return {"Authorization": "Bearer sdk-token"}
++
++    mock_databricks_env.config.authenticate = sdk_authenticator
++    mock_databricks_env.config.auth_type = "azure-cli"
++    _setup_notebook_context(mock_databricks_env, mocker)
++
++    creds = DatabricksCredentials(
++        catalog="test_catalog",
++        server_hostname="test.databricks.com",
++        http_path="/sql/1.0/test",
++    )
++    creds.on_resolved()
++
++    # sdk authenticator overwrites notebook token (devel parity)
++    assert creds.access_token is sdk_authenticator
++
++
+ @pytest.mark.parametrize("auth_type", ("pat", "oauth2"))
+ def test_default_credentials(auth_type: str) -> None:
+     # create minimal default env
+
+
+===== COMMIT b3990a91 =====
+
+
+commit b3990a910
+Author: AyushPatel101
+Date: 2026-03-06
+
+    fix: set start_out_of_range flag when row equals start_value with range_start="open" (#3708)
+
+diff --git a/dlt/extract/incremental/transform.py b/dlt/extract/incremental/transform.py
+index 5a7b46cf8..634897bcb 100644
+--- a/dlt/extract/incremental/transform.py
++++ b/dlt/extract/incremental/transform.py
+@@ -328,7 +328,7 @@ class JsonIncremental(IncrementalTransform):
+ 
+             if self.range_start == "open" and processed_row_value == self.start_value:
+                 # We only want greater than start_value
+-                return None, False, False
++                return None, True, False
+ 
+             # skip the record that is not a start_value or new_value: that record was already processed
+             if self.start_value is None:
+diff --git a/tests/extract/test_incremental.py b/tests/extract/test_incremental.py
+index 9be3d27d3..2f21de5a6 100644
+--- a/tests/extract/test_incremental.py
++++ b/tests/extract/test_incremental.py
+@@ -2301,6 +2301,29 @@ def test_out_of_range_flags(item_type: TestDataItemFormat) -> None:
+     pipeline.extract(ascending_single_item())
+ 
+ 
++@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
++def test_start_out_of_range_open_equals_start_value(item_type: TestDataItemFormat) -> None:
++    """start_out_of_range is set when row equals start_value with range_start='open'"""
++
++    @dlt.resource
++    def descending(
++        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
++            "updated_at", initial_value=10, row_order="desc", range_start="open"
++        )
++    ) -> Any:
++        # descending from 12 down to 8, with value 10 == start_value
++        for i in [12, 11, 10, 9, 8]:
++            yield data_to_item_format(item_type, [{"updated_at": i}])
++            # 10 equals start_value and range_start="open" so it's out of range
++            if i <= 10:
++                assert updated_at.start_out_of_range is True
++
++    # early stopping should close the generator when row_order="desc"
++    data = list(descending)
++    # only 12 and 11 are > 10 (open range excludes 10)
++    assert data_item_length(data) == 2
++
++
+ @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+ def test_async_row_order_out_of_range(item_type: TestDataItemFormat) -> None:
+     @dlt.resource
+
+
+===== COMMIT 3201e053 =====
+
+
+commit 3201e053d
+Author: Denis Krivenko
+Date: 2026-03-05
+
+    fix: docstring typo in BigQuery factory (#3705)
+
+diff --git a/dlt/destinations/impl/bigquery/factory.py b/dlt/destinations/impl/bigquery/factory.py
+index 3d3781823..d0ed90da1 100644
+--- a/dlt/destinations/impl/bigquery/factory.py
++++ b/dlt/destinations/impl/bigquery/factory.py
+@@ -179,7 +179,7 @@ class bigquery(Destination[BigQueryClientConfiguration, "BigQueryClient"]):
+         environment: str = None,
+         **kwargs: Any,
+     ) -> None:
+-        """Configure the MsSql destination to use in a pipeline.
++        """Configure the BigQuery destination to use in a pipeline.
+ 
+         All arguments provided here supersede other configuration sources such as environment variables and dlt config files.
+ 
+
+
+===== COMMIT bcf8b93a =====
+
+
+commit bcf8b93a5
+Author: Travior
+Date: 2026-03-05
+
+    fix(lance): allow `dataset_name=None` when instantiating dataset (#3710)
+
+diff --git a/dlt/destinations/impl/lancedb/sql_client.py b/dlt/destinations/impl/lancedb/sql_client.py
+index 423792620..3dc173878 100644
+--- a/dlt/destinations/impl/lancedb/sql_client.py
++++ b/dlt/destinations/impl/lancedb/sql_client.py
+@@ -124,9 +124,19 @@ class LanceDBSQLClient(DuckDbSqlClient):
+ 
+     def create_view(self, table_name: str) -> None:
+         lance_table_uri = get_lance_table_uri(self.lancedb_client, table_name)
++
++        # lancedb allows omitting the dataset_name, calling `make_qualified_table_name` will
++        # prepend the dataset_name even if it is None
++        if self.dataset_name:
++            view_name = self.make_qualified_table_name(table_name)
++        else:
++            view_name = self.capabilities.escape_identifier(
++                self.capabilities.casefold_identifier(table_name)
++            )
++
+         create_view_sql = _prepare_create_view_statement(
+             lance_table_uri=lance_table_uri,
+-            view_name=self.make_qualified_table_name(table_name),
++            view_name=view_name,
+         )
+         try:
+             self.open_connection().execute(create_view_sql)
+diff --git a/tests/load/lancedb/test_pipeline.py b/tests/load/lancedb/test_pipeline.py
+index fc855c109..c738f735d 100644
+--- a/tests/load/lancedb/test_pipeline.py
++++ b/tests/load/lancedb/test_pipeline.py
+@@ -561,6 +561,10 @@ def test_empty_dataset_allowed() -> None:
+     assert client.sentinel_table == "dltSentinelTable"  # type: ignore
+     assert_table(pipe, "content", expected_items_count=3)
+ 
++    dataset = pipe.dataset()
++    rows = dataset.content.select("value").fetchall()
++    assert len(rows) == 3
++
+ 
+ def test_lancedb_remove_nested_orphaned_records_with_chunks() -> None:
+     @dlt.resource(
+
+
+===== COMMIT 68c9b7f3 =====
+
+
+commit 68c9b7f30
+Author: rudolfix
+Date: 2026-03-04
+
+    (feat) adds iceberg table properties (#3699)
 

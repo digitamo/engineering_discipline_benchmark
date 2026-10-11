@@ -1,483 +1,3 @@
-
-# function from: https://github.com/dlt-hub/verified-sources/tree/master/sources/zendesk
-def get_pages(
-    url: str,
-    endpoint: str,
-    auth: tuple[str, str],
-    data_point_name: str,
-    params: Optional[dict[str, Any]] = None,
-) -> Iterable[list[dict[str, Any]]]:
-    """
-    Makes a request to a paginated endpoint and returns a generator of data items per page.
-
-    Args:
-        url (str): The base URL.
-        endpoint (str): The url to the endpoint, e.g. /api/v2/calls
-        auth (Tuple[str, str]): Credentials for authentication.
-        data_point_name (str): The key which data items are nested under in the response object (e.g. calls)
-        params (Optional[Dict[str, Any]], optional): Optional dict of query params to include in the request.
-
-    Yields:
-        List[Dict[str, Any]]: Generator of pages, each page is a list of dict data items.
-    """
-    # update the page size to enable cursor pagination
-    params = params or {}
-    params["per_page"] = 1000
-    headers = None
-
-    # make request and keep looping until there is no next page
-    get_url = f"{url}{endpoint}"
-    while get_url:
-        response = client.get(get_url, headers=headers, auth=auth, params=params)
-        response.raise_for_status()
-        response_json = response.json()
-        result = response_json[data_point_name]
-        yield result
-
-        get_url = None
-        # See https://developer.zendesk.com/api-reference/ticketing/ticket-management/incremental_exports/#json-format
-        if not response_json["end_of_stream"]:
-            get_url = response_json["next_page"]
-
-
-if __name__ == "__main__":
-    # create a pipeline with an appropriate name
-    pipeline = dlt.pipeline(
-        pipeline_name="qdrant_zendesk_pipeline",
-        destination="qdrant",
-        dataset_name="zendesk_data",
-    )
-
-    # here we instantiate the source
-    source = zendesk_support()
-    # ...and apply special hints on the ticket resource to tell qdrant which fields to embed
-    qdrant_adapter(source.tickets_data, embed=["subject", "description"])
-
-    # run the dlt pipeline and print info about the load process
-    load_info = pipeline.run(source)
-
-    print(load_info)
-
-    # getting the authenticated Qdrant client to connect to your Qdrant database
-    with pipeline.destination_client() as destination_client:
-        from qdrant_client import QdrantClient
-
-        qdrant_client: QdrantClient = destination_client.db_client  # type: ignore
-        # view Qdrant collections you'll find your dataset here:
-        print(qdrant_client.get_collections())
-
-        # query Qdrant with prompt: getting tickets info close to "cancellation"
-        response = qdrant_client.query(
-            "zendesk_data_tickets_data",  # tickets_data collection
-            query_text="cancel subscription",  # prompt to search
-            limit=3,  # limit the number of results to the nearest 3 embeddings
-        )
-
-        assert len(response) <= 3 and len(response) > 0
-```
-
-
-===== FILE: docs/website/docs/examples/transformers.md =====
-
----
-title: Pokemon details in parallel using transformers
-description: Learn how to use dlt transformers and how to speed up your loads with parallelism
-keywords: [transformers, parallelism, example]
----
-# Pokemon details in parallel using transformers
-
-For this example, we will be loading Pokemon data from the [PokeAPI](https://pokeapi.co/) with the help of transformers to load
-Pokemon details in parallel.
-
-We'll learn how to:
-
-- create 2 [transformers](../general-usage/resource.md#process-resources-with-dlttransformer) and connect them to a resource with the pipe operator `|`;
-- [load these transformers in parallel](../reference/performance.md#parallelism-within-a-pipeline) using the `@dlt.defer` decorator;
-- [configure parallelism](../reference/performance.md#parallel-pipeline-config-example) in the `config.toml` file;
-- deselect the main resource, so it will not be loaded into the database;
-- importing and using a pre-configured `requests` library with automatic retries (`from dlt.sources.helpers import requests`).
-
-## Full source code
-
-```py execute
-import dlt
-from dlt.sources.helpers import requests
-
-
-@dlt.source(max_table_nesting=2)
-def source(pokemon_api_url: str):
-    # note that we deselect `pokemon_list` - we do not want it to be loaded
-    @dlt.resource(write_disposition="replace", selected=False)
-    def pokemon_list():
-        """Retrieve a first page of Pokemons and yield it. We do not retrieve all the pages in this example"""
-        yield requests.get(pokemon_api_url).json()["results"]
-
-    # transformer that retrieves a list of objects in parallel
-    @dlt.transformer
-    def pokemon(pokemons):
-        """Yields details for a list of `pokemons`"""
-
-        # @dlt.defer marks a function to be executed in parallel
-        # in a thread pool
-        @dlt.defer
-        def _get_pokemon(_pokemon):
-            return requests.get(_pokemon["url"]).json()
-
-        # call and yield the function result normally, the @dlt.defer takes care of parallelism
-        for _pokemon in pokemons:
-            yield _get_pokemon(_pokemon)
-
-    # a special case where just one item is retrieved in transformer
-    # a whole transformer may be marked for parallel execution
-    @dlt.transformer(parallelized=True)
-    def species(pokemon_details):
-        """Yields species details for a pokemon"""
-        species_data = requests.get(pokemon_details["species"]["url"]).json()
-        # link back to pokemon so we have a relation in loaded data
-        species_data["pokemon_id"] = pokemon_details["id"]
-        # You can return the result instead of yield since the transformer only generates one result
-        return species_data
-
-    # create two simple pipelines with | operator
-    # 1. send list of pokemons into `pokemon` transformer to get pokemon details
-    # 2. send pokemon details into `species` transformer to get species details
-    # NOTE: dlt is smart enough to get data from pokemon_list and pokemon details once
-
-    return (pokemon_list | pokemon, pokemon_list | pokemon | species)
-
-
-if __name__ == "__main__":
-    # build duck db pipeline
-    pipeline = dlt.pipeline(
-        pipeline_name="pokemon", destination="duckdb", dataset_name="pokemon_data"
-    )
-
-    # the pokemon_list resource does not need to be loaded
-    pipeline.run(source("https://pokeapi.co/api/v2/pokemon"))
-
-    last_trace = pipeline.last_trace
-    assert last_trace is not None
-    normalize_info = last_trace.last_normalize_info
-    assert normalize_info is not None
-
-    row_counts = dict(normalize_info.row_counts)
-    assert row_counts["pokemon"] == 20
-    assert row_counts["species"] == 20
-    assert "pokemon_list" not in row_counts
-```
-
-
-===== FILE: docs/website/docs/general-usage/credentials/advanced.md =====
-
----
-title: Access to configuration in code
-description: Access configuration via dlt function arguments or explicitly
-keywords: [credentials, secrets.toml, secrets, config, configuration, environment variables, provider]
----
-# Access to configuration in code
-
-## Access to configuration in dlt decorated functions
-
-`dlt` automatically generates configuration **specs** for functions decorated with `@dlt.source`, `@dlt.resource`, and `@dlt.destination`, without additional code needed. You can configure these functions using any of the [standard configuration methods](setup.md) including environment variables and TOML files. You can call them like regular Python functions - dlt injects configuration values for any argument you don't explicitly provide.
-
-### Injection rules
-
-1. Arguments passed explicitly are **never injected**. This makes the injection mechanism optional. Example with the Pipedrive source:
-
-  ```py
-  import os
-  from typing import Iterator
-  from dlt.extract import DltResource
-
-  @dlt.source(name="pipedrive")
-  def pipedrive_source(
-      pipedrive_api_key: str = dlt.secrets.value,
-      since_timestamp: pendulum.DateTime | str | None = "1970-01-01 00:00:00",
-  ) -> Iterator[DltResource]:
-    ...
-
-  my_key = os.environ["MY_PIPEDRIVE_KEY"]
-  my_source = pipedrive_source(pipedrive_api_key=my_key)
-  ```
-
-  You can specify `pipedrive_api_key` explicitly if you prefer not to use the [standard options](setup) for credential handling.
-
-2. Required arguments (without default values) **are never injected** and must be specified explicitly when calling. Example:
-
-  ```py
-  @dlt.source
-  def slack_data(channels_list: list[str], api_key: str = dlt.secrets.value):
-    ...
-  ```
-
-  The `channels_list` argument won't be injected and will produce an error if not specified explicitly.
-
-3. Arguments with default values are injected if found in config providers. Otherwise, the default values from the function signature are used. Example:
-
-  ```py
-  from dlt.common.typing import TAnyDateTime
-
-  START_DATE: pendulum.DateTime = pendulum.DateTime(2024, 1, 1)
-
-  @dlt.source
-  def slack_source(
-    page_size: int = 100,
-    access_token: str = dlt.secrets.value,
-    start_date: TAnyDateTime | None = START_DATE
-  ):
-    ...
-  ```
-
-  `dlt` first searches for `page_size`, `access_token`, and `start_date` in config providers in a [specific order](setup). If these values aren't found, it falls back to the default values.
-
-4. Arguments with special defaults `dlt.secrets.value` and `dlt.config.value` **must be injected** (or explicitly passed). If not found in config providers, `dlt` raises an exception.
-
-  Additionally, `dlt.secrets.value` indicates to `dlt` that the value is a secret, meaning it will only be injected from secure config providers.
-
-### Add typing to your sources and resources
-
-We recommend adding type annotations to your function signatures. This requires minimal effort and provides several important benefits:
-
-1. You won't receive invalid data types in your code.
-2. `dlt` automatically parses and converts types for you, eliminating the need for manual parsing.
-3. `dlt` can generate sample config and secret files for your source automatically.
-4. You can request [built-in and custom credentials](complex_types) (connection strings, AWS/GCP/Azure credentials).
-5. You can specify multiple possible types via `Union`, such as OAuth or API Key authorization.
-
-Example:
-
-```py
-from dlt.common.configuration.specs import GcpServiceAccountCredentials
-
-@dlt.source
-def google_sheets(
-    spreadsheet_id: str = dlt.config.value,
-    tab_names: list[str] = dlt.config.value,
-    credentials: GcpServiceAccountCredentials = dlt.secrets.value,
-    only_strings: bool = False
-):
-    ...
-```
-
-Benefits:
-
-1. You'll receive a properly typed list of strings as `tab_names`.
-2. You'll receive properly configured Google credentials (see [GCP Credential Configuration](complex_types#gcp-credentials)), which users can provide in different forms:
-
-  * `service.json` as a string or dictionary (in code or via config providers)
-  * Connection string (used in SQL Alchemy)
-  * Default credentials if nothing is passed (such as those available on Cloud Function runners)
-
-## Organize configuration and secrets with sections
-
-`dlt` organizes configuration and secrets sections in a **configuration layout** that integrates with the [injection mechanism](#injection-rules). This structure applies to all [configuration providers](setup), including TOML files, environment variables, and other sources.
-
-This hierarchical structure efficiently handles simple cases while supporting more complex scenarios, such as multiple sources with different credentials or multiple pipelines sharing configuration in the same project.
-
-```text
-pipeline_name
-    |
-    |-sources
-        |-<source 1 module name>
-            |-<source function 1 name>
-                |- {all source and resource options and secrets}
-            |-<source function 2 name>
-                |- {all source and resource options and secrets}
-        |-<source 2 module>
-            |...
-
-        |-extract
-            |- extract options for resources i.e., parallelism settings, maybe retries
-    |-destination
-        |- <destination name>
-            |- {destination options}
-                |-credentials
-                    |-{credentials options}
-    |-schema
-        |-<schema name>
-            |-schema settings: not implemented but I'll let people set nesting level, name convention, normalizer, etc. here
-    |-load
-    |-normalize
-```
-
-When using TOML files, this structure is represented as nested sections with dotted keys. For environment variables and other config providers, the layout is flattened using double underscores (e.g., `PIPELINE_NAME__SOURCES__MODULE_NAME__FUNCTION_NAME__OPTION`).
-
-### Compact sources layout
-
-When a source's **section** (typically the module name) differs from its **name** (the function name), `dlt` also accepts a shorter configuration path that uses the source name directly under `sources`:
-
-```text
-sources.<name>.<key>
-```
-
-This is in addition to the full path `sources.<section>.<name>.<key>`. Both the full path and the section path (`sources.<section>.<key>`) take precedence over the compact path. This is particularly useful when you [rename a source](../source.md#rename-the-source) with `.clone()`:
-
-```toml
-# compact layout — just the source name
-[sources.my_db.credentials]
-password="..."
-
-# full layout — section + name (takes precedence)
-[sources.my_db_module.my_db.credentials]
-password="..."
-```
-
-## Access configs and secrets in code
-
-While `dlt` handles credentials automatically, you can also access them directly in your code. The `dlt.secrets` and `dlt.config` objects provide dictionary-like access to configuration values and secrets, enabling custom preprocessing if required. You can also store custom settings in the same configuration files.
-
-```py notype
-# Use `dlt.secrets` and `dlt.config` to explicitly retrieve values from providers
-source_instance = google_sheets(
-    dlt.config["sheet_id"],
-    dlt.config["my_section.tabs"],
-    dlt.secrets["my_section.gcp_credentials"]
-)
-
-source_instance.run(destination="bigquery")
-```
-
-`dlt.config` and `dlt.secrets` function as dictionaries. `dlt` examines all [config providers](setup) - environment variables, TOML files, etc. - to populate these dictionaries. You can also use `dlt.config.get()` or `dlt.secrets.get()` to retrieve a value and convert it to a specific type:
-
-```py
-from dlt.common.configuration.specs import GcpServiceAccountCredentials
-
-credentials = dlt.secrets.get("my_section.gcp_credentials", GcpServiceAccountCredentials)
-```
-
-This creates a `GcpServiceAccountCredentials` instance from the values stored under the `my_section.gcp_credentials` key.
-
-## Write configs and secrets in code
-
-You can also set values programmatically using `dlt.config` and `dlt.secrets`:
-
-```py notype
-dlt.config["sheet_id"] = "23029402349032049"
-dlt.secrets["destination.postgres.credentials"] = BaseHook.get_connection('postgres_dsn').extra
-```
-
-This effectively mocks the TOML provider with your specified values.
-
-## Configure destination credentials in code
-
-You can programmatically set destination credentials when needed. This example demonstrates how to use [GcpServiceAccountCredentials](complex_types#gcp-credentials) **spec** with a BigQuery destination:
-
-```py
-import os
-
-import dlt
-from dlt.sources.credentials import GcpServiceAccountCredentials
-from dlt.destinations import bigquery
-
-# Retrieve credentials from environment variable
-creds_dict = os.getenv('BIGQUERY_CREDENTIALS')
-
-# Create and initialize credentials instance
-gcp_credentials = GcpServiceAccountCredentials()
-gcp_credentials.parse_native_representation(creds_dict)
-
-# Pass credentials to the BigQuery destination
-pipeline = dlt.pipeline(destination=bigquery(credentials=gcp_credentials))
-pipeline.run([{"key1": "value1"}], table_name="temp")
-```
-
-### Google Sheets source example
-
-This example demonstrates a `google_sheets` source function that reads selected tabs from Google Sheets:
-
-```py
-@dlt.source
-def google_sheets(
-    spreadsheet_id=dlt.config.value,
-    tab_names=dlt.config.value,
-    credentials=dlt.secrets.value,
-    only_strings=False
-):
-    # Handle credentials as either dictionary or string
-    if isinstance(credentials, str):
-        credentials = json.loads(credentials)
-    # Handle tabs as either list or comma-separated string
-    if isinstance(tab_names, str):
-      tab_names = tab_names.split(",")
-    sheets = build('sheets', 'v4', credentials=ServiceAccountCredentials.from_service_account_info(credentials))  # ty: ignore
-    tabs = []
-    for tab_name in tab_names:
-        data = _get_sheet(sheets, spreadsheet_id, tab_name)  # ty: ignore[unresolved-reference]
-        tabs.append(dlt.resource(data, name=tab_name))
-    return tabs
-```
-
-The `@dlt.source` decorator makes all arguments in the function configurable. The special defaults `dlt.secrets.value` and `dlt.config.value` indicate to `dlt` that these arguments are required and must either be passed explicitly or exist in the configuration. Additionally, `dlt.secrets.value` designates an argument as a secret.
-
-In this example:
-
-- `spreadsheet_id` is a **required config** argument
-- `tab_names` is a **required config** argument
-- `credentials` is a **required secret** argument (Google Sheets credentials as a dictionary)
-- `only_strings` is an **optional config** argument with a default value
-
-:::tip
-`dlt.resource` functions in the same way, so [standalone resources](../resource.md#declare-a-standalone-resource) (not defined as inner functions of a **source**) follow the same injection rules
-:::
-
-## Write custom specs
-
-**Custom specifications** let you take full control over the function arguments. You can:
-
-- Control which values should be injected, the types, default values.
-- Specify optional and final fields.
-- Form hierarchical configurations (specs in specs).
-- Provide your own handlers for `on_partial` (called before failing on missing config key) or `on_resolved`.
-- Provide your own native value parsers.
-- Provide your own default credentials logic.
-- Utilize Python dataclass functionality.
-- Utilize Python `dict` functionality (`specs` instances can be created from dicts and serialized from dicts).
-
-In fact, `dlt` synthesizes a unique spec for each decorated function. For example, in the case of `google_sheets`, the following class is created:
-
-```py notype
-from dlt.common.configuration import configspec, with_config, BaseConfiguration
-
-@configspec
-class GoogleSheetsConfiguration(BaseConfiguration):
-  tab_names: list[str] = None  # mandatory
-  credentials: GcpServiceAccountCredentials = None # mandatory secret
-  only_strings: bool | None = False
-```
-
-### All specs derive from [BaseConfiguration](https://github.com/dlt-hub/dlt/blob/devel/dlt/common/configuration/specs/base_configuration.py#L170)
-
-This class serves as a foundation for creating configuration objects with specific characteristics:
-
-- It provides methods to parse and represent the configuration in native form (`parse_native_representation` and `to_native_representation`).
-
-- It defines methods for accessing and manipulating configuration fields.
-
-- It implements a dictionary-compatible interface on top of the dataclass. This allows instances of this class to be treated like dictionaries.
-
-- It defines helper functions for checking if a certain attribute is present, if a field is valid, and for calling methods in the method resolution order (MRO).
-
-More information about this class can be found in the class docstrings.
-
-### All credentials derive from [CredentialsConfiguration](https://github.com/dlt-hub/dlt/blob/devel/dlt/common/configuration/specs/base_configuration.py#L307)
-
-This class is a subclass of `BaseConfiguration` and is meant to serve as a base class for handling various types of credentials. It defines methods for initializing credentials, converting them to native representations, and generating string representations while ensuring sensitive information is appropriately handled.
-
-More information about this class can be found in the class docstrings.
-
-
-===== FILE: docs/website/docs/general-usage/credentials/complex_types.md =====
-
----
-title: Built-in credentials
-description: Configure access to AWS, Azure, Google Cloud and other systems
-keywords: [credentials, secrets.toml, secrets, config, configuration, environment
-      variables, specs]
----
-# Built-in credentials
-
-## Overview
-
 `dlt` provides built-in credential (**specs**) for seamless integration with common external systems. These specs can be configured using the methods described in the [overview](setup.md) documentation. For major cloud providers like AWS, Azure, and Google Cloud, `dlt` also calls client-specific code to authenticate users and can automatically retrieve default credentials from the running environment. Additionally, `dlt` understands common string representations for credentials such as connection strings or service json, making it easier to work with different credential formats beyond the typical dictionary representation.
 
 :::tip
@@ -3242,4 +2762,299 @@ The first step is to register on [SerpAPI](https://serpapi.com/) and obtain the 
    `Transformers` are a form of `dlt resource` that takes input from other resources
    via the `data_from` argument to enrich or transform the data. To read more:
    [Click here.](../../general-usage/resource#process-resources-with-dlttransformer)
+
+   Conversely, `add_map` is used to customize a resource and applies transformations at an item level
+   within a resource. It's useful for tasks like anonymizing individual data records. More on this
+   can be found under
+   [Customize resources](../../general-usage/resource#customize-resources) in the
+   documentation.
+
+1. Here, we create the pipeline and use the `add_map` functionality:
+
+   ```py notype
+   # Create the pipeline
+   pipeline = dlt.pipeline(
+       pipeline_name="data_enrichment_one",
+       destination="duckdb",
+       dataset_name="user_device_enrichment",
+   )
+
+   # Run the pipeline with the transformed source
+   load_info = pipeline.run(tracked_data.add_map(fetch_average_price))
+
+   print(load_info)
+   ```
+
+   :::info
+   Please note that the same outcome can be achieved by using the transformer function. To
+   do so, you need to add the transformer decorator at the top of the `fetch_average_price` function.
+   For `pipeline.run`, you can use the following code:
+
+   ```py notype
+   # using fetch_average_price as a transformer function
+   load_info = pipeline.run(
+       tracked_data | fetch_average_price,
+       table_name="tracked_data"
+   )
+   ```
+
+   This will execute the `fetch_average_price` function with the tracked data and return the average
+   price.
+   :::
+
+### Run the pipeline
+
+1. Install necessary dependencies for the preferred
+   [destination](../../dlt-ecosystem/destinations/), for example, duckdb:
+
+   ```sh
+   pip install "dlt[duckdb]"
+   ```
+
+1. Run the pipeline with the following command:
+
+   ```sh
+   python device_enrichment_pipeline.py
+   ```
+
+1. To ensure that everything loads as expected, use the command:
+
+   ```sh
+   dlt pipeline <pipeline_name> show
+   ```
+
+   For example, the "pipeline_name" for the above pipeline example is `data_enrichment_one`; you can use
+   any custom name instead.
+
+
+===== FILE: docs/website/docs/general-usage/data-quality-lifecycle.md =====
+
+---
+title: Data quality lifecycle
+description: End-to-end data quality checks across the dlt pipeline lifecycle
+keywords: [data quality, validation, contracts, pydantic, schema, monitoring, governance]
+---
+# Data quality lifecycle
+
+The data quality lifecycle has rarely been achievable
+in a single tool due to the runtime constraints of
+traditional ETL vendors.
+
+## One library, end-to-end ingestion, transformation, with data quality and lineage
+
+dlt is an open source pythonic ingestion library while dlthub is a commercial addition to dlt spanning into transformation and other areas of the data stack.
+
+Because `dlt` together with `dltHub` span the entire pipeline, starting from ingestion, passing through a portable staging layer, and extending into the transformation, it uniquely bridges these gaps.
+
+Instead of stitching together four or five separate tools, you write Python code that works across the entire pipeline. No glue scripts. No context lost between systems, end to end lineage and metadata.
+
+![Data Quality Lifecycle](https://storage.googleapis.com/dlt-blog-images/docs-DQ-lifecycle.png)
+
+**The three checkpoints for data quality:**
+
+1. **In-flight:** Check individual records as data is extracted, before loading it.
+2. **Staging:** We optionally load the data to an optionally transient staging area where we can test it without breaking production.
+3. **Destination:** Check properties of the full dataset currently written to the destination.
+
+## The five pillars of data quality
+
+`dlt` addresses quality across five core dimensions, offering support for implementing these checks across the entire data lifecycle.
+
+1. **Structural Integrity:** Does the data fit the destination schema and types?
+2. **Semantic Validity:** Does the data make business sense?
+3. **Uniqueness & Relations:** Is the dataset consistent with itself?
+4. **Privacy & Governance:** Is the data safe and compliant?
+5. **Operational Health:** Is the pipeline running correctly?
+
+![Five Pillars of Data Quality](https://storage.googleapis.com/dlt-blog-images/docs-DQ-pillars.png)
+
+---
+
+### 1. Structural Integrity
+
+*Does the data fit the destination schema and types?*
+
+These checks ensure incoming data conforms to the expected shape and technical types before loading, preventing broken pipelines and "garbage" tables.
+
+| Job to be Done             | dlt Solution                                                                                                                                                              | Learn More                                | Availability |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- | ------------ |
+| Prevent unexpected columns | **Schema Contracts (Frozen Mode):** Set your schema to `frozen` to raise an immediate error if the source API adds an undocumented field.                                 | [Schema Contracts](schema-contracts.md)   | dlt          |
+| Enforce data types         | **Type Coercion:** `dlt` automatically coerces compatible types (for example, string `"100"` to int `100`) and rejects non-coercible values to ensure column consistency. | [Schema](schema.md)                       | dlt          |
+| Fix naming errors          | **Normalization:** `dlt` automatically cleans table and column names (converting to `snake_case`) to prevent SQL syntax errors in the destination.                        | [Naming Convention](naming-convention.md) | dlt          |
+| Enforce required fields    | **Nullability Constraints:** Mark fields as `nullable=False` in your resource hints to drop or error on records missing critical keys.                                    | [Resource](resource.md)                   | dlt          |
+
+---
+
+### 2. Semantic Validity
+
+*Does the data make business sense?*
+
+These checks verify the content of the data against business logic. While structural checks handle types (*is it a number?*), semantic checks handle meaning (*is it a valid age?*).
+
+| Job to be Done          | dlt Solution                                                                                                                                                                            | Learn More                                                                      | Availability |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------ |
+| Validate logic & ranges | **Pydantic Models:** Attach Pydantic models to your resources to enforce logic like `age > 0` or email format validation in-stream.                                                     | [Schema Contracts](schema-contracts.md#use-pydantic-models-for-data-validation) | dlt          |
+| Filter bad rows         | **`add_filter`:** Apply a predicate function to exclude records that don't meet criteria (for example, `lambda x: x["status"] != "deleted"`).                                           | [Transform with add_map](../dlt-ecosystem/transformations/add-map.md)           | dlt          |
+| Check batch anomalies   | **Staging Tests:** Use the portable runtime (for example, Ibis/DuckDB) to query the staging buffer. Example: "Alert if the average order value in this batch is > $10k."                | [Staging](../dlt-ecosystem/staging.md)                                          | dlt          |
+| Built-in data checks    | **Data Quality Checks:** Use built-in checks like `is_in()`, `is_unique()`, `is_primary_key()` with pre-load or post-load execution, plus actions on failure (drop, quarantine, alert). | [Data Quality](https://dlthub.com/docs/hub/data-quality)                        | dlthub       |
+
+---
+
+### 3. Uniqueness & Relations
+
+*Is the dataset consistent with itself?*
+
+These checks manage duplication and preserve relationships between different tables in your dataset.
+
+| Job to be Done           | dlt Solution                                                                                                                                                                                  | Learn More                                                     | Availability |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ------------ |
+| Prevent duplicates       | **Merge Disposition:** Define `primary_key` and `write_disposition='merge'` to automatically upsert records. `dlt` handles the deduping logic for you.                                        | [Incremental Loading](incremental-loading.md)                  | dlt          |
+| Track historical changes | **SCD2 Strategy:** Use `write_disposition={"disposition": "merge", "strategy": "scd2"}` to automatically maintain validity windows (`_dlt_valid_from`, `_dlt_valid_to`) for dimension tables. | [Merge Loading](merge-loading.md#scd2-strategy)                | dlt          |
+| Link parent/child data   | **Automatic Lineage:** `dlt` automatically generates foreign keys (`_dlt_parent_id`) when unnesting complex JSON, preserving the link between parent and child tables.                        | [Destination Tables](destination-tables.md#nested-tables)      | dlt          |
+| Find orphan keys         | **Post-Load Assertions:** Run SQL tests on the destination to identify child records missing a valid parent (for example, Orders without Customers).                                          | [SQL Transformations](../dlt-ecosystem/transformations/sql.md) | dlt          |
+
+---
+
+### 4. Privacy & Governance
+
+*Is the data safe and compliant?*
+
+Data quality also means compliance. These features ensure sensitive data is handled correctly before it becomes a liability in your warehouse.
+
+| Job to be Done                    | dlt Solution                                                                                                                                                                                        | Learn More                                                                                  | Availability |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------ |
+| Mask/Hash PII                     | **Transformation Hooks:** Use `add_map` to hash emails or redact names in-stream. Data is sanitized in memory before it ever touches the disk.                                                      | [Pseudonymizing Columns](customising-pipelines/pseudonymizing_columns.md)                   | dlt          |
+| Drop sensitive columns            | **Column Removal:** Use `add_map` to completely remove columns (for example, `ssn`, `credit_card`) before they ever reach the destination.                                                          | [Removing Columns](customising-pipelines/removing_columns.md)                               | dlt          |
+| Enforce PII Contracts             | **Pydantic Models:** Use Pydantic schemas to strictly define and detect sensitive fields (for example, `EmailStr`), ensuring they are caught and hashed before loading.                             | [Schema Contracts](schema-contracts.md)                                                     | dlt          |
+| Join on private data              | **Deterministic Hashing:** Use a secret salt via `dlt.secrets` to deterministically hash IDs, allowing you to join tables on "User ID" without exposing the actual user identity.                   | [Credentials Setup](credentials/setup.md)                                                   | dlt          |
+| Track PII through transformations | **Column-Level Hint Forwarding:** PII hints (for example, `x-annotation-pii`) are automatically propagated through SQL transformations, so downstream tables retain knowledge of sensitive origins. | [Transformations](https://dlthub.com/docs/hub/transformations#column-level-hint-forwarding) | dlthub       |
+
+---
+
+### 5. Operational Health
+
+*Is the pipeline running correctly?*
+
+Monitoring the reliability of the delivery mechanism itself. Even perfectly valid data is "bad quality" if it arrives 24 hours late.
+
+| Job to be Done          | dlt Solution                                                                                                                                                                                     | Learn More                                                                                            | Availability |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- | ------------ |
+| Detect empty loads      | **Volume Monitoring:** Inspect `load_info` metrics after a run. Trigger an alert if `row_count` drops to zero unexpectedly.                                                                      | [Running in Production](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) | dlt          |
+| Collect custom metrics  | **Custom Metrics:** Track business-specific statistics during extraction (for example, page counts, API call counts) using `dlt.current.resource_metrics()`.                                     | [Resource](resource.md#collect-custom-metrics)                                                        | dlt          |
+| Monitor Freshness (SLA) | **Load Metadata:** Query the `_dlt_loads` table in your destination to verify the `inserted_at` timestamp meets your freshness SLA.                                                              | [Destination Tables](destination-tables.md#load-packages-and-load-ids)                                | dlt          |
+| Audit Schema Drift      | **Schema History:** Even in permissive modes, `dlt` tracks every schema change. Use the audit trail to see exactly when a new column was introduced.                                             | [Schema Evolution](schema-evolution.md)                                                               | dlt          |
+| Alert on schema changes | **Schema Update Alerts:** Inspect `load_info.load_packages[].schema_update` after each run to detect new tables/columns and trigger alerts (for example, Slack notification when schema drifts). | [Running in Production](../running-in-production/running.md#inspect-save-and-alert-on-schema-changes) | dlt          |
+| Trace Lineage           | **Load IDs:** Every row in your destination is tagged with `_dlt_load_id`. You can trace any specific record back to the exact pipeline run that produced it.                                    | [Destination Tables](destination-tables.md#data-lineage)                                              | dlt          |
+| Alert on failures       | **Slack Integration:** Send pipeline success/failure notifications via Slack incoming webhooks configured in `dlt.secrets`.                                                                      | [Alerting](../running-in-production/running.md#using-slack-to-send-messages)                          | dlt          |
+
+## Validate data quality during development
+
+Use the [dltHub Dashboard](../hub/ingestion/dashboard.md) to interactively inspect your pipeline during development. The dashboard lets you:
+
+- Query loaded data and verify row counts match expectations
+- Inspect schemas, columns, and all column hints
+- Check incremental state of each resource
+- Review load history and trace information
+- Catch issues like pagination bugs (suspiciously round counts) before they reach production
+
+```sh
+dlt pipeline {pipeline_name} show
+```
+
+## Get the full lifecycle with dltHub
+
+The features marked `dlt` in the tables above are available today in the open-source library. **dltHub** provides a managed runtime and additional data quality capabilities:
+
+- **Run dlt on the dltHub runtime** — Execute all your existing dlt pipelines with managed infrastructure, scheduling, and observability built-in.
+- **Built-in data quality checks** — Use `is_in()`, `is_unique()`, `is_primary_key()`, and more with row-level and batch-level validation.
+- **Pre-load and post-load execution** — Run checks in staging before data hits your warehouse, or validate after load with full dataset access.
+- **Follow-up actions on failure** — Bad data quarantine to enable faster debugging.
+- **Column-level hint forwarding** — Track PII and other sensitive column hints through SQL transformations.
+
+[Learn more about dltHub Data Quality →](https://dlthub.com/docs/hub/data-quality)
+
+
+===== FILE: docs/website/docs/general-usage/dataset-access/data-quality-dashboard.md =====
+
+---
+title: Monitoring
+description: Monitoring and testing data quality
+keywords: [destination, schema, data, monitoring, testing, quality]
+---
+# Data monitoring
+
+Data quality monitoring is concerned with ensuring that quality data arrives at the data warehouse
+on time. The reason we do monitoring instead of alerting for this is because we cannot easily define
+alerts for what could go wrong.
+
+This is why we want to capture enough context to allow a person to decide if the data looks OK or
+requires further investigation when monitoring the data quality. A staple of monitoring are line
+charts and time-series charts that provide a baseline or a pattern that a person can interpret.
+
+For example, to monitor data loading, consider plotting "count of records by `loaded_at` date/hour",
+"created at", "modified at", or other recency markers.
+
+## Rows count
+
+To find the number of rows loaded per table, use the following command:
+
+```sh
+dlt pipeline <pipeline_name> trace
+```
+
+This command will display the names of the tables that were loaded and the number of rows in each table.
+The above command provides the row count for the Chess source. As shown below:
+
+```sh
+Step normalize COMPLETED in 2.37 seconds.
+Normalized data for the following tables:
+- _dlt_pipeline_state: 1 row(s)
+- payments: 1329 row(s)
+- tickets: 1492 row(s)
+- orders: 2940 row(s)
+- shipment: 2382 row(s)
+- retailers: 1342 row(s)
+```
+
+To load this information back to the destination, you can use the following:
+
+```py
+# Create a pipeline with the specified name, destination, and dataset
+# Run the pipeline
+
+# Get the trace of the last run of the pipeline
+# The trace contains timing information on extract, normalize, and load steps
+trace = pipeline.last_trace
+
+# Load the trace information into a table named "_trace" in the destination
+pipeline.run([trace], table_name="_trace")
+```
+
+This process loads several additional tables to the destination, which provide insights into
+the extract, normalize, and load steps. Information on the number of rows loaded for each table,
+along with the `load_id`, can be found in the `_trace__steps__extract_info__table_metrics` table.
+The `load_id` is an epoch timestamp that indicates when the loading was completed. Here's a graphical
+representation of the rows loaded with `load_id` for different tables:
+
+![image](https://storage.googleapis.com/dlt-blog-images/docs_monitoring_count_of_rows_vs_load_id.jpg)
+
+## Data load time
+
+Data loading time for each table can be obtained by using the following command:
+
+```sh
+dlt pipeline <pipeline_name> load-package
+```
+
+The above information can also be obtained from the script as follows:
+
+```py
+info = pipeline.run(source, table_name="table_name", write_disposition='append')
+
+print(info.load_packages[0])
+```
+
+> `load_packages[0]` will print the information of the first load package in the list of load packages.
+
+## Tools to create dashboards
 

@@ -1,1519 +1,3 @@
-diff --git a/docs/docs_tools/examples/prepare_examples_tests.py b/docs/docs_tools/examples/prepare_examples_tests.py
-index 3939c9044..e2ef6eff4 100644
---- a/docs/docs_tools/examples/prepare_examples_tests.py
-+++ b/docs/docs_tools/examples/prepare_examples_tests.py
-@@ -20,6 +20,7 @@ SKIP_EXAMPLES: List[str] = [
-     "qdrant_zendesk",
-     "incremental_loading",
-     "logfire_telemetry_export",
-+    "arize_phoenix_export",
- ]
- # Examples will be skipped from forked subprocesses
- SKIP_FORK_EXAMPLES: List[str] = ["custom_destination_lancedb"]
-diff --git a/docs/examples/arize_phoenix_export/__init__.py b/docs/examples/arize_phoenix_export/__init__.py
-new file mode 100644
-index 000000000..e69de29bb
-diff --git a/docs/examples/arize_phoenix_export/arize_phoenix_export.py b/docs/examples/arize_phoenix_export/arize_phoenix_export.py
-new file mode 100644
-index 000000000..5d4e9cfca
---- /dev/null
-+++ b/docs/examples/arize_phoenix_export/arize_phoenix_export.py
-@@ -0,0 +1,412 @@
-+"""
-+---
-+title: Export Arize Phoenix Telemetry
-+description: Export traces, spans, and evaluations from Arize Phoenix to your data lake
-+keywords: [arize, phoenix, opentelemetry, traces, spans, evaluations, observability, llm, export]
-+---
-+
-+[Arize Phoenix](https://phoenix.arize.com/) is an open-source observability platform for AI and LLM
-+applications. It captures traces, spans, and evaluations (e.g. relevance scores, hallucination checks)
-+that are sent via the OpenTelemetry (OTel) protocol.
-+
-+To enable analytics, reporting, and offline evaluation, this telemetry needs to be exported to a
-+data lakehouse or warehouse. Arize Phoenix persists data in a relational database — either **PostgreSQL**
-+(recommended for production) or **SQLite** (the default for single-node deployments).
-+
-+The `dlt` library's built-in `sql_database()` source makes extraction straightforward:
-+
-+* Connect directly to Phoenix's Postgres or SQLite backend with a connection string.
-+* Use `resolve_foreign_keys=True` so dlt automatically links child tables (e.g. spans → traces).
-+* Load to **DuckDB** for zero-config local analytics, or swap to any other dlt destination.
-+
-+## Credentials
-+
-+### PostgreSQL
-+
-+Add the following block to `.dlt/secrets.toml`, filling in the values from your deployment:
-+
-+```toml
-+# .dlt/secrets.toml
-+[sources.sql_database.credentials]
-+drivername = "postgresql"
-+host = "localhost"
-+port = 5432
-+database = "phoenix"
-+username = "phoenix"
-+password = "phoenix"
-+```
-+
-+You also need the psycopg2 driver installed:
-+
-+```bash
-+pip install psycopg2-binary
-+```
-+
-+Where to find these values:
-+- **Docker Compose**: look for the `db` service in your `docker-compose.yml`. The credentials are
-+  set via `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` environment variables. The host
-+  is the service name (or `localhost` if the port is published to the host).
-+- **Helm chart**: check `values.yaml` under `postgresql.auth` or the `PHOENIX_SQL_DATABASE_URL`
-+  environment variable on the Phoenix deployment.
-+
-+### SQLite
-+
-+Add the following block to `.dlt/secrets.toml`, pointing `database` at the `.db` file on disk:
-+
-+```toml
-+# .dlt/secrets.toml
-+[sources.sql_database.credentials]
-+drivername = "sqlite"
-+database = "/path/to/phoenix.db"
-+```
-+
-+Where to find the file:
-+- **Docker Compose**: the SQLite file lives at `/phoenix/storage/phoenix.db` inside the container.
-+  Volume-mount it to a host path so the pipeline can read it directly:
-+  ```yaml
-+  volumes:
-+    - ./data/phoenix.db:/phoenix/storage/phoenix.db
-+  ```
-+  Then set `database` to the host-side path (e.g. `./data/phoenix.db`).
-+- **No volume mount**: copy the file out first with
-+  `docker cp <container>:/phoenix/storage/phoenix.db ./phoenix.db`, then point `database` at the
-+  copied file.
-+
-+NOTE. You need the `dlt[sql-database]` extra installed:
-+
-+```bash
-+pip install "dlt[sql-database]"
-+```
-+
-+## Data model
-+
-+dlt automatically discovers every table in the Phoenix database and infers their relationships from
-+foreign keys — no schema configuration required. The exact set of tables you get depends on which
-+Phoenix features you have used: tables are only created in the database once the corresponding
-+feature is exercised. For example, the `datasets` and `dataset_examples` tables do not exist until
-+you create a dataset through the Phoenix web UI.
-+
-+The tables most relevant for AI observability are:
-+
-+- **`projects`** — top-level containers; each project groups a set of traces.
-+- **`traces`** — a trace is a complete request or workflow, identified by a `trace_id`.
-+- **`spans`** — the core table. Every OTEL span belongs to a trace. Spans carry timing, status,
-+  LLM token counts, input/output values, and arbitrary OpenInference attributes.
-+- **`span_annotations`** — evaluations attached to individual spans (e.g. relevance score,
-+  hallucination label), produced by human raters or automated LLM judges.
-+- **`trace_annotations`** — same as `span_annotations` but scoped to a full trace.
-+- **`datasets`** — curated collections of examples, created via the Phoenix web UI or SDK.
-+- **`dataset_examples`** — the individual rows inside a dataset, each linked back to a source span.
-+- **`dataset_versions`** — snapshot history of a dataset, enabling reproducible evaluations.
-+- **`experiments`** — prompt playground runs executed against a dataset version.
-+- **`experiment_runs`** — individual outputs produced by an experiment for each dataset example.
-+
-+Some tables are internal to Phoenix (e.g. migration tracking, internal job queues).
-+You can explicitly select a subset of tables to load via the parameter `sql_database(..., table_names=...)`.
-+
-+```mermaid
-+erDiagram
-+    alembic_version{
-+    text version_num PK
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    users{
-+    bigint id PK
-+    bigint user_role_id
-+    text username
-+    text email
-+    text profile_picture_url
-+    binary password_hash
-+    binary password_salt
-+    bool reset_password
-+    text oauth2_client_id
-+    text oauth2_user_id
-+    timestamp created_at
-+    timestamp updated_at
-+    text auth_method
-+    text ldap_unique_id
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    user_roles{
-+    bigint id PK
-+    text name
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    projects{
-+    bigint id PK
-+    text name
-+    text description
-+    text gradient_start_color
-+    text gradient_end_color
-+    timestamp created_at
-+    timestamp updated_at
-+    bigint trace_retention_policy_id
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    project_trace_retention_policies{
-+    bigint id PK
-+    text name
-+    text cron_expression
-+    json rule
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    generative_models{
-+    bigint id PK
-+    text name
-+    text provider
-+    text name_pattern
-+    bool is_built_in
-+    timestamp start_time
-+    timestamp created_at
-+    timestamp updated_at
-+    timestamp deleted_at
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    token_prices{
-+    bigint id PK
-+    bigint model_id
-+    text token_type
-+    bool is_prompt
-+    double base_rate
-+    json customization
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    evaluators{
-+    bigint id PK
-+    text name
-+    text description
-+    json metadata
-+    text kind
-+    bigint user_id
-+    timestamp created_at
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    builtin_evaluators{
-+    bigint id PK
-+    text kind
-+    text key
-+    json input_schema
-+    json output_configs
-+    timestamp synced_at
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    dataset_examples{
-+    bigint id PK
-+    bigint dataset_id
-+    bigint span_rowid
-+    timestamp created_at
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    datasets{
-+    bigint id PK
-+    text name
-+    text description
-+    json metadata
-+    timestamp created_at
-+    timestamp updated_at
-+    bigint user_id
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    spans{
-+    bigint id PK
-+    bigint trace_rowid
-+    text span_id
-+    text parent_id
-+    text name
-+    text span_kind
-+    timestamp start_time
-+    timestamp end_time
-+    json attributes
-+    json events
-+    text status_code
-+    text status_message
-+    bigint cumulative_error_count
-+    bigint cumulative_llm_token_count_prompt
-+    bigint cumulative_llm_token_count_completion
-+    bigint llm_token_count_prompt
-+    bigint llm_token_count_completion
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    traces{
-+    bigint id PK
-+    bigint project_rowid
-+    text trace_id
-+    timestamp start_time
-+    timestamp end_time
-+    bigint project_session_rowid
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    project_sessions{
-+    bigint id PK
-+    text session_id
-+    bigint project_id
-+    timestamp start_time
-+    timestamp end_time
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    dataset_example_revisions{
-+    bigint id PK
-+    bigint dataset_example_id
-+    bigint dataset_version_id
-+    json input
-+    json output
-+    json metadata
-+    text revision_kind
-+    timestamp created_at
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    dataset_versions{
-+    bigint id PK
-+    bigint dataset_id
-+    text description
-+    json metadata
-+    timestamp created_at
-+    bigint user_id
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    span_annotations{
-+    bigint id PK
-+    bigint span_rowid
-+    text name
-+    text label
-+    double score
-+    text explanation
-+    json metadata
-+    text annotator_kind
-+    timestamp created_at
-+    timestamp updated_at
-+    bigint user_id
-+    text identifier
-+    text source
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    project_annotation_configs{
-+    bigint id PK
-+    bigint project_id
-+    bigint annotation_config_id
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    annotation_configs{
-+    bigint id PK
-+    text name
-+    json config
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    span_costs{
-+    bigint id PK
-+    bigint span_rowid
-+    bigint trace_rowid
-+    bigint model_id
-+    timestamp span_start_time
-+    double total_cost
-+    double total_tokens
-+    double prompt_cost
-+    double prompt_tokens
-+    double completion_cost
-+    double completion_tokens
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    span_cost_details{
-+    bigint id PK
-+    bigint span_cost_id
-+    text token_type
-+    bool is_prompt
-+    double cost
-+    double tokens
-+    double cost_per_token
-+    text _dlt_load_id
-+    text _dlt_id UK
-+}
-+    users ||--|{ user_roles : ""
-+    projects ||--|{ project_trace_retention_policies : ""
-+    token_prices ||--|{ generative_models : ""
-+    evaluators ||--|{ users : ""
-+    builtin_evaluators ||--|{ evaluators : ""
-+    dataset_examples ||--|{ datasets : ""
-+    dataset_examples ||--|{ spans : ""
-+    datasets ||--|{ users : ""
-+    spans ||--|{ traces : ""
-+    traces ||--|{ projects : ""
-+    traces ||--|{ project_sessions : ""
-+    project_sessions ||--|{ projects : ""
-+    dataset_example_revisions ||--|{ dataset_versions : ""
-+    dataset_example_revisions ||--|{ dataset_examples : ""
-+    dataset_versions ||--|{ datasets : ""
-+    dataset_versions ||--|{ users : ""
-+    span_annotations ||--|{ users : ""
-+    span_annotations ||--|{ spans : ""
-+    project_annotation_configs ||--|{ projects : ""
-+    project_annotation_configs ||--|{ annotation_configs : ""
-+    span_costs ||--|{ traces : ""
-+    span_costs ||--|{ spans : ""
-+    span_costs ||--|{ generative_models : ""
-+    span_cost_details ||--|{ span_costs : ""
-+```
-+
-+"""
-+
-+import dlt
-+from dlt.sources.sql_database import sql_database
-+
-+
-+@dlt.source
-+def arize_phoenix_source(credentials=dlt.secrets.value):
-+    """Returns all Arize Phoenix tables as a dlt source.
-+
-+    Reads directly from Phoenix's relational backend (PostgreSQL or SQLite) using
-+    dlt's built-in `sql_database` source. Foreign key relationships are resolved
-+    automatically so destination tables reference each other correctly.
-+
-+    The primary tables of interest are:
-+
-+    - **spans**: Every OTEL span recorded by Phoenix — the core unit of telemetry.
-+      Each row represents one span with timing, attributes, status, and token counts.
-+    - **traces**: Groups of related spans sharing the same `trace_id`.
-+    - **projects**: Phoenix projects that spans are assigned to.
-+    - **span_annotations**: Human or model-generated evaluations attached to spans
-+      (e.g. relevance score, hallucination label).
-+    - **trace_annotations**: Evaluations at the trace level.
-+    - **datasets / dataset_examples**: Curated examples used in prompt playgrounds
-+      or regression test suites.
-+
-+    Args:
-+        credentials: SQLAlchemy-compatible connection string or credential dict,
-+            loaded from `secrets.toml`. Supports both PostgreSQL and SQLite URIs.
-+
-+    Returns:
-+        A list of dlt resources — one per Phoenix database table.
-+    """
-+    return sql_database(
-+        credentials=credentials,
-+        resolve_foreign_keys=True,
-+    )
-+
-+
-+if __name__ == "__main__":
-+    pipeline = dlt.pipeline(
-+        pipeline_name="arize_phoenix",
-+        # can be configure to any dlt destination
-+        destination="duckdb",
-+    )
-+    load_info = pipeline.run(arize_phoenix_source())
-+    print(load_info)
-
-
-===== COMMIT 88bd3437 =====
-
-
-commit 88bd34377
-Author: djudjuu
-Date: 2026-05-05
-
-    control section opening from url (#3686)
-
-diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
-index ca9b58464..7c169d086 100644
---- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
-+++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
-@@ -792,33 +792,47 @@ def ui_controls(mo_cli_arg_with_test_identifiers: bool):
-         label=utils.ui.small(strings.app_refresh_button),
-     )
- 
-+    # read sections from query params to allow navigation via URL
-+    try:
-+        _open_sections = (cast(str, mo.query_params().get("sections")) or "").split(",")
-+    except Exception:
-+        _open_sections = []
-+
-     # page switches
-     dlt_section_sync_switch: mo.ui.switch = mo.ui.switch(
-         value=True, label="sync" if mo_cli_arg_with_test_identifiers else ""
-     )
-     dlt_section_info_switch: mo.ui.switch = mo.ui.switch(
--        value=False, label="overview" if mo_cli_arg_with_test_identifiers else ""
-+        value="overview" in _open_sections,
-+        label="overview" if mo_cli_arg_with_test_identifiers else "",
-     )
-     dlt_section_schema_switch: mo.ui.switch = mo.ui.switch(
--        value=False, label="schema" if mo_cli_arg_with_test_identifiers else ""
-+        value="schema" in _open_sections,
-+        label="schema" if mo_cli_arg_with_test_identifiers else "",
-     )
-     dlt_section_browse_data_switch: mo.ui.switch = mo.ui.switch(
--        value=False, label="data" if mo_cli_arg_with_test_identifiers else ""
-+        value="data" in _open_sections,
-+        label="data" if mo_cli_arg_with_test_identifiers else "",
-     )
-     dlt_section_state_switch: mo.ui.switch = mo.ui.switch(
--        value=False, label="state" if mo_cli_arg_with_test_identifiers else ""
-+        value="state" in _open_sections,
-+        label="state" if mo_cli_arg_with_test_identifiers else "",
-     )
-     dlt_section_trace_switch: mo.ui.switch = mo.ui.switch(
--        value=False, label="trace" if mo_cli_arg_with_test_identifiers else ""
-+        value="trace" in _open_sections,
-+        label="trace" if mo_cli_arg_with_test_identifiers else "",
-     )
-     dlt_section_loads_switch: mo.ui.switch = mo.ui.switch(
--        value=False, label="loads" if mo_cli_arg_with_test_identifiers else ""
-+        value="loads" in _open_sections,
-+        label="loads" if mo_cli_arg_with_test_identifiers else "",
-     )
-     dlt_section_ibis_browser_switch: mo.ui.switch = mo.ui.switch(
--        value=False, label="ibis" if mo_cli_arg_with_test_identifiers else ""
-+        value="ibis" in _open_sections,
-+        label="ibis" if mo_cli_arg_with_test_identifiers else "",
-     )
-     dlt_section_data_quality_switch: mo.ui.switch = mo.ui.switch(
--        value=False, label="data_quality" if mo_cli_arg_with_test_identifiers else ""
-+        value="data_quality" in _open_sections,
-+        label="data_quality" if mo_cli_arg_with_test_identifiers else "",
-     )
- 
-     # other switches
-diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
-index 8c5b9f45e..d63aa8f1d 100644
---- a/tests/e2e/helpers/dashboard/test_e2e.py
-+++ b/tests/e2e/helpers/dashboard/test_e2e.py
-@@ -396,3 +396,42 @@ def test_broken_trace_pipeline(page: Page, broken_trace_pipeline: Any, pipelines
-     # should also render the trace section, but there should be an error message
-     _open_section(page, "trace")
-     expect(page.get_by_text("Error while building trace section:")).to_be_visible()
-+
-+
-+def test_sections_query_param(page: Page, fruit_pipeline: Any):
-+    """Sections specified in ?sections= query param should be pre-opened."""
-+    # navigate with sections=trace,loads in the URL
-+    page.goto("http://localhost:2718/?pipeline=fruit_pipeline&sections=trace,loads")
-+
-+    # wait for the pipeline to load
-+    expect(page.get_by_role("switch", name="trace")).to_be_visible(timeout=20000)
-+
-+    # trace and loads switches should be checked (verifies URL params are parsed correctly)
-+    expect(page.get_by_role("switch", name="trace")).to_be_checked()
-+    expect(page.get_by_role("switch", name="loads")).to_be_checked()
-+
-+    # other sections should NOT be checked
-+    expect(page.get_by_role("switch", name="overview")).not_to_be_checked()
-+    expect(page.get_by_role("switch", name="schema")).not_to_be_checked()
-+    expect(page.get_by_role("switch", name="data")).not_to_be_checked()
-+    expect(page.get_by_role("switch", name="state")).not_to_be_checked()
-+
-+    # navigate away to release the DuckDB lock before the next test's fixture
-+    _go_home(page)
-+
-+
-+def test_sections_query_param_all(page: Page, fruit_pipeline: Any):
-+    """All sections should open when all are specified in ?sections= query param."""
-+    page.goto(
-+        "http://localhost:2718/?pipeline=fruit_pipeline"
-+        "&sections=overview,schema,data,state,trace,loads"
-+    )
-+
-+    # wait for the pipeline to load
-+    expect(page.get_by_role("switch", name="overview")).to_be_visible(timeout=20000)
-+
-+    # all specified switches should be checked
-+    for section in ["overview", "schema", "data", "state", "trace", "loads"]:
-+        expect(page.get_by_role("switch", name=section)).to_be_checked()
-+
-+    _go_home(page)
-
-
-===== COMMIT f191e724 =====
-
-
-commit f191e7248
-Author: Anuun Chinbat
-Date: 2026-05-05
-
-    Fix/3592 bypass non interactive flag prompts (#3910)
-
-diff --git a/dlt/_workspace/cli/_dlt.py b/dlt/_workspace/cli/_dlt.py
-index 27fef889c..a244ff4fc 100644
---- a/dlt/_workspace/cli/_dlt.py
-+++ b/dlt/_workspace/cli/_dlt.py
-@@ -88,11 +88,29 @@ class NonInteractiveAction(argparse.Action):
-         option_string: str = None,
-     ) -> None:
-         fmt.ALWAYS_CHOOSE_DEFAULT = True
--        fmt.note(
--            "Non interactive mode. Default choices are automatically made for confirmations and"
--            " prompts."
-+
-+
-+class YesAction(argparse.Action):
-+    def __init__(
-+        self,
-+        option_strings: Sequence[str],
-+        dest: Any = argparse.SUPPRESS,
-+        default: Any = argparse.SUPPRESS,
-+        help: str = None,  # noqa
-+    ) -> None:
-+        super(YesAction, self).__init__(
-+            option_strings=option_strings, dest=dest, default=default, nargs=0, help=help
-         )
- 
-+    def __call__(
-+        self,
-+        parser: argparse.ArgumentParser,
-+        namespace: argparse.Namespace,
-+        values: Any,
-+        option_string: str = None,
-+    ) -> None:
-+        fmt.ALWAYS_CONFIRM = True
-+
- 
- class DebugAction(argparse.Action):
-     def __init__(
-@@ -145,6 +163,12 @@ def _create_parser() -> Tuple[argparse.ArgumentParser, Dict[str, SupportsCliComm
-             " prompts."
-         ),
-     )
-+    parser.add_argument(
-+        "-y",
-+        "--yes",
-+        action=YesAction,
-+        help="Automatically accept all confirmations.",
-+    )
-     parser.add_argument(
-         "--debug",
-         action=DebugAction,
-diff --git a/dlt/_workspace/cli/echo.py b/dlt/_workspace/cli/echo.py
-index b28e6fffb..969c9ed46 100644
---- a/dlt/_workspace/cli/echo.py
-+++ b/dlt/_workspace/cli/echo.py
-@@ -6,26 +6,36 @@ import click
- 
- ALWAYS_CHOOSE_DEFAULT = False
- ALWAYS_CHOOSE_VALUE: Any = None
-+ALWAYS_CONFIRM = False
- 
- 
- @contextlib.contextmanager
--def always_choose(always_choose_default: bool, always_choose_value: Any) -> Iterator[None]:
-+def always_choose(
-+    always_choose_default: bool,
-+    always_choose_value: Any,
-+    always_confirm: bool = False,
-+) -> Iterator[None]:
-     """Temporarily answer all confirmations and prompts with preset values.
- 
-     Args:
-         always_choose_default: When True, confirm/prompt calls return their default.
-         always_choose_value: When set, confirm/prompt calls return this value instead.
-+        always_confirm: When True, confirm calls always return True, regardless of
-+            `always_choose_default` and `always_choose_value`.
-     """
--    global ALWAYS_CHOOSE_DEFAULT, ALWAYS_CHOOSE_VALUE
-+    global ALWAYS_CHOOSE_DEFAULT, ALWAYS_CHOOSE_VALUE, ALWAYS_CONFIRM
-     _always_choose_default = ALWAYS_CHOOSE_DEFAULT
-     _always_choose_value = ALWAYS_CHOOSE_VALUE
-+    _always_confirm = ALWAYS_CONFIRM
-     ALWAYS_CHOOSE_DEFAULT = always_choose_default
-     ALWAYS_CHOOSE_VALUE = always_choose_value
-+    ALWAYS_CONFIRM = always_confirm
-     try:
-         yield
-     finally:
-         ALWAYS_CHOOSE_DEFAULT = _always_choose_default
-         ALWAYS_CHOOSE_VALUE = _always_choose_value
-+        ALWAYS_CONFIRM = _always_confirm
- 
- 
- @contextlib.contextmanager
-@@ -49,7 +59,9 @@ def suppress_echo() -> Iterator[None]:
- def maybe_no_stdin() -> ContextManager[None]:
-     """Automatically choose default values if stdin not connected"""
-     return always_choose(
--        True if not sys.stdin.isatty() else ALWAYS_CHOOSE_DEFAULT, ALWAYS_CHOOSE_VALUE
-+        True if not sys.stdin.isatty() else ALWAYS_CHOOSE_DEFAULT,
-+        ALWAYS_CHOOSE_VALUE,
-+        ALWAYS_CONFIRM,
-     )
- 
- 
-@@ -79,6 +91,8 @@ def note(msg: str) -> None:
- 
- 
- def confirm(text: str, default: Optional[bool] = None) -> bool:
-+    if ALWAYS_CONFIRM:
-+        return True
-     if ALWAYS_CHOOSE_VALUE:
-         return bool(ALWAYS_CHOOSE_VALUE)
-     if ALWAYS_CHOOSE_DEFAULT:
-diff --git a/docs/website/docs/reference/command-line-interface.md b/docs/website/docs/reference/command-line-interface.md
-index 837499135..165ddc10e 100644
---- a/docs/website/docs/reference/command-line-interface.md
-+++ b/docs/website/docs/reference/command-line-interface.md
-@@ -30,7 +30,7 @@ Creates, adds, inspects and deploys dlt pipelines. Further help is available at
- **Usage**
- ```sh
- dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
--    [--non-interactive] [--debug] [--no-pwd]
-+    [--non-interactive] [-y] [--debug] [--no-pwd]
-     {telemetry,schema,pipeline,init,deploy,dashboard,ai} ...
- ```
- 
-@@ -44,6 +44,7 @@ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
- * `--disable-telemetry` - Disables telemetry before command is executed
- * `--enable-telemetry` - Enables telemetry before command is executed
- * `--non-interactive` - Non interactive mode. default choices are automatically made for confirmations and prompts.
-+* `-y, --yes` - Automatically accept all confirmations.
- * `--debug` - Displays full stack traces on exceptions. useful for debugging if the output is not clear enough.
- * `--no-pwd` - Do not add current working directory to sys.path. by default $pwd is added to reproduce python behavior when running scripts.
- 
-diff --git a/tests/workspace/cli/common/test_cli_invoke.py b/tests/workspace/cli/common/test_cli_invoke.py
-index 33c6edc1a..f0e7f6b2f 100644
---- a/tests/workspace/cli/common/test_cli_invoke.py
-+++ b/tests/workspace/cli/common/test_cli_invoke.py
-@@ -3,9 +3,11 @@ import sys
- import pytest
- import shutil
- from pathlib import Path
-+from typing import Iterator
- from pytest_console_scripts import ScriptRunner
- from unittest.mock import patch
- 
-+import dlt
- from dlt.common.runners.venv import Venv
- from dlt.common.utils import custom_environ
- 
-@@ -16,6 +18,15 @@ from tests.utils import get_test_storage_root
- BASE_COMMANDS = ["init", "deploy", "pipeline", "telemetry", "schema"]
- 
- 
-+@pytest.fixture(autouse=True)
-+def reset_echo_globals() -> Iterator[None]:
-+    """Reset echo globals to their default values."""
-+    yield
-+    fmt.ALWAYS_CHOOSE_DEFAULT = False
-+    fmt.ALWAYS_CHOOSE_VALUE = None
-+    fmt.ALWAYS_CONFIRM = False
-+
-+
- @pytest.fixture(autouse=True)
- def disable_debug() -> None:
-     # reset debug flag so other tests may pass
-@@ -222,6 +233,61 @@ def test_invoke_deploy_mock(script_runner: ScriptRunner) -> None:
-         }
- 
- 
-+@pytest.mark.parametrize(
-+    "flags,confirms",
-+    [
-+        (["-y"], True),
-+        (["--yes"], True),
-+        (["--yes", "--non-interactive"], True),
-+        (["-y", "--non-interactive"], True),
-+        (["--non-interactive"], False),
-+    ],
-+    ids=[
-+        "short",
-+        "long",
-+        "yes-and-non-interactive",
-+        "y-and-non-interactive",
-+        "non-interactive-only",
-+    ],
-+)
-+def test_yes_flag_auto_confirms(
-+    script_runner: ScriptRunner, flags: list[str], confirms: bool
-+) -> None:
-+    """Destructive commands like sync and drop ask for confirmation with default=False.
-+    --non-interactive uses the default, so nothing happens. -y/--yes overrides to True, so the commands actually execute.
-+    """
-+    result = script_runner.run(["dlt", "init", "chess", "duckdb"])
-+    assert result.returncode == 0
-+
-+    os.environ.pop("DESTINATION__DUCKDB__CREDENTIALS", None)
-+    venv = Venv.restore_current()
-+    venv.run_script("chess_pipeline.py")
-+
-+    # sync
-+    result = script_runner.run(["dlt", *flags, "pipeline", "chess_pipeline", "sync"])
-+    assert result.returncode == 0, f"STDERR: {result.stderr}"
-+    if confirms:
-+        assert "Dropping local state" in result.stdout
-+        assert "Restoring from destination" in result.stdout
-+    else:
-+        assert "Dropping local state" not in result.stdout
-+
-+    pipeline = dlt.attach(pipeline_name="chess_pipeline")
-+    assert "players_games" in pipeline.default_schema.tables
-+
-+    # drop
-+    result = script_runner.run(
-+        ["dlt", *flags, "pipeline", "chess_pipeline", "drop", "players_games"]
-+    )
-+    assert result.returncode == 0, f"STDERR: {result.stderr}"
-+    pipeline = dlt.attach(pipeline_name="chess_pipeline")
-+    if confirms:
-+        assert "Selected resource(s): ['players_games']" in result.stdout
-+        assert "players_games" not in pipeline.default_schema.tables
-+    else:
-+        assert "players_games" in pipeline.default_schema.tables
-+
-+
- @pytest.mark.skipif(sys.stdin.isatty(), reason="stdin connected, test skipped")
- def test_no_tty() -> None:
-     with fmt.maybe_no_stdin():
-diff --git a/tests/workspace/cli/test_pipeline_command.py b/tests/workspace/cli/test_pipeline_command.py
-index e02269857..d7a5e8f67 100644
---- a/tests/workspace/cli/test_pipeline_command.py
-+++ b/tests/workspace/cli/test_pipeline_command.py
-@@ -4,6 +4,7 @@ import contextlib
- import pytest
- import logging
- from subprocess import CalledProcessError
-+from typing import Any
- 
- import dlt
- from dlt.common.runners.venv import Venv
-@@ -19,6 +20,21 @@ from tests.workspace.cli.utils import (
- )
- 
- 
-+CHOOSE_PRIORITY_CASES = [
-+    # always_confirm=True overrides everything
-+    (dict(always_choose_default=True, always_choose_value=False, always_confirm=True), True),
-+    # always_choose_value overrides always_choose_default
-+    (dict(always_choose_default=True, always_choose_value=True, always_confirm=False), True),
-+    # always_choose_default kicks in only when value/confirm are off
-+    (dict(always_choose_default=True, always_choose_value=None, always_confirm=False), False),
-+]
-+CHOOSE_PRIORITY_IDS = [
-+    "always-confirm-overrides-everything",
-+    "always-choose-value-overrides-always-choose-default",
-+    "always-choose-default-kicks-in-if-allowed",
-+]
-+
-+
- def test_pipeline_command_operations(repo_dir: str) -> None:
-     _init_command.init_command("chess", "duckdb", repo_dir)
- 
-@@ -199,7 +215,10 @@ def test_pipeline_command_failed_jobs(repo_dir: str) -> None:
-         assert "JOB file type: jsonl" in _out
- 
- 
--def test_pipeline_command_drop_partial_loads(repo_dir: str) -> None:
-+@pytest.mark.parametrize("choose_kwargs,confirms", CHOOSE_PRIORITY_CASES, ids=CHOOSE_PRIORITY_IDS)
-+def test_pipeline_command_drop_partial_loads(
-+    repo_dir: str, choose_kwargs: dict[str, Any], confirms: bool
-+) -> None:
-     _init_command.init_command("chess", "dummy", repo_dir)
-     os.environ["EXCEPTION_PROB"] = "1.0"
- 
-@@ -234,17 +253,21 @@ def test_pipeline_command_drop_partial_loads(repo_dir: str) -> None:
-     print(_out)
- 
-     with io.StringIO() as buf, contextlib.redirect_stdout(buf):
--        with echo.always_choose(False, True):
-+        with echo.always_choose(**choose_kwargs):
-             _pipeline_command.pipeline_command("drop-pending-packages", "chess_pipeline", None, 1)
-             _out = buf.getvalue()
--            assert "Pending packages deleted" in _out
-     print(_out)
- 
--    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
--        _pipeline_command.pipeline_command("drop-pending-packages", "chess_pipeline", None, 1)
--        _out = buf.getvalue()
--        assert "No pending packages found" in _out
--    print(_out)
-+    if confirms:
-+        assert "Pending packages deleted" in _out
-+        # verify packages are gone
-+        with io.StringIO() as buf, contextlib.redirect_stdout(buf):
-+            _pipeline_command.pipeline_command("drop-pending-packages", "chess_pipeline", None, 1)
-+            _out = buf.getvalue()
-+            assert "No pending packages found" in _out
-+        print(_out)
-+    else:
-+        assert "Pending packages deleted" not in _out
- 
- 
- def test_drop_from_wrong_dir(repo_dir: str) -> None:
-@@ -290,7 +313,10 @@ def test_drop_from_wrong_dir(repo_dir: str) -> None:
-         assert "WARNING: You should run this from the same directory as the pipeline script" in _out
- 
- 
--def test_pipeline_command_drop_with_global_args(repo_dir: str) -> None:
-+@pytest.mark.parametrize("choose_kwargs,confirms", CHOOSE_PRIORITY_CASES, ids=CHOOSE_PRIORITY_IDS)
-+def test_pipeline_command_drop_with_global_args(
-+    repo_dir: str, choose_kwargs: dict[str, Any], confirms: bool
-+) -> None:
-     """Test that global CLI arguments don't cause errors in pipeline drop command."""
-     _init_command.init_command("chess", "duckdb", repo_dir)
- 
-@@ -303,9 +329,8 @@ def test_pipeline_command_drop_with_global_args(repo_dir: str) -> None:
-         print(cpe.stderr)
-         raise
- 
--    # Test drop command with global arguments that should be ignored
-     with io.StringIO() as buf, contextlib.redirect_stdout(buf):
--        with echo.always_choose(False, True):
-+        with echo.always_choose(**choose_kwargs):
-             _pipeline_command.pipeline_command(
-                 "drop",
-                 "chess_pipeline",
-@@ -316,8 +341,10 @@ def test_pipeline_command_drop_with_global_args(repo_dir: str) -> None:
-                 debug=False,  # Another global arg
-             )
-         _out = buf.getvalue()
--        assert "Selected resource(s): ['players_games']" in _out
- 
--    # Verify the command actually executed
-     pipeline = dlt.attach(pipeline_name="chess_pipeline")
--    assert "players_games" not in pipeline.default_schema.tables
-+    if confirms:
-+        assert "Selected resource(s): ['players_games']" in _out
-+        assert "players_games" not in pipeline.default_schema.tables
-+    else:
-+        assert "players_games" in pipeline.default_schema.tables
-
-
-===== COMMIT 55078eb0 =====
-
-
-commit 55078eb0b
-Author: Anuun Chinbat
-Date: 2026-05-05
-
-    fix: correctly materialize empty tables for multi-table resources (#3901)
-
-diff --git a/dlt/extract/extract.py b/dlt/extract/extract.py
-index 9628e4aa9..11267e7b7 100644
---- a/dlt/extract/extract.py
-+++ b/dlt/extract/extract.py
-@@ -345,42 +345,30 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
-     ) -> None:
-         schema = source.schema
-         json_extractor = extractors["object"]
--        resources_with_items = set().union(*[e.resources_with_items for e in extractors.values()])
-+        tables_with_items = set().union(*[e.tables_with_items for e in extractors.values()])
-         # find REPLACE resources that did not yield any pipe items and create empty jobs for them
-         # NOTE: do not include tables that have never seen data
-         data_tables = {t["name"]: t for t in schema.data_tables(seen_data_only=True)}
-         tables_by_resources = utils.group_tables_by_resource(data_tables)
-         for resource in source.resources.selected.values():
--            if resource.write_disposition != "replace" or resource.name in resources_with_items:
--                continue
-             if resource.name not in tables_by_resources:
-                 continue
-             for table in tables_by_resources[resource.name]:
-+                write_disposition = table.get("write_disposition") or resource.write_disposition
-+                if write_disposition != "replace" or table["name"] in tables_with_items:
-+                    continue
-                 # we only need to write empty files for the root tables
-                 if not utils.is_nested_table(table):
-                     json_extractor.write_empty_items_file(table["name"])
- 
--        # collect resources that received empty materialized lists and had no items
--        resources_with_empty = (
-+        # collect tables that received empty materialized lists and had no items
-+        tables_with_empty = (
-             set()
--            .union(*[e.resources_with_empty for e in extractors.values()])
--            .difference(resources_with_items)
-+            .union(*[e.tables_with_empty for e in extractors.values()])
-+            .difference(tables_with_items)
-         )
--        # get all possible tables
--        data_tables = {t["name"]: t for t in schema.data_tables()}
--        tables_by_resources = utils.group_tables_by_resource(data_tables)
--        for resource_name in resources_with_empty:
--            if resource := source.resources.selected.get(resource_name):
--                if tables := tables_by_resources.get("resource_name"):
--                    # write empty tables
--                    for table in tables:
--                        # we only need to write empty files for the root tables
--                        if not utils.is_nested_table(table):
--                            json_extractor.write_empty_items_file(table["name"])
--                else:
--                    table_name = json_extractor._get_static_table_name(resource, None)
--                    if table_name:
--                        json_extractor.write_empty_items_file(table_name)
-+        for table_name in tables_with_empty:
-+            json_extractor.write_empty_items_file(table_name)
- 
-     def _extract_single_source(
-         self,
-diff --git a/dlt/extract/extractors.py b/dlt/extract/extractors.py
-index 983ab9c21..3110cdd02 100644
---- a/dlt/extract/extractors.py
-+++ b/dlt/extract/extractors.py
-@@ -124,10 +124,10 @@ class Extractor:
-         self.schema = schema
-         self.naming = schema.naming
-         self.collector = collector
--        self.resources_with_items: Set[str] = set()
--        """Tracks resources that received items"""
--        self.resources_with_empty: Set[str] = set()
--        """Track resources that received empty materialized list"""
-+        self.tables_with_items: Set[str] = set()
-+        """Tracks tables that received items"""
-+        self.tables_with_empty: Set[str] = set()
-+        """Tracks tables that received empty materialized list"""
-         self.load_id = load_id
-         self.item_storage = item_storage
-         self._table_contracts: Dict[str, TSchemaContractDict] = {}
-@@ -190,10 +190,10 @@ class Extractor:
-         self.collector.update(table_name, inc=new_rows_count)
-         # if there were rows or item was empty arrow table
-         if new_rows_count > 0 or self.__class__ is ArrowExtractor:
--            self.resources_with_items.add(resource_name)
-+            self.tables_with_items.add(table_name)
-         else:
-             if isinstance(items, MaterializedEmptyList):
--                self.resources_with_empty.add(resource_name)
-+                self.tables_with_empty.add(table_name)
- 
-     def _import_item(
-         self,
-@@ -210,7 +210,7 @@ class Extractor:
-             meta.file_format,
-         )
-         self.collector.update(table_name, inc=metrics.items_count)
--        self.resources_with_items.add(resource_name)
-+        self.tables_with_items.add(table_name)
- 
-     def _write_to_dynamic_table(self, resource: DltResource, items: TDataItems, meta: Any) -> None:
-         if not isinstance(items, list):
-diff --git a/tests/extract/test_extract.py b/tests/extract/test_extract.py
-index 7f20ea4c0..b80dac3b5 100644
---- a/tests/extract/test_extract.py
-+++ b/tests/extract/test_extract.py
-@@ -13,6 +13,7 @@ from dlt.common.storages import (
- )
- from dlt.common.storages.schema_storage import SchemaStorage
- from dlt.common.typing import TTableNames, TDataItems
-+from dlt.common.utils import uniq_id
- 
- from dlt.extract import DltResource, DltSource
- from dlt.extract.exceptions import DataItemRequiredForDynamicTableHints, ResourceExtractionError
-@@ -613,6 +614,54 @@ def test_materialize_table_schema_with_pipe_items():
-     assert found_empty_list
- 
- 
-+@pytest.mark.parametrize(
-+    "yield_one,yield_two",
-+    [(True, False), (False, True), (False, False), (True, True)],
-+    ids=["only_first", "only_second", "neither", "both"],
-+)
-+def test_materialize_table_schema_multi_table(yield_one: bool, yield_two: bool) -> None:
-+    """Empty table materialization works correctly for resources that produce multiple tables."""
-+
-+    @dlt.resource
-+    def multi_table():
-+        yield dlt.mark.with_hints(
-+            dlt.mark.materialize_table_schema(),
-+            dlt.mark.make_hints(
-+                table_name="table_one",
-+                write_disposition="replace",
-+                columns={"col_one": {"data_type": "text"}},
-+            ),
-+            create_table_variant=True,
-+        )
-+        yield dlt.mark.with_hints(
-+            dlt.mark.materialize_table_schema(),
-+            dlt.mark.make_hints(
-+                table_name="table_two",
-+                write_disposition="replace",
-+                columns={"col_two": {"data_type": "bigint"}},
-+            ),
-+            create_table_variant=True,
-+        )
-+        if yield_one:
-+            yield dlt.mark.with_table_name({"col_one": "val"}, table_name="table_one")
-+        if yield_two:
-+            yield dlt.mark.with_table_name({"col_two": 5}, table_name="table_two")
-+
-+    p = dlt.pipeline(
-+        pipeline_name="materialize_multi_" + uniq_id(),
-+        destination="duckdb",
-+        dev_mode=True,
-+    )
-+    extract_info = p.extract(multi_table())
-+
-+    extracted_tables = {
-+        job.job_file_info.table_name for job in extract_info.load_packages[0].jobs["new_jobs"]
-+    }
-+    # both tables should always have jobs — either with data or empty files
-+    assert "table_one" in extracted_tables
-+    assert "table_two" in extracted_tables
-+
-+
- @pytest.mark.parametrize(
-     "with_custom_metrics", [True, False], ids=["with_custom_metrics", "without_custom_metrics"]
- )
-diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
-index 31a0a656a..e0c41242b 100644
---- a/tests/pipeline/test_pipeline.py
-+++ b/tests/pipeline/test_pipeline.py
-@@ -86,6 +86,7 @@ from tests.pipeline.utils import (
-     load_table_counts,
-     load_tables_to_dicts,
-     many_delayed,
-+    table_exists,
- )
- 
- from dlt.destinations.dataset import get_destination_client_initial_config
-@@ -3573,6 +3574,109 @@ def test_yielding_empty_list_creates_table() -> None:
-             assert rows[0] == (1, None)
- 
- 
-+@pytest.mark.parametrize(
-+    "yield_one,yield_two",
-+    [(True, False), (False, True), (False, False), (True, True)],
-+    ids=["only_first", "only_second", "neither", "both"],
-+)
-+def test_materialize_table_schema_multi_table_duckdb(yield_one: bool, yield_two: bool) -> None:
-+    """End-to-end check that a multi-table resource materializes both tables in duckdb,
-+    whether they receive data or not. Dispatch happens via `with_table_name` and table
-+    variants are pre-declared with `materialize_table_schema()`.
-+    """
-+
-+    @dlt.resource
-+    def multi_table():
-+        yield dlt.mark.with_hints(
-+            dlt.mark.materialize_table_schema(),
-+            dlt.mark.make_hints(
-+                table_name="table_one",
-+                write_disposition="replace",
-+                columns={"col_one": {"data_type": "text"}},
-+            ),
-+            create_table_variant=True,
-+        )
-+        yield dlt.mark.with_hints(
-+            dlt.mark.materialize_table_schema(),
-+            dlt.mark.make_hints(
-+                table_name="table_two",
-+                write_disposition="replace",
-+                columns={"col_two": {"data_type": "bigint"}},
-+            ),
-+            create_table_variant=True,
-+        )
-+        if yield_one:
-+            yield dlt.mark.with_table_name({"col_one": "val"}, table_name="table_one")
-+        if yield_two:
-+            yield dlt.mark.with_table_name({"col_two": 5}, table_name="table_two")
-+
-+    pipeline = dlt.pipeline(
-+        pipeline_name="materialize_multi_e2e_" + uniq_id(),
-+        destination="duckdb",
-+        dev_mode=True,
-+    )
-+    load_info = pipeline.run(multi_table())
-+    assert_load_info(load_info)
-+
-+    expected = {
-+        "table_one": 1 if yield_one else 0,
-+        "table_two": 1 if yield_two else 0,
-+    }
-+    assert_table_counts(pipeline, expected)
-+
-+    schema_tables = pipeline.default_schema.tables
-+    assert "col_one" in schema_tables["table_one"]["columns"]
-+    assert "col_two" in schema_tables["table_two"]["columns"]
-+
-+
-+def test_materialize_table_schema_with_nested_hints_duckdb() -> None:
-+    """Pre-declared nested table via `nested_hints` is added to the schema but does NOT
-+    materialize at the destination when only the root yields `materialize_table_schema()`.
-+    The normalizer attaches parent/child linking columns only when real nested data flows
-+    through it, so an empty nested table cannot be meaningfully created up front.
-+    """
-+
-+    @dlt.resource(
-+        name="users",
-+        write_disposition="replace",
-+        columns=[
-+            {"name": "id", "data_type": "bigint", "nullable": False},
-+            {"name": "name", "data_type": "text"},
-+        ],
-+        nested_hints={
-+            "purchases": dlt.mark.make_nested_hints(
-+                columns=[{"name": "price", "data_type": "decimal"}],
-+            ),
-+        },
-+    )
-+    def users_with_nested():
-+        yield dlt.mark.materialize_table_schema()
-+
-+    pipeline = dlt.pipeline(
-+        pipeline_name="materialize_nested_e2e_" + uniq_id(),
-+        destination="duckdb",
-+        dev_mode=True,
-+    )
-+    load_info = pipeline.run(users_with_nested())
-+    assert_load_info(load_info)
-+
-+    # root table is materialized empty in duckdb with declared columns
-+    assert table_exists(pipeline, "users")
-+    assert load_table_counts(pipeline, "users") == {"users": 0}
-+    users_columns = pipeline.default_schema.tables["users"]["columns"]
-+    assert {"id", "name", "_dlt_load_id", "_dlt_id"}.issubset(users_columns.keys())
-+
-+    # nested table is computed into the schema from `nested_hints`
-+    assert "users__purchases" in pipeline.default_schema.tables
-+    nested_columns = pipeline.default_schema.tables["users__purchases"]["columns"]
-+    assert "price" in nested_columns
-+
-+    # but it is NOT created at the destination — no MaterializedEmptyList ever flows
-+    # through `_write_item` for the nested name, and parent linkage columns are produced
-+    # by the normalizer only on real nested rows
-+    assert not table_exists(pipeline, "users__purchases")
-+
-+
- @pytest.mark.parametrize(
-     "local_path_kind",
-     (
-
-
-===== COMMIT 9c825eb4 =====
-
-
-commit 9c825eb47
-Author: Travior
-Date: 2026-05-05
-
-    fix `with_load_id` breaking on non-root sibling branches (#3878)
-
-diff --git a/dlt/dataset/relation.py b/dlt/dataset/relation.py
-index 7982daa57..13988f864 100644
---- a/dlt/dataset/relation.py
-+++ b/dlt/dataset/relation.py
-@@ -29,9 +29,8 @@ from dlt.common.schema.typing import (
-     TTableSchema,
-     TTableSchemaColumns,
-     C_DLT_LOAD_ID,
--    TTableReference,
- )
--from dlt.common.schema import utils as schema_utils, TSchemaTables
-+from dlt.common.schema import utils as schema_utils
- from dlt.common.typing import Self, TSortOrder, TypedDict
- from dlt.common.exceptions import ValueErrorWithKnownValues
- from dlt.dataset import lineage
-@@ -590,16 +589,14 @@ class Relation(WithSqlClient):
-     def with_load_id_col(self) -> dlt.Relation:
-         """Return the relation with the `_dlt_load_id` included.
- 
--        This only works on relations created via ``.table()``.
-+        This only works on relations created via `.table()`.
- 
--        There are 3 cases:
--        - If the relation is a root table, this is a no-op
--        - If the relation has a root key, join relation to root table
--        - If the relation has a parent key, iteratively join the root to the relation
--        - Else raise
-+        If the relation already includes `_dlt_load_id`, it is returned unchanged.
-+        Otherwise, the root table is joined to add the column to the current relation.
- 
--        This should only raise if the `dlt.Schema` was tempered, breaking the
--        dlt-generated root and parent relationships.
-+        Raises:
-+            ValueError: If called on a non-table relation, a root table without
-+                `_dlt_load_id`, or a relation whose root load ID column cannot be located.
-         """
-         if not self._table_name or self._query is not None:
-             raise ValueError(
-@@ -607,16 +604,34 @@ class Relation(WithSqlClient):
-                 " It can't be applied to arbitrary relation."
-             )
- 
--        table_schema = self._dataset.schema.tables[self._table_name]
-+        normalized_load_id = self._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID)
- 
--        if self._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID) in self.columns:
-+        if normalized_load_id in self.columns:
-             return self
--        elif schema_utils.has_column_with_prop(table_schema, "root_key"):
--            return _add_load_id_via_root_key(self)
--        elif schema_utils.has_column_with_prop(table_schema, "parent_key"):
--            return _add_load_id_via_parent_key(self)
--        else:
--            raise ValueError
-+
-+        root_table_name = schema_utils.get_root_table(
-+            self._dataset.schema.tables, self._table_name
-+        )["name"]
-+        if root_table_name == self._table_name:
-+            raise ValueError(f"{root_table_name} is a root table, but load id column is not present.")
-+
-+        join_alias = "_dlt_root"
-+        joined = self.join(root_table_name, alias=join_alias)
-+        joined_expression = joined.sqlglot_expression.copy()
-+        left_projection = joined_expression.selects[: len(self.sqlglot_expression.selects)]
-+        load_id_output_name = f"{join_alias}__{normalized_load_id}"
-+        load_id_expr = next(
-+            (expr for expr in joined_expression.selects if expr.output_name == load_id_output_name),
-+            None,
-+        )
-+        if load_id_expr is None:
-+            raise ValueError(f"Could not locate column {normalized_load_id}")
-+
-+        joined_expression.set("expressions", [*left_projection, load_id_expr.this.copy()])
-+
-+        rel = self.__copy__()
-+        rel._sqlglot_expression = joined_expression
-+        return rel
- 
-     def from_loads(
-         self,
-@@ -726,154 +741,3 @@ def _get_relation_output_columns_schema(
-         allow_partial=allow_partial,
-     )
-     return columns_schema, normalized_query
--
--
--def _add_load_id_via_root_key_query(
--    table_name: str,
--    root_table_name: str,
--    child_root_key: str,
--    root_row_key: str,
--    *,
--    normalized_load_id: str = C_DLT_LOAD_ID,
--) -> sge.Select:
--    child_table = sge.Table(
--        this=sge.to_identifier(table_name, quoted=True),
--        alias=sge.TableAlias(this=sge.to_identifier("child", quoted=False)),
--    )
--    root_table_expr = sge.Table(
--        this=sge.to_identifier(root_table_name, quoted=True),
--        alias=sge.TableAlias(this=sge.to_identifier("root", quoted=False)),
--    )
--
--    # Build column list: child.*, root._dlt_load_id
--    columns = [
--        sge.Column(table=sge.to_identifier("child", quoted=False), this=sge.Star()),
--        sge.Column(
--            table=sge.to_identifier("root", quoted=False),
--            this=sge.to_identifier(normalized_load_id, quoted=True),
--        ),
--    ]
--
--    join_condition = sge.EQ(
--        this=sge.Column(
--            table=sge.to_identifier("child", quoted=False),
--            this=sge.to_identifier(child_root_key, quoted=True),
--        ),
--        expression=sge.Column(
--            table=sge.to_identifier("root", quoted=False),
--            this=sge.to_identifier(root_row_key, quoted=True),
--        ),
--    )
--
--    query = (
--        sge.Select(expressions=columns)
--        .from_(child_table)
--        .join(root_table_expr, on=join_condition, join_type="INNER")
--    )
--    return query
--
--
--def _add_load_id_via_root_key(relation: dlt.Relation) -> dlt.Relation:
--    """Return the input relation with the `_dlt_load_id` column added.
--
--    This is done by joining the `root_table._dlt_id` with the `table._dlt_root_id`
--    """
--    origin_table_name: str = relation._table_name
--    tables_schema = relation._dataset.schema.tables
--    root_table = schema_utils.get_root_table(tables_schema, origin_table_name)
--    root_table_name = root_table["name"]
--
--    ref = schema_utils.create_root_child_reference(tables_schema, origin_table_name)
--    child_root_key = ref["columns"][0]
--    root_row_key = ref["referenced_columns"][0]
--
--    # Construct SELECT with INNER JOIN
--    query = _add_load_id_via_root_key_query(
--        table_name=origin_table_name,
--        root_table_name=root_table_name,
--        child_root_key=child_root_key,
--        root_row_key=root_row_key,
--        normalized_load_id=relation._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID),
--    )
--
--    rel = relation.__copy__()
--    rel._sqlglot_expression = query
--    return rel
--
--
--def _add_load_id_via_parent_key_query(
--    table_name: str, table_schemas: TSchemaTables, normalized_load_id: str = C_DLT_LOAD_ID
--) -> sge.Select:
--    # The reference_chain goes from root to the queried table
--    # Each reference contains: child table -> parent table relationship
--    # We need to build joins from the queried table back to root
--    reference_chain = []
--    root_table_name = schema_utils.get_root_table(table_schemas, table_name)["name"]
--    for reference in schema_utils.get_all_parent_child_references_from_root(
--        table_schemas, root_table_name
--    ):
--        reference_chain.append(reference)
--        if reference["table"] == table_name:
--            break
--
--    queried_table = sge.Table(
--        this=sge.to_identifier(table_name, quoted=True),
--        alias=sge.TableAlias(this=sge.to_identifier("t0", quoted=False)),
--    )
--
--    # build final table query with all columns explicitly + _dlt_load_id from root table
--    columns = [
--        sge.Column(
--            table=sge.to_identifier("t0", quoted=False),
--            this=sge.to_identifier(col_name, quoted=True),
--        )
--        for col_name in table_schemas[table_name]["columns"]
--    ]
--    columns.append(
--        sge.Column(
--            table=sge.to_identifier(f"t{len(reference_chain)}", quoted=False),
--            this=sge.to_identifier(normalized_load_id, quoted=True),
--        )
--    )
--    query = sge.Select(expressions=columns).from_(queried_table)
--
--    # loop through references from table to root to append INNER JOINs
--    for i, ref in enumerate(reversed(reference_chain)):
--        parent_alias = f"t{i + 1}"
--        parent_table = sge.Table(
--            this=sge.to_identifier(ref["referenced_table"], quoted=True),
--            alias=sge.TableAlias(this=sge.to_identifier(parent_alias, quoted=False)),
--        )
--        join_condition = sge.EQ(
--            this=sge.Column(
--                table=sge.to_identifier(f"t{i}", quoted=False),
--                this=sge.to_identifier(ref["columns"][0], quoted=True),
--            ),
--            expression=sge.Column(
--                table=sge.to_identifier(parent_alias, quoted=False),
--                this=sge.to_identifier(ref["referenced_columns"][0], quoted=True),
--            ),
--        )
--        query = query.join(parent_table, on=join_condition, join_type="INNER")
--
--    return query
--
--
--def _add_load_id_via_parent_key(relation: dlt.Relation) -> dlt.Relation:
--    """Return the input relation with the `_dlt_load_id` column added.
--
--    This is done by iteratively joining the `root_table._dlt_id` with `child._dlt_parent_id`
--    until the input relation is reached.
--    """
--    origin_table_name: str = relation._table_name
--    table_schemas = relation._dataset.schema.tables
--
--    query = _add_load_id_via_parent_key_query(
--        table_name=origin_table_name,
--        table_schemas=table_schemas,
--        normalized_load_id=relation._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID),
--    )
--
--    rel = relation.__copy__()
--    rel._sqlglot_expression = query
--    return rel
-diff --git a/tests/dataset/test_relation.py b/tests/dataset/test_relation.py
-index 7a6c3333e..0bafcfb19 100644
---- a/tests/dataset/test_relation.py
-+++ b/tests/dataset/test_relation.py
-@@ -6,6 +6,7 @@ import pytest
- from sqlglot import expressions as sge
- 
- import dlt
-+from dlt.common.utils import uniq_id
- from dlt.common.schema.schema import Schema
- from dlt.common.schema.typing import C_DLT_LOAD_ID, LOADS_TABLE_NAME, VERSION_TABLE_NAME
- from dlt.common.schema.utils import new_table
-@@ -195,6 +196,45 @@ def test_relation_with_load_id(
-     assert list(df.columns) == expected_columns
- 
- 
-+def test_relation_with_load_id_on_parallel_child_branch(tmp_path) -> None:
-+    data = [
-+        {
-+            "id": 1,
-+            "orders": [{"order_id": 101, "total_amount": 100.0}],
-+            "profiles": [{"type": "personal"}],
-+        },
-+        {
-+            "id": 2,
-+            "orders": [{"order_id": 102, "total_amount": 200.0}],
-+            "profiles": [{"type": "work"}],
-+        },
-+    ]
-+
-+    @dlt.resource(name="users")
-+    def users():
-+        yield data
-+
-+    pipeline = dlt.pipeline(
-+        pipeline_name="parallel_child_branch_" + uniq_id(),
-+        pipelines_dir=str(tmp_path / "pipelines_dir"),
-+        destination=dlt.destinations.duckdb(str(tmp_path / "parallel_child_branch.duckdb")),
-+        dev_mode=True,
-+    )
-+    pipeline.run(users(), dataset_name="test")
-+
-+    table = pipeline.dataset().table("users__profiles")
-+    output = table.with_load_id_col()
-+    expected_columns = table.columns + [C_DLT_LOAD_ID]
-+
-+    assert output.columns == expected_columns
-+
-+    df = output.df()
-+
-+    assert len(df) == len(data)
-+    assert list(df.columns) == expected_columns
-+    assert set(df[C_DLT_LOAD_ID]) == {pipeline.last_trace.last_normalize_info.loads_ids[0]}
-+
-+
- @pytest.mark.parametrize("selected_load_id_idx", [[0], [1], [0, 1]])
- @pytest.mark.parametrize("table_name", ["products", "users__orders", "users__orders__items"])
- @pytest.mark.parametrize("add_load_id_column", [True, False])
-
-
-===== COMMIT d44ae685 =====
-
-
-commit d44ae685f
-Author: Travior
-Date: 2026-05-05
-
-    Improve docs around `join` usage (#3902)
-
 diff --git a/docs/website/docs/general-usage/dataset-access/dataset.md b/docs/website/docs/general-usage/dataset-access/dataset.md
 index 81f6af7e5..a45382a5e 100644
 --- a/docs/website/docs/general-usage/dataset-access/dataset.md
@@ -2910,4 +1394,1318 @@ Author: Violetta Mishechkina
 Date: 2026-04-28
 
     Docs/improved dashboard docs (#3484)
+
+diff --git a/docs/website/docs/general-usage/dashboard.md b/docs/website/docs/general-usage/dashboard.md
+index 37b028631..455b529a7 100644
+--- a/docs/website/docs/general-usage/dashboard.md
++++ b/docs/website/docs/general-usage/dashboard.md
+@@ -1,39 +1,39 @@
+ ---
+-title: Inspect your pipeline with the workspace dashboard
++title: "Dashboard: inspect the pipeline"
+ description: Open a comprehensive dashboard with information about your pipeline
+ keywords: [pipeline, schema, data, inspect]
+ ---
+ 
+-# Inspect your pipeline with the workspace dashboard
++# Dashboard: inspect the pipeline
+ 
+-Once you have run a pipeline locally, you can launch a web app that displays detailed information about your pipeline. This app is built with the marimo Python notebook framework. For this to work, you will need to have the `marimo` package installed.
++Once you have run a [pipeline](pipeline.md) locally, you can launch a web app that displays detailed information about your pipeline. This app is built with the [marimo](https://marimo.io/) Python notebook framework. For this to work, you will need to have the `dlt[workspace]` package installed.
+ 
+ :::tip
+-The workspace dashboard app works with all destinations that are supported by our dataset. Vector databases are generally unsupported at this point; however, you can still inspect metadata such as run traces, schemas, and pipeline state.
++The dashboard works with all [destinations](destination.md) that are supported by the [dataset interface](dataset-access/dataset.md). Vector databases are not supported at this moment. However, you can still inspect metadata such as run traces, schemas, and pipeline state.
+ :::
+ 
+-## Features
++## Overview
+ 
+-You can use the dashboard app to:
++The dashboard is a locally hosted application built on [marimo](https://marimo.io/). It comes preconfigured with the key pipeline metadata and operational context you need to review pipeline health and validate data quality.
+ 
+-* Get an overview of the pipeline state, including whether the local state differs from the remote state on the destination
+-* Inspect all schemas of your pipeline, including tables, child tables, and columns, along with all column hints
+-* Inspect the incremental state of each resource
+-* Query the data from the attached destination
+-* Get information about exceptions encountered during the last run of the selected pipeline
+-* Inspect the full run trace, including which configs were found and where; the results of the extract, normalize, and load steps (with timing and row counts); and information about the execution context (dlt version, platform, etc.)
+-* See a history of load packages and associated table counts
++With the dashboard, you can:
+ 
+-You can even eject the code for the dashboard app into your current working directory and start editing it either in your code editor or in marimo edit mode to create your own custom dashboard app!
++1. [Inspect pipeline metadata](#pipeline-info)
++2. [Query data in the destination](#querying-your-dataset)
++3. [Review traces and exceptions](#last-run-trace)
++4. [Check the history of pipeline runs](#pipeline-loads)
++5. [Verify incremental loading behavior](#pipeline-state)
++
++You can also customize the dashboard and create a personalized version tailored to your workflow.
+ 
+ ![Dashboard overview](https://storage.googleapis.com/dlt-blog-images/dashboard-overview.png)
+ 
+ 
+-## Prerequisites
++## Quick start
+ 
+-To install marimo, run the following command:
++You need to install dlt workspace using the following command:
+ ```sh
+-pip install marimo
++pip install "dlt[workspace]"
+ ```
+ 
+ ## Launching the dashboard
+@@ -55,14 +55,14 @@ Use the pipeline name you defined in your Python code with the `pipeline_name` a
+ 
+ ## Credentials
+ 
+-`dlt` will resolve your destination credentials from:
++`dlt` will resolve your destination [credentials](credentials/index.md) from:
+ * `secrets.toml` and `config.toml` in the `.dlt` folder of the current working directory (CWD), which is the directory you started the dashboard from 
+ * `secrets.toml` and `config.toml` in the global `dlt` folder at `~/.dlt`. 
+ * Environment variables
+ 
+ It is best to run the dashboard from the same folder where you ran your pipeline, or to keep your credentials in the global folder.
+ 
+-`dlt` will NOT be able to pick up any credentials that you have configured in your code, since the dlt dashboard app runs independent of any pipeline scripts you have.
++`dlt` will NOT be able to pick up any credentials that you have configured in your code, since the dlt dashboard app runs independently of any pipeline scripts you have.
+ 
+ ## Using the dashboard
+ 
+@@ -82,7 +82,7 @@ This section is a development checklist for validating a new REST API pipeline u
+ 
+ **What to look for**
+ 
+-- If your first successful run shows a suspiciously round count (e.g., **10 / 20 / 100**) for a resource whose page size matches that number, you probably captured only page 1.
++- If your first successful run shows a suspiciously round count (for example, **10 / 20 / 100**) for a resource whose page size matches that number, you probably captured only page 1.
+ - Cross-check the source's expected volume (API docs, admin UI, or a known "ground truth") vs. what landed.
+ 
+ To do so, navigate to the Dataset Browser and load row counts:
+@@ -94,7 +94,7 @@ To do so, navigate to the Dataset Browser and load row counts:
+ - The wrong paginator pattern was chosen vs. the API docs (cursor vs. offset vs. page/size).
+ - The API supports multiple pagination styles per endpoint and you implemented the wrong one.
+ 
+-**What to do:** Re-read the endpoint's official documentation (or ask your agent to do so) and confirm the exact pagination contract (parameter names, response fields, end-of-data signal).
++**What to do:** reread the endpoint's official documentation (or ask your agent to do so) and confirm the exact pagination contract (parameter names, response fields, end-of-data signal).
+ 
+ ### 2) Am I loading data correctly?
+ 
+@@ -106,7 +106,7 @@ Using `replace` write disposition is slower but simpler. If you are using it to
+ 
+ - Run **multiple increments** and check that each run only brings the delta.
+ - Validate in two places:
+-    - **Pipeline State**: the resource's cursor (e.g., `last_extracted_at` / `last_value`) should advance to the end of the previous run. This is how it looks in the raw pipeline state:
++    - **Pipeline State**: the resource's cursor (for example, `last_extracted_at` / `last_value`) should advance to the end of the previous run. This is how it looks in the raw pipeline state:
+ 
+     ![Pipeline state cursor](https://storage.googleapis.com/dlt-blog-images/docs-dashboard-dq2.png)
+ 
+@@ -242,46 +242,93 @@ The dashboard app should mostly be self-explanatory. Go to the section that corr
+ 
+ The following sections are available:
+ 
++### Pipeline info
++
++The overview section serves as a health check for your pipeline. If a run fails, this is where dlt surfaces the exception details and stack traces. Review last executed to ensure the pipeline is running on the expected schedule or has recently completed a load.
++
++![Pipeline info](https://storage.googleapis.com/dlt-blog-images/dashboard-pipeline-overview.png)
++
++* **Last executed:** The timestamp of the last successful run. This is the primary indicator that your pipeline is running on schedule.
++
++* **Credentials:** Displays the connection string or file path currently being used to reach the destination.
++
++* **Schemas:** Lists all schemas associated with the pipeline name.
+ 
+-### Pipeline Info
++#### Remote state
+ 
+-The overview section gives you a general sense of the state of your pipeline and will also display exception information if the last run of your pipeline failed.
++This section queries and displays the state information that has been successfully committed to the **destination**, confirming what is stored outside the local working directory.
+ 
+-![Pipeline Info](https://storage.googleapis.com/dlt-blog-images/dashboard-pipeline-overview.png)
++* The `state_version` shown here should generally match the `state_version` in the Pipeline Overview if the last run was successful.
++* Click `Load and show remote state` to query the destination and retrieve this information.
+ 
+ ### Schema explorer
+ 
+-The schema explorer allows you to dive deep into your pipeline's schemas and see all tables, columns, and hints.
++The schema browser allows you to dive deep into your pipeline's [schemas](schema.md) and see all tables, columns, and type hints. This view is based on the dlt schema, the internal blueprint used to create and update tables in your destination.
++
++When loading data for the first time, use this section to:
++
++1. Click `Show child tables` to ensure that nested data is unnested successfully and at the required level.
++2. Inspect the **type hints** specifically, making sure that timestamps and large numbers are captured in the right way.
++3. Raw Schema as YAML can be exported and stored in your git repository as a reference for the dataset schema.
+ 
+ ![Schema explorer](https://storage.googleapis.com/dlt-blog-images/dashboard-schema-explorer.png)
+ 
+-### Dataset Browser
++### Dataset browser
+ 
+-The dataset browser allows you to query data from your destination and inspect the state of each of your resources, which contain information about their incremental status and other custom state values.
++The dataset browser allows you to query data directly from your destination. You can inspect the state of each of your resources. Click the `Load row counts` button to refresh the record counts for all tables based on the current destination data.
+ 
+ ![Dataset Browser](https://storage.googleapis.com/dlt-blog-images/dashboard-dataset-browser.png)
+ 
+-### Querying your Dataset
++### Querying your dataset
+ 
+-This is what a query on the fruitshop dataset looks like:
++You can use SQL to query your dataset here. Querying the dataset works with all remote and local destinations including Iceberg tables, Delta tables and Filesystem destination. This is what a query on the fruitshop dataset looks like:
+ 
+ ![Querying Data](https://storage.googleapis.com/dlt-blog-images/dashboard-query.png)
+ 
++All query results are cached. The **Query History** shows previous runs that benefit from this cache. Click `Clear cache` to force a fresh execution against the destination. Queries are executed directly on your destination (for example, DuckDB).
++
+ ### Pipeline state
+ 
+-This is a raw view of the full pipeline state.
++This section displays a raw, JSON view of the currently stored pipeline state. This state is critical for tracking progress, especially for [incremental loading](incremental-loading.md) logic.
+ 
+ ![Pipeline state](https://storage.googleapis.com/dlt-blog-images/dashboard-state.png)
+ 
+ ### Last run trace
+ 
+-This is an overview of the results from your last local pipeline run.
++This section provides a detailed overview of the most recent run for the selected pipeline. You can use this for performance tuning and debugging execution issues. It contains the following:
++
++1. **Trace Overview**
++    This is a summary of the entire run. It shows the full duration, start time, and end time.
++
++2. **Execution Context**
++    This section details the environment in which the pipeline was executed, including Python and dlt versions and details like operating system (os), CPU count (cpu), and whether it was a CI run (ci_run).
++
++3. **Steps Overview**
+ 
+-![Last run trace](https://storage.googleapis.com/dlt-blog-images/dashboard-trace.png)
++    This table breaks down the total duration into the three phases of a dlt pipeline run: extract, normalize, and load.
++    - **Bottleneck Check:** Use the duration column to identify performance bottlenecks.
++        - A long extract time suggests a slow source.
++        - Long normalize or load times often point to destination performance or data complexity issues.
++
++    **Deep Dive:** you can click on each step to see more specific details like table names, item counts, file sizes, and timestamps for that specific phase.
++
++4. **Resolved Config Values**
++    This section lists the configuration values that were resolved and used during this pipeline run. Use this to ensure your intended config values were correctly picked up, or to find errors where configuration you set up was not used. The values of the resolved configs are not displayed for security reasons.
++
++5. **Raw Trace**
++    Clicking Show displays the complete trace information (including all sections above) as a raw JSON payload, which can be viewed and downloaded for advanced analysis or error reporting.
++
++    ![Last run trace](https://storage.googleapis.com/dlt-blog-images/dashboard-trace.png)
+ 
+ ### Pipeline loads
++This section displays a history of all load packages found in the _dlt_loads table. It tracks every load package committed to the destination.
++
++By selecting a specific load, you can:
++
++* See exactly how many rows were added to each specific table in that run.
++* View the full schema that resulted from this load.
++* Download the raw schema as a YAML file for historical debugging.
+ 
+-This provides an overview and detailed information about loads found in the _dlt_loads table and their associated rows.
+ 
+ ![Pipeline loads](https://storage.googleapis.com/dlt-blog-images/dashboard-loads.png)
+ 
+@@ -295,13 +342,67 @@ dlt pipeline {pipeline_name} show --edit
+ dlt dashboard --edit
+ ```
+ 
+-This will copy the dashboard code to the local folder and start marimo in edit mode. If a local copy already exists, it will not overwrite it but will start it in edit mode. Once you have the local version, you can also use the regular marimo commands to run or edit this notebook. This way, you can maintain multiple versions of your dashboard or other marimo apps in your project:
++This will copy the dashboard code to the local folder and start marimo in edit mode. If a local copy already exists, it will not overwrite it but will start it in edit mode. 
++
++Below is an example of a custom cell created to verify unique number of rows vs total rows to ensure there are no duplicates in each table after a new run. You can also use the Generate with AI feature to easily add custom cells for your own use cases.  
++
++![Adding custom cell in dashboard](https://storage.googleapis.com/dlt-blog-images/dashboards-custom-cell.png)
++
++Here is the [marimo](https://docs.marimo.io/api/) code used to generate the cell above. `mo` (marimo), `dlt`, and `utils` (from `dlt._workspace.helpers.dashboard`) are already available in the ejected dashboard:
++```py
++@app.cell
++def _(dlt_pipeline: dlt.Pipeline, dlt_selected_schema_name):
++    # Create a list to hold the data for the table
++    data = []
++
++    if dlt_pipeline:
++        _table_names = dlt_pipeline.schemas[dlt_selected_schema_name].tables.keys()
++        for table_name in _table_names:
++            _schema_table = dlt_pipeline.schemas[dlt_selected_schema_name].tables[table_name]
++        
++            # Fetch column names assuming _schema_table is a dictionary
++            column_names = list(_schema_table.get('columns', []))
++        
++            if not column_names:
++                data.append({"Table Name": table_name, "Total Rows": 0, "Unique Rows": "N/A"})
++                continue
++        
++            # Construct the SQL query to count total rows and unique rows across all columns
++            columns_quoted = ', '.join(f'"{col}"' for col in column_names)  # Quote column names
++            count_query = f'SELECT COUNT(*) as total_rows, COUNT(DISTINCT ({columns_quoted})) as unique_rows FROM "{table_name}"'
++
++            # Execute the query and handle any errors
++            _query_result, _error_message, _traceback_string = utils.queries.get_query_result(dlt_pipeline, count_query)
++
++            if _error_message:
++                data.append({"Table Name": table_name, "Total Rows": "Error", "Unique Rows": "Error"})
++            else:
++                row_count_info = _query_result.iloc[0]
++                data.append({
++                    "Table Name": table_name,
++                    "Total Rows": row_count_info['total_rows'],
++                    "Unique Rows": row_count_info['unique_rows']  # Count of distinct rows
++                })
++
++    # Prepare the result in a tabular format to display
++    if data:
++        basic_data_checks_table = utils.ui.dlt_table(data)
++
++    # Display the table with a title
++    mo.vstack([
++        mo.md("### Basic Data Checks"),
++        basic_data_checks_table
++    ]) if data else None
++    return
++```
++
++Once you have the local version, you can also use the regular marimo commands to run or edit this notebook. This way, you can maintain multiple versions of your dashboard or other marimo apps in your project:
+ 
+ ```sh
+ # this will run a local dashboard
+ marimo run dlt_dashboard.py
+ 
+-# this will run the marimo edit mode
++# this will run the marimo in edit mode
+ marimo edit dlt_dashboard.py
+ ```
+ 
+diff --git a/docs/website/docs/general-usage/dataset-access/marimo.md b/docs/website/docs/general-usage/dataset-access/marimo.md
+index c4dc675e4..494385697 100644
+--- a/docs/website/docs/general-usage/dataset-access/marimo.md
++++ b/docs/website/docs/general-usage/dataset-access/marimo.md
+@@ -12,10 +12,10 @@ This page shows how dlt + marimo + [ibis](./ibis-backend.md) provide a rich envi
+ 
+ ## Prerequisites
+ 
+-To install marimo and ibis with the duckdb extras, run the following command: 
++Install the workspace extra, which includes marimo, ibis, and DuckDB:
+ 
+ ```sh
+-pip install marimo "ibis-framework[duckdb]"
++pip install "dlt[workspace]"
+ ```
+ 
+ ## Launch marimo
+@@ -33,6 +33,10 @@ Here's a screenshot of the interface you should see:
+ 
+ ![](./static/marimo_notebook.png)
+ 
++To run an existing local marimo notebook:
++```sh
++marimo run my_notebook.py
++```
+ 
+ ## Features
+ 
+@@ -91,7 +95,7 @@ The **Datasources** displays a limited range of data types.
+ 
+ ### Create a dashboard and data apps
+ 
+-marimo notebooks can be [deployed as web applications with interactive UI and charts](https://docs.marimo.io/guides/apps/) and the code hidden. Try adding [marimo UI input elements](https://docs.marimo.io/guides/interactivity/), rich markdown, and charts (matplotlib, plotly, altair, etc.). Combined, dlt + marimo + ibis make it easy to build a simple dashboard on top of fresh data.
++Marimo notebooks can also be [deployed as web applications with interactive UI and charts](https://docs.marimo.io/guides/apps/) and the code hidden. Try adding [marimo UI input elements](https://docs.marimo.io/guides/interactivity/), rich markdown, and charts (matplotlib, plotly, altair, etc.). Combined, dlt + marimo + ibis make it easy to build a simple dashboard on top of fresh data.
+ 
+ 
+ ## Further reading
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 1daf29b77..862e5bd60 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -254,6 +254,7 @@ const sidebars = {
+       items: [
+         'walkthroughs/create-a-pipeline',
+         'walkthroughs/run-a-pipeline',
++        'general-usage/dashboard',
+         /*{
+           type: "category",
+           label: "Build with LLMs",
+@@ -297,7 +298,6 @@ const sidebars = {
+           ]
+         },
+         'walkthroughs/adjust-a-schema',
+-        'general-usage/dashboard',
+         {
+           type: 'category',
+           label: 'Access loaded data',
+
+
+===== COMMIT ae7379a3 =====
+
+
+commit ae7379a37
+Author: Aman Gupta
+Date: 2026-04-28
+
+    Updated documentation for pg pg_replication (#3900)
+
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/pg_replication.md b/docs/website/docs/dlt-ecosystem/verified-sources/pg_replication.md
+index 0b9899817..2ee3bfe60 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/pg_replication.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/pg_replication.md
+@@ -287,4 +287,12 @@ def query_adapter_callback(query, table, incremental=None, _engine=None) -> sa.T
+     return sa.text(select_clause)
+ ```
+ 
+-This approach enables you to track changes based on the `xmin` value instead of a manually defined column, which is especially useful in cases where mutation tracking is needed but a timestamp or serial column is not available.
+\ No newline at end of file
++This approach enables you to track changes based on the `xmin` value instead of a manually defined column, which is especially useful in cases where mutation tracking is needed but a timestamp or serial column is not available.
++
++## Alternative: CDC with Debezium
++
++If you need CDC from other databases, Debezium can be the CDC source and dlt can load the change events into your destination.
++
++In this setup, Debezium runs in-process (via `pydbzengine`). It reads the database's transaction log (for example WAL or binlog) and produces a JSON record for each change. A dlt pipeline loads those records into your destination.
++
++See the [Debezium + dlt demo](https://github.com/dlt-hub/dlt_demos/tree/main/dlt-debezium-demo) for a complete example.
+\ No newline at end of file
+
+
+===== COMMIT 1f4a059f =====
+
+
+commit 1f4a059f1
+Author: Travior
+Date: 2026-04-28
+
+    feat(snowflake): Extend Snowflake query tags beyond load jobs (#3759)
+
+diff --git a/dlt/common/destination/client.py b/dlt/common/destination/client.py
+index 5123476f1..dda81c071 100644
+--- a/dlt/common/destination/client.py
++++ b/dlt/common/destination/client.py
+@@ -621,7 +621,7 @@ class JobClientBase(ABC):
+     def prepare_load_job_execution(  # noqa: B027, optional override
+         self, job: RunnableLoadJob
+     ) -> None:
+-        """Prepare the connected job client for the execution of a load job (used for query tags in sql clients)"""
++        """Prepare the connected job client for a load job, including load-specific query-tag context when supported."""
+         pass
+ 
+     def should_truncate_table_before_load(self, table_name: str) -> bool:
+diff --git a/dlt/destinations/impl/snowflake/configuration.py b/dlt/destinations/impl/snowflake/configuration.py
+index 604d018a8..71933d53e 100644
+--- a/dlt/destinations/impl/snowflake/configuration.py
++++ b/dlt/destinations/impl/snowflake/configuration.py
+@@ -165,7 +165,7 @@ class SnowflakeClientConfiguration(DestinationClientDwhWithStagingConfiguration)
+     """Optional csv format configuration"""
+ 
+     query_tag: Optional[str] = None
+-    """A tag with placeholders to tag sessions executing jobs"""
++    """A template with placeholders used to tag Snowflake sessions for dlt operations."""
+ 
+     create_indexes: bool = False
+     """Whether UNIQUE or PRIMARY KEY constrains should be created"""
+diff --git a/dlt/destinations/impl/snowflake/factory.py b/dlt/destinations/impl/snowflake/factory.py
+index 4f4d9da81..f6901978f 100644
+--- a/dlt/destinations/impl/snowflake/factory.py
++++ b/dlt/destinations/impl/snowflake/factory.py
+@@ -188,7 +188,7 @@ class snowflake(Destination[SnowflakeClientConfiguration, "SnowflakeClient"]):
+             stage_name (Optional[str], optional): Name of an existing stage to use for loading data. Default uses implicit stage per table
+             keep_staged_files (bool, optional): Whether to delete or keep staged files after loading
+             csv_format (Optional[CsvFormatConfiguration]): Optional csv format configuration
+-            query_tag (Optional[str]): A tag with placeholders to tag sessions executing jobs
++            query_tag (Optional[str]): A template with placeholders used to tag Snowflake sessions for dlt operations
+             create_indexes (bool, optional): Whether UNIQUE or PRIMARY KEY constrains should be created
+             use_decfloat (bool, optional): Whether to use DECFLOAT type for unbound decimals. DECFLOAT stores
+                 exact decimal values with up to 36 significant digits and a dynamic exponent.
+diff --git a/dlt/destinations/impl/snowflake/sql_client.py b/dlt/destinations/impl/snowflake/sql_client.py
+index eab5c7838..ed458d7d4 100644
+--- a/dlt/destinations/impl/snowflake/sql_client.py
++++ b/dlt/destinations/impl/snowflake/sql_client.py
+@@ -12,7 +12,7 @@ from dlt.destinations.exceptions import (
+ from dlt.destinations.sql_client import (
+     DBApiCursorImpl,
+     SqlClientBase,
+-    TJobQueryTags,
++    TQueryTags,
+     raise_database_error,
+     raise_open_connection_error,
+ )
+@@ -141,7 +141,7 @@ class SnowflakeSqlClient(SqlClientBase[snowflake_lib.SnowflakeConnection], DBTra
+         self._conn.rollback()
+         self._conn.autocommit(True)
+ 
+-    def set_query_tags(self, tags: TJobQueryTags) -> None:
++    def set_query_tags(self, tags: Optional[TQueryTags]) -> None:
+         super().set_query_tags(tags)
+         if self.query_tag:
+             self._tag_session()
+diff --git a/dlt/destinations/job_client_impl.py b/dlt/destinations/job_client_impl.py
+index 473024916..1ca36bd1b 100644
+--- a/dlt/destinations/job_client_impl.py
++++ b/dlt/destinations/job_client_impl.py
+@@ -44,7 +44,7 @@ from dlt.common.schema.utils import (
+ )
+ from dlt.common.utils import read_dialect_and_sql
+ from dlt.common.storages import FileStorage
+-from dlt.common.storages.load_package import LoadJobInfo, ParsedLoadJobFileName
++from dlt.common.storages.load_package import LoadJobInfo, ParsedLoadJobFileName, load_package_state, CurrentLoadPackageStateNotAvailable
+ from dlt.common.schema import TColumnSchema, Schema, TTableSchemaColumns, TSchemaTables
+ from dlt.common.schema import TColumnHint
+ from dlt.common.destination.client import (
+@@ -290,6 +290,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
+                 self.sql_client.drop_dataset()
+ 
+     def initialize_storage(self, truncate_tables: Iterable[str] = None) -> None:
++        self._set_query_tags(operation="prepare_storage")
+         if not self.is_storage_initialized():
+             self.sql_client.create_dataset()
+         elif truncate_tables:
+@@ -303,6 +304,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
+         only_tables: Iterable[str] = None,
+         expected_update: TSchemaTables = None,
+     ) -> Optional[TSchemaTables]:
++        self._set_query_tags(operation="update_stored_schema")
+         super().update_stored_schema(only_tables, expected_update)
+         applied_update: TSchemaTables = {}
+         schema_info = self.get_stored_schema_by_hash(self.schema.stored_version_hash)
+@@ -329,6 +331,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
+             tables: Names of tables to drop.
+             delete_schema: If True, also delete all versions of the current schema from storage
+         """
++        self._set_query_tags(operation="drop_tables")
+         with self.maybe_ddl_transaction():
+             self.sql_client.drop_tables(*tables)
+             if delete_schema:
+@@ -411,6 +414,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
+         return None
+ 
+     def complete_load(self, load_id: str) -> None:
++        self._set_query_tags(operation="complete_load", load_id=load_id)
+         name = self.sql_client.make_qualified_table_name(self.schema.loads_table_name)
+         now_ts = pendulum.now()
+         self.sql_client.execute_sql(
+@@ -529,6 +533,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
+         pass
+ 
+     def get_stored_schema(self, schema_name: str = None) -> StorageSchemaInfo:
++        self._set_query_tags(operation="get_stored_schema")
+         name = self.sql_client.make_qualified_table_name(self.schema.version_table_name)
+         c_schema_name, c_inserted_at = self._norm_and_escape_columns("schema_name", "inserted_at")
+         if not schema_name:
+@@ -545,6 +550,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
+             return self._row_to_schema_info(query, schema_name)
+ 
+     def get_stored_state(self, pipeline_name: str) -> StateInfo:
++        self._set_query_tags(operation="get_stored_state")
+         state_table = self.sql_client.make_qualified_table_name(self.schema.state_table_name)
+         loads_table = self.sql_client.make_qualified_table_name(self.schema.loads_table_name)
+         c_load_id, c_dlt_load_id, c_pipeline_name, c_status = self._norm_and_escape_columns(
+@@ -907,24 +913,39 @@ WHERE """
+         return loaded_tables
+ 
+     def prepare_load_job_execution(self, job: RunnableLoadJob) -> None:
+-        self._set_query_tags_for_job(load_id=job._load_id, table=job._load_table)
++        self._set_query_tags(operation="load", load_id=job._load_id, table=job._load_table)
+ 
+-    def _set_query_tags_for_job(self, load_id: str, table: PreparedTableSchema) -> None:
+-        """Sets query tags in sql_client for a job in package `load_id`, starting for a particular `table`"""
++    def _set_query_tags(
++        self, operation: str, *, load_id: str = "", table: Optional[PreparedTableSchema] = None
++    ) -> None:
+         from dlt.common.pipeline import current_pipeline
+ 
++        if not load_id:
++            try:
++                load_id = load_package_state()["load_id"]
++            except CurrentLoadPackageStateNotAvailable:
++                load_id = ""
++
+         pipeline = current_pipeline()
+         pipeline_name = pipeline.pipeline_name if pipeline else ""
++        if table:
++            table_name = table["name"] if table else ""
++            resource = (
++                get_inherited_table_hint(
++                    self.schema.tables, table_name, "resource", allow_none=True
++                )
++                or ""
++            )
++        else:
++            table_name = ""
++            resource = ""
++
+         self.sql_client.set_query_tags(
+             {
++                "operation": operation,
+                 "source": self.schema.name,
+-                "resource": (
+-                    get_inherited_table_hint(
+-                        self.schema.tables, table["name"], "resource", allow_none=True
+-                    )
+-                    or ""
+-                ),
+-                "table": table["name"],
++                "resource": resource,
++                "table": table_name,
+                 "load_id": load_id,
+                 "pipeline_name": pipeline_name,
+             }
+diff --git a/dlt/destinations/sql_client.py b/dlt/destinations/sql_client.py
+index c5198724b..9bc7b849f 100644
+--- a/dlt/destinations/sql_client.py
++++ b/dlt/destinations/sql_client.py
+@@ -19,6 +19,7 @@ from typing import (
+     Generator,
+     cast,
+ )
++from typing_extensions import NotRequired
+ 
+ from dlt.common.destination.exceptions import DestinationUndefinedEntity
+ from dlt.common.typing import TFun, TypedDict, Self
+@@ -42,14 +43,19 @@ from dlt.destinations.typing import (
+ from dlt.common.destination.dataset import DBApiCursor
+ 
+ 
+-class TJobQueryTags(TypedDict):
+-    """Applied to sql client when a job using it starts. Using to tag queries"""
++class TQueryTags(TypedDict):
++    """Query-tag values applied to a SQL client session for a dlt operation."""
+ 
+     source: str
+     resource: str
+     table: str
+     load_id: str
+     pipeline_name: str
++    operation: NotRequired[str]
++
++
++# compatibility export, query tags are no longer job scoped
++TJobQueryTags = TQueryTags
+ 
+ 
+ class SqlClientBase(ABC, Generic[TNativeConn]):
+@@ -75,7 +81,7 @@ class SqlClientBase(ABC, Generic[TNativeConn]):
+         self.staging_dataset_name = staging_dataset_name
+         self.database_name = database_name
+         self.capabilities = capabilities
+-        self._query_tags: TJobQueryTags = None
++        self._query_tags: Optional[TQueryTags] = None
+ 
+     @abstractmethod
+     def open_connection(self) -> TNativeConn:
+@@ -291,8 +297,8 @@ SELECT 1
+         """Checks if staging dataset is currently active"""
+         return self.dataset_name == self.staging_dataset_name
+ 
+-    def set_query_tags(self, tags: TJobQueryTags) -> None:
+-        """Sets current schema (source), resource, load_id and table name when a job starts"""
++    def set_query_tags(self, tags: Optional[TQueryTags]) -> None:
++        """Sets the query-tag payload for the current SQL client session."""
+         self._query_tags = tags
+ 
+     def _ensure_native_conn(self) -> None:
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+index dadc7e5e1..435bb80c5 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+@@ -507,25 +507,27 @@ You'll need these settings when [importing external files](../../general-usage/r
+ 
+ ### Query tagging
+ 
+-`dlt` [tags sessions](https://docs.snowflake.com/en/sql-reference/parameters#query-tag) that execute loading jobs with the following job properties:
++`dlt` [tags sessions](https://docs.snowflake.com/en/sql-reference/parameters#query-tag) used for Snowflake operations with the following properties:
++* **operation** - high-level dlt operation currently using the session
+ * **source** - name of the source (identical with the name of the `dlt` schema)
+ * **resource** - name of the resource (if known, else empty string)
+-* **table** - name of the table loaded by the job
+-* **load_id** - load id of the job
++* **table** - name of the table involved in the operation (if known, else empty string)
++* **load_id** - load id associated with the operation (if known, else empty string)
+ * **pipeline_name** - name of the active pipeline (or empty string if not found)
+ 
+ You can define a query tag by defining a query tag placeholder in Snowflake credentials:
+ 
+ ```toml
+ [destination.snowflake]
+-query_tag='{{"source":"{source}", "resource":"{resource}", "table": "{table}", "load_id":"{load_id}", "pipeline_name":"{pipeline_name}"}}'
++query_tag='{{"operation":"{operation}", "source":"{source}", "resource":"{resource}", "table": "{table}", "load_id":"{load_id}", "pipeline_name":"{pipeline_name}"}}'
+ ```
+ which contains Python named formatters corresponding to tag names i.e., `{source}` will assume the name of the dlt source.
+ 
+ :::note
+ 1. Query tagging is off by default. The `query_tag` configuration field is `None` by default and must be set to enable tagging.
+-2. Only sessions associated with a job are tagged. Sessions that migrate schemas remain untagged.
+-3. Jobs processing table chains (i.e., SQL merge jobs) will use the top-level table as **table**.
++2. `dlt` sets query tags for major Snowflake operations such as storage preparation, schema and state reads, schema updates, load jobs, and load completion.
++3. Fields such as **resource**, **table**, and **load_id** may be empty for operations where that context does not apply.
++4. Jobs processing table chains (i.e., SQL merge jobs) will use the top-level table as **table**.
+ :::
+ 
+ ### dbt support
+diff --git a/tests/load/pipeline/test_snowflake_pipeline.py b/tests/load/pipeline/test_snowflake_pipeline.py
+index e4708266f..58b082e51 100644
+--- a/tests/load/pipeline/test_snowflake_pipeline.py
++++ b/tests/load/pipeline/test_snowflake_pipeline.py
+@@ -91,11 +91,94 @@ def test_snowflake_query_tagging(
+     from dlt.destinations.impl.snowflake.sql_client import SnowflakeSqlClient
+ 
+     os.environ["DESTINATION__SNOWFLAKE__QUERY_TAG"] = QUERY_TAG
+-    tag_query_spy = mocker.spy(SnowflakeSqlClient, "_tag_session")
+-    pipeline = destination_config.setup_pipeline("test_snowflake_case_sensitive_identifiers")
++    set_query_tags_spy = mocker.spy(SnowflakeSqlClient, "set_query_tags")
++    pipeline = destination_config.setup_pipeline("test_snowflake_query_tagging")
+     info = pipeline.run([1, 2, 3], table_name="digits", **destination_config.run_kwargs)
+     assert_load_info(info)
+-    assert tag_query_spy.call_count == 2
++
++    expected_load_id = info.loads_ids[0]
++    expected_pipeline_name = pipeline.pipeline_name
++    expected_source = pipeline.default_schema.name
++    expected_resource = pipeline.default_schema.get_table("digits")["resource"]
++
++    tag_calls = [call.args[1] for call in set_query_tags_spy.call_args_list]
++    load_tags = [
++        call for call in tag_calls if call["operation"] == "load" and call["table"] == "digits"
++    ]
++    assert load_tags
++    assert load_tags[0] == {
++        "operation": "load",
++        "source": expected_source,
++        "resource": expected_resource,
++        "table": "digits",
++        "load_id": expected_load_id,
++        "pipeline_name": expected_pipeline_name,
++    }
++
++    complete_load_tags = [call for call in tag_calls if call["operation"] == "complete_load"]
++    assert complete_load_tags
++    assert complete_load_tags[0] == {
++        "operation": "complete_load",
++        "source": expected_source,
++        "resource": "",
++        "table": "",
++        "load_id": expected_load_id,
++        "pipeline_name": expected_pipeline_name,
++    }
++
++    operations = {call["operation"] for call in tag_calls}
++    assert operations == {
++        "complete_load",
++        "get_stored_state",
++        "load",
++        "prepare_storage",
++        "update_stored_schema",
++    }
++
++    set_query_tags_spy.reset_mock()
++    pipeline._schema_storage.clear_storage()
++    pipeline.sync_destination()
++
++    sync_tag_calls = [call.args[1] for call in set_query_tags_spy.call_args_list]
++    operations = {call["operation"] for call in sync_tag_calls}
++    assert operations == {"get_stored_state", "get_stored_schema"}
++    for operation in ("get_stored_state", "get_stored_schema"):
++        operation_tags = [call for call in sync_tag_calls if call["operation"] == operation]
++        assert operation_tags
++        assert operation_tags[0] == {
++            "operation": operation,
++            "source": expected_source,
++            "resource": "",
++            "table": "",
++            "load_id": "",
++            "pipeline_name": expected_pipeline_name,
++        }
++
++    set_query_tags_spy.reset_mock()
++    info = pipeline.run(
++        [1, 2, 3], table_name="digits", refresh="drop_sources", **destination_config.run_kwargs
++    )
++    assert_load_info(info)
++    refresh_load_id = info.loads_ids[0]
++    refresh_tag_calls = [call.args[1] for call in set_query_tags_spy.call_args_list]
++    operations = {call["operation"] for call in refresh_tag_calls}
++    assert operations == {
++        "complete_load",
++        "drop_tables",
++        "load",
++        "prepare_storage",
++        "update_stored_schema",
++    }
++    drop_table_tags = [call for call in refresh_tag_calls if call["operation"] == "drop_tables"]
++    assert drop_table_tags
++    assert drop_table_tags[0] == {
++        "operation": "drop_tables",
++        "source": expected_source,
++        "resource": "",
++        "table": "",
++        "load_id": refresh_load_id,
++        "pipeline_name": expected_pipeline_name,
++    }
+ 
+ 
+ # do not remove - it allows us to filter tests by destination
+diff --git a/tests/load/snowflake/test_snowflake_client.py b/tests/load/snowflake/test_snowflake_client.py
+index fadb2fb61..87119829e 100644
+--- a/tests/load/snowflake/test_snowflake_client.py
++++ b/tests/load/snowflake/test_snowflake_client.py
+@@ -12,7 +12,7 @@ from dlt.common.schema.schema import Schema
+ from dlt.destinations.impl.snowflake.snowflake import SUPPORTED_HINTS, SnowflakeClient
+ from dlt.destinations.job_client_impl import SqlJobClientBase
+ 
+-from dlt.destinations.sql_client import TJobQueryTags
++from dlt.destinations.sql_client import TQueryTags
+ 
+ from tests.cases import TABLE_UPDATE
+ from tests.load.utils import yield_client_with_storage, cm_yield_client, empty_schema
+@@ -22,10 +22,11 @@ from tests.load.utils import yield_client_with_storage, cm_yield_client, empty_s
+ pytestmark = pytest.mark.essential
+ 
+ QUERY_TAG = (
+-    '{{"source":"{source}", "resource":"{resource}", "table": "{table}", "load_id":"{load_id}",'
+-    ' "pipeline_name":"{pipeline_name}"}}'
++    '{{"operation":"{operation}", "source":"{source}", "resource":"{resource}", "table": "{table}",'
++    ' "load_id":"{load_id}", "pipeline_name":"{pipeline_name}"}}'
+ )
+-QUERY_TAGS_DICT: TJobQueryTags = {
++QUERY_TAGS_DICT: TQueryTags = {
++    "operation": "load",
+     "source": "test_source",
+     "resource": "test_resource",
+     "table": "test_table",
+@@ -81,25 +82,23 @@ def test_query_tag(client: SnowflakeClient, mocker: MockerFixture):
+     client.sql_client.set_query_tags(None)
+     execute_sql_spy.assert_called_once_with(sql="ALTER SESSION UNSET QUERY_TAG")
+     execute_sql_spy.reset_mock()
+-    client.sql_client.set_query_tags({})  # type: ignore[typeddict-item]
+-    execute_sql_spy.assert_called_once_with(sql="ALTER SESSION UNSET QUERY_TAG")
+-    execute_sql_spy.reset_mock()
+     # set query tags
+     client.sql_client.set_query_tags(QUERY_TAGS_DICT)
+     execute_sql_spy.assert_called_once_with(
+         sql=(
+-            'ALTER SESSION SET QUERY_TAG = \'{"source":"test_source", "resource":"test_resource",'
+-            ' "table": "test_table", "load_id":"1109291083091", "pipeline_name":"test_pipeline"}\''
++            'ALTER SESSION SET QUERY_TAG = \'{"operation":"load", "source":"test_source",'
++            ' "resource":"test_resource", "table": "test_table", "load_id":"1109291083091",'
++            ' "pipeline_name":"test_pipeline"}\''
+         )
+     )
+     # remove query tag from config
+     client.sql_client.query_tag = None
+     execute_sql_spy.reset_mock()
+     client.sql_client.set_query_tags(QUERY_TAGS_DICT)
+-    execute_sql_spy.assert_not_called
++    execute_sql_spy.assert_not_called()
+     execute_sql_spy.reset_mock()
+     client.sql_client.set_query_tags(None)
+-    execute_sql_spy.assert_not_called
++    execute_sql_spy.assert_not_called()
+ 
+ 
+ def test_session_autocommit() -> None:
+
+
+===== COMMIT 5b290680 =====
+
+
+commit 5b290680a
+Author: Anton Burnashev
+Date: 2026-04-27
+
+    fix(pyarrow): preserve string encoding for UUID columns under pyarrow 24+ (#3894)
+
+diff --git a/dlt/common/libs/pyarrow.py b/dlt/common/libs/pyarrow.py
+index d49f4e9a0..8ac579403 100644
+--- a/dlt/common/libs/pyarrow.py
++++ b/dlt/common/libs/pyarrow.py
+@@ -49,6 +49,7 @@ import ctypes
+ TAnyArrowItem = Union[pyarrow.Table, pyarrow.RecordBatch]
+ 
+ ARROW_DECIMAL_MAX_PRECISION = 76
++ARROW_UUID_EXTENSION_NAME = "arrow.uuid"
+ 
+ 
+ class UnsupportedArrowTypeException(DltException):
+@@ -1014,6 +1015,13 @@ def convert_numpy_to_arrow(
+     try:
+         # type=None lets pyarrow infer the type from the data
+         inferred_array = pa.array(column_data, type=inferred_arrow_type)
++        # pyarrow 24+ infers Python UUIDs natively (apache/arrow#48727)
++        # Preserve dlt's pre-24 string encoding when no data_type is set
++        if dlt_data_type is None and _is_arrow_uuid_extension(inferred_array.type):
++            inferred_array = pa.array(
++                [None if v is None else custom_encode(v) for v in column_data],
++                type=pa.string(),
++            )
+     # detailed error handling should happen in fallback cases
+     except (pa.ArrowInvalid, pyarrow.ArrowTypeError):
+         logger.warning(
+@@ -1475,3 +1483,10 @@ def cast_date64_columns_to_timestamp(tbl: pyarrow.Table, tz: Optional[str] = Non
+ 
+     new_schema = pyarrow.schema(fields, metadata=tbl.schema.metadata)
+     return pyarrow.Table.from_arrays(arrays, schema=new_schema)
++
++
++def _is_arrow_uuid_extension(arrow_type: Any) -> bool:
++    return (
++        isinstance(arrow_type, pyarrow.BaseExtensionType)
++        and arrow_type.extension_name == ARROW_UUID_EXTENSION_NAME
++    )
+
+
+===== COMMIT 679e0e26 =====
+
+
+commit 679e0e269
+Author: Katharina Lenz
+Date: 2026-04-27
+
+    docs: add the link to the Snowflake marketplace listing (#3888)
+
+diff --git a/docs/website/docs/walkthroughs/run-in-snowflake/database-connector-app.md b/docs/website/docs/walkthroughs/run-in-snowflake/database-connector-app.md
+index f20d47c0f..bed95bc8a 100644
+--- a/docs/website/docs/walkthroughs/run-in-snowflake/database-connector-app.md
++++ b/docs/website/docs/walkthroughs/run-in-snowflake/database-connector-app.md
+@@ -37,7 +37,7 @@ Before creating your first pipeline, make sure you have:
+ 4. (Optional) An S3 bucket if you plan to stage data externally
+ 
+ ## Install and open the app
+-Use the link we provided to you or find and install the app via the [Snowflake Marketplace](https://app.snowflake.com/marketplace).
++Find and install the app via the [dlt Connector App listing on the Snowflake Marketplace](https://app.snowflake.com/marketplace/listing/GZ1MMZ1IPICU/dlthub-dlt-connector-app).
+ 
+ 
+ ## Set up connection
+
+
+===== COMMIT 488bd394 =====
+
+
+commit 488bd3946
+Author: Joaquin Coromina
+Date: 2026-04-24
+
+    fix: clearer error from `dlt.attach()` when pipeline cannot be restored (#3890)
+
+diff --git a/dlt/pipeline/__init__.py b/dlt/pipeline/__init__.py
+index 5884ecb90..03145d0ca 100644
+--- a/dlt/pipeline/__init__.py
++++ b/dlt/pipeline/__init__.py
+@@ -244,15 +244,24 @@ def attach(
+         )
+ 
+         # we cannot restore the pipeline if the destination is not provided
+-        # or found in the env, wipe the working folder and re-raise
++        # or found in the config, wipe the working folder and re-raise
+         if not p.destination:
+             p._wipe_working_folder()
+             raise CannotRestorePipelineException(
+                 pipeline_name,
+                 p.working_dir,
+-                f"the pipeline was not found in {p.working_dir} found and no destination was"
+-                " provided to restore from.",
+-            )
++                f"No local pipeline state found in '{p.working_dir}'.\n\n"
++                "dlt can restore pipeline state from a destination, but requires a destination."
++                " Pass it as an argument to dlt.attach() or configure it via dlt's"
++                " config system.\n\n"
++                f'`dlt.attach(pipeline_name="{pipeline_name}", destination="<your-destination>",'
++                ' dataset_name="<your-dataset>")`\n\n'
++                f"Note: if no dataset_name is provided, dlt looks in '{pipeline_name}_dataset'"
++                " by default.\n\n"
++                "If you only need to read or query data without pipeline state, use"
++                " `dlt.dataset()` instead:\n\n"
++                '`dlt.dataset(destination="<your-destination>", dataset_name="<your-dataset>")`',
++            ) from None
+         p.sync_destination()
+ 
+         # if remote state was not found,
+@@ -262,9 +271,16 @@ def attach(
+             raise CannotRestorePipelineException(
+                 pipeline_name,
+                 p.working_dir,
+-                f"the pipeline was not found in {p.working_dir} found and provided destination and"
+-                " dataset do not contain state for this pipeline.",
+-            )
++                f"Checked local state in '{p.working_dir}' and remote state in dataset"
++                f" '{p.dataset_name}' on destination '{p.destination.destination_name}'."
++                " No state found for this pipeline in either location.\n\n"
++                "If the pipeline was run with a different dataset name, pass the correct"
++                " dataset_name= to dlt.attach() or configure it via dlt's config system.\n\n"
++                "If you only need to read or query data without pipeline state, use"
++                " `dlt.dataset()` instead:\n\n"
++                f'`dlt.dataset(destination="{p.destination.destination_name}",'
++                f' dataset_name="{p.dataset_name}")`',
++            ) from None
+         return p
+ 
+ 
+diff --git a/tests/load/pipeline/test_pipelines.py b/tests/load/pipeline/test_pipelines.py
+index 39a4a551c..00dffe96c 100644
+--- a/tests/load/pipeline/test_pipelines.py
++++ b/tests/load/pipeline/test_pipelines.py
+@@ -314,7 +314,8 @@ def test_attach_edgecases(destination_config: DestinationTestConfiguration) -> N
+     p._wipe_working_folder()
+     with pytest.raises(CannotRestorePipelineException) as exc_info:
+         dlt.attach("test_attach_edgecases")
+-    assert "no destination was provided to restore from" in str(exc_info.value)
++    assert "No local pipeline state found" in str(exc_info.value)
++    assert "dlt can restore pipeline state from a destination" in str(exc_info.value)
+     # no working folder left behing
+     assert not p._pipeline_storage.has_folder("")
+ 
+@@ -323,9 +324,7 @@ def test_attach_edgecases(destination_config: DestinationTestConfiguration) -> N
+     with pytest.raises(CannotRestorePipelineException) as exc_info:
+         dlt.attach("test_attach_edgecases", destination="duckdb", dataset_name="incorrect")
+     # no working folder left behing
+-    assert "provided destination and dataset do not contain state for this pipeline" in str(
+-        exc_info.value
+-    )
++    assert "No state found for this pipeline in either location" in str(exc_info.value)
+     assert not p._pipeline_storage.has_folder("")
+ 
+     # re-attaching with destination and dataset name will work
+diff --git a/tests/workspace/cli/common/test_cli_invoke.py b/tests/workspace/cli/common/test_cli_invoke.py
+index 8bce0f541..33c6edc1a 100644
+--- a/tests/workspace/cli/common/test_cli_invoke.py
++++ b/tests/workspace/cli/common/test_cli_invoke.py
+@@ -60,7 +60,7 @@ def test_invoke_pipeline(script_runner: ScriptRunner) -> None:
+     # info on non existing pipeline
+     result = script_runner.run(["dlt", "pipeline", "debug_pipeline", "info"])
+     assert result.returncode == -2
+-    assert "the pipeline was not found in" in result.stderr
++    assert "No local pipeline state found" in result.stderr
+ 
+     shutil.copytree(
+         os.path.join(WORKSPACE_CLI_CASES_DIR, "deploy_pipeline"), ".", dirs_exist_ok=True
+diff --git a/tests/workspace/cli/test_pipeline_command.py b/tests/workspace/cli/test_pipeline_command.py
+index 39c21448b..e02269857 100644
+--- a/tests/workspace/cli/test_pipeline_command.py
++++ b/tests/workspace/cli/test_pipeline_command.py
+@@ -154,7 +154,7 @@ def test_pipeline_command_operations(repo_dir: str) -> None:
+             )
+         _out = buf.getvalue()
+ 
+-        assert "could not be restored: the pipeline was not found in " in _out
++        assert "No local pipeline state found" in _out
+         assert "Selected resource(s): ['players_profiles']" in _out
+ 
+         # Command was executed
+
+
+===== COMMIT fdb39bd8 =====
+
+
+commit fdb39bd81
+Author: Shreyas
+Date: 2026-04-22
+
+    docs(consistency): fix `pipeline.md` (#3885)
+
+diff --git a/docs/website/docs/general-usage/pipeline.md b/docs/website/docs/general-usage/pipeline.md
+index d2933ac46..c991e8333 100644
+--- a/docs/website/docs/general-usage/pipeline.md
++++ b/docs/website/docs/general-usage/pipeline.md
+@@ -13,7 +13,7 @@ Once the pipeline runs, all resources are evaluated and the data is loaded at th
+ 
+ Example:
+ 
+-This pipeline will load a list of objects into a DuckDB table named "three":
++This pipeline loads a list of objects into a DuckDB table named "three":
+ 
+ ```py
+ import dlt
+@@ -27,32 +27,30 @@ print(info)
+ 
+ You instantiate a pipeline by calling the `dlt.pipeline` function with the following arguments:
+ 
+-- `pipeline_name`: a name of the pipeline that will be used to identify it in trace and monitoring
+-  events and to restore its state and data schemas on subsequent runs. If not provided, `dlt` will
+-  create a pipeline name from the file name of the currently executing Python module.
++- `pipeline_name`: a name of the pipeline that is used to identify it in trace and monitoring
++  events and to restore its state and data schemas on subsequent runs. If not provided, `dlt` creates a pipeline name from the filename of the currently executing Python module.
+ - `destination`: a name of the [destination](../dlt-ecosystem/destinations) to which dlt
+-  will load the data. It may also be provided to the `run` method of the `pipeline` and can be declared in [various ways](destination.md). 
+-- `dataset_name`: a name of the dataset to which the data will be loaded. A dataset is a logical
+-  group of tables, i.e., `schema` in relational databases or a folder grouping many files. It may also be
++  loads the data. It may also be provided to the `run` method of the `pipeline` and can be declared in [various ways](destination.md). 
++- `dataset_name`: a name of the dataset to which the data is loaded. A dataset is a logical
++  group of tables, that is, `schema` in relational databases or a folder grouping many files. It may also be
+   provided later to the `run` or `load` methods of the pipeline. If not provided, then
+   it defaults to the `{pipeline_name}_dataset` on destinations that require datasets (most of the warehouses).
+-  It will stay empty on destinations that do not separate tables into datasets (or database schemas) i.e.
+-  on vector databases or ClickHouse.
++  It stays empty on destinations that don't separate tables into datasets (or database schemas), that is, on vector databases or ClickHouse.
+ 
+ To load the data, you call the `run` method and pass your data in the `data` argument.
+ 
+ Arguments:
+ 
+ - `data` (the first argument) may be a dlt source, resource, generator function, or any Iterator or
+-  Iterable (i.e., a list or the result of the `map` function).
++  Iterable (that is, a list or the result of the `map` function).
+ - `write_disposition` controls how to write data to a table. Defaults to "append".
+-  - `append` will always add new data at the end of the table.
+-  - `replace` will replace existing data with new data.
+-  - `merge` will deduplicate and merge data based on `primary_key` and `merge_key` hints.
+-- `table_name`: specified in cases when the table name cannot be inferred, i.e., from the resources or name
++  - `append` always adds new data at the end of the table.
++  - `replace` replaces existing data with new data.
++  - `merge` deduplicates and merges data based on `primary_key` and `merge_key` hints.
++- `table_name`: specified in cases when the table name can't be inferred, that is, from the resources or name
+   of the generator function.
+ 
+-Example: This pipeline will load the data the generator `generate_rows(10)` produces:
++Example: This pipeline loads the data the generator `generate_rows(10)` produces:
+ 
+ ```py
+ import dlt
+@@ -79,7 +77,7 @@ You can inspect stored artifacts using the command
+ [programmatically](../walkthroughs/run-a-pipeline.md#4-inspect-a-load-process).
+ 
+ > 💡 A pipeline with a given name looks for its working directory in the location above - so if you have two
+-> pipeline scripts that create a pipeline with the same name, they will see the same working folder
++> pipeline scripts that create a pipeline with the same name, they see the same working folder
+ > and share all the possible state. You may override the default location using the `pipelines_dir`
+ > argument when creating the pipeline.
+ 
+@@ -102,29 +100,29 @@ into all CLI commands to get info/trace for that pipeline.
+ 
+ ## Do experiments with dev mode
+ 
+-If you [create a new pipeline script](../walkthroughs/create-a-pipeline.md), you will be
+-experimenting a lot. If you want each time the pipeline resets its state and loads data to a
++If you [create a new pipeline script](../walkthroughs/create-a-pipeline.md), you experiment
++a lot. If you want each time the pipeline resets its state and loads data to a
+ new dataset, set the `dev_mode` argument of the `dlt.pipeline` method to True. Each time the
+ pipeline is created, `dlt` adds a datetime-based suffix to the dataset name.
+ 
+ ## Drop destination schema / dataset to start over
+-If you drop the destination schema / dataset to which your pipeline loads data, the pipeline will fully reset its
+-state and working directory and will execute its first run. 
+-If your pipeline does not share the dataset with any other pipeline and you do not keep any additional data in it - this
++If you drop the destination schema / dataset to which your pipeline loads data, the pipeline fully resets its
++state and working directory and executes its first run. 
++If your pipeline doesn't share the dataset with any other pipeline and you don't keep any additional data in it - this
+ operation is also safe to be executed in production to trigger full refresh without a need to writing additional code.
+ 
+ ## Refresh pipeline data and state
+ 
+ You can reset parts or all of your sources by using the `refresh` argument to `dlt.pipeline` or the pipeline's `run` or `extract` method.
+-That means when you run the pipeline, the sources/resources being processed will have their state reset and their tables either dropped or truncated,
++That means when you run the pipeline, the sources/resources being processed have their state reset and their tables either dropped or truncated,
+ depending on which refresh mode is used.
+ 
+ :::tip
+-`dlt` will modify your destination only if extract and normalize steps of refresh run succeeded. In any other case all modifications, including 
++`dlt` modifies your destination only if extract and normalize steps of refresh run succeeded. In any other case all modifications, including 
+ schema and state, are discarded.
+ :::
+ 
+-The `refresh` option works with all relational or SQL destinations and cloud storages and files (`filesystem`). It does not work with vector databases (we are working on that) and with custom destinations.
++The `refresh` option works with all relational or SQL destinations and cloud storages and files (`filesystem`). It doesn't work with vector databases (support is in progress) and with custom destinations.
+ 
+ The `refresh` argument should have one of the following string values to decide the refresh mode:
+ 
+@@ -145,24 +143,24 @@ import dlt
+ pipeline = dlt.pipeline("airtable_demo", destination="duckdb")
+ pipeline.run(airtable_emojis(), refresh="drop_sources")
+ ```
+-In the example above, we instruct `dlt` to wipe the pipeline state belonging to the `airtable_emojis` source and drop all the database tables in `duckdb` to
++The preceding example instructs `dlt` to wipe the pipeline state belonging to the `airtable_emojis` source and drop all the database tables in `duckdb` to
+ which data was loaded. The `airtable_emojis` source had two resources named "📆 Schedule" and "💰 Budget" loading to tables "_schedule" and "_budget". Here's
+ what `dlt` does step by step:
+ 1. Collects a list of tables to drop by looking for all the tables in the schema that are created in the destination.
+ 2. Removes existing pipeline state associated with the `airtable_emojis` source.
+ 3. Resets the schema associated with the `airtable_emojis` source.
+-4. Executes `extract` and `normalize` steps. These will create fresh pipeline state and a schema.
++4. Executes `extract` and `normalize` steps. These create fresh pipeline state and a schema.
+ 5. Before it executes the `load` step, the collected tables are dropped from staging and regular dataset.
+ 6. Schema `airtable_emojis` (associated with the source) is removed from the `_dlt_version` table.
+-7. Executes the `load` step as usual so tables are re-created and fresh schema and pipeline state are stored.
++7. Executes the `load` step as usual so tables are recreated and fresh schema and pipeline state are stored.
+ 
+ ### Selectively drop tables and resource state with `drop_resources`
+ 
+-Limits the refresh to the resources being processed in `pipeline.run` or `pipeline.extract` (e.g., by using `source.with_resources(...)`).
++Limits the refresh to the resources being processed in `pipeline.run` or `pipeline.extract` (for example, by using `source.with_resources(...)`).
+ Tables belonging to those resources are dropped, and their resource state is wiped (that includes incremental state).
+ The tables are deleted both from the pipeline's schema and from the destination database.
+ 
+-Source level state keys are not deleted in this mode (i.e., `dlt.current.source_state()[<'my_key>'] = '<my_value>'`)
++Source level state keys aren't deleted in this mode (that is, `dlt.current.source_state()[<'my_key>'] = '<my_value>'`)
+ 
+ :::warning
+ This erases schema history for all affected sources, and only the latest schema version is stored.
+@@ -174,13 +172,12 @@ import dlt
+ pipeline = dlt.pipeline("airtable_demo", destination="duckdb")
+ pipeline.run(airtable_emojis().with_resources("📆 Schedule"), refresh="drop_resources")
+ ```
+-Above, we request that the state associated with the "📆 Schedule" resource is reset, and the table generated by it ("_schedule") is dropped. Other resources,
+-tables, and state are not affected. Please check `drop_sources` for a step-by-step description of what `dlt` does internally.
++Above, the state associated with the "📆 Schedule" resource is reset, and the table generated by it ("_schedule") is dropped. Other resources,
++tables, and state aren't affected. Please check `drop_sources` for a step-by-step description of what `dlt` does internally.
+ 
+ ### Selectively truncate tables and reset resource state with `drop_data`
+ 
+-Same as `drop_resources`, but instead of dropping tables from the schema, only the data is deleted from them (i.e., by `TRUNCATE <table_name>` in SQL destinations). Resource state for selected resources is also wiped. In the case of [incremental resources](incremental/cursor.md), this will
+-reset the cursor state and fully reload the data from the `initial_value`.
++Same as `drop_resources`, but instead of dropping tables from the schema, only the data is deleted from them (that is, by `TRUNCATE <table_name>` in SQL destinations). Resource state for selected resources is also wiped. In the case of [incremental resources](incremental/cursor.md), this resets the cursor state and fully reloads the data from the `initial_value`.
+ 
+ The schema remains unmodified in this case.
+ ```py
+@@ -190,7 +187,7 @@ pipeline = dlt.pipeline("airtable_demo", destination="duckdb")
+ pipeline.run(airtable_emojis().with_resources("📆 Schedule"), refresh="drop_data")
+ ```
+ Above, the incremental state of the "📆 Schedule" is reset before the `extract` step so data is fully reacquired. Just before the `load` step starts,
+-the "_schedule" is truncated, and new (full) table data will be inserted/copied.
++the "_schedule" is truncated, and new (full) table data is inserted/copied.
+ 
+ ## Monitor the loading progress
+ 
+@@ -201,14 +198,14 @@ the pipeline run is progressing. dlt supports 4 progress monitors out of the box
+   bars that also allows for logging.
+ - [tqdm](https://github.com/tqdm/tqdm) - the most popular Python progress bar lib, proven to work in
+   Notebooks.
+-- [alive_progress](https://github.com/rsalmei/alive-progress) - with the most fancy animations.
+-- **log** - dumps the progress information to log, console, or text stream. **the most useful on
++- [alive_progress](https://github.com/rsalmei/alive-progress) - with the fanciest animations.
++- **log** - dumps the progress information to log, console, or text stream. **The most useful on
+   production** optionally adds memory and CPU usage stats.
+ 
+ > 💡 You must install the required progress bar library yourself.
+ 
+ You pass the progress monitor in the `progress` argument of the pipeline. You can use a name from the
+-list above as in the following example:
++preceding list as in the following example:
+ 
+ ```py
+ # create a pipeline loading chess data that dumps
+
+
+===== COMMIT 3583acd7 =====
+
+
+commit 3583acd77
+Author: Violetta Mishechkina
+Date: 2026-04-21
+
+    docs: dlthub high level structure (#3727)
+
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index e2deb541e..1daf29b77 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -497,69 +497,59 @@ const sidebars = {
+       items: [
+         'hub/intro',
+         'hub/getting-started/installation',
+-        { type: 'ref', id: 'dlt-ecosystem/llm-tooling/llm-native-workflow' },
+         'hub/getting-started/runtime-tutorial',
+       ]
++    },
++        {
++      type: 'category',
++      label: 'AI Workbench',
++      items: [
++        'dlt-ecosystem/llm-tooling/llm-native-workflow',
++      ]
+     },
+     {
+       type: 'category',
+-      label: 'Workspace',
+-       link: {
+-         type: 'doc',
+-         id: 'hub/workspace/overview',
+-       },
++      label: 'Ingestion',
+       items: [
+-         'hub/workspace/overview',
+-        {
+-          type: 'category',
+-          label: 'Create pipeline',
+-          items: [
+-          'hub/workspace/init',
+-          'hub/ecosystem/ms-sql',
+-          ]
+-        },
+-        {
+-          type: 'category',
+-          label: 'Ensure data quality',
+-          items: [
+-            { type: 'ref', id: 'general-usage/dashboard' },
+-            'hub/features/mcp-server',
+-            'hub/features/quality/data-quality',
+-          ]
+-        },
+-        {
+-          type: 'category',
+-          label: 'Create reports and transformations',
+-          items: [
+-            { type: 'ref', id: 'general-usage/dataset-access/marimo' },
+-            { type: 'ref', id: 'general-usage/dataset-access/dataset' },
+-            'hub/features/transformations/index',
+-            'hub/features/transformations/dbt-transformations',
+-          ]
+-        },
+-        {
+-          type: 'category',
+-          label: 'Deploy workspace',
+-          items: [
+-            'hub/core-concepts/profiles-dlthub',
+-          ]
+-        },
++        'hub/workspace/init',
++        { type: 'ref', id: 'general-usage/dashboard' },
++        'hub/ecosystem/ms-sql',
++        'hub/ecosystem/delta',
++        'hub/ecosystem/iceberg',
++        'hub/ecosystem/snowflake_plus',
++      ]
++    },
++    {
++      type: 'category',
++      label: 'Transformations',
++      items: [
++        'hub/features/transformations/index',
++        'hub/features/transformations/dbt-transformations',
+       ]
+     },
+     {
+       type: 'category',
+-      label: 'Runtime',
++      label: 'Pipeline operations',
+       items: [
+         'hub/runtime/overview',
++        'hub/core-concepts/profiles-dlthub',
+       ]
+     },
+     {
+       type: 'category',
+-      label: 'Storage',
++      label: 'Data quality & governance',
+       items: [
+-        'hub/ecosystem/delta',
+-        'hub/ecosystem/iceberg',
+-        'hub/ecosystem/snowflake_plus',
++        'hub/features/quality/data-quality',
++        'hub/features/quality/advanced',
++        'hub/features/quality/tests',
++      ]
++    },
++    {
++      type: 'category',
++      label: 'Data discovery & serving',
++      items: [
++        'hub/core-concepts/datasets',
++        { type: 'ref', id: 'general-usage/dataset-access/marimo' },
+       ]
+     },
+     'hub/command-line-interface',
+
+
+===== COMMIT a12e1378 =====
+
+
+commit a12e1378f
+Author: Thierry Jean
+Date: 2026-04-14
+
+    docs: cookbook section (#3860)
 

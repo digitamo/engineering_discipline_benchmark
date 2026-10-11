@@ -1,481 +1,3 @@
-# First transformation: mask email addresses
-def mask_email(record):
-    record["email"] = hashlib.sha256(record["email"].encode()).hexdigest()
-    return record
-
-# Second transformation: enrich with full name
-def enrich_full_name(record):
-    record["full_name"] = f"{record['first_name']} {record['last_name']}"
-    return record
-
-# Attach transformations explicitly controlling their order
-transformed_users = (
-    user_data()
-    .add_map(enrich_full_name)  # By default, this would be at the end
-    .add_map(mask_email, insert_at=1)  # Explicitly run masking first after extraction
-)
-
-# Verify the transformed data
-for user in transformed_users:
-    print(user)
-```
-
-Expected output
-
-```py
-{'id': 1, 'first_name': 'John', 'last_name': 'Doe', 'email': '<hashed_value>', 'full_name': 'John Doe'}
-{'id': 2, 'first_name': 'Jane', 'last_name': 'Smith', 'email': '<hashed_value>', 'full_name': 'Jane Smith'}
-```
-
-By explicitly using `insert_at=1`, the email masking step (`mask_email`) is executed right after data extraction and before enrichment. This ensures sensitive data is handled securely at the earliest stage possible.
-
-## Incremental behavior with `insert_at`
-
-Use `insert_at` to control when your transformation runs in the pipeline and ensure it executes before incremental filtering. See [incremental loading documentation](../../general-usage/incremental/cursor#transform-records-before-incremental-processing) for more details.
-
-## Filling missing data for incremental loading
-
-Use `add_map` to ensure records are compatible with incremental loading.
-
-If the incremental cursor field (e.g., `updated_at`) is missing, you can provide a fallback like `created_at`. This ensures all records have a valid cursor value and can be processed correctly by the incremental step.
-
-[In this example](../../general-usage/incremental/cursor#transform-records-before-incremental-processing), the third record is made incremental-ready by assigning it a fallback `updated_at` value. This ensures it isn't skipped by the incremental loader.
-
-## `add_map` vs `add_yield_map`
-
-The difference between `add_map` and `add_yield_map` matters when a transformation returns multiple records from a single input.
-
-### **`add_map`**
-
-- Use `add_map` when you want to transform each item into exactly one item.
-- Think of it like modifying or enriching a row.
-- You use a regular function that returns one modified item.
-- Great for adding fields or changing structure.
-
-```py
-import dlt
-
-@dlt.resource
-def resource():
-    yield [{"name": "Alice"}, {"name": "Bob"}]
-
-def add_greeting(item):
-    item["greeting"] = f"Hello, {item['name']}!"
-    return item
-
-resource.add_map(add_greeting)
-
-for row in resource():
-    print(row)
-```
-
-Output
-
-```sh
-{'name': 'Alice', 'greeting': 'Hello, Alice!'}
-{'name': 'Bob', 'greeting': 'Hello, Bob!'}
-```
-
-### **`add_yield_map`**
-
-- Use `add_yield_map` when you want to turn one item into multiple items, or possibly no items.
-- Your function is a generator that uses yield.
-- Great for pivoting nested data, flattening lists, or filtering rows.
-
-Example
-
-```py
-import dlt
-
-@dlt.resource
-def resource():
-    yield [
-        {"name": "Alice", "hobbies": ["reading", "chess"]},
-        {"name": "Bob", "hobbies": ["cycling"]}
-    ]
-
-def expand_hobbies(item):
-    for hobby in item["hobbies"]:
-        yield {"name": item["name"], "hobby": hobby}
-
-resource.add_yield_map(expand_hobbies)
-
-for row in resource():
-    print(row)
-```
-
-Output
-
-```sh
-{'name': 'Alice', 'hobby': 'reading'}
-{'name': 'Alice', 'hobby': 'chess'}
-{'name': 'Bob', 'hobby': 'cycling'}
-```
-
-## Best practices for using `add_map`
-
-- **Keep transformations simple:**
-    Functions passed to `add_map` run on each record and should be stateless and lightweight. Use them for tasks like string cleanup or basic calculations. For heavier operations (like per-record API calls), batch the work or move it outside `add_map`, for example into a transformer resource or a post-load step.
-
-- **Use the right tool for the job:**
-    Use `add_map` for one-to-one record transformations. If you need to drop records, use `add_filter` instead of returning `None` in a map function. To split or expand one record into many, use `add_yield_map`.
-
-- **Chain transformations when needed:**
-    Since `add_map` and `add_filter` return the resource object, you can chain multiple transformations in sequence. Just be mindful of the order, they execute in the order they are added unless you explicitly control it using `insert_at`.
-
-- **Ordering with `insert_at`:**
-    When using multiple transforms and built-in steps (like incremental loading), control their order with `insert_at`.
-
-    Pipeline steps are zero-indexed in the order they are added. Index `0` is usually the initial data extraction. To run a custom map first, set `insert_at=1`. For multiple custom steps, assign different indices (e.g., one at `1`, another at `2`). If you're unsure about the order, iterate over the resource or check the `dlt` logs to confirm how steps are applied.
-
-- **Advanced consideration - data formats**
-    Most `dlt` sources yield dictionaries or lists of them. However, some backends, such as PyArrow, may return data as NumPy arrays or Arrow tables. In these cases, your `add_map` or `add_yield_map` function must handle the input format, possibly by converting it to a list of dicts or a pandas DataFrame. This is an advanced scenario, but important if your transformation fails due to unexpected input types.
-
-
-===== FILE: docs/website/docs/dlt-ecosystem/transformations/dbt/dbt.md =====
-
----
-title: Transform data with dbt
-description: Transforming the data loaded by a dlt pipeline with dbt
-keywords: [transform, dbt, runner, dbt cloud]
----
-# Transform data with dbt
-
-[dbt](https://github.com/dbt-labs/dbt-core) is a framework that allows for the simple structuring of your transformations into DAGs. The benefits of using dbt include:
-
-- End-to-end cross-db compatibility for dlt→dbt pipelines.
-- Ease of use by SQL analysts, with a low learning curve.
-- High flexibility and configurability in usage, supports templating, can run backfills, etc.
-- Support for testing and accelerated troubleshooting.
-
-## dbt runner in dlt
-
-You can run dbt with `dlt` by using the dbt runner.
-
-The dbt runner:
-
-- Can create a virtual environment for dbt on the fly;
-- Can run a dbt package from online sources (e.g., GitHub) or from local files;
-- Passes configuration and credentials to dbt, so you do not need to handle them separately from `dlt`, enabling dbt to configure on the fly.
-
-## How to use the dbt runner
-
-For an example of how to use the dbt runner, see the [jaffle shop example](https://github.com/dlt-hub/dlt/blob/devel/docs/examples/archive/dbt_run_jaffle.py).
-Included below is another example where we run a `dlt` pipeline and then a dbt package via `dlt`:
-
-:::info
-Docstrings are available to read in your IDE.
-:::
-
-```py
-# Load all Pipedrive endpoints to the pipedrive_raw dataset
-pipeline = dlt.pipeline(
-    pipeline_name='pipedrive',
-    destination='bigquery',
-    dataset_name='pipedrive_raw'
-)
-
-load_info = pipeline.run(pipedrive_source())
-print(load_info)
-
-# Create a transformation on a new dataset called 'pipedrive_dbt'
-# We created a local dbt package
-# and added pipedrive_raw to its sources.yml
-# The destination for the transformation is passed in the pipeline
-pipeline = dlt.pipeline(
-    pipeline_name='pipedrive',
-    destination='bigquery',
-    dataset_name='pipedrive_dbt'
-)
-
-# Make or restore venv for dbt, using the latest dbt version
-# NOTE: If you have dbt installed in your current environment, just skip this line
-#       and the `venv` argument to dlt.dbt.package()
-venv = dlt.dbt.get_venv(pipeline)
-
-# Get runner, optionally pass the venv
-dbt = dlt.dbt.package(
-    pipeline,
-    "pipedrive/dbt_pipedrive/pipedrive",
-    venv=venv
-)
-
-# Run the models and collect any info
-# If running fails, the error will be raised with a full stack trace
-models = dbt.run_all()
-
-# On success, print the outcome
-for m in models:
-    print(
-        f"Model {m.model_name} materialized" +
-        f" in {m.time}" +
-        f" with status {m.status}" +
-        f" and message {m.message}"
-    )
-```
-
-## How to run dbt runner without pipeline
-
-You can use the dbt runner without a dlt pipeline. The example below will clone and run **jaffle shop** using a dbt profile that you supply.
-It assumes that dbt is installed in the current Python environment and the `profile.yml` is in the same folder as the Python script.
-
-```py notype
-import os
-
-from dlt.helpers.dbt import create_runner
-
-runner = create_runner(
-    None,  # use current virtual env to run dlt
-    None,  # we do not need dataset name and we do not pass any credentials in environment to dlt
-    working_dir=".",  # the package below will be cloned to current dir
-    package_location="https://github.com/dbt-labs/jaffle_shop.git",
-    package_profiles_dir=os.path.abspath(
-        "."
-    ),  # profiles.yml must be placed in this dir
-    package_profile_name="duckdb_dlt_dbt_test",  # name of the profile
-)
-
-models = runner.run_all()
-```
-
-Here's an example **duckdb** profile:
-
-```yaml
-duckdb_dlt_dbt_test:
-  target: analytics
-  outputs:
-    analytics:
-      type: duckdb
-      # Schema: "{{ var('destination_dataset_name', var('source_dataset_name')) }}"
-      path: "duckdb_dlt_dbt_test.duckdb"
-      extensions:
-        - httpfs
-        - parquet
-```
-
-You can run the example with dbt debug log: `RUNTIME__LOG_LEVEL=DEBUG python dbt_standalone.py`
-
-## dbt Cloud
-
-### API client
-
-The dbt Cloud Client is a Python class designed to interact with the dbt Cloud API (version 2).
-It provides methods to perform various operations on dbt Cloud, such as triggering job runs and retrieving job run statuses.
-
-```py
-from dlt.helpers.dbt_cloud import DBTCloudClientV2
-
-# Initialize the client
-client = DBTCloudClientV2(api_token="YOUR_API_TOKEN", account_id="YOUR_ACCOUNT_ID")
-
-# Example: Trigger a job run
-job_run_id = client.trigger_job_run(job_id=1234, data={"cause": "Triggered via API"})
-print(f"Job run triggered successfully. Run ID: {job_run_id}")
-
-# Example: Get run status
-run_status = client.get_run_status(run_id=job_run_id)
-print(f"Job run status: {run_status['status_humanized']}")
-```
-
-### Helper functions
-
-These Python functions provide an interface to interact with the dbt Cloud API.
-They simplify the process of triggering and monitoring job runs in dbt Cloud.
-
-#### `run_dbt_cloud_job()`
-
-This function triggers a job run in dbt Cloud using the specified configuration.
-It supports various customization options and allows for monitoring the job's status.
-
-```py
-from dlt.helpers.dbt_cloud import run_dbt_cloud_job
-
-# Trigger a job run with default configuration
-status = run_dbt_cloud_job()
-
-# Trigger a job run with additional data
-additional_data = {
-    "git_sha": "abcd1234",
-    "schema_override": "custom_schema",
-    # ... other parameters
-}
-status = run_dbt_cloud_job(job_id=1234, data=additional_data, wait_for_outcome=True)
-```
-
-#### `get_dbt_cloud_run_status()`
-
-If you have already started a job run and have a run ID, then you can use the `get_dbt_cloud_run_status` function.
-
-This function retrieves the full information about a specific dbt Cloud job run.
-It also supports options for waiting until the run is complete.
-
-```py
-from dlt.helpers.dbt_cloud import get_dbt_cloud_run_status
-
-# Retrieve status for a specific run
-status = get_dbt_cloud_run_status(run_id=1234, wait_for_outcome=True)
-```
-
-### Set credentials
-
-#### secrets.toml
-
-When using dlt locally, we recommend using the `.dlt/secrets.toml` method to set credentials.
-
-If you used the `dlt init` command, then the `.dlt` folder has already been created.
-Otherwise, create a `.dlt` folder in your working directory and a `secrets.toml` file inside it.
-
-This is where you store sensitive information securely, like access tokens. Keep this file safe.
-
-Use the following format for dbt Cloud API authentication:
-
-```toml
-[dbt_cloud]
-api_token = "set me up!" # required for authentication
-account_id = "set me up!" # required for both helper functions
-job_id = "set me up!" # optional only for the run_dbt_cloud_job function (you can pass this explicitly as an argument to the function)
-run_id = "set me up!" # optional for the get_dbt_cloud_run_status function (you can pass this explicitly as an argument to the function)
-```
-
-#### Environment variables
-
-dlt supports reading credentials from the environment.
-
-If dlt tries to read this from environment variables, it will use a different naming convention.
-
-For environment variables, all names are capitalized and sections are separated with a double underscore "__".
-
-For example, for the above secrets, we would need to put into the environment:
-
-```sh
-DBT_CLOUD__API_TOKEN
-DBT_CLOUD__ACCOUNT_ID
-DBT_CLOUD__JOB_ID
-```
-
-For more information, read the [Credentials](../../../general-usage/credentials/index.md) documentation.
-
-
-===== FILE: docs/website/docs/dlt-ecosystem/transformations/dlthub.md =====
-
----
-title: Transformations with dltHub
-description: Python-defined transformations that run eagerly on your compute or lazily on the warehouse with dlt.hub.transformation
-keywords: [transformations, dlthub, ibis, sql, incremental, lazy, eager]
----
-# Transformations with dltHub
-
-[dltHub](../../hub/transformations/index.md) extends `dlt` with `@dlt.hub.transformation` — transformations defined in Python that run **eagerly** on your compute (e.g. local DuckDB, Pandas, Polars, or Arrow) or **lazily** on the warehouse — the same code, executed where it makes the most sense. A transformation is a resource that takes a `dlt.Dataset` and yields an Ibis expression, a `Relation`, or a plain SQL query; `dlt` compiles it to the destination SQL dialect and materializes the result into a table. When source and target share the same physical location, no data is transferred to the machine running the pipeline.
-
-The example below incrementally appends new rows from the `orders` table to `recent_orders` — each run picks up after the last processed `created_at`:
-
-```py
-import dlt
-import pendulum
-
-@dlt.hub.transformation(
-    write_disposition="merge",
-    primary_key="id",
-    incremental=dlt.sources.incremental(
-        "created_at",
-        initial_value=pendulum.datetime(2000, 1, 1, tz="UTC"),
-    ),
-)
-def recent_orders(dataset: dlt.Dataset) -> Any:
-    yield dataset.table("orders")
-
-pipeline.run(recent_orders(pipeline.dataset()))
-```
-
-A few highlights:
-
-- **Eager or lazy execution** — run transformations eagerly on your own compute (pull data as DataFrames/Arrow tables and process them in Python) or lazily as SQL pushed down to the warehouse, where nothing leaves the destination. You pick per transformation; the decorator stays the same.
-- **Incremental out of the box** — stateful cursors (as above) or scheduler-set `[start, end)` windows for idempotent retries and partition backfills on the [dltHub platform](../../hub/pipeline-operations/triggers.md#scheduler-driven-intervals).
-- **Schema evolution and lineage** — result tables evolve automatically and column-level hints are forwarded from source to transformed tables.
-- **Write in what you know** — Ibis expressions, raw SQL, or [Pandas/Polars DataFrames and Arrow tables](../../hub/transformations/index.md#using-pandas-or-polars-dataframes-and-arrow-tables).
-- **Full resource semantics** — `write_disposition`, `primary_key`, merge loading, and grouping transformations into sources all work as with regular resources.
-
-See the [dltHub transformations docs](../../hub/transformations/index.md) for the full guide. Use of dltHub is subject to a commercial [dltHub License](../../hub/license.md).
-
-
-===== FILE: docs/website/docs/dlt-ecosystem/transformations/encryption.md =====
-
----
-title: Data security and encryption
-description: Transforming the data for encryption in transit, client-side encryption, and encryption at rest.
-keywords: [transform, data security, encryption]
----
-# Data security and encryption
-
-The modern data landscape requires robust security measures to protect sensitive information throughout its lifecycle. Organizations must implement comprehensive encryption strategies to safeguard data against increasingly sophisticated threats
-
-## Encryption throughout the lifecycle
-
-Data is vulnerable both while moving between systems (in transit) and when stored at rest. dlt addresses both needs:
-
-- **Data in transit**:
-
-    During transfers, data can be intercepted or tampered with. Employing secure protocols (e.g., SSL/TLS) or encrypted connection strings prevents unauthorized access and ensures confidentiality.
-
-- **Client-side encryption**:
-
-    Encrypting data on the client side before transmission adds an extra layer of security. By using libraries like AWS Encryption SDK, Google Tink, or Azure Key Vault, organizations can ensure that data is encrypted before it leaves the source, maintaining control over encryption keys and safeguarding sensitive information throughout its journey.
-
-- **Data at rest / Server-side encryption**:
-
-    Even if a storage system is compromised, encryption at rest prevents unauthorized access. dlt can leverage disk encryption (e.g., BitLocker, FileVault, dm-crypt/LUKS) or the destination’s server-side encryption to keep data safe on the local machine and in the cloud.
-
-This layered approach ensures comprehensive protection, covering every stage of data’s journey from extraction to storage.
-
-## Client-side encryption
-
-### Why client-side encryption?
-
-Client-side encryption empowers you to encrypt data before it ever leaves your environment. This ensures that:
-
-- **You maintain full control of encryption keys** (often managed through KMS solutions like AWS KMS, Google Cloud KMS, or Azure Key Vault).
-- **Data remains protected** during transit and while stored at the destination, even if the destination’s security is compromised.
-
-### Common client-side encryption tools
-
-- AWS Encryption SDK
-- Tink by Google
-- Azure Key Vault & Blob Client-Side Encryption
-- OpenSSL
-
-## Encryption in transit and server-side encryption
-
-### Encrypted partitions for dlt’s working directory
-
-Because dlt extracts and processes data locally before loading it to a destination, the files on your local disk contain sensitive data. Encrypting the partition where these files reside ensures your data is protected at rest on the local system. You can use the following systems to safeguard your data at rest.
-
-- **Windows**: BitLocker
-- **macOS**: FileVault
-- **Linux**: dm-crypt/LUKS, Loop-AES
-
-### Encryption in transit
-
-Encrypting data while it travels to the destination is equally important. With dlt, you can configure your connection string to enforce encryption. Depending on the target database or storage, options might include:
-
-- Adding `Encrypt=yes` and `encrypt=true` to your **connection string** to ensure TLS/SSL is used for all communication.
-- Using secure protocols such as HTTPS for cloud-based destinations.
-
-### Server-side encryption
-
-Server-side encryption (SSE) complements your client-side encryption measures by encrypting data once it arrives at the destination. Popular services include:
-
-- **Amazon S3 SSE**: Offers SSE-S3 (using AWS-managed keys) or SSE-KMS (using customer-managed keys in AWS KMS).
-- **BigQuery**: Provides options for customer-managed encryption keys (CMEK), allowing for more granular key management.
-
-## Managing encryption in dlt
-
-### Steps for setting up encrypted pipelines
-
-1. **Provision encryption keys**: Use your preferred cloud KMS or on-prem solution to create and manage cryptographic keys.
-2. **Integrate with Client-Side Libraries**: Install and configure the relevant encryption SDK (e.g., AWS Encryption SDK) in your environment.
-3. **Incorporate encryption logic**: Modify your dlt resource functions to encrypt sensitive fields before they are loaded to the destination.
-4. **Test and validate**: Ensure that your data is encrypted and can be decrypted correctly using your keys.
-
 Below is an example showing how to encrypt specific fields in a nested data structure using AWS KMS before loading data with dlt. The same principle can be applied to other encryption libraries, such as Google Tink or Azure Key Vault.
 
 :::note
@@ -3116,4 +2638,456 @@ print(load_info)
 ### 5. Incremental loading
 
 Here are a few simple ways to load your data incrementally:
+
+1. [Load files based on modification date](#load-files-based-on-modification-date). Only load files that have been updated since the last time `dlt` processed them. `dlt` checks the files' metadata (like the modification date) and skips those that haven't changed.
+2. [Load new records based on a specific column](#load-new-records-based-on-a-specific-column). You can load only the new or updated records by looking at a specific column, like `updated_at`. Unlike the first method, this approach would read all files every time and then filter the records which were updated.
+3. [Combine loading only updated files and records](#combine-loading-only-updated-files-and-records). Finally, you can combine both methods. It could be useful if new records could be added to existing files, so you not only want to filter the modified files, but also the modified records.
+
+#### Load files based on modification date
+
+For example, to load only new CSV files with [incremental loading](../../../general-usage/incremental-loading.md), you can use the `apply_hints` method.
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_csv
+
+# This configuration will only consider new CSV files
+new_files = filesystem(
+  bucket_url="s3://bucket_name",
+  file_glob="directory/*.csv",
+  incremental=dlt.sources.incremental("modification_date")
+)
+
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run((new_files | read_csv()).with_name("csv_files"))
+print(load_info)
+```
+
+#### Load new records based on a specific column
+
+In this example, we load only new records based on the field called `updated_at`. This method may be useful if you are not able to
+filter files by modification date because, for example, all files are modified each time a new record appears.
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_csv
+
+# We consider all CSV files
+all_files = filesystem(bucket_url="s3://bucket_name", file_glob="directory/*.csv")
+
+# But filter out only updated records
+filesystem_pipe = (all_files | read_csv())
+filesystem_pipe.apply_hints(incremental=dlt.sources.incremental("updated_at"))
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run(filesystem_pipe)
+print(load_info)
+```
+
+#### Combine loading only updated files and records
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_csv
+
+# This configuration will only consider modified CSV files
+new_files = filesystem(
+  bucket_url="s3://bucket_name",
+  file_glob="directory/*.csv", incremental=dlt.sources.incremental("modification_date")
+)
+
+# And in each modified file, we filter out only updated records
+filesystem_pipe = (new_files | read_csv())
+filesystem_pipe.apply_hints(incremental=dlt.sources.incremental("updated_at"))
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run(filesystem_pipe)
+print(load_info)
+```
+
+### 6. Split large incremental loads
+
+If you have many files to process or they are large you may choose to split pipeline runs into smaller chunks (where single file is the smallest). There are
+two methods to do that:
+
+* **Partitioning** where you split source data in several ranges, load them (possibly in parallel) and then continue to load data incrementally.
+* **Split** where you load data sequentially in small chunks
+
+#### Partitioning works as follows
+
+1. Obtain a list of files i.e. by just listing your resource `files = list(filesystem(...))`
+2. Order your list by `modification_date` or `file_url` and split it into equal chunks.
+3. For each chunk find min and max of the range
+4. Use [incremental with `end_value`](../../../general-usage/incremental/cursor.md#using-end_value-for-backfill) for backfill.
+5. You can load each partition in a loop or in parallel (i.e. in separate process).
+6. Continue regular incremental loading with `initial_value` set to the value at the end of the range (`modification_date` or `file_url`)
+and make the start range open to avoid duplicates.
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem
+
+# list and sort all csv files for deterministic partitioning
+fs_ = filesystem(bucket_url=bucket_url, file_glob="**/*.csv")
+# we assume that file paths are named so files added later in time come at the end when sorted
+file_urls = sorted([file["file_url"] for file in fs_])
+
+pipeline = dlt.pipeline("test_partitioned_load", destination="duckdb")
+
+# load each partition using initial_value and end_value
+for i in range(len(file_urls) // 4 + 1):
+    files_range = file_urls[i * 4 : (i + 1) * 4]
+    if not files_range:
+        continue
+
+    # close both ranges to load inclusively
+    file_name_incremental = dlt.sources.incremental(
+        "file_url",
+        initial_value=files_range[0],
+        end_value=files_range[-1],
+        range_start="closed",
+        range_end="closed",
+    )
+    file_resource = filesystem(
+        bucket_url=bucket_url, file_glob="**/*.csv", incremental=file_name_incremental
+    ).with_name("files")
+    load_info = pipeline.run(file_resource)
+    print(load_info)
+
+# note we could also extract max modification_time and use it for subsequent incremental loading
+file_name_incremental = dlt.sources.incremental(
+    "file_url",
+    initial_value=file_urls[-1],
+    range_start="open",
+)
+file_resource = filesystem(
+    bucket_url=bucket_url, file_glob="**/*.csv", incremental=file_name_incremental
+).with_name("files")
+# will write initial incremental state
+pipeline.run(file_resource)
+```
+
+Please read [notes on parallelism](../../../general-usage/incremental/cursor.md#partition-large-backfills)
+
+#### Split loading works as follows
+
+1. Use `incremental` property with **row_order** set.
+2. Limit number of files returned per page when creating `filesystem` instance to get manageable chunks
+3. Limit the resource by number of pages or time
+4. Run pipeline in a loop as long as it is not empty
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem
+
+# return files in order of modification_date
+incremental_ = dlt.sources.incremental("modification_date", row_order="asc")  # type: ignore
+# each page contains only one file
+fs_ = filesystem(bucket_url=bucket_url, file_glob="csv/*", incremental=incremental_, files_per_page=1)
+
+# process one file in each run, you could also use max_time to process files i.e. for an hour
+while not pipeline.run(fs_.with_name("files").add_limit(1)).is_empty:
+    print(pipeline.last_trace.last_load_info)  # ty: ignore[unresolved-attribute]
+```
+
+**Note that you must set row_order on incremental to not miss a file**:
+
+### 7. Filter files
+
+If you need to filter out files based on their metadata, you can easily do this using the `add_filter` method.
+Within your filtering function, you'll have access to [any field](#fileitem-fields) of the `FileItem` representation.
+
+#### Filter by name
+
+To filter only files that have `London` and `Berlin` in their names, you can do the following:
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_csv
+
+# Filter files accessing file_name field
+filtered_files = filesystem(bucket_url="s3://bucket_name", file_glob="directory/*.csv")
+filtered_files.add_filter(lambda item: ("London" in item["file_name"]) or ("Berlin" in item["file_name"]))
+
+filesystem_pipe = (filtered_files | read_csv())
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run(filesystem_pipe)
+print(load_info)
+```
+
+:::tip
+You could also use `file_glob` to filter files by names. It works very well in simple cases, for example, filtering by extension:
+
+```py
+from dlt.sources.filesystem import filesystem
+
+filtered_files = filesystem(bucket_url="s3://bucket_name", file_glob="**/*.json")
+```
+
+:::
+
+#### Filter by size
+
+If for some reason you only want to load small files, you can also do that:
+
+:::note
+Over `http` and `https`, the resource needs `fetch_file_info=True`. Without `fetch_file_info`,
+`size_in_bytes` is missing and the filter below raises `KeyError`.
+:::
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_csv
+
+MAX_SIZE_IN_BYTES = 10
+
+# Filter files accessing size_in_bytes field
+filtered_files = filesystem(bucket_url="s3://bucket_name", file_glob="directory/*.csv")
+filtered_files.add_filter(lambda item: item["size_in_bytes"] < MAX_SIZE_IN_BYTES)
+
+filesystem_pipe = (filtered_files | read_csv())
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run(filesystem_pipe)
+print(load_info)
+```
+
+## Standalone filesystem resource
+
+You can use the [standalone filesystem](../../../general-usage/resource.md#declare-a-standalone-resource) resource to list files in cloud storage or a local filesystem. This allows you to customize file readers or manage files using [fsspec](https://filesystem-spec.readthedocs.io/en/latest/index.html).
+
+```py
+from dlt.sources.filesystem import filesystem
+
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+files = filesystem(bucket_url="s3://my_bucket/data", file_glob="csv_folder/*.csv")
+pipeline.run(files)
+```
+
+The filesystem ensures consistent file representation across bucket types and offers methods to access and read data. You can quickly build pipelines to:
+
+- Extract text from PDFs ([unstructured data source](https://github.com/dlt-hub/verified-sources/tree/master/sources/unstructured_data)).
+- Stream large file content directly from buckets.
+- Copy files locally ([copy files](#copy-files-locally))
+
+### `FileItem` representation
+
+- All dlt sources/resources that yield files follow the [FileItem](https://github.com/dlt-hub/dlt/blob/devel/dlt/common/storages/fsspec_filesystem.py#L40) contract.
+- File content is typically not loaded (you can control it with the `extract_content` parameter of the filesystem resource). Instead, full file info and methods to access content are available.
+- Users can request an authenticated [fsspec AbstractFileSystem](https://filesystem-spec.readthedocs.io/en/latest/_modules/fsspec/spec.html#AbstractFileSystem) instance.
+
+#### `FileItem` fields
+
+- `file_url` - complete URL of the file (e.g., `s3://bucket-name/path/file`). This field serves as a primary key.
+- `file_name` - name of the file from the bucket URL.
+- `relative_path` - set when doing `glob`, is a relative path to a `bucket_url` argument.
+- `mime_type` - file's MIME type. It is sourced from the bucket provider or inferred from its extension.
+- `modification_date` - file's last modification time (format: `datetime.datetime`, always UTC).
+- `size_in_bytes` - file size. Not present when the filesystem does not report it (see `fetch_file_info`).
+- `file_content` - content, provided upon request.
+
+:::info
+When using a nested or recursive glob pattern, `relative_path` will include the file's path relative to `bucket_url`. For instance, using the resource: `filesystem("az://dlt-ci-test-bucket/standard_source/samples", file_glob="met_csv/A801/*.csv")` will produce file names relative to the `/standard_source/samples` path, such as `met_csv/A801/A881_20230920.csv`. For local filesystems, POSIX paths (using "/" as separator) are returned.
+:::
+
+### File manipulation
+
+[FileItem](https://github.com/dlt-hub/dlt/blob/devel/dlt/common/storages/fsspec_filesystem.py#L40), backed by a dictionary implementation, offers these helpers:
+
+- `read_bytes()` - method, which returns the file content as bytes.
+- `open()` - method which provides a file object when opened.
+- `filesystem` - field, which gives access to authorized `AbstractFilesystem` with standard fsspec methods.
+
+## Create your own readers
+
+Although the `filesystem` resource yields the files from cloud storage or a local filesystem, you need to apply a transformer resource to retrieve the records from files. dlt natively supports three file types: [CSV](../../file-formats.md#csv), [Parquet](../../file-formats.md#parquet), and [JSONL](../../file-formats.md#jsonl) (more details in [filesystem transformer resource](#2-choose-the-right-reader)).
+
+But you can easily create your own. In order to do this, you just need a function that takes as input a `FileItemDict` iterator and yields a list of records (recommended for performance) or individual records.
+
+### Example: read data from Excel files
+
+The code below sets up a pipeline that reads from an Excel file using a standalone transformer:
+
+```py
+from typing import Iterator
+
+import dlt
+from dlt.common.storages.fsspec_filesystem import FileItemDict
+from dlt.common.typing import TDataItems
+from dlt.sources.filesystem import filesystem
+
+BUCKET_URL = "s3://my_bucket/data"
+
+# Define a standalone transformer to read data from an Excel file.
+@dlt.transformer
+def read_excel(
+    items: Iterator[FileItemDict], sheet_name: str
+) -> Iterator[TDataItems]:
+    # Import the required pandas library.
+    import pandas as pd
+
+    # Iterate through each file item.
+    for file_obj in items:
+        # Open the file object.
+        with file_obj.open() as file:
+            # Read from the Excel file and yield its content as dictionary records.
+            yield pd.read_excel(file, sheet_name).to_dict(orient="records")
+
+# Set up the pipeline to fetch a specific Excel file from a filesystem (bucket).
+example_xls = filesystem(
+    bucket_url=BUCKET_URL, file_glob="../directory/example.xlsx"
+) | read_excel("example_table")   # Pass the data through the transformer to read the "example_table" sheet.
+
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb", dataset_name="example_xls_data")
+# Execute the pipeline and load the extracted data into the "duckdb" destination.
+load_info = pipeline.run(example_xls.with_name("example_xls_data"))
+# Print the loading information.
+print(load_info)
+```
+
+### Example: read data from XML files
+
+You can use any third-party library to parse an `xml` file (e.g., [BeautifulSoup](https://pypi.org/project/beautifulsoup4/), [pandas](https://pandas.pydata.org/docs/reference/api/pandas.read_xml.html)). In the following example, we will be using the [xmltodict](https://pypi.org/project/xmltodict/) Python library.
+
+```py
+from typing import Iterator
+
+import dlt
+from dlt.common.storages.fsspec_filesystem import FileItemDict
+from dlt.common.typing import TDataItems
+from dlt.sources.filesystem import filesystem
+
+BUCKET_URL = "s3://my_bucket/data"
+
+# Define a standalone transformer to read data from an XML file.
+@dlt.transformer
+def read_xml(items: Iterator[FileItemDict]) -> Iterator[TDataItems]:
+    # Import the required xmltodict library.
+    import xmltodict
+
+    # Iterate through each file item.
+    for file_obj in items:
+        # Open the file object.
+        with file_obj.open() as file:
+            # Parse the file to dict records.
+            yield xmltodict.parse(file.read())
+
+# Set up the pipeline to fetch a specific XML file from a filesystem (bucket).
+example_xml = filesystem(
+    bucket_url=BUCKET_URL, file_glob="../directory/example.xml"
+) | read_xml()   # Pass the data through the transformer
+
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb", dataset_name="example_xml_data")
+# Execute the pipeline and load the extracted data into the "duckdb" destination.
+load_info = pipeline.run(example_xml.with_name("example_xml_data"))
+
+# Print the loading information.
+print(load_info)
+```
+
+## Clean files after loading
+
+You can get an fsspec client from the filesystem resource after it was extracted, i.e., in order to delete processed files, etc. The filesystem module contains a convenient method `fsspec_from_resource` that can be used as follows:
+
+```py
+from dlt.sources.filesystem import filesystem, read_csv
+from dlt.sources.filesystem.helpers import fsspec_from_resource
+
+# Get filesystem source.
+gs_resource = filesystem("gs://ci-test-bucket/")
+# Extract files.
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+pipeline.run(gs_resource | read_csv())
+# Get fs client.
+fs_client = fsspec_from_resource(gs_resource)
+# Do any operation.
+fs_client.ls("ci-test-bucket/standard_source/samples")
+```
+
+## Copy files locally
+
+To copy files locally, add a step in the filesystem resource and then load the listing to the database:
+
+```py
+import os
+
+import dlt
+from dlt.common.storages.fsspec_filesystem import FileItemDict
+from dlt.sources.filesystem import filesystem
+
+def _copy(item: FileItemDict) -> FileItemDict:
+    # Instantiate fsspec and copy file
+    dest_file = os.path.join("./local_folder", item["file_name"])
+    # Create destination folder
+    os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+    # Download file
+    item.fsspec.download(item["file_url"], dest_file)
+    # Return file item unchanged
+    return item
+
+BUCKET_URL = "gs://ci-test-bucket/"
+
+# Use recursive glob pattern and add file copy step
+downloader = filesystem(BUCKET_URL, file_glob="**").add_map(_copy)
+
+# NOTE: You do not need to load any data to execute extract; below, we obtain
+# a list of files in a bucket and also copy them locally
+listing = list(downloader)
+print(listing)
+# Download to table "listing"
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run(
+    downloader.with_name("listing"), write_disposition="replace"
+)
+# Pretty print the information on data that was loaded
+print(load_info)
+print(listing)
+print(pipeline.last_trace.last_normalize_info)  # ty: ignore[unresolved-attribute]
+```
+
+## Troubleshoot
+
+### Access extremely long file paths
+
+Windows supports paths up to 255 characters. When you access a path longer than 255 characters, you'll see a `FileNotFound` exception.
+
+To go over this limit, you can use [extended paths](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation?tabs=registry).
+**Note that Python glob does not work with extended UNC paths**, so you will not be able to use them
+
+```toml
+[sources.filesystem]
+bucket_url = '\\?\C:\a\b\c'
+```
+
+### If you get an empty list of files
+
+If you are running a dlt pipeline with the filesystem source and get zero records, we recommend you check
+the configuration of `bucket_url` and `file_glob` parameters.
+
+For example, with Azure Blob Storage, people sometimes mistake the account name for the container name. Make sure you've set up a URL as `"az://<container name>/"`.
+
+Also, please reference the [glob](https://filesystem-spec.readthedocs.io/en/latest/api.html#fsspec.spec.AbstractFileSystem.glob) function to configure the resource correctly. Use `**` to include recursive files. Note that the local filesystem supports full Python [glob](https://docs.python.org/3/library/glob.html#glob.glob) functionality, while cloud storage supports a restricted `fsspec` [version](https://filesystem-spec.readthedocs.io/en/latest/api.html#fsspec.spec.AbstractFileSystem.glob).
+
+<!--@@@DLT_TUBA filesystem-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/verified-sources/freshdesk.md =====
+
+---
+title: Freshdesk
+description: dlt verified source for Freshdesk API
+keywords: [freshdesk api, freshdesk verified source, freshdesk]
+---
+# Freshdesk
+
+import Header from './_source-info-header.md';
+
+<Header/>
+
+[Freshdesk](https://www.freshworks.com/freshdesk/) is a cloud-based customer service software
+that provides businesses with tools for managing customer support via multiple channels including
+email, phone, websites, and social media.
+
+This Freshdesk `dlt` verified source and
+[pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/freshdesk_pipeline.py)
+loads data using the "Freshdesk API" to the destination of your choice.
+
+Resources that can be loaded using this verified source are:
 

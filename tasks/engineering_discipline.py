@@ -542,15 +542,17 @@ def find_chunks(filler: str) -> list[Path]:
     """Locate the filler's chunk files.
 
     Chunks ship flat inside a dataset. The mount path is derived from the slug
-    and is not always predictable, so search before giving up.
+    and is not always what you would guess, so search before giving up.
     """
     for directory in (ROOT_LOCAL, Path("/kaggle/input/engineering-discipline-haystack")):
         found = sorted(directory.glob(f"{filler}_chunk_*.txt"))
         if found:
             return found
-    for match in sorted(glob.glob(f"/kaggle/input/**/{filler}_chunk_*.txt", recursive=True)):
-        return sorted(glob.glob(f"/kaggle/input/**/{filler}_chunk_*.txt", recursive=True))
-    return []
+
+    matches = sorted(glob.glob(f"/kaggle/input/**/{filler}_chunk_*.txt", recursive=True))
+    if matches:
+        print(f"  found {len(matches)} {filler} chunks under {Path(matches[0]).parent}")
+    return [Path(m) for m in matches]
 
 
 def assemble_context(filler: str, target_tokens: int) -> tuple[str, int]:

@@ -1,1662 +1,3 @@
-diff --git a/dlt/_workspace/cli/_init_command.py b/dlt/_workspace/cli/_init_command.py
-index 77914dd58..0710f075f 100644
---- a/dlt/_workspace/cli/_init_command.py
-+++ b/dlt/_workspace/cli/_init_command.py
-@@ -35,7 +35,7 @@ from dlt._workspace.cli._pipeline_files import (
-     TVerifiedSourceFileEntry,
-     TVerifiedSourceFileIndex,
- )
--from dlt._workspace.cli.exceptions import CliCommandInnerException
-+from dlt._workspace.cli.exceptions import CliCommandException, CliCommandInnerException
- from dlt._workspace.cli._ai_command import SUPPORTED_IDES, TSupportedIde
- 
- 
-@@ -173,6 +173,27 @@ def init_pipeline_at_destination(
-             - The type of the source (e.g., "template", "core", "verified").
-             - Name of the selected ide for dlthub sources (defaults to "cursor")
-     """
-+    # extract source name from dlthub source name: dlthub:<name>
-+    # TODO: add new source type
-+    is_dlthub_source, display_source_name, source_name = _get_source_display_name(source_name)
-+    # source and destination names are used as Python identifiers in generated code
-+    if not is_valid_schema_name(display_source_name):
-+        fmt.error(
-+            "Source name %s is not a valid Python identifier. Use snake_case names"
-+            " containing only lowercase letters, numbers and underscores (max %d"
-+            " characters)."
-+            % (fmt.bold(display_source_name), InvalidSchemaName.MAXIMUM_SCHEMA_NAME_LENGTH)
-+        )
-+        raise CliCommandException()
-+    if destination_type and not is_valid_schema_name(destination_type):
-+        fmt.error(
-+            "Destination name %s is not a valid Python identifier. Use snake_case"
-+            " names containing only lowercase letters, numbers and underscores (max"
-+            " %d characters)."
-+            % (fmt.bold(destination_type), InvalidSchemaName.MAXIMUM_SCHEMA_NAME_LENGTH)
-+        )
-+        raise CliCommandException()
-+
-     # try to import the destination and get config spec
-     if destination_type:
-         destination_reference = Destination.from_reference(destination_type)
-@@ -184,9 +205,6 @@ def init_pipeline_at_destination(
- 
-     # discover type of source
-     source_type: files_ops.TSourceType = "template"
--    # extract source name from dlthub source name: dlthub:<name>
--    # TODO: add new source type
--    is_dlthub_source, display_source_name, source_name = _get_source_display_name(source_name)
-     if source_name in files_ops.get_sources_names(core_sources_storage, source_type="core"):
-         source_type = "core"
-     # do not look into verified sources when setting up dlthub source
-@@ -271,8 +289,6 @@ def init_pipeline_at_destination(
-             remote_modified = {file_name: None for file_name in source_configuration.files}
-         else:
-             # is single file template source
--            if not is_valid_schema_name(source_name):
--                raise InvalidSchemaName(source_name)
-             source_configuration = files_ops.get_template_configuration(
-                 templates_storage, source_name, display_source_name
-             )
-diff --git a/dlt/sources/sql_database/helpers.py b/dlt/sources/sql_database/helpers.py
-index b11f9749c..43e464d48 100644
---- a/dlt/sources/sql_database/helpers.py
-+++ b/dlt/sources/sql_database/helpers.py
-@@ -5,7 +5,6 @@ from typing import (
-     Callable,
-     Any,
-     Dict,
--    Iterable,
-     List,
-     Literal,
-     Optional,
-@@ -325,11 +324,20 @@ class TableLoader(BaseTableLoader):
-                 )
-                 yield df
-             elif self.backend == "pyarrow":
--                yield row_tuples_to_arrow(
-+                # add columns present in cursor but missing from schema hints
-+                for col_name in columns:
-+                    if col_name not in self.columns:
-+                        self.columns[col_name] = {"name": col_name}
-+                # build arrow table using cursor column order for correct
-+                # positional mapping (self.columns may be in schema order
-+                # after merge_columns reordering)
-+                cursor_columns = {c: self.columns[c] for c in columns}
-+                table = row_tuples_to_arrow(
-                     partition,
--                    columns=_add_missing_columns(self.columns, columns),
-+                    columns=cursor_columns,
-                     tz=backend_kwargs.get("tz", "UTC"),
-                 )
-+                yield table
- 
- 
- class ConnectorXTableLoader(BaseTableLoader):
-@@ -518,6 +526,21 @@ def table_rows(
-             # Handle callable columns hint (can't resolve without data item)
-             columns_hints = resource.columns
- 
-+    # warn about and remove columns_hints entries that don't match any
-+    # reflected source column.
-+    source_columns = {c.name for c in table.columns}
-+    unmatched = [c for c in columns_hints if c not in source_columns]
-+    if unmatched:
-+        logger.warning(
-+            "Resource columns %s for table '%s' do not match any reflected"
-+            " source columns and will be ignored. Note: source column names"
-+            " are not normalized at this stage. Use the original database"
-+            " column names in apply_hints.",
-+            unmatched,
-+            table.name,
-+        )
-+        columns_hints = {c: columns_hints[c] for c in columns_hints if c not in unmatched}
-+
-     # determine loader class from registry
-     if table_loader_class is None:
-         table_loader_class = get_table_loader_class(backend)
-@@ -586,16 +609,6 @@ def remove_nullability_adapter(table: Table) -> Table:
-     return table
- 
- 
--def _add_missing_columns(
--    schema_columns: TTableSchemaColumns, result_columns: Iterable[str]
--) -> TTableSchemaColumns:
--    """Adds columns present in cursor but not present in schema"""
--    for column_name in result_columns:
--        if column_name not in schema_columns:
--            schema_columns[column_name] = {"name": column_name}
--    return schema_columns
--
--
- def _execute_table_adapter(
-     table: Table,
-     adapter: Optional[TTableAdapter],
-diff --git a/tests/load/sources/sql_database/postgres_source.py b/tests/load/sources/sql_database/postgres_source.py
-index e42e4853a..e4c7beb31 100644
---- a/tests/load/sources/sql_database/postgres_source.py
-+++ b/tests/load/sources/sql_database/postgres_source.py
-@@ -191,6 +191,15 @@ class PostgresSourceDB:
-         _make_precision_table("has_precision", False)
-         _make_precision_table("has_precision_nullable", True)
- 
-+        Table(
-+            "camelCaseTable",
-+            self.metadata,
-+            Column("userId", Integer(), primary_key=True, autoincrement=True),
-+            Column("firstName", Text(), nullable=False),
-+            Column("isActive", Boolean(), nullable=False),
-+            Column("createdAt", DateTime(timezone=True), nullable=False),
-+        )
-+
-         if self.with_unsupported_types:
-             Table(
-                 "has_unsupported_types",
-@@ -386,11 +395,30 @@ class PostgresSourceDB:
-             conn.execute(table_pk.insert().values(rows_pk))
-             conn.execute(table_fk.insert().values(rows_fk))
- 
-+    def _fake_camel_case_data(self, n: int = 100) -> None:
-+        table = self.metadata.tables[f"{self.schema}.camelCaseTable"]
-+        # not added to table_infos: camelCase name is not directly
-+        # queryable in destinations that normalise identifiers
-+        person = mimesis.Person()
-+        dev = mimesis.Development()
-+        dt = mimesis.Datetime()
-+        rows = [
-+            dict(
-+                firstName=person.name(),
-+                isActive=dev.boolean(),
-+                createdAt=dt.datetime(timezone="UTC"),
-+            )
-+            for _ in range(n)
-+        ]
-+        with self.engine.begin() as conn:
-+            conn.execute(table.insert().values(rows))
-+
-     def insert_data(self) -> None:
-         self._fake_chat_data()
-         self._fake_precision_data("has_precision")
-         self._fake_precision_data("has_precision_nullable", null_n=10)
-         self._fake_composite_foreign_key_data()
-+        self._fake_camel_case_data()
-         if self.with_unsupported_types:
-             self._fake_unsupported_data()
- 
-diff --git a/tests/load/sources/sql_database/test_sql_database_source.py b/tests/load/sources/sql_database/test_sql_database_source.py
-index de62e7d81..8c14ee52d 100644
---- a/tests/load/sources/sql_database/test_sql_database_source.py
-+++ b/tests/load/sources/sql_database/test_sql_database_source.py
-@@ -153,6 +153,220 @@ def test_pyarrow_applies_hints_before_extract(
-     assert pa.types.is_float64(numeric_col_schema_in_parquet)
- 
- 
-+@pytest.mark.parametrize("backend", ["sqlalchemy", "pyarrow", "pandas", "connectorx"])
-+@pytest.mark.parametrize(
-+    "defer_table_reflect",
-+    [False, True],
-+    ids=lambda x: "defer_table_reflect" + ("_true" if x else "=false"),
-+)
-+def test_apply_hints_column_order(
-+    postgres_db: PostgresSourceDB,
-+    defer_table_reflect: bool,
-+    backend: TableBackend,
-+) -> None:
-+    """Reproduces #3604: apply_hints with complete column hints causes merge_columns
-+    to reorder incomplete reflected columns, breaking positional data mapping.
-+
-+    With reflection_level="minimal", reflected columns lack data_type (incomplete).
-+    When apply_hints provides data_type (complete), merge_columns pops the incomplete
-+    column and re-adds it at the end of the dict, changing the column order.
-+    The reordered columns no longer match the SQL cursor's positional data.
-+    """
-+    # for arrow-based backends, verify types directly on yielded tables
-+    if backend in ("pyarrow", "pandas"):
-+        resource = sql_table(
-+            credentials=postgres_db.credentials,
-+            schema=postgres_db.schema,
-+            table="has_precision",
-+            backend=backend,
-+            reflection_level="minimal",
-+            defer_table_reflect=defer_table_reflect,
-+        )
-+        resource.apply_hints(
-+            columns={
-+                "bool_col": {"data_type": "bool"},
-+                "date_col": {"data_type": "date"},
-+            },
-+        )
-+        items = list(resource.add_limit(1, count_rows=True))
-+        for item in items:
-+            # pandas DataFrames are converted to arrow for type checking
-+            if hasattr(item, "columns") and hasattr(item, "index") and len(item.index) > 0:
-+                at = pa.Table.from_pandas(item)
-+            elif isinstance(item, pa.Table) and item.num_rows > 0:
-+                at = item
-+            else:
-+                continue
-+            # bool_col must actually contain boolean data, not dates or other types
-+            assert pa.types.is_boolean(at.schema.field("bool_col").type)
-+            # date_col must NOT be boolean (pandas with minimal reflection may yield string)
-+            assert not pa.types.is_boolean(at.schema.field("date_col").type)
-+            break
-+        else:
-+            raise AssertionError("No non-empty arrow/pandas items yielded")
-+
-+    # end-to-end: data is correctly mapped after loading
-+    resource2 = sql_table(
-+        credentials=postgres_db.credentials,
-+        schema=postgres_db.schema,
-+        table="has_precision",
-+        backend=backend,
-+        reflection_level="minimal",
-+        defer_table_reflect=defer_table_reflect,
-+    )
-+    resource2.apply_hints(
-+        columns={
-+            "bool_col": {"data_type": "bool"},
-+            "date_col": {"data_type": "date"},
-+        },
-+    )
-+    pipeline = make_pipeline("duckdb")
-+    load_info = pipeline.run(resource2.add_limit(1, count_rows=True))
-+    assert_load_info(load_info)
-+
-+    with pipeline.sql_client() as client:
-+        rows = client.execute_sql("SELECT bool_col, date_col FROM has_precision LIMIT 1")
-+        row = rows[0]
-+        assert isinstance(row[0], (bool, int))  # bool_col should be boolean
-+        assert hasattr(row[1], "year")  # date_col should be date-like
-+
-+
-+@pytest.mark.parametrize("backend", ["sqlalchemy", "pyarrow", "pandas", "connectorx"])
-+@pytest.mark.parametrize(
-+    "defer_table_reflect",
-+    [False, True],
-+    ids=lambda x: "deferred" if x else "non_deferred",
-+)
-+def test_non_snake_case_columns(
-+    postgres_db: PostgresSourceDB, defer_table_reflect: bool, backend: TableBackend
-+) -> None:
-+    """Verifies all backends work with non-snake-case column names.
-+
-+    Data items from the resource must use the original camelCase column
-+    names. pipeline.run normalizes them to snake_case for the destination.
-+    """
-+    resource = sql_table(
-+        credentials=postgres_db.credentials,
-+        schema=postgres_db.schema,
-+        table="camelCaseTable",
-+        backend=backend,
-+        reflection_level="full",
-+        defer_table_reflect=defer_table_reflect,
-+    )
-+    resource.apply_hints(
-+        columns={
-+            "isActive": {"data_type": "bool"},
-+            "createdAt": {"data_type": "timestamp"},
-+        },
-+    )
-+
-+    items = list(resource.add_limit(1, count_rows=True))
-+
-+    # extract column names from the first non-empty data item
-+    keys = None
-+    for item in items:
-+        if isinstance(item, dict):
-+            keys = list(item.keys())
-+            break
-+        elif isinstance(item, list) and len(item) > 0:
-+            keys = list(item[0].keys())
-+            break
-+        elif isinstance(item, pa.Table) and item.num_rows > 0:
-+            keys = item.column_names
-+            break
-+        elif hasattr(item, "columns") and hasattr(item, "index") and len(item.index) > 0:
-+            keys = item.columns.tolist()
-+            break
-+    assert keys is not None, "No non-empty data items yielded"
-+    assert "isActive" in keys
-+    assert "createdAt" in keys
-+    assert "firstName" in keys
-+
-+    # end-to-end: normalized names in destination, data still correct
-+    resource2 = sql_table(
-+        credentials=postgres_db.credentials,
-+        schema=postgres_db.schema,
-+        table="camelCaseTable",
-+        backend=backend,
-+        reflection_level="full",
-+        defer_table_reflect=defer_table_reflect,
-+    )
-+    pipeline = make_pipeline("duckdb")
-+    load_info = pipeline.run(resource2.add_limit(1, count_rows=True))
-+    assert_load_info(load_info)
-+
-+    with pipeline.sql_client() as client:
-+        rows = client.execute_sql(
-+            "SELECT first_name, is_active, created_at FROM camel_case_table LIMIT 1"
-+        )
-+        row = rows[0]
-+        assert isinstance(row[0], str)
-+        assert isinstance(row[1], (bool, int))
-+        assert hasattr(row[2], "year")
-+
-+
-+@pytest.mark.parametrize(
-+    "defer_table_reflect",
-+    [False, True],
-+    ids=lambda x: "deferred" if x else "non_deferred",
-+)
-+def test_pyarrow_normalized_hints_on_camel_case_columns(
-+    postgres_db: PostgresSourceDB, defer_table_reflect: bool, caplog: Any
-+) -> None:
-+    """When users pass normalized (snake_case) names in apply_hints while
-+    database columns are camelCase, table_rows warns and strips the
-+    unmatched columns before passing them to the loader.
-+
-+    Hints:
-+      - "is_active" with data_type (complete/bound) — normalized form of "isActive"
-+      - "created_at" without data_type (incomplete/unbound) — normalized form of "createdAt"
-+    """
-+    import logging
-+
-+    resource = sql_table(
-+        credentials=postgres_db.credentials,
-+        schema=postgres_db.schema,
-+        table="camelCaseTable",
-+        backend="pyarrow",
-+        reflection_level="minimal",
-+        defer_table_reflect=defer_table_reflect,
-+    )
-+    resource.apply_hints(
-+        columns={
-+            "is_active": {"data_type": "bool"},  # normalized, won't match "isActive"
-+            "created_at": {"name": "created_at"},  # normalized, no data_type, unbound
-+        },
-+    )
-+
-+    pipeline = make_pipeline("duckdb")
-+    # temporarily enable propagation so caplog captures dlt logger output
-+    dlt_logger = logging.getLogger("dlt")
-+    dlt_logger.propagate = True
-+    try:
-+        with caplog.at_level(logging.WARNING, logger="dlt"):
-+            load_info = pipeline.run(resource.add_limit(1, count_rows=True))
-+    finally:
-+        dlt_logger.propagate = False
-+    assert_load_info(load_info)
-+
-+    # warning was emitted about unmatched columns
-+    warning_messages = [r.message for r in caplog.records if "do not match" in r.message]
-+    assert len(warning_messages) == 1, f"Expected 1 warning, got: {warning_messages}"
-+    assert "is_active" in warning_messages[0]
-+    assert "created_at" in warning_messages[0]
-+    assert "camelCaseTable" in warning_messages[0]
-+
-+    # data is correct in destination: snake_case names, proper types
-+    with pipeline.sql_client() as client:
-+        rows = client.execute_sql(
-+            "SELECT first_name, is_active, created_at FROM camel_case_table LIMIT 1"
-+        )
-+        row = rows[0]
-+        assert isinstance(row[0], str)
-+        assert isinstance(row[1], (bool, int))
-+        assert hasattr(row[2], "year")
-+
-+
- def test_sqlalchemy_no_quoted_name(postgres_db: PostgresSourceDB, mocker: MockerFixture) -> None:
-     """
-     Ensures that table names internally passed as `quoted_name` to `sql_table` are not persisted
-diff --git a/tests/workspace/cli/test_init_command.py b/tests/workspace/cli/test_init_command.py
-index c5ae35d86..4e46b97dc 100644
---- a/tests/workspace/cli/test_init_command.py
-+++ b/tests/workspace/cli/test_init_command.py
-@@ -126,6 +126,26 @@ def test_init_command_pipeline_default_template(
-     assert len(visitor.known_resource_calls) == 1
- 
- 
-+@pytest.mark.parametrize(
-+    "source_name,destination",
-+    [
-+        ("robin-ai", "bigquery"),  # hyphen
-+        ("dlthub:robin-ai", "bigquery"),  # dlthub prefix with hyphen
-+        ("123source", "bigquery"),  # starts with digit
-+        ("my source", "bigquery"),  # space
-+        ("valid_source", "big-query"),  # invalid destination
-+    ],
-+    ids=["hyphen", "dlthub_hyphen", "digit_start", "space", "invalid_dest"],
-+)
-+def test_init_command_invalid_identifiers(
-+    repo_dir: str, workspace_files: FileStorage, source_name: str, destination: str
-+) -> None:
-+    from dlt._workspace.cli.exceptions import CliCommandException
-+
-+    with pytest.raises(CliCommandException):
-+        _init_command.init_command(source_name, destination, repo_dir)
-+
-+
- def test_default_source_file_selection() -> None:
-     templates_storage = files_ops.get_single_file_templates_storage()
- 
-@@ -701,7 +721,6 @@ def test_init_all_vibe_sources_together(workspace_files: FileStorage) -> None:
-     random_vibez = [
-         "news_api",
-         "alpaca",
--        "robin",
-         "kwanko",
-         "powerlink",
-         "mysql_instance",
-@@ -709,7 +728,7 @@ def test_init_all_vibe_sources_together(workspace_files: FileStorage) -> None:
-         "coalesce",
-         "jobnimbus",
-         "perplexity_ai",
--        "wordpress_site",
-+        "robin_api",
-     ]
- 
-     for source_name in random_vibez:
-
-
-===== COMMIT c466cfca =====
-
-
-commit c466cfca1
-Author: rudolfix
-Date: 2026-02-16
-
-    (feat) adds dlt source preprocessors to source factory (#3636)
-
-diff --git a/.github/workflows/test_destinations_remote.yml b/.github/workflows/test_destinations_remote.yml
-index 53b51744e..71fe9c6f2 100644
---- a/.github/workflows/test_destinations_remote.yml
-+++ b/.github/workflows/test_destinations_remote.yml
-@@ -118,7 +118,7 @@ jobs:
-               destinations: "[\"mssql\"]"
-               filesystem_drivers: "[\"memory\"]"
-               extras: "--extra mssql --extra s3 --extra gs --extra az --extra parquet --group adbc"
--              pre_install_commands: "sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
-+              pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
-               post_install_commands: "uv run dbc install mssql"
-               always_run_all_tests: true
- 
-@@ -127,14 +127,14 @@ jobs:
-               destinations: "[\"synapse\"]"
-               filesystem_drivers: "[\"memory\"]"
-               extras: "--extra synapse --extra parquet"
--              pre_install_commands: "sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
-+              pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
- 
-             # Fabric
-             - name: fabric
-               destinations: "[\"fabric\"]"
-               filesystem_drivers: "[\"memory\"]"
-               extras: "--extra fabric"
--              pre_install_commands: "sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
-+              pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
- 
-             # Postgres and Redshift (used to be test_destinations.yml)
-             - name: redshift
-diff --git a/.github/workflows/test_hub.yml b/.github/workflows/test_hub.yml
-index d7f210e28..4b3bb611d 100644
---- a/.github/workflows/test_hub.yml
-+++ b/.github/workflows/test_hub.yml
-@@ -65,6 +65,7 @@ jobs:
-       # NOTE: needed for mssql source tests in plus
-       - name: Install ODBC driver for SQL Server
-         run: |
-+          sudo apt-get update
-           sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18
-         if: matrix.os == 'ubuntu-latest'
- 
-diff --git a/.github/workflows/test_sources_local.yml b/.github/workflows/test_sources_local.yml
-index 87f33632a..18dbf155d 100644
---- a/.github/workflows/test_sources_local.yml
-+++ b/.github/workflows/test_sources_local.yml
-@@ -71,6 +71,7 @@ jobs:
- 
-       - name: Install dependencies
-         run: |
-+          sudo apt-get update
-           sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18
-           uv sync --group pipeline --group sources --extra duckdb --extra parquet --extra filesystem --extra cli --extra sql_database --group adbc ${{ matrix.dbms_extras }}
- 
-diff --git a/dlt/extract/decorators.py b/dlt/extract/decorators.py
-index e2f6da0a2..241bcce5c 100644
---- a/dlt/extract/decorators.py
-+++ b/dlt/extract/decorators.py
-@@ -4,6 +4,7 @@ from types import ModuleType
- from functools import update_wrapper, wraps
- from typing import (
-     Any,
-+    Awaitable,
-     Callable,
-     Dict,
-     Iterator,
-@@ -18,12 +19,12 @@ from typing import (
- from typing_extensions import TypeVar, Self
- 
- from dlt.common import logger
--from dlt.common.configuration import with_config, get_fun_spec, known_sections, configspec
-+from dlt.common.configuration import with_config, get_fun_spec, known_sections
- from dlt.common.configuration.container import Container
- from dlt.common.configuration.exceptions import ContextDefaultCannotBeCreated
- from dlt.common.configuration.inject import set_fun_spec
- from dlt.common.configuration.resolve import inject_section
--from dlt.common.configuration.specs import BaseConfiguration, ContainerInjectableContext
-+from dlt.common.configuration.specs import BaseConfiguration
- from dlt.common.configuration.specs.config_section_context import ConfigSectionContext
- from dlt.common.exceptions import ArgumentsOverloadException
- from dlt.common.pipeline import PipelineContext
-@@ -108,6 +109,20 @@ class DltSourceFactoryWrapper(SourceFactory[TSourceFunParams, TDltSourceImpl]):
-         self.spec: Type[BaseConfiguration] = None
-         self.parallelized: bool = None
-         self._impl_cls: Type[TDltSourceImpl] = DltSource  # type: ignore[assignment]
-+        self._postprocessors: List[
-+            Callable[[TDltSourceImpl], Union[TDltSourceImpl, Awaitable[TDltSourceImpl]]]
-+        ] = []
-+
-+    def add_postprocessor(
-+        self, func: Callable[[TDltSourceImpl], Union[TDltSourceImpl, Awaitable[TDltSourceImpl]]]
-+    ) -> None:
-+        """Adds a callback that receives and returns a DltSource after it is created."""
-+        self._postprocessors.append(func)
-+
-+    def _apply_postprocessors(self, source: TDltSourceImpl) -> TDltSourceImpl:
-+        for func in self._postprocessors:
-+            source = func(source)  # type: ignore[assignment]
-+        return source
- 
-     def clone(
-         self,
-@@ -159,6 +174,7 @@ class DltSourceFactoryWrapper(SourceFactory[TSourceFunParams, TDltSourceImpl]):
-         # also remember original source function
-         ovr._f = self._f
-         ovr.ref = self.ref
-+        ovr._postprocessors = list(self._postprocessors)
-         ovr._update_wrapper()
-         # try to bind _f
-         ovr.wrap()
-@@ -183,7 +199,7 @@ class DltSourceFactoryWrapper(SourceFactory[TSourceFunParams, TDltSourceImpl]):
-                 resource.apply_hints(schema_contract=self.schema_contract)
-         else:
-             source = self._deco_f(*args, **kwargs)
--        return source
-+        return self._apply_postprocessors(source)
- 
-     def bind(self, f: AnyFun) -> Self:
-         """Binds wrapper to the original source function and registers the source reference. This method is called only once by the decorator"""
-diff --git a/dlt/extract/pipe.py b/dlt/extract/pipe.py
-index 3c4f908d5..383c77a7d 100644
---- a/dlt/extract/pipe.py
-+++ b/dlt/extract/pipe.py
-@@ -16,7 +16,13 @@ from typing import (
- )
- 
- from dlt.common.reflection.inspect import isasyncgenfunction, isgeneratorfunction
--from dlt.common.typing import AnyFun, AnyType, TDataItems, resolve_single_annotation
-+from dlt.common.typing import (
-+    AnyFun,
-+    AnyType,
-+    TDataItems,
-+    is_subclass,
-+    resolve_single_annotation,
-+)
- from dlt.common.utils import get_callable_name, uniq_id
- 
- from dlt.extract.exceptions import (
-@@ -353,8 +359,7 @@ class Pipe(SupportsPipe):
-                 return_annotation = resolve_single_annotation(
-                     sig.return_annotation, globalns=globals()
-                 )
--                if inspect.isclass(return_annotation):
--                    return issubclass(return_annotation, DltResource)
-+                return is_subclass(return_annotation, DltResource)
- 
-         return False
- 
-diff --git a/dlt/extract/reference.py b/dlt/extract/reference.py
-index 05178b345..08b83864c 100644
---- a/dlt/extract/reference.py
-+++ b/dlt/extract/reference.py
-@@ -1,17 +1,17 @@
- from abc import ABC, abstractmethod
--from importlib import import_module
- from typing import (
-+    Awaitable,
-     Callable,
-     Dict,
-     List,
-     Any,
-     Generic,
-     Tuple,
-+    Union,
-     overload,
-     ClassVar,
-     Type,
- )
--from typing_extensions import Self, TypeVar
- 
- from dlt.common import logger
- from dlt.common.configuration.specs import BaseConfiguration, known_sections
-@@ -20,7 +20,7 @@ from dlt.common.reflection.ref import object_from_ref
- from dlt.common.runtime.run_context import get_plugin_modules
- from dlt.common.schema import Schema
- from dlt.common.schema.typing import TSchemaContract
--from dlt.common.typing import ParamSpec
-+from dlt.common.typing import ParamSpec, Self, TypeVar
- from dlt.common.warnings import Dlt04DeprecationWarning, deprecated
- 
- from dlt.extract.source import DltSource
-@@ -31,14 +31,36 @@ TSourceFunParams = ParamSpec("TSourceFunParams")
- 
- 
- class SourceFactory(ABC, Generic[TSourceFunParams, TDltSourceImpl]):
-+    name: str
-+    """Name of the source which is also the name of the associated schema."""
-+    section: str
-+    """Configuration section right after 'sources' in default layout."""
-+    max_table_nesting: int
-+    """Maximum depth of nested table above which remaining nodes are loaded as structs or JSON."""
-+    root_key: bool
-+    """Enables merging on all resources by propagating root foreign key to nested tables."""
-+    schema: Schema
-+    """An explicit `Schema` instance to be associated with the source."""
-+    schema_contract: TSchemaContract
-+    """Schema contract settings that will be applied to this source."""
-+    spec: Type[BaseConfiguration]
-+    """A specification of configuration and secret values required by the source."""
-+    parallelized: bool
-+    """If `True`, resource generators will be extracted in parallel with other resources."""
-+
-+    # TODO: model after Destination, which also needs to be broken down into reference and factory
-+    ref: "SourceReference"
-+
-     def __call__(
-         self, *args: TSourceFunParams.args, **kwargs: TSourceFunParams.kwargs
-     ) -> TDltSourceImpl:
-         pass
- 
--    # TODO: make factory to expose SourceReference with actual spec, name and section
--    # model after Destination, which also needs to be broken down into reference and factory
--    ref: "SourceReference"
-+    @abstractmethod
-+    def add_postprocessor(
-+        self, func: Callable[[TDltSourceImpl], Union[TDltSourceImpl, Awaitable[TDltSourceImpl]]]
-+    ) -> None:
-+        """Adds a callback that receives and returns a DltSource after it is created."""
- 
-     @abstractmethod
-     def clone(
-diff --git a/tests/extract/test_decorators.py b/tests/extract/test_decorators.py
-index 9a5bef302..ad6172f09 100644
---- a/tests/extract/test_decorators.py
-+++ b/tests/extract/test_decorators.py
-@@ -1,6 +1,7 @@
- from functools import wraps
- import inspect
- import os
-+import sys
- from typing import Awaitable, Callable, List, Optional, Dict, Iterator, Any, cast
- 
- import pytest
-@@ -842,7 +843,7 @@ def test_source_reference_with_args() -> None:
-         "shorthand.with_shorthand_registry", _impl_sig=with_shorthand_registry
-     ).clone(section="changed")
-     # reveal_type(ref_t)
--    assert ref_t.section == "changed"  # type: ignore[attr-defined]
-+    assert ref_t.section == "changed"
-     # here source has correctly typed signature from with_shorthand_registry
-     source = ref_t(["A", "B"])
-     assert source.section == "changed"
-@@ -900,13 +901,13 @@ def test_source_reference_auto_import() -> None:
-     SourceReference.SOURCES.clear()
-     # make sure to import resource first
-     ref = SourceReference.find("tests.extract.cases.section_source.named_module.resource_f_2")
--    assert ref.section == "name_overridden"  # type: ignore[attr-defined]
-+    assert ref.section == "name_overridden"
-     assert list(ref("A")) == ["A"]
-     # TODO: fix double references (with renamed section and without, should be only 2 sections here)
-     assert len(SourceReference.SOURCES) == 4
- 
-     ref = SourceReference.find("tests.extract.cases.section_source.named_module.source_f_1")
--    assert ref.section == "name_overridden"  # type: ignore[attr-defined]
-+    assert ref.section == "name_overridden"
- 
- 
- def test_source_reference_from_type() -> None:
-@@ -949,8 +950,8 @@ def test_source_factory_clone(cloner: str) -> None:
-     assert list(source) == ["AXA"]
- 
-     # there are some overrides from decorator
--    assert with_shorthand_registry.name == "shorthand_registry"  # type: ignore
--    assert with_shorthand_registry.section == "shorthand"  # type: ignore
-+    assert with_shorthand_registry.name == "shorthand_registry"
-+    assert with_shorthand_registry.section == "shorthand"
- 
-     # creates clones
-     source_f_1: DltSourceFactoryWrapper[Any, DltSource] = factory(  # type: ignore
-@@ -1420,6 +1421,19 @@ def test_resource_returning_resource() -> None:
-     assert list(r) == [1, 2, 3]
- 
- 
-+@pytest.mark.skipif(sys.version_info < (3, 10), reason="list[] syntax requires Python 3.10+")
-+def test_resource_with_non_class_return_annotation() -> None:
-+    @dlt.resource
-+    def customers(i: int = 0) -> list[dict[str, Any]]:
-+        return [{"id": idx, "name": f"customer_{idx}"} for idx in range(i)]
-+
-+    assert list(customers(3)) == [
-+        {"id": 0, "name": "customer_0"},
-+        {"id": 1, "name": "customer_1"},
-+        {"id": 2, "name": "customer_2"},
-+    ]
-+
-+
- def test_resource_rename_credentials_separation():
-     os.environ["SOURCES__TEST_DECORATORS__REGULAR_SIGNATURE__SECRET_END"] = "5"
-     assert list(regular_signature(1)) == [1, 2, 3, 4]
-@@ -1711,3 +1725,69 @@ def test_parallelized_resource_decorator() -> None:
-     with pytest.raises(StopIteration):
-         # Inner generator is also closed
-         next(gen_orig)
-+
-+
-+def test_source_postprocessor() -> None:
-+    @dlt.source
-+    def multi_resource():
-+        return dlt.resource([1, 2, 3], name="alpha"), dlt.resource([4, 5], name="beta")
-+
-+    # add a postprocessor that selects only one resource
-+    multi_resource.add_postprocessor(lambda s: s.with_resources("alpha"))
-+
-+    source = multi_resource()
-+    assert "alpha" in source.selected_resources
-+    assert "beta" not in source.selected_resources
-+    assert list(source) == [1, 2, 3]
-+
-+
-+def test_source_multiple_postprocessors() -> None:
-+    call_order: List[str] = []
-+
-+    @dlt.source
-+    def ordered_source():
-+        return dlt.resource([1, 2, 3], name="data")
-+
-+    def first(s: DltSource) -> DltSource:
-+        call_order.append("first")
-+        return s
-+
-+    def second(s: DltSource) -> DltSource:
-+        call_order.append("second")
-+        return s
-+
-+    ordered_source.add_postprocessor(first)
-+    ordered_source.add_postprocessor(second)
-+
-+    ordered_source()
-+    assert call_order == ["first", "second"]
-+
-+
-+def test_source_postprocessor_preserved_on_clone() -> None:
-+    @dlt.source
-+    def cloneable():
-+        return dlt.resource([1, 2, 3], name="alpha"), dlt.resource([4, 5], name="beta")
-+
-+    cloneable.add_postprocessor(lambda s: s.with_resources("alpha"))
-+
-+    cloned = cloneable.clone(section="new_section")
-+    source = cloned()
-+    assert list(source) == [1, 2, 3]
-+
-+
-+@pytest.mark.asyncio
-+async def test_async_source_postprocessor() -> None:
-+    @dlt.source
-+    async def async_multi():
-+        return dlt.resource([1, 2, 3], name="alpha"), dlt.resource([4, 5], name="beta")
-+
-+    async def select_alpha(s: Awaitable[DltSource]) -> DltSource:
-+        source = await s
-+        return source.with_resources("alpha")
-+
-+    async_multi.add_postprocessor(select_alpha)  # type: ignore[arg-type]
-+
-+    source = await async_multi()  # type: ignore[misc]
-+    assert "alpha" in source.selected_resources
-+    assert "beta" not in source.selected_resources
-+    assert list(source) == [1, 2, 3]
-diff --git a/tests/pipeline/test_max_nesting.py b/tests/pipeline/test_max_nesting.py
-index 5f57e219a..ea246ed11 100644
---- a/tests/pipeline/test_max_nesting.py
-+++ b/tests/pipeline/test_max_nesting.py
-@@ -181,7 +181,7 @@ def test_update_table_nesting_level_source():
-     )
- 
-     # change the max_table_nesting level of the source and load another formerly unloaded resource
--    source.max_table_nesting = 4  # type: ignore
-+    source.max_table_nesting = 4
-     pipeline.run(source().with_resources("base_table_1", "base_table_2"))
- 
-     # for base_table_1 it will stay the same since it is already loaded
-@@ -222,7 +222,7 @@ def test_nesting_levels_reset_after_drop(nesting_defininition_location: str):
-     if nesting_defininition_location == "resource":
-         base_table_1.max_table_nesting = 3
-     else:
--        source.max_table_nesting = 3  # type: ignore[attr-defined]
-+        source.max_table_nesting = 3
-     pipeline.run(source())
- 
-     all_table_names = pipeline.default_schema.data_table_names()
-
-
-===== COMMIT e24d8df7 =====
-
-
-commit e24d8df7f
-Author: Travior
-Date: 2026-02-15
-
-    feat/2673 snowflake swap replace (#3540)
-
-diff --git a/dlt/destinations/impl/snowflake/configuration.py b/dlt/destinations/impl/snowflake/configuration.py
-index 18269a3e7..604d018a8 100644
---- a/dlt/destinations/impl/snowflake/configuration.py
-+++ b/dlt/destinations/impl/snowflake/configuration.py
-@@ -173,6 +173,9 @@ class SnowflakeClientConfiguration(DestinationClientDwhWithStagingConfiguration)
-     use_vectorized_scanner: bool = False
-     """Whether to use or not use the vectorized scanner in COPY INTO"""
- 
-+    enable_atomic_swap: bool = False
-+    """When enabled and using the `staging-optimized` replace strategy, tables will be atomically swapped using `ALTER TABLE ... SWAP WITH ...` instead of being cloned. This preserves permissions and enables zero-downtime loading."""
-+
-     use_decfloat: bool = False
-     """Whether to use DECFLOAT type for unbound decimals instead of DECIMAL"""
- 
-diff --git a/dlt/destinations/impl/snowflake/factory.py b/dlt/destinations/impl/snowflake/factory.py
-index 611f059e6..2bb16f171 100644
---- a/dlt/destinations/impl/snowflake/factory.py
-+++ b/dlt/destinations/impl/snowflake/factory.py
-@@ -173,6 +173,7 @@ class snowflake(Destination[SnowflakeClientConfiguration, "SnowflakeClient"]):
-         query_tag: Optional[str] = None,
-         create_indexes: bool = False,
-         use_decfloat: bool = False,
-+        enable_atomic_swap: bool = False,
-         destination_name: str = None,
-         environment: str = None,
-         **kwargs: Any,
-@@ -192,6 +193,7 @@ class snowflake(Destination[SnowflakeClientConfiguration, "SnowflakeClient"]):
-             use_decfloat (bool, optional): Whether to use DECFLOAT type for unbound decimals. DECFLOAT stores
-                 exact decimal values with up to 36 significant digits and a dynamic exponent.
-                 Only works with text-based staging formats (jsonl, csv) - not parquet.
-+            enable_atomic_swap (bool, optional): Whether to use atomic swap when replacing with replace strategy `staging-optimized`.
-             destination_name (str, optional): Name of the destination. Defaults to None.
-             environment (str, optional): Environment name. Defaults to None.
-             **kwargs (Any, optional): Additional arguments forwarded to the destination config
-@@ -204,6 +206,7 @@ class snowflake(Destination[SnowflakeClientConfiguration, "SnowflakeClient"]):
-             query_tag=query_tag,
-             create_indexes=create_indexes,
-             use_decfloat=use_decfloat,
-+            enable_atomic_swap=enable_atomic_swap,
-             destination_name=destination_name,
-             environment=environment,
-             **kwargs,
-diff --git a/dlt/destinations/impl/snowflake/snowflake.py b/dlt/destinations/impl/snowflake/snowflake.py
-index 70737d234..9fb6f43e0 100644
---- a/dlt/destinations/impl/snowflake/snowflake.py
-+++ b/dlt/destinations/impl/snowflake/snowflake.py
-@@ -1,4 +1,4 @@
--from typing import Optional, Sequence, List, Dict, Literal
-+from typing import Optional, Sequence, List, Dict, Literal, Any
- 
- from dlt.common import logger
- from dlt.common.data_writers.escape import escape_snowflake_literal
-@@ -14,6 +14,8 @@ from dlt.common.destination.client import (
- )
- from dlt.common.schema.utils import get_columns_names_with_prop
- from dlt.common.storages.file_storage import FileStorage
-+from dlt.destinations.sql_jobs import SqlStagingReplaceFollowupJob
-+from dlt.destinations.sql_client import SqlClientBase
- from dlt.common.schema import TColumnSchema, Schema, TColumnHint
- from dlt.common.schema.typing import TColumnType, TTableSchema
- 
-@@ -48,6 +50,25 @@ class SnowflakeMergeJob(SqlMergeFollowupJob):
-         return sql
- 
- 
-+class SnowflakeStagingReplaceJob(SqlStagingReplaceFollowupJob):
-+    @classmethod
-+    def generate_sql(
-+        cls,
-+        table_chain: Sequence[PreparedTableSchema],
-+        sql_client: SqlClientBase[Any],
-+    ) -> List[str]:
-+        sql: List[str] = []
-+        for table in table_chain:
-+            with sql_client.with_staging_dataset():
-+                staging_table_name = sql_client.make_qualified_table_name(table["name"])
-+            table_name = sql_client.make_qualified_table_name(table["name"])
-+            sql.append(
-+                f"ALTER TABLE {table_name} SWAP WITH {staging_table_name}",
-+            )
-+
-+        return sql
-+
-+
- class SnowflakeLoadJob(RunnableLoadJob, HasFollowupJobs):
-     def __init__(
-         self,
-@@ -163,6 +184,17 @@ class SnowflakeClient(SqlJobClientWithStagingDataset, SupportsStagingDestination
-     ) -> List[FollowupJobRequest]:
-         return [SnowflakeMergeJob.from_table_chain(table_chain, self.sql_client)]
- 
-+    def _create_replace_followup_jobs(
-+        self, table_chain: Sequence[PreparedTableSchema]
-+    ) -> List[FollowupJobRequest]:
-+        root_table = table_chain[0]
-+        if (
-+            root_table["x-replace-strategy"] == "staging-optimized"  # type: ignore[typeddict-item]
-+            and self.config.enable_atomic_swap
-+        ):
-+            return [SnowflakeStagingReplaceJob.from_table_chain(table_chain, self.sql_client)]
-+        return super()._create_replace_followup_jobs(table_chain)
-+
-     def _make_add_column_sql(
-         self, new_columns: Sequence[TColumnSchema], table: PreparedTableSchema = None
-     ) -> List[str]:
-diff --git a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
-index 0e3fecbd4..dadc7e5e1 100644
---- a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
-+++ b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
-@@ -169,6 +169,34 @@ All write dispositions are supported.
- 
- If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be dropped and recreated with a [clone command](https://docs.snowflake.com/en/sql-reference/sql/create-clone) from the staging tables.
- 
-+#### Atomic swap replacement
-+
-+Snowflake supports atomic table swapping as an optional optimization when using the `staging-optimized` replace strategy. When enabled via the `enable_atomic_swap` configuration option, destination and staging tables are swapped using Snowflake's `ALTER TABLE ... SWAP WITH ...` functionality instead of the default clone operation.
-+
-+Each table retains its original permissions after swapping, so you must ensure any `FUTURE GRANT`s configured on the staging schema are appropriate for your use case. Additionally, dlt does not automatically drop staging tables, which means the previous production table (with all its permissions) becomes the staging table for the next load.
-+
-+To enable atomic swap, add the following to your configuration:
-+
-+```toml
-+[destination.snowflake]
-+enable_atomic_swap = true
-+```
-+
-+Or via environment variable:
-+```text
-+DESTINATION__SNOWFLAKE__ENABLE_ATOMIC_SWAP=true
-+```
-+
-+Or as an argument to `dlt.destinations.snowflake`:
-+```py
-+import dlt
-+
-+pipeline = dlt.pipeline(
-+    pipeline_name="...",
-+    destination=dlt.destinations.snowflake(enable_atomic_swap=True),
-+)
-+```
-+
- ### Data loading
- 
- The data is loaded using an internal Snowflake stage. We use the `PUT` command and per-table built-in stages by default. Stage files are kept by default, unless specified otherwise via the `keep_staged_files` parameter:
-diff --git a/tests/load/pipeline/test_replace_disposition.py b/tests/load/pipeline/test_replace_disposition.py
-index 1c3b0d493..124bc0be5 100644
---- a/tests/load/pipeline/test_replace_disposition.py
-+++ b/tests/load/pipeline/test_replace_disposition.py
-@@ -446,3 +446,82 @@ def test_replace_sql_queries(
-         else:
-             assert clone_sql_generator_spy.call_count == 1
-             assert insert_sql_generator_spy.call_count == 0
-+
-+
-+@pytest.mark.essential
-+@pytest.mark.parametrize(
-+    "destination_config",
-+    destinations_configs(
-+        default_sql_configs=True,
-+        subset=["snowflake"],
-+    ),
-+    ids=lambda x: x.name,
-+)
-+def test_snowflake_atomic_swap_replace(
-+    destination_config: DestinationTestConfiguration,
-+    mocker: MockerFixture,
-+    monkeypatch: pytest.MonkeyPatch,
-+) -> None:
-+    """Test Snowflake atomic swap with sequential loads, nested tables, and empty resource."""
-+    from dlt.destinations.sql_jobs import SqlStagingFollowupJob, SqlStagingReplaceFollowupJob
-+    from dlt.destinations.impl.snowflake.snowflake import SnowflakeStagingReplaceJob
-+
-+    monkeypatch.setenv("DESTINATION__REPLACE_STRATEGY", "staging-optimized")
-+    monkeypatch.setenv("DESTINATION__SNOWFLAKE__ENABLE_ATOMIC_SWAP", "true")
-+
-+    clone_spy = mocker.spy(SqlStagingReplaceFollowupJob, "_generate_clone_sql")
-+    insert_spy = mocker.spy(SqlStagingFollowupJob, "_generate_insert_sql")
-+    swap_spy = mocker.spy(SnowflakeStagingReplaceJob, "generate_sql")
-+
-+    pipeline = destination_config.setup_pipeline("snowflake_atomic_swap_test", dev_mode=True)
-+
-+    @dlt.resource(name="items", write_disposition="replace", primary_key="id")
-+    def load_items(offset):
-+        for i in range(offset, offset + 3):
-+            yield {
-+                "id": i,
-+                "name": f"item {i}",
-+                "sub_items": [
-+                    {"id": i * 100 + 1, "name": f"sub {i * 100 + 1}"},
-+                    {"id": i * 100 + 2, "name": f"sub {i * 100 + 2}"},
-+                ],
-+            }
-+
-+    # first load: nested data via swap
-+    info = pipeline.run(load_items(0), **destination_config.run_kwargs)
-+    assert_load_info(info)
-+
-+    assert swap_spy.call_count == 1
-+    assert clone_spy.call_count == 0
-+    assert insert_spy.call_count == 0
-+    for sql_stmt in swap_spy.return_value:
-+        assert "SWAP WITH" in sql_stmt
-+
-+    assert load_table_counts(pipeline, "items", "items__sub_items") == {
-+        "items": 3,
-+        "items__sub_items": 6,
-+    }
-+
-+    # second load: different data, verifies full replacement after prior swap
-+    swap_spy.reset_mock()
-+    info = pipeline.run(load_items(100), **destination_config.run_kwargs)
-+    assert_load_info(info)
-+
-+    assert swap_spy.call_count == 1
-+    assert load_table_counts(pipeline, "items", "items__sub_items") == {
-+        "items": 3,
-+        "items__sub_items": 6,
-+    }
-+    table_dicts = load_tables_to_dicts(pipeline, "items")
-+    assert {int(r["id"]) for r in table_dicts["items"]} == {100, 101, 102}
-+
-+    # third load: empty resource clears all tables
-+    @dlt.resource(name="items", write_disposition="replace", primary_key="id")
-+    def load_items_empty():
-+        if False:
-+            yield
-+
-+    swap_spy.reset_mock()
-+    info = pipeline.run(load_items_empty(), **destination_config.run_kwargs)
-+    assert_load_info(info)
-+    assert_empty_tables(pipeline, "items", "items__sub_items")
-
-
-===== COMMIT c4b3cd9c =====
-
-
-commit c4b3cd9cf
-Author: rudolfix
-Date: 2026-02-14
-
-    detect when running via agent (#3628)
-
-diff --git a/dlt/common/runtime/exec_info.py b/dlt/common/runtime/exec_info.py
-index 04ac091d6..a08554434 100644
---- a/dlt/common/runtime/exec_info.py
-+++ b/dlt/common/runtime/exec_info.py
-@@ -61,6 +61,14 @@ def exec_info_names() -> List[TExecInfoNames]:
-         names.append("gcp_cloud_function")
-     if is_streamlit():
-         names.append("streamlit")
-+    if is_claude_code():
-+        names.append("claude_code")
-+    if is_claude_code_cli():
-+        names.append("claude_code_cli")
-+    if is_cursor():
-+        names.append("cursor")
-+    if is_codex():
-+        names.append("codex")
-     return names
- 
- 
-@@ -76,6 +84,47 @@ def is_streamlit() -> bool:
-     return "STREAMLIT_SERVER_PORT" in os.environ
- 
- 
-+def is_claude_code() -> bool:
-+    """Return True if running under Claude Code (CLI or API).
-+
-+    Detects CLAUDECODE environment variable set by Claude Code.
-+    https://code.claude.com/docs/en/settings
-+    """
-+    return os.environ.get("CLAUDECODE") == "1"
-+
-+
-+def is_claude_code_cli() -> bool:
-+    """Return True if running under Claude Code CLI specifically.
-+
-+    Detects CLAUDECODE=1 and CLAUDE_CODE_ENTRYPOINT=cli environment variables.
-+    Note: Both claude_code and claude_code_cli will be present when running via CLI.
-+    https://code.claude.com/docs/en/settings
-+    """
-+    return os.environ.get("CLAUDECODE") == "1" and os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "cli"
-+
-+
-+def is_cursor() -> bool:
-+    """Return True if running in Cursor IDE Agent.
-+
-+    Detects CURSOR_AGENT environment variable set when Cursor Agent is running.
-+    https://cursor.com/docs/agent/terminal
-+    """
-+    return os.environ.get("CURSOR_AGENT") == "1"
-+
-+
-+def is_codex() -> bool:
-+    """Return True if running in OpenAI Codex.
-+
-+    Detects CODEX_CI, CODEX_THREAD_ID, or CODEX_SANDBOX environment variables.
-+    https://developers.openai.com/codex/cli/features/
-+    """
-+    return (
-+        os.environ.get("CODEX_CI") == "1"
-+        or os.environ.get("CODEX_THREAD_ID") is not None
-+        or os.environ.get("CODEX_SANDBOX") is not None
-+    )
-+
-+
- def is_notebook() -> bool:
-     try:
-         return bool(str(get_ipython()))  # type: ignore
-diff --git a/dlt/common/runtime/typing.py b/dlt/common/runtime/typing.py
-index 29df6b3a0..480f6b872 100644
---- a/dlt/common/runtime/typing.py
-+++ b/dlt/common/runtime/typing.py
-@@ -18,6 +18,10 @@ TExecInfoNames = Literal[
-     "dagster",
-     "prefect",
-     "marimo",
-+    "claude_code",
-+    "claude_code_cli",
-+    "cursor",
-+    "codex",
- ]
- 
- 
-diff --git a/tests/common/configuration/utils.py b/tests/common/configuration/utils.py
-index 1adb0cac7..7d59fb694 100644
---- a/tests/common/configuration/utils.py
-+++ b/tests/common/configuration/utils.py
-@@ -112,18 +112,9 @@ class InstrumentedConfiguration(BaseConfiguration):
- 
- 
- @pytest.fixture(scope="function")
--def environment() -> Any:
--    saved_environ = environ.copy()
--    # preserve these explicitly
--    preserved = {
--        DLT_TEST_STORAGE_ROOT: saved_environ.get(DLT_TEST_STORAGE_ROOT),
--        PYTEST_XDIST_WORKER: saved_environ.get(PYTEST_XDIST_WORKER),
--    }
-+def environment(preserve_environ) -> Any:
-     environ.clear()
--    environ.update({k: v for k, v in preserved.items() if v is not None})
--    yield environ
--    environ.clear()
--    environ.update(saved_environ)
-+    return environ
- 
- 
- @pytest.fixture(autouse=True)
-diff --git a/tests/common/conftest.py b/tests/common/conftest.py
-new file mode 100644
-index 000000000..0e84c4108
---- /dev/null
-+++ b/tests/common/conftest.py
-@@ -0,0 +1 @@
-+from tests.utils import preserve_environ
-diff --git a/tests/common/runners/test_runners.py b/tests/common/runners/test_runners.py
-index 8b897d476..e3fa86458 100644
---- a/tests/common/runners/test_runners.py
-+++ b/tests/common/runners/test_runners.py
-@@ -3,7 +3,7 @@ import pytest
- import sys
- import time
- import multiprocessing
--from typing import ClassVar, Tuple, Type
-+from typing import ClassVar, Iterator, Tuple, Type
- 
- from dlt.common.runtime import signals
- from dlt.common.configuration import resolve_configuration, configspec
-@@ -76,10 +76,14 @@ _counter = 0
- 
- 
- @pytest.fixture(autouse=True)
--def default_args() -> None:
-+def default_args() -> Iterator[None]:
-     signals._received_signal = 0
-     global _counter
-     _counter = 0
-+    try:
-+        yield
-+    finally:
-+        signals._received_signal = 0
- 
- 
- # test runner functions
-diff --git a/tests/common/runners/utils.py b/tests/common/runners/utils.py
-index 3d6adbf70..00dc1bd1b 100644
---- a/tests/common/runners/utils.py
-+++ b/tests/common/runners/utils.py
-@@ -16,8 +16,10 @@ ALL_METHODS = set(multiprocessing.get_all_start_methods()).intersection(["fork",
- @pytest.fixture(autouse=True)
- def mp_method_auto() -> Iterator[None]:
-     method = multiprocessing.get_start_method()
--    yield
--    multiprocessing.set_start_method(method, force=True)
-+    try:
-+        yield
-+    finally:
-+        multiprocessing.set_start_method(method, force=True)
- 
- 
- class _TestRunnableWorkerMethod(Runnable[Executor]):
-diff --git a/tests/common/runtime/test_exec_info.py b/tests/common/runtime/test_exec_info.py
-new file mode 100644
-index 000000000..ee92c23a5
---- /dev/null
-+++ b/tests/common/runtime/test_exec_info.py
-@@ -0,0 +1,142 @@
-+import pytest
-+
-+from dlt.common.runtime.exec_info import (
-+    exec_info_names,
-+    is_aws_lambda,
-+    is_claude_code,
-+    is_claude_code_cli,
-+    is_codespaces,
-+    is_codex,
-+    is_cursor,
-+    is_gcp_cloud_function,
-+    is_github_actions,
-+    is_running_in_airflow_task,
-+    is_streamlit,
-+)
-+from dlt.common.typing import DictStrStr
-+
-+from tests.common.configuration.utils import environment
-+
-+
-+@pytest.mark.parametrize(
-+    "env_var,detect_fn",
-+    [
-+        ("CODESPACES", is_codespaces),
-+        ("GITHUB_ACTIONS", is_github_actions),
-+        ("STREAMLIT_SERVER_PORT", is_streamlit),
-+        ("AWS_LAMBDA_FUNCTION_NAME", is_aws_lambda),
-+        ("FUNCTION_NAME", is_gcp_cloud_function),
-+        ("AIRFLOW_CTX_TASK_ID", is_running_in_airflow_task),
-+    ],
-+    ids=[
-+        "codespaces",
-+        "github-actions",
-+        "streamlit",
-+        "aws-lambda",
-+        "gcp-cloud-function",
-+        "airflow-task",
-+    ],
-+)
-+def test_env_presence_detection(env_var: str, detect_fn, environment: DictStrStr) -> None:
-+    assert detect_fn() is False
-+    environment[env_var] = "1"
-+    assert detect_fn() is True
-+
-+
-+def test_is_claude_code(environment: DictStrStr) -> None:
-+    assert is_claude_code() is False
-+
-+    # wrong value does not trigger
-+    environment["CLAUDECODE"] = "0"
-+    assert is_claude_code() is False
-+
-+    environment["CLAUDECODE"] = "1"
-+    assert is_claude_code() is True
-+
-+
-+def test_is_claude_code_cli(environment: DictStrStr) -> None:
-+    assert is_claude_code_cli() is False
-+
-+    # only CLAUDECODE — not enough
-+    environment["CLAUDECODE"] = "1"
-+    assert is_claude_code_cli() is False
-+
-+    # only entrypoint — not enough
-+    del environment["CLAUDECODE"]
-+    environment["CLAUDE_CODE_ENTRYPOINT"] = "cli"
-+    assert is_claude_code_cli() is False
-+
-+    # both set
-+    environment["CLAUDECODE"] = "1"
-+    assert is_claude_code_cli() is True
-+
-+
-+def test_is_cursor(environment: DictStrStr) -> None:
-+    assert is_cursor() is False
-+
-+    # empty or "0" must not trigger
-+    environment["CURSOR_AGENT"] = ""
-+    assert is_cursor() is False
-+    environment["CURSOR_AGENT"] = "0"
-+    assert is_cursor() is False
-+
-+    environment["CURSOR_AGENT"] = "1"
-+    assert is_cursor() is True
-+
-+
-+def test_is_codex(environment: DictStrStr) -> None:
-+    assert is_codex() is False
-+
-+    # wrong CODEX_CI value alone
-+    environment["CODEX_CI"] = "0"
-+    assert is_codex() is False
-+
-+    # each trigger independently
-+    environment["CODEX_CI"] = "1"
-+    assert is_codex() is True
-+
-+    del environment["CODEX_CI"]
-+    environment["CODEX_THREAD_ID"] = "thread-abc"
-+    assert is_codex() is True
-+
-+    del environment["CODEX_THREAD_ID"]
-+    environment["CODEX_SANDBOX"] = "/tmp/sandbox"
-+    assert is_codex() is True
-+
-+
-+@pytest.mark.parametrize(
-+    "env_vars,expected_names",
-+    [
-+        ({"CLAUDECODE": "1"}, ["claude_code"]),
-+        (
-+            {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"},
-+            ["claude_code", "claude_code_cli"],
-+        ),
-+        ({"CURSOR_AGENT": "1"}, ["cursor"]),
-+        ({"CODEX_CI": "1"}, ["codex"]),
-+        ({"CODEX_THREAD_ID": "t-1"}, ["codex"]),
-+        (
-+            {"CLAUDECODE": "1", "CURSOR_AGENT": "1", "CODEX_CI": "1"},
-+            ["claude_code", "cursor", "codex"],
-+        ),
-+    ],
-+    ids=[
-+        "claude-code-only",
-+        "claude-code-cli",
-+        "cursor",
-+        "codex-ci",
-+        "codex-thread-id",
-+        "all-agents",
-+    ],
-+)
-+def test_exec_info_names_includes_agents(env_vars, expected_names, environment: DictStrStr) -> None:
-+    environment.update(env_vars)
-+    names = exec_info_names()
-+    for expected in expected_names:
-+        assert expected in names
-+
-+
-+def test_exec_info_names_excludes_agents_when_absent(environment: DictStrStr) -> None:
-+    names = exec_info_names()
-+    agent_names = {"claude_code", "claude_code_cli", "cursor", "codex"}
-+    assert agent_names.isdisjoint(set(names))
-diff --git a/tests/common/runtime/test_signals.py b/tests/common/runtime/test_signals.py
-index 1dfcbe753..eccde4e2e 100644
---- a/tests/common/runtime/test_signals.py
-+++ b/tests/common/runtime/test_signals.py
-@@ -15,9 +15,11 @@ pytestmark = pytest.mark.serial
- 
- @pytest.fixture(autouse=True)
- def clear_signal() -> Iterator[None]:
--    yield
--    signals.exit_event.clear()
--    signals._clear_signals()
-+    try:
-+        yield
-+    finally:
-+        signals.exit_event.clear()
-+        signals._clear_signals()
- 
- 
- def test_sleep() -> None:
-diff --git a/tests/conftest.py b/tests/conftest.py
-index c08240bc1..679d2c968 100644
---- a/tests/conftest.py
-+++ b/tests/conftest.py
-@@ -72,7 +72,6 @@ def pytest_xdist_setupnodes(config, specs):
-         "ducklake",
-         "httpfs",
-         "iceberg",
--        "lance",
-         "motherduck",
-         "parquet",
-         "postgres_scanner",
-@@ -80,12 +79,21 @@ def pytest_xdist_setupnodes(config, specs):
-         "sqlite_scanner",
-     ]
- 
-+    community_extensions = [
-+        "lance",
-+    ]
-+
-     with duckdb.connect() as conn:
-         for ext in extensions:
-             try:
-                 conn.execute(f"INSTALL {ext}")
-             except Exception:
-                 pass  # extension might not be available
-+        for ext in community_extensions:
-+            try:
-+                conn.execute(f"INSTALL {ext} FROM community")
-+            except Exception:
-+                pass  # extension might not be available
- 
- 
- def pytest_configure(config):
-diff --git a/tests/helpers/dbt_tests/local/utils.py b/tests/helpers/dbt_tests/local/utils.py
-index 06abccf59..d74cfb5ab 100644
---- a/tests/helpers/dbt_tests/local/utils.py
-+++ b/tests/helpers/dbt_tests/local/utils.py
-@@ -59,11 +59,13 @@ def setup_rasa_runner_client(
-     with cm_yield_client(destination_name, FIXTURES_DATASET_NAME) as client:
-         # emit environ so credentials are passed to dbt profile
-         add_config_to_env(client.config, ("DLT",))
--        yield
--        # delete temp schemas
--        dataset_name = f"{destination_dataset_name}_views"
--        delete_dataset(client.sql_client, dataset_name)
--        dataset_name = f"{destination_dataset_name}_staging"
--        delete_dataset(client.sql_client, dataset_name)
--        dataset_name = f"{destination_dataset_name}_event"
--        delete_dataset(client.sql_client, dataset_name)
-+        try:
-+            yield
-+        finally:
-+            # delete temp schemas
-+            dataset_name = f"{destination_dataset_name}_views"
-+            delete_dataset(client.sql_client, dataset_name)
-+            dataset_name = f"{destination_dataset_name}_staging"
-+            delete_dataset(client.sql_client, dataset_name)
-+            dataset_name = f"{destination_dataset_name}_event"
-+            delete_dataset(client.sql_client, dataset_name)
-diff --git a/tests/load/filesystem/utils.py b/tests/load/filesystem/utils.py
-index 80be6b18a..cb2c50360 100644
---- a/tests/load/filesystem/utils.py
-+++ b/tests/load/filesystem/utils.py
-@@ -101,9 +101,10 @@ def self_signed_cert() -> Iterator[str]:
-         cert_file.write(cert.public_bytes(serialization.Encoding.PEM))
-         cert_path = cert_file.name
- 
--    yield cert_path
--
--    os.remove(cert_path)
-+    try:
-+        yield cert_path
-+    finally:
-+        os.remove(cert_path)
- 
- 
- @pytest.fixture
-diff --git a/tests/load/utils.py b/tests/load/utils.py
-index 6796efa4a..6bf665815 100644
---- a/tests/load/utils.py
-+++ b/tests/load/utils.py
-@@ -1243,19 +1243,21 @@ def yield_client_with_storage(
- 
-     with cm_yield_client(destination, dataset_name, default_config_values, schema_name) as client:
-         client.initialize_storage()
--        yield client
--        if client.is_storage_initialized():
--            try:
--                client.drop_storage()
--            except Exception as exc:
--                print(f"drop dataset {dataset_name}: {exc}")
--        if isinstance(client, WithStagingDataset):
--            with client.with_staging_dataset():
--                if client.is_storage_initialized():
--                    try:
--                        client.drop_storage()
--                    except Exception as exc:
--                        print(f"drop dataset {dataset_name} STAGING: {exc}")
-+        try:
-+            yield client
-+        finally:
-+            if client.is_storage_initialized():
-+                try:
-+                    client.drop_storage()
-+                except Exception as exc:
-+                    print(f"drop dataset {dataset_name}: {exc}")
-+            if isinstance(client, WithStagingDataset):
-+                with client.with_staging_dataset():
-+                    if client.is_storage_initialized():
-+                        try:
-+                            client.drop_storage()
-+                        except Exception as exc:
-+                            print(f"drop dataset {dataset_name} STAGING: {exc}")
- 
- 
- def delete_dataset(client: SqlClientBase[Any], normalized_dataset_name: str) -> None:
-diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
-index 3d7372316..ad00f35df 100644
---- a/tests/pipeline/test_pipeline.py
-+++ b/tests/pipeline/test_pipeline.py
-@@ -97,9 +97,6 @@ def test_default_pipeline() -> None:
-     # this is a name of executing test harness or blank pipeline on windows
-     possible_names = ["dlt_pytest", "dlt_pipeline"]
-     assert p.pipeline_name in possible_names
--    assert p.pipelines_dir == os.path.abspath(
--        os.path.join(get_test_storage_root(), ".dlt", "pipelines")
--    )
-     # default dataset name is not created until a destination that requires it is set
-     assert p.dataset_name is None
-     assert p.destination is None
-@@ -119,6 +116,13 @@ def test_default_pipeline() -> None:
-     assert p.default_schema_name in ["dlt_pytest", "dlt"]
- 
- 
-+def test_default_pipelines_dir() -> None:
-+    p = dlt.pipeline("test_pipeline" + uniq_id())
-+    assert p.pipelines_dir == os.path.abspath(
-+        os.path.join(get_test_storage_root(), ".dlt", "pipelines")
-+    )
-+
-+
- def test_pipeline_runtime_configuration() -> None:
-     c = resolve.resolve_configuration(PipelineConfiguration())
-     assert c.pipeline_name.startswith("dlt_")
-@@ -149,9 +153,6 @@ def test_default_pipeline_dataset_layout(environment) -> None:
-         dataset_name_layout % "dlt_pipeline_dataset",
-     ]
-     assert p.pipeline_name in possible_names
--    assert p.pipelines_dir == os.path.abspath(
--        os.path.join(get_test_storage_root(), ".dlt", "pipelines")
--    )
-     # dataset that will be used to load data is the pipeline name
-     assert p.dataset_name in possible_dataset_names
-     assert p.default_schema_name is None
-diff --git a/tests/utils.py b/tests/utils.py
-index 2da8d1604..d92524a92 100644
---- a/tests/utils.py
-+++ b/tests/utils.py
-@@ -371,10 +371,12 @@ class MockableRunContext(RunContext):
- def auto_unload_modules() -> Iterator[None]:
-     """Unload all modules inspected in this tests"""
-     prev_modules = dict(sys.modules)
--    yield
--    mod_diff = set(sys.modules.keys()) - set(prev_modules.keys())
--    for mod in mod_diff:
--        del sys.modules[mod]
-+    try:
-+        yield
-+    finally:
-+        mod_diff = set(sys.modules.keys()) - set(prev_modules.keys())
-+        for mod in mod_diff:
-+            del sys.modules[mod]
- 
- 
- @pytest.fixture(autouse=True)
-@@ -383,14 +385,16 @@ def deactivate_pipeline(preserve_environ) -> Iterator[None]:
-     container = Container()
-     if container[PipelineContext].is_active():
-         container[PipelineContext].deactivate()
--    yield
--    if container[PipelineContext].is_active():
--        # take existing pipeline
--        # NOTE: no more needed. test storage is wiped fully when test starts
--        # p = dlt.pipeline()
--        # p._wipe_working_folder()
--        # deactivate context
--        container[PipelineContext].deactivate()
-+    try:
-+        yield
-+    finally:
-+        if container[PipelineContext].is_active():
-+            # take existing pipeline
-+            # NOTE: no more needed. test storage is wiped fully when test starts
-+            # p = dlt.pipeline()
-+            # p._wipe_working_folder()
-+            # deactivate context
-+            container[PipelineContext].deactivate()
- 
- 
- @pytest.fixture(autouse=True)
-diff --git a/tests/workspace/cli/utils.py b/tests/workspace/cli/utils.py
-index 15569f8d8..e2adbfa90 100644
---- a/tests/workspace/cli/utils.py
-+++ b/tests/workspace/cli/utils.py
-@@ -23,8 +23,10 @@ WORKSPACE_CLI_CASES_DIR = os.path.abspath(os.path.join("tests", "workspace", "cl
- def auto_echo_default_choice() -> Iterator[None]:
-     """Always answer default in CLI interactions"""
-     echo.ALWAYS_CHOOSE_DEFAULT = True
--    yield
--    echo.ALWAYS_CHOOSE_DEFAULT = False
-+    try:
-+        yield
-+    finally:
-+        echo.ALWAYS_CHOOSE_DEFAULT = False
- 
- 
- @pytest.fixture(scope="session")
-
-
-===== COMMIT 8041e25c =====
-
-
-commit 8041e25c4
-Author: rudolfix
-Date: 2026-02-14
-
-    (bugfix) (chores) cleans up query lifecycle (#3627)
-
 diff --git a/dlt/common/libs/sqlglot.py b/dlt/common/libs/sqlglot.py
 index 537595a44..7de8aa7ee 100644
 --- a/dlt/common/libs/sqlglot.py
@@ -2994,4 +1335,1754 @@ Author: Alberto
 Date: 2026-02-06
 
     Fix failing testsdue parallelism (#3593)
+
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index cb72e7127..45c2a1b12 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -108,7 +108,4 @@ jobs:
+   # test_tools_dbt_cloud:
+   #   needs: [test_common, authorize_run_from_fork]
+   #   uses: ./.github/workflows/test_tools_dbt_cloud.yml
+-  #   secrets: inherit
+-
+-
+-
++  #   secrets: inherit
+\ No newline at end of file
+diff --git a/.github/workflows/test_destinations_local.yml b/.github/workflows/test_destinations_local.yml
+index 05d15c164..344e0fded 100644
+--- a/.github/workflows/test_destinations_local.yml
++++ b/.github/workflows/test_destinations_local.yml
+@@ -23,15 +23,23 @@ jobs:
+         include:
+ 
+           # Duckdb, Postgres, Filesystem, Weaviate, Qdrant (could be split?)
+-          - name: filesystem, weaviate, qdrant
+-            destinations: "[\"filesystem\", \"weaviate\", \"qdrant\"]"
++          - name: filesystem, weaviate
++            destinations: "[\"filesystem\", \"weaviate\"]"
+             filesystem_drivers: "[\"memory\", \"file\", \"sftp\"]"
+-            extras: "--extra parquet --extra cli --extra filesystem --extra qdrant --extra weaviate --extra deltalake --extra pyiceberg --extra sftp"
++            extras: "--extra parquet --extra cli --extra filesystem --extra weaviate --extra deltalake --extra pyiceberg --extra sftp"
+             needs_weaviate: true
+-            needs_qdrant: true
+             needs_ftp: true
+             post_install_commands: "uv run pip install sqlalchemy==2.0.18" # minimum version required by `pyiceberg`
+ 
++          # Qdrant runs test serially, concurrency is problematic
++          - name: qdrant
++            destinations: "[\"qdrant\"]"
++            filesystem_drivers: "[\"memory\", \"file\", \"sftp\"]"
++            extras: "--extra parquet --extra cli --extra qdrant --extra sftp"
++            needs_qdrant: true
++            needs_ftp: true
++            pytest_xdist_n: 1
++
+           # TODO: also test ducklake in remote mode with a buckets and remote postgres
+           - name: postgres, duckdb, ducklake, and dummy
+             destinations: "[\"postgres\", \"duckdb\", \"ducklake\", \"dummy\"]"
+@@ -186,10 +194,10 @@ jobs:
+         if: ${{ matrix.post_install_commands }}
+ 
+       # always run full suite, also on branches
+-      - name: Run tests (limiting xdist workers to 4 since local postgres cant handle more)
++      - name: Run destination load tests
+         run: make test-dest-load
+         env:
+-          PYTEST_XDIST_N: 4
++          PYTEST_XDIST_N: ${{ matrix.pytest_xdist_n || 4 }}
+ 
+       #
+       # Tear down services 
+diff --git a/.gitignore b/.gitignore
+index 67bd1801e..cec73cb2c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -157,3 +157,6 @@ local_cache/
+ # test file for examples are generated and should not be committed
+ docs/examples/**/test*.py
+ compiled_requirements.txt
++
++# docker folder for running tests as other OS
++tests/.docker/
+diff --git a/tests/load/qdrant/test_pipeline.py b/tests/load/qdrant/test_pipeline.py
+index b289b17f5..8dec36945 100644
+--- a/tests/load/qdrant/test_pipeline.py
++++ b/tests/load/qdrant/test_pipeline.py
+@@ -376,7 +376,7 @@ def test_qdrant_local_parallelism_disabled(preserve_environ) -> None:
+     os.environ["DATA_WRITER__FILE_MAX_ITEMS"] = "20"
+ 
+     with TemporaryDirectory() as tmpdir:
+-        p = dlt.pipeline(destination=dlt.destinations.qdrant(path=tmpdir))
++        p = dlt.pipeline(destination=dlt.destinations.qdrant(qd_path=tmpdir))
+ 
+         # Data writer limit ensures that we create multiple load files to the same table
+         @dlt.resource
+diff --git a/tests/load/test_job_client.py b/tests/load/test_job_client.py
+index d8ed61b1a..af3acb0dd 100644
+--- a/tests/load/test_job_client.py
++++ b/tests/load/test_job_client.py
+@@ -1143,7 +1143,7 @@ def test_many_schemas_single_dataset(
+     ids=lambda x: x.name,
+ )
+ def test_schema_retrieval(destination_config: DestinationTestConfiguration) -> None:
+-    p = destination_config.setup_pipeline("schema_test", dev_mode=True)
++    p = destination_config.setup_pipeline("schema_test" + uniq_id(), dev_mode=True)
+     from dlt.common.schema import utils
+ 
+     # we create 2 versions of 2 schemas
+diff --git a/tests/load/utils.py b/tests/load/utils.py
+index a7eda4f11..8d26e5537 100644
+--- a/tests/load/utils.py
++++ b/tests/load/utils.py
+@@ -554,7 +554,7 @@ def destinations_configs(
+             ),
+             DestinationTestConfiguration(
+                 destination_type="qdrant",
+-                credentials=dict(path=str(Path(FILE_BUCKET) / f"qdrant_data_{worker}")),
++                credentials=dict(path="qdrant_data"),
+                 extra_info="local-file",
+             ),
+             DestinationTestConfiguration(
+
+
+===== COMMIT 76dc74e4 =====
+
+
+commit 76dc74e46
+Author: Anton Karling
+Date: 2026-02-05
+
+    fix (3591) - respect `filename=True` in `read_csv_duckdb` (#3606)
+
+diff --git a/dlt/sources/filesystem/readers.py b/dlt/sources/filesystem/readers.py
+index dd36a05ac..b87cbae97 100644
+--- a/dlt/sources/filesystem/readers.py
++++ b/dlt/sources/filesystem/readers.py
+@@ -115,11 +115,17 @@ def _read_csv_duckdb(
+ 
+     helper = fetch_arrow if use_pyarrow else fetch_json
+ 
++    add_filename = duckdb_kwargs.pop("filename", False)
++
+     for item in items:
+         with item.open() as f:
+             file_data = duckdb.from_csv_auto(f, **duckdb_kwargs)  # type: ignore
+ 
+-            yield from helper(file_data, chunk_size)
++            for batch in helper(file_data, chunk_size):
++                if add_filename:
++                    for record in batch:
++                        record["filename"] = item["file_name"]  # type: ignore
++                yield batch
+ 
+ 
+ if TYPE_CHECKING:
+diff --git a/tests/sources/filesystem/test_readers.py b/tests/sources/filesystem/test_readers.py
+index 2acc5fc7e..00f70910e 100644
+--- a/tests/sources/filesystem/test_readers.py
++++ b/tests/sources/filesystem/test_readers.py
+@@ -152,6 +152,16 @@ def test_read_csv_duckdb(tmp_path: pathlib.Path, data: list[dict[str, Any]]) ->
+     assert read_data == [data]
+ 
+ 
++def test_read_csv_duckdb_filename(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
++    file_ = _create_csv_file(data=data, tmp_path=tmp_path)
++
++    for record in _read_csv_duckdb([file_], filename=True):
++        assert record[0]["filename"] == file_["file_name"]
++
++    for record in _read_csv_duckdb([file_]):
++        assert "filename" not in record[0].keys()
++
++
+ def test_read_csv_duckdb_use_pyarrow(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
+     file_ = _create_csv_file(data=data, tmp_path=tmp_path)
+     iterator = _read_csv_duckdb([file_], use_pyarrow=True)
+
+
+===== COMMIT 7507025d =====
+
+
+commit 7507025d7
+Author: Shreyas
+Date: 2026-02-04
+
+    feat: update GitHub API pipeline template (#3603)
+
+diff --git a/dlt/_workspace/_templates/_single_file_templates/github_api_pipeline.py b/dlt/_workspace/_templates/_single_file_templates/github_api_pipeline.py
+index 1423a8dc3..4f93dd46e 100644
+--- a/dlt/_workspace/_templates/_single_file_templates/github_api_pipeline.py
++++ b/dlt/_workspace/_templates/_single_file_templates/github_api_pipeline.py
+@@ -1,47 +1,69 @@
+-"""The Github API templates provides a starting point to read data from REST APIs with REST Client helper"""
++"""The Github API templates provides a starting point to read data from REST APIs with REST Client"""
+ 
+ # mypy: disable-error-code="no-untyped-def,arg-type"
+ 
+ from typing import Optional
+-
+ import dlt
+-
+-from dlt.sources.helpers.rest_client import paginate
++from dlt.sources.helpers.rest_client import RESTClient
+ from dlt.sources.helpers.rest_client.auth import BearerTokenAuth
+ from dlt.sources.helpers.rest_client.paginators import HeaderLinkPaginator
+ 
+ 
+-@dlt.resource(write_disposition="replace")
+-def github_api_resource(access_token: Optional[str] = dlt.secrets.value):
+-    url = "https://api.github.com/repos/dlt-hub/dlt/issues"
++@dlt.source
++def github_source(access_token: Optional[str] = dlt.secrets.value):
++    # Optional auth: works with and without secrets
++    auth = BearerTokenAuth(token=access_token) if access_token else None
++
++    client = RESTClient(
++        base_url="https://api.github.com",
++        auth=auth,
++        paginator=HeaderLinkPaginator(),
++        headers={
++            "Accept": "application/vnd.github+json",
++            "X-GitHub-Api-Version": "2022-11-28",
++        },
++    )
+ 
+-    # Github allows both authenticated and non-authenticated requests (with low rate limits)
+-    auth = BearerTokenAuth(access_token) if access_token else None
+-    for page in paginate(
+-        url, auth=auth, paginator=HeaderLinkPaginator(), params={"state": "open", "per_page": "100"}
++    # Define a resource which fetches repos data
++    @dlt.resource(name="repos", write_disposition="replace")
++    def repos():
++        for page in client.paginate("orgs/dlt-hub/repos"):
++            yield page
++
++    # Define a resource which fetches issues data (incremental by updated_at timestamp)
++    @dlt.resource(name="issues", write_disposition="append")
++    def issues(
++        updated_at=dlt.sources.incremental(
++            "updated_at",
++            initial_value="2026-01-01T00:00:00Z",
++        )
+     ):
+-        yield page
++        for page in client.paginate(
++            "repos/dlt-hub/dlt/issues",
++            params={
++                "state": "open",
++                "sort": "updated",
++                "direction": "desc",
++                "since": updated_at.start_value,
++                "per_page": "100",
++            },
++        ):
++            yield page
+ 
+-
+-@dlt.source
+-def github_api_source(access_token: Optional[str] = dlt.secrets.value):
+-    return github_api_resource(access_token=access_token)
++    return [repos, issues]
+ 
+ 
+ def run_source() -> None:
+-    # configure the pipeline with your destination details
++    # Define pipeline
+     pipeline = dlt.pipeline(
+-        pipeline_name="github_api_pipeline", destination="duckdb", dataset_name="github_api_data"
++        pipeline_name="github_api_pipeline",
++        destination="duckdb",
++        dataset_name="github_api_data",
++        progress="log",
+     )
+ 
+-    # print credentials by running the resource
+-    data = list(github_api_resource())
+-
+-    # print the data yielded from resource
+-    print(data)  # noqa: T201
+-
+     # run the pipeline with your parameters
+-    load_info = pipeline.run(github_api_source())
++    load_info = pipeline.run(github_source())
+ 
+     # pretty print the information on data that was loaded
+     print(load_info)  # noqa: T201
+
+
+===== COMMIT d919dd2b =====
+
+
+commit d919dd2b0
+Author: rudolfix
+Date: 2026-02-04
+
+    escapes sort columns (#3594)
+
+diff --git a/dlt/destinations/sql_jobs.py b/dlt/destinations/sql_jobs.py
+index d15777ebc..96cb770e2 100644
+--- a/dlt/destinations/sql_jobs.py
++++ b/dlt/destinations/sql_jobs.py
+@@ -652,6 +652,8 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+ 
+         # get dedup sort information
+         dedup_sort = get_dedup_sort_tuple(root_table)
++        if dedup_sort is not None:
++            dedup_sort = (escape_column_id(dedup_sort[0]), dedup_sort[1])
+         skip_dedup: bool = root_table.get("x-stage-data-deduplicated", False)  # type: ignore[assignment]
+ 
+         insert_temp_table_name: str = None
+diff --git a/tests/load/pipeline/test_merge_disposition.py b/tests/load/pipeline/test_merge_disposition.py
+index 583384b21..998e53891 100644
+--- a/tests/load/pipeline/test_merge_disposition.py
++++ b/tests/load/pipeline/test_merge_disposition.py
+@@ -1,4 +1,5 @@
+ from copy import copy
++import os
+ import pytest
+ import random
+ from typing import List, cast
+@@ -1588,6 +1589,54 @@ def test_dedup_sort_hint(destination_config: DestinationTestConfiguration) -> No
+         info = p.run(r(), **destination_config.run_kwargs)
+ 
+ 
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(default_sql_configs=True, supports_merge=True),
++    ids=lambda x: x.name,
++)
++def test_dedup_sort_hint_case_sensitive(
++    destination_config: DestinationTestConfiguration,
++) -> None:
++    """Test that dedup_sort column names are properly escaped in merge SQL.
++
++    Reproduces https://github.com/dlt-hub/dlt/issues/3529 where unescaped
++    dedup_sort column names cause failures with case-sensitive naming
++    conventions on destinations that casefold unquoted identifiers.
++    """
++    # use direct naming to preserve mixed case in column names
++    os.environ["SCHEMA__NAMING"] = "direct"
++
++    table_name = "test_dedup_sort_cs"
++
++    @dlt.resource(
++        name=table_name,
++        write_disposition="merge",
++        primary_key="id",
++        columns={"Sequence": {"dedup_sort": "desc", "nullable": False}},
++    )
++    def data_resource(data):
++        yield data
++
++    p = destination_config.setup_pipeline("dedup_sort_cs", dev_mode=True)
++
++    # three records with same primary key
++    data = [
++        {"id": 1, "val": "foo", "Sequence": 1},
++        {"id": 1, "val": "baz", "Sequence": 3},
++        {"id": 1, "val": "bar", "Sequence": 2},
++    ]
++    info = p.run(data_resource(data), **destination_config.run_kwargs)
++    assert_load_info(info)
++    assert load_table_counts(p, table_name)[table_name] == 1
++
++    # record with highest value in sort column is inserted (because "desc")
++    result = load_tables_to_dicts(p, table_name, exclude_system_cols=True)
++    assert_records_as_set(
++        result[table_name],
++        [{"id": 1, "val": "baz", "Sequence": 3}],
++    )
++
++
+ @pytest.mark.no_load
+ def test_merge_strategy_config() -> None:
+     # merge strategy invalid
+
+
+===== COMMIT 666805d0 =====
+
+
+commit 666805d0f
+Author: rudolfix
+Date: 2026-02-04
+
+    bumps to 1.21.1a0 (#3607)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index d834a90fa..534c9b52b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "dlt"
+-version = "1.21.0"
++version = "1.21.1a0"
+ description = "dlt is an open-source python-first scalable data loading library that does not require any backend to run."
+ authors = [{ name = "dltHub Inc.", email = "services@dlthub.com" }]
+ requires-python = ">=3.9.2, <3.15"
+diff --git a/uv.lock b/uv.lock
+index 7eaad642f..49117f30f 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2060,7 +2060,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.21.0"
++version = "1.21.1a0"
+ source = { editable = "." }
+ dependencies = [
+     { name = "click" },
+
+
+===== COMMIT 41dfabfc =====
+
+
+commit 41dfabfc7
+Author: rudolfix
+Date: 2026-02-04
+
+    implements several bug fixes and tests for pydantic model synth (#3605)
+
+diff --git a/dlt/common/libs/pydantic.py b/dlt/common/libs/pydantic.py
+index 5595af364..30c77e0f6 100644
+--- a/dlt/common/libs/pydantic.py
++++ b/dlt/common/libs/pydantic.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations as _annotations
++import collections.abc
+ from copy import copy
+ from typing import (
+     Dict,
+@@ -60,6 +61,14 @@ _TPydanticModel = TypeVar("_TPydanticModel", bound=BaseModel)
+ snake_case_naming_convention = SnakeCaseNamingConvention()
+ 
+ 
++def _is_set_origin(origin: type) -> bool:
++    """Check if a type origin is set-like (set or frozenset)."""
++    try:
++        return issubclass(origin, collections.abc.Set)
++    except TypeError:
++        return False
++
++
+ class ListModel(BaseModel, Generic[_TPydanticModel]):
+     items: List[_TPydanticModel]
+ 
+@@ -100,7 +109,6 @@ def pydantic_to_table_schema_columns(
+     Args:
+         model: The pydantic model to convert. Can be a class or an instance.
+ 
+-
+     Returns:
+         TTableSchemaColumns: table schema columns dict
+     """
+@@ -222,6 +230,7 @@ def apply_schema_contract_to_model(
+     model: Type[_TPydanticModel],
+     column_mode: TSchemaEvolutionMode,
+     data_mode: TSchemaEvolutionMode = "freeze",
++    _child_models: Optional[Dict[int, Type[BaseModel]]] = None,
+ ) -> Type[_TPydanticModel]:
+     """Configures or re-creates `model` so it behaves according to `column_mode` and `data_mode` settings.
+ 
+@@ -230,6 +239,9 @@ def apply_schema_contract_to_model(
+ 
+     `discard_row` is implemented in `validate_item`.
+     """
++    # save dlt_config before model may be replaced by the evolve path
++    original_dlt_config = getattr(model, "dlt_config", None)
++
+     if data_mode == "evolve":
+         # create a lenient model that accepts any data
+         model = create_model(model.__name__ + "Any", **{n: (Any, None) for n in model.model_fields})  # type: ignore
+@@ -242,7 +254,9 @@ def apply_schema_contract_to_model(
+     extra = column_mode_to_extra(column_mode)
+ 
+     if extra == get_extra_from_model(model):
+-        # no need to change the model
++        # no need to change the model, but restore dlt_config lost by the evolve path
++        if original_dlt_config:
++            model.dlt_config = original_dlt_config  # type: ignore[attr-defined]
+         return model
+ 
+     if _PYDANTIC_2:
+@@ -255,21 +269,38 @@ def apply_schema_contract_to_model(
+         config.extra = extra  # type: ignore[attr-defined]
+         prepare_config(config, model.Config.__name__)  # type: ignore[attr-defined]
+ 
+-    _child_models: Dict[int, Type[BaseModel]] = {}
++    if _child_models is None:
++        _child_models = {}
+ 
+     def _process_annotation(t_: Type[Any]) -> Type[Any]:
+         """Recursively recreates models with applied schema contract"""
+         if is_annotated(t_):
+             a_t, *a_m = get_args(t_)
+             return Annotated[_process_annotation(a_t), tuple(a_m)]  # type: ignore[return-value]
++        origin = get_origin(t_)
++        # tuple must be checked before is_list_generic_type (tuple is a Sequence)
++        if origin is tuple:
++            args = get_args(t_)
++            if not args:
++                return t_
++            if len(args) == 2 and args[1] is Ellipsis:
++                # variable-length: Tuple[T, ...]
++                return origin[_process_annotation(args[0]), ...]  # type: ignore[no-any-return]
++            # heterogeneous: Tuple[T1, T2, ...]
++            processed = tuple(_process_annotation(a) for a in args)
++            return origin[processed]  # type: ignore[no-any-return]
+         elif is_list_generic_type(t_):
+             l_t: Type[Any] = get_args(t_)[0]
+-            return get_origin(t_)[_process_annotation(l_t)]  # type: ignore[no-any-return]
++            return origin[_process_annotation(l_t)]  # type: ignore[no-any-return]
+         elif is_dict_generic_type(t_):
+             k_t: Type[Any]
+             v_t: Type[Any]
+             k_t, v_t = get_args(t_)
+-            return get_origin(t_)[k_t, _process_annotation(v_t)]  # type: ignore[no-any-return]
++            return origin[k_t, _process_annotation(v_t)]  # type: ignore[no-any-return]
++        # set/frozenset are not Sequence or Mapping so need a separate check
++        elif origin is not None and _is_set_origin(origin):
++            s_t: Type[Any] = get_args(t_)[0]
++            return origin[_process_annotation(s_t)]  # type: ignore[no-any-return]
+         elif is_union_type(t_):
+             u_t_s = tuple(_process_annotation(u_t) for u_t in extract_union_types(t_))
+             return Union[u_t_s]  # type: ignore[return-value]
+@@ -279,7 +310,7 @@ def apply_schema_contract_to_model(
+                 return _child_models[id(t_)]
+             else:
+                 _child_models[id(t_)] = child_model = apply_schema_contract_to_model(
+-                    t_, column_mode, data_mode
++                    t_, column_mode, data_mode, _child_models=_child_models
+                 )
+                 return child_model
+         return t_
+@@ -290,15 +321,33 @@ def apply_schema_contract_to_model(
+         else:
+             return f.annotation  # type: ignore[no-any-return]
+ 
+-    new_model: Type[_TPydanticModel] = create_model(  # type: ignore[call-overload]
+-        model.__name__ + "Extra" + extra.title(),
+-        __config__=config,
+-        **{n: (_process_annotation(_rebuild_annotated(f)), f) for n, f in model.__fields__.items()},  # type: ignore[attr-defined]
+-    )
+-    # pass dlt config along
+-    dlt_config = getattr(model, "dlt_config", None)
+-    if dlt_config:
+-        new_model.dlt_config = dlt_config  # type: ignore[attr-defined]
++    processed_fields = {
++        n: (_process_annotation(_rebuild_annotated(f)), f)
++        for n, f in model.__fields__.items()  # type: ignore[attr-defined]
++    }
++
++    if _PYDANTIC_2:
++        # use __base__ to inherit validators (@field_validator, @model_validator)
++        new_model: Type[_TPydanticModel] = create_model(  # type: ignore[call-overload]
++            model.__name__ + "Extra" + extra.title(),
++            __base__=model,
++            **processed_fields,
++        )
++        # override config on the subclass and rebuild to pick up the new extra setting
++        new_model.model_config = config
++        new_model.model_rebuild(force=True)
++    else:
++        new_model = create_model(  # type: ignore[call-overload]
++            model.__name__ + "Extra" + extra.title(),
++            __config__=config,
++            **processed_fields,
++        )
++
++    # restore dlt_config: the evolve path replaces model with a bare "Any" model that
++    # lacks dlt_config. For the non-evolve path __base__ inheritance preserves it,
++    # but setting it explicitly is harmless and keeps both paths consistent.
++    if original_dlt_config:
++        new_model.dlt_config = original_dlt_config  # type: ignore[attr-defined]
+     return new_model
+ 
+ 
+diff --git a/tests/libs/test_pydantic.py b/tests/libs/test_pydantic.py
+index 7e3e539fa..5fea69571 100644
+--- a/tests/libs/test_pydantic.py
++++ b/tests/libs/test_pydantic.py
+@@ -1,4 +1,5 @@
+ import sys
++import warnings
+ from copy import copy
+ from dataclasses import dataclass, field
+ import uuid
+@@ -6,12 +7,15 @@ import pytest
+ from typing import (
+     ClassVar,
+     Final,
++    FrozenSet,
+     Generic,
+     Sequence,
++    Set,
+     Mapping,
+     Dict,
+     MutableMapping,
+     MutableSequence,
++    Tuple,
+     TypeVar,
+     Union,
+     Optional,
+@@ -33,8 +37,22 @@ from dlt.common.libs.pydantic import (
+     validate_and_filter_item,
+     validate_and_filter_items,
+     create_list_model,
++    column_mode_to_extra,
++    extra_to_column_mode,
++    get_extra_from_model,
++)
++from dlt.common.warnings import Dlt100DeprecationWarning
++from pydantic import (
++    UUID4,
++    BaseModel,
++    Field,
++    Json,
++    AnyHttpUrl,
++    ConfigDict,
++    ValidationError,
++    field_validator,
++    model_validator,
+ )
+-from pydantic import UUID4, BaseModel, Json, AnyHttpUrl, ConfigDict, ValidationError
+ 
+ from dlt.common.schema.exceptions import DataValidationError
+ 
+@@ -755,3 +773,682 @@ def test_parent_nullable_means_children_nullable():
+ 
+     assert schema["optional_child__child_attribute"]["nullable"]
+     assert schema["non_optional_child__child_attribute"]["nullable"] is False
++
++
++# --- Group 1: Helper function unit tests ---
++
++
++def test_column_mode_to_extra() -> None:
++    """All TSchemaEvolutionMode values map to the correct pydantic extra setting."""
++    assert column_mode_to_extra("evolve") == "allow"
++    assert column_mode_to_extra("discard_value") == "ignore"
++    assert column_mode_to_extra("freeze") == "forbid"
++    # discard_row falls through to the default "forbid"
++    assert column_mode_to_extra("discard_row") == "forbid"
++
++
++def test_extra_to_column_mode() -> None:
++    """Reverse mapping from pydantic extra setting to TSchemaEvolutionMode."""
++    assert extra_to_column_mode("forbid") == "freeze"
++    assert extra_to_column_mode("allow") == "evolve"
++    assert extra_to_column_mode("ignore") == "discard_value"
++    # any other value also maps to discard_value
++    assert extra_to_column_mode("something_else") == "discard_value"
++
++
++def test_get_extra_from_model() -> None:
++    """get_extra_from_model returns the correct extra config for various models."""
++    # ModelWithConfig has explicit extra="allow"
++    assert get_extra_from_model(ModelWithConfig) == "allow"
++    # Model has no explicit extra — defaults to "ignore" in pydantic 2
++    assert get_extra_from_model(Model) == "ignore"
++
++    # model with extra="forbid"
++    class ForbidModel(BaseModel):
++        model_config = ConfigDict(extra="forbid")
++        x: int = 0
++
++    assert get_extra_from_model(ForbidModel) == "forbid"
++
++
++# --- Group 2: Synthesized model structure ---
++
++
++def test_synthesized_any_model_has_any_types() -> None:
++    """When data_mode='evolve', a lenient model is created with Any types."""
++
++    class StrictModel(BaseModel):
++        b: bool
++        n: int
++        s: str
++
++    result = apply_schema_contract_to_model(StrictModel, "freeze", "evolve")
++    # model name ends with "Any" (then "ExtraForbid" for the column mode)
++    assert "Any" in result.__name__
++    # all original field names are preserved
++    assert set(result.model_fields.keys()) == {"b", "n", "s"}
++    # model accepts wrong types because all fields are Any
++    instance = result.model_validate({"b": "not_bool", "n": "not_int", "s": 999})
++    assert instance.b == "not_bool"
++    assert instance.n == "not_int"
++    assert instance.s == 999
++
++
++def test_apply_schema_contract_early_return_identity() -> None:
++    """When the model already has the desired extra, it is returned as-is."""
++    # ModelWithConfig has extra="allow" which maps to column_mode="evolve"
++    result = apply_schema_contract_to_model(ModelWithConfig, "evolve")
++    assert result is ModelWithConfig
++
++    # Model has extra="ignore" which maps to column_mode="discard_value"
++    result2 = apply_schema_contract_to_model(Model, "discard_value")
++    assert result2 is Model
++
++
++def test_dlt_config_preserved_on_synthesized_model() -> None:
++    """dlt_config attribute is carried over to the synthesized model."""
++
++    class ConfiguredModel(BaseModel):
++        x: int = 0
++        dlt_config: ClassVar[DltConfig] = {
++            "skip_nested_types": True,
++            "return_validated_models": True,
++        }
++
++    # column mode change triggers model synthesis
++    result = apply_schema_contract_to_model(ConfiguredModel, "freeze")
++    assert hasattr(result, "dlt_config")
++    assert result.dlt_config["skip_nested_types"] is True
++    assert result.dlt_config["return_validated_models"] is True
++
++    # data_mode="evolve" creates an intermediate "Any" model, but dlt_config is
++    # preserved from the original model via original_dlt_config save/restore
++    result2 = apply_schema_contract_to_model(ConfiguredModel, "evolve", "evolve")
++    assert hasattr(result2, "dlt_config")
++    assert result2.dlt_config == ConfiguredModel.dlt_config
++
++    # evolve + discard_value triggers the early return path (the "Any" model's
++    # default extra="ignore" matches discard_value) — dlt_config must still survive
++    result3 = apply_schema_contract_to_model(ConfiguredModel, "discard_value", "evolve")
++    assert hasattr(result3, "dlt_config")
++    assert result3.dlt_config == ConfiguredModel.dlt_config
++
++
++def test_synthesized_model_is_subclass_of_original() -> None:
++    """Synthesized model inherits from the original via __base__, so isinstance works."""
++
++    class Original(BaseModel):
++        x: int = 0
++
++    synthesized = apply_schema_contract_to_model(Original, "evolve", "freeze")
++    assert synthesized is not Original
++    assert issubclass(synthesized, Original)
++
++    # instances of the synthesized model pass isinstance checks against the original
++    instance = synthesized.model_validate({"x": 1, "extra": "allowed"})
++    assert isinstance(instance, Original)
++    assert instance.x == 1
++
++    # the evolve path (data_mode="evolve") creates an "Any" model without __base__,
++    # then wraps it — so the final model is NOT a subclass of the original
++    any_model = apply_schema_contract_to_model(Original, "freeze", "evolve")
++    assert not issubclass(any_model, Original)
++
++
++# --- Group 3: Nested model transformation ---
++
++
++def test_nested_model_config_propagation_validates_data() -> None:
++    """Synthesized User model with evolve column mode actually validates data."""
++    model_evolve = apply_schema_contract_to_model(User, "evolve", "freeze")
++
++    # add extra fields at root and nested levels
++    data = copy(USER_INSTANCE_DATA)
++    data["extra_root"] = "extra_value"
++    data["address"] = copy(data["address"])
++    data["address"]["extra_nested"] = "nested_extra"  # type: ignore[index]
++
++    # should parse without errors because column_mode=evolve allows extra fields
++    instance = model_evolve.model_validate(data)
++    assert instance.user_id == 1
++    assert instance.extra_root == "extra_value"  # type: ignore[attr-defined]
++    # nested model also accepts extra fields
++    assert instance.address.extra_nested == "nested_extra"  # type: ignore[attr-defined]
++
++
++def test_nested_model_transformation_in_containers() -> None:
++    """Inner BaseModel types inside List, Dict, Union, Mapping etc. are replaced."""
++    model = apply_schema_contract_to_model(User, "evolve", "freeze")
++
++    # helper: extract the inner model name from a field annotation
++    def get_inner_model_names(annotation: Any) -> List[str]:
++        """Collect all BaseModel subclass names found in the annotation."""
++        names: List[str] = []
++        args = get_args(annotation)
++        for arg in args:
++            if isinstance(arg, type) and issubclass(arg, BaseModel):
++                names.append(arg.__name__)
++            else:
++                names.extend(get_inner_model_names(arg))
++        return names
++
++    # user_labels: List[UserLabel] — inner model should be transformed
++    user_labels_ann = model.model_fields["user_labels"].annotation
++    inner_names = get_inner_model_names(user_labels_ann)
++    assert any(
++        "ExtraAllow" in n for n in inner_names
++    ), f"UserLabel in List not transformed: {inner_names}"
++
++    # unity: Union[UserAddress, UserLabel, Dict[str, UserAddress]]
++    unity_ann = model.model_fields["unity"].annotation
++    inner_names = get_inner_model_names(unity_ann)
++    # should have transformed versions of UserAddress and UserLabel
++    assert any(
++        "UserAddress" in n and "ExtraAllow" in n for n in inner_names
++    ), f"UserAddress in Union not transformed: {inner_names}"
++    assert any(
++        "UserLabel" in n and "ExtraAllow" in n for n in inner_names
++    ), f"UserLabel in Union not transformed: {inner_names}"
++
++    # address field itself is Annotated[UserAddress, ...] — check the inner type
++    address_ann = model.model_fields["address"].annotation
++    assert "ExtraAllow" in address_ann.__name__
++
++    # inside transformed UserAddress, check ro_labels: Mapping[str, UserLabel]
++    addr_model = address_ann
++    ro_labels_ann = addr_model.model_fields["ro_labels"].annotation
++    inner_names = get_inner_model_names(ro_labels_ann)
++    assert any(
++        "ExtraAllow" in n for n in inner_names
++    ), f"UserLabel in Mapping not transformed: {inner_names}"
++
++
++def test_child_model_cache_shared_across_nesting_levels() -> None:
++    """_child_models cache is shared across the whole nested tree, so the same
++    original type always produces the same synthesized class regardless of
++    nesting depth.
++    """
++    model = apply_schema_contract_to_model(User, "evolve", "freeze")
++
++    # UserLabel at User level: user_label and user_labels use the same synthesized class
++    user_label_type = model.model_fields["user_label"].annotation
++    user_labels_inner = get_args(model.model_fields["user_labels"].annotation)[0]
++    assert user_label_type is user_labels_inner, "same-level references must be identical"
++
++    # UserLabel also appears in unity: Union[UserAddress, UserLabel, ...]
++    unity_args = get_args(model.model_fields["unity"].annotation)
++    unity_user_label = next(
++        a for a in unity_args if isinstance(a, type) and issubclass(a, UserLabel)
++    )
++    assert unity_user_label is user_label_type, "same-level Union member must be identical"
++
++    # UserAddress at User level: address and unity use the same synthesized class
++    address_type = model.model_fields["address"].annotation
++    unity_user_address = next(
++        a for a in unity_args if isinstance(a, type) and issubclass(a, UserAddress)
++    )
++    assert address_type is unity_user_address, "same-level references must be identical"
++
++    # UserLabel inside UserAddress (nested level) is the SAME class as at User level
++    addr_model = address_type
++    addr_label_type = addr_model.model_fields["label"].annotation
++    # Optional[UserLabel] → extract UserLabel from the union
++    addr_label_inner = next(
++        a for a in get_args(addr_label_type) if isinstance(a, type) and issubclass(a, UserLabel)
++    )
++    assert addr_label_inner is user_label_type, "cross-level references must be identical"
++    assert issubclass(user_label_type, UserLabel)
++
++
++def test_nested_model_discard_row_on_nested_violation() -> None:
++    """When a nested model field has invalid data, the whole item is discarded."""
++
++    class Inner(BaseModel):
++        value: int
++
++    class Outer(BaseModel):
++        name: str
++        inner: Inner
++
++    # discard_row for both columns and data
++    model = apply_schema_contract_to_model(Outer, "discard_row", "discard_row")
++
++    # valid item works
++    result = validate_and_filter_item(
++        "test", model, {"name": "ok", "inner": {"value": 1}}, "discard_row", "discard_row"
++    )
++    assert result is not None
++    assert result.name == "ok"
++
++    # invalid nested data — value should be int, not a string
++    result = validate_and_filter_item(
++        "test",
++        model,
++        {"name": "bad", "inner": {"value": "not_int"}},
++        "discard_row",
++        "discard_row",
++    )
++    # whole item discarded because nested model fails validation
++    assert result is None
++
++    # extra field in nested model
++    result = validate_and_filter_item(
++        "test",
++        model,
++        {"name": "extra", "inner": {"value": 1, "extra": "x"}},
++        "discard_row",
++        "discard_row",
++    )
++    assert result is None
++
++
++# --- Group 4: Validation happy paths and edge cases ---
++
++
++def test_validate_item_happy_path() -> None:
++    """Valid single item returns a proper model instance."""
++
++    class ItemModel(BaseModel):
++        a: int
++        b: str
++
++    model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++    result = validate_and_filter_item(
++        "test_table", model, {"a": 42, "b": "hello"}, "freeze", "freeze"
++    )
++    assert result is not None
++    assert isinstance(result, BaseModel)
++    assert result.a == 42
++    assert result.b == "hello"
++
++
++def test_validate_items_happy_path() -> None:
++    """All-valid list returns all items as model instances."""
++
++    class ItemModel(BaseModel):
++        x: int
++
++    model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++    list_model = create_list_model(model)
++    items = [{"x": 1}, {"x": 2}, {"x": 3}]
++    result = validate_and_filter_items("test_table", list_model, items, "freeze", "freeze")
++    assert len(result) == 3
++    assert all(isinstance(r, BaseModel) for r in result)
++    assert [r.x for r in result] == [1, 2, 3]
++
++
++def test_validate_items_empty_list() -> None:
++    """Empty input list returns empty output."""
++
++    class ItemModel(BaseModel):
++        x: int
++
++    model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++    list_model = create_list_model(model)
++    result = validate_and_filter_items("test_table", list_model, [], "freeze", "freeze")
++    assert result == []
++
++
++def test_validate_item_unsupported_modes() -> None:
++    """NotImplementedError for unsupported mode combinations in single-item validation."""
++
++    class ItemModel(BaseModel):
++        b: bool
++
++    # model with forbid extra — will raise extra_forbidden on extra fields
++    freeze_model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++
++    # extra_forbidden error with unsupported column_mode="evolve" passed to validate
++    # (the model itself forbids extra, but we tell validate to treat it as "evolve")
++    with pytest.raises(NotImplementedError, match="column_mode"):
++        validate_and_filter_item("test", freeze_model, {"b": True, "extra": 1}, "evolve", "freeze")
++
++    # data type error with unsupported data_mode="evolve" passed to validate
++    # (the model is strict but we tell validate to treat it as "evolve")
++    with pytest.raises(NotImplementedError, match="data_mode"):
++        validate_and_filter_item("test", freeze_model, {"b": 2}, "freeze", "evolve")
++
++
++def test_validate_items_unsupported_modes() -> None:
++    """NotImplementedError for unsupported mode combinations in list validation."""
++
++    class ItemModel(BaseModel):
++        b: bool
++
++    freeze_model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++    list_model = create_list_model(freeze_model)
++
++    # extra_forbidden error with unsupported column_mode
++    with pytest.raises(NotImplementedError, match="column_mode"):
++        validate_and_filter_items(
++            "test",
++            list_model,
++            [{"b": True}, {"b": False, "extra": 1}],
++            "evolve",
++            "freeze",
++        )
++
++    # data type error with unsupported data_mode
++    with pytest.raises(NotImplementedError, match="data_mode"):
++        validate_and_filter_items(
++            "test",
++            list_model,
++            [{"b": True}, {"b": 2}],
++            "freeze",
++            "evolve",
++        )
++
++
++# --- Group 5: Schema generation edge cases ---
++
++
++def test_model_with_field_aliases() -> None:
++    """Field aliases are used as column names in schema generation."""
++
++    class AliasModel(BaseModel):
++        model_config = ConfigDict(populate_by_name=True)
++        full_name: str = Field(alias="fullName")
++        age: int
++
++    result = pydantic_to_table_schema_columns(AliasModel)
++    # alias "fullName" should be used as the column name
++    assert "fullName" in result
++    assert result["fullName"]["data_type"] == "text"
++    assert result["fullName"]["name"] == "fullName"
++    # non-aliased field uses its own name
++    assert "age" in result
++
++
++def test_unknown_type_fallback_to_text() -> None:
++    """Custom class that is not a BaseModel falls back to data_type='text'."""
++
++    class CustomType:
++        pass
++
++    class ModelWithCustomType(BaseModel):
++        model_config = ConfigDict(arbitrary_types_allowed=True)
++        custom: CustomType
++        normal: int
++
++    result = pydantic_to_table_schema_columns(ModelWithCustomType)
++    # unknown type falls back to text
++    assert result["custom"]["data_type"] == "text"
++    assert result["normal"]["data_type"] == "bigint"
++
++
++def test_deeply_nested_model_flattening_respects_per_model_config() -> None:
++    """skip_nested_types is per-model — it is NOT propagated to nested models.
++
++    Parent(skip_nested_types=True) flattens its own Child field into separate
++    columns. But Child has no dlt_config, so when recursing into Child,
++    GrandChild is treated as json (the default, no flattening).
++    """
++
++    class GrandChild(BaseModel):
++        gc_field: str
++
++    class ChildDeep(BaseModel):
++        gc: GrandChild
++        c_field: int
++
++    class ParentDeep(BaseModel):
++        child: ChildDeep
++        p_field: float
++        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
++
++    result = pydantic_to_table_schema_columns(ParentDeep)
++    # top-level scalar
++    assert "p_field" in result
++    assert result["p_field"]["data_type"] == "double"
++    # child scalar is flattened one level (Parent's skip_nested_types applies)
++    assert "child__c_field" in result
++    assert result["child__c_field"]["data_type"] == "bigint"
++    # grandchild is NOT flattened further — Child has no dlt_config so
++    # GrandChild appears as json in the recursive call
++    assert "child__gc" in result
++    assert result["child__gc"]["data_type"] == "json"
++
++
++def test_deeply_nested_model_flattening_with_explicit_child_config() -> None:
++    """When the nested model ALSO has skip_nested_types=True, it flattens its own children."""
++
++    class GrandChild(BaseModel):
++        gc_field: str
++
++    class ChildDeep(BaseModel):
++        gc: GrandChild
++        c_field: int
++        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
++
++    class ParentDeep(BaseModel):
++        child: ChildDeep
++        p_field: float
++        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
++
++    result = pydantic_to_table_schema_columns(ParentDeep)
++    assert result["p_field"]["data_type"] == "double"
++    assert result["child__c_field"]["data_type"] == "bigint"
++    # both Parent and Child have skip_nested_types=True, so full flattening
++    assert "child__gc__gc_field" in result
++    assert result["child__gc__gc_field"]["data_type"] == "text"
++
++
++def test_skip_complex_types_emits_deprecation_warning() -> None:
++    """Using skip_complex_types triggers Dlt100DeprecationWarning."""
++
++    class DepModel(BaseModel):
++        x: int = 0
++        nested: Dict[str, Any] = {}
++        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": True}
++
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        pydantic_to_table_schema_columns(DepModel)
++
++    dep_warnings = [w for w in caught if issubclass(w.category, Dlt100DeprecationWarning)]
++    assert len(dep_warnings) >= 1
++    assert "skip_complex_types" in str(dep_warnings[0].message)
++
++
++# --- Group 6: create_list_model gaps ---
++
++
++def test_create_list_model_naming() -> None:
++    """create_list_model produces a model name derived from the module __name__.
++
++    NOTE: the current implementation uses 'List' + __name__ of the pydantic module,
++    which produces 'Listdlt.common.libs.pydantic'. This test documents the current
++    behavior which is likely a bug — it should probably use the model class name.
++    """
++
++    class MyItem(BaseModel):
++        x: int
++
++    list_model = create_list_model(MyItem)
++    # current (buggy) behavior: name is module-based, not model-based
++    assert list_model.__name__ == "Listdlt.common.libs.pydantic"
++
++
++# --- Group 7: DataValidationError schema_contract field ---
++
++
++def test_validation_error_schema_contract_field() -> None:
++    """DataValidationError.schema_contract contains a partial dict per entity.
++
++    NOTE: the docs claim schema_contract is 'the full, expanded schema contract'
++    but the implementation passes only the violated entity. This test documents
++    the current behavior.
++    """
++
++    class ItemModel(BaseModel):
++        b: bool
++
++    freeze_model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++
++    # data_type violation — schema_contract should reference data_type
++    with pytest.raises(DataValidationError) as exc_info:
++        validate_and_filter_item("test", freeze_model, {"b": 2}, "freeze", "freeze")
++    assert exc_info.value.schema_contract == {"data_type": "freeze"}
++    assert exc_info.value.schema_entity == "data_type"
++
++    # columns violation (extra field) — schema_contract should reference columns
++    with pytest.raises(DataValidationError) as exc_info:
++        validate_and_filter_item("test", freeze_model, {"b": True, "extra": 1}, "freeze", "freeze")
++    assert exc_info.value.schema_contract == {"columns": "freeze"}
++    assert exc_info.value.schema_entity == "columns"
++
++    # same for list validation
++    list_model = create_list_model(freeze_model)
++    with pytest.raises(DataValidationError) as exc_info:
++        validate_and_filter_items("test", list_model, [{"b": 2}], "freeze", "freeze")
++    assert exc_info.value.schema_contract == {"data_type": "freeze"}
++
++    with pytest.raises(DataValidationError) as exc_info:
++        validate_and_filter_items("test", list_model, [{"b": True, "extra": 1}], "freeze", "freeze")
++    assert exc_info.value.schema_contract == {"columns": "freeze"}
++
++
++# --- Group 8: Bidirectional mapping ---
++
++
++def test_default_contract_from_model_extra_setting() -> None:
++    """Unit test for the bidirectional column mode ↔ model extra mapping.
++
++    This is used in validation.py to derive the default schema contract from a
++    model's existing extra setting.
++    """
++    # default model (no explicit extra) → "ignore" → "discard_value"
++    assert extra_to_column_mode(get_extra_from_model(Model)) == "discard_value"
++    # model with extra="allow" → "evolve"
++    assert extra_to_column_mode(get_extra_from_model(ModelWithConfig)) == "evolve"
++
++    # model with extra="forbid" → "freeze"
++    class ForbidModel(BaseModel):
++        model_config = ConfigDict(extra="forbid")
++        x: int = 0
++
++    assert extra_to_column_mode(get_extra_from_model(ForbidModel)) == "freeze"
++
++
++# --- Group 9: _process_annotation edge cases ---
++
++
++def test_set_inner_model_transformed() -> None:
++    """_process_annotation recurses into Set[BaseModel] and transforms the inner model."""
++
++    class Inner(BaseModel):
++        model_config = ConfigDict(frozen=True)
++        x: int
++
++    class WithSet(BaseModel):
++        items: Set[Inner]
++
++    evolved = apply_schema_contract_to_model(WithSet, "evolve", "freeze")
++    # the inner model should have been transformed to accept extra fields
++    ann = evolved.model_fields["items"].annotation
++    inner_args = get_args(ann)
++    assert len(inner_args) == 1
++    # inner model should have "ExtraAllow" in name if transformed
++    inner_name = getattr(inner_args[0], "__name__", "")
++    assert "ExtraAllow" in inner_name, f"Inner model in Set not transformed: {inner_name}"
++
++
++def test_frozenset_inner_model_transformed() -> None:
++    """_process_annotation recurses into FrozenSet[BaseModel] and transforms the inner model."""
++
++    class Inner(BaseModel):
++        model_config = ConfigDict(frozen=True)
++        x: int
++
++    class WithFrozenSet(BaseModel):
++        items: FrozenSet[Inner]
++
++    evolved = apply_schema_contract_to_model(WithFrozenSet, "evolve", "freeze")
++    ann = evolved.model_fields["items"].annotation
++    inner_args = get_args(ann)
++    assert len(inner_args) == 1
++    inner_name = getattr(inner_args[0], "__name__", "")
++    assert "ExtraAllow" in inner_name, f"Inner model in FrozenSet not transformed: {inner_name}"
++
++
++def test_variable_length_tuple_preserved() -> None:
++    """_process_annotation preserves Tuple[Model, ...] variable-length semantics."""
++
++    class Inner(BaseModel):
++        x: int
++
++    class WithVarTuple(BaseModel):
++        items: Tuple[Inner, ...]
++
++    evolved = apply_schema_contract_to_model(WithVarTuple, "evolve", "freeze")
++    # should still accept variable-length tuples after transformation
++    inst = evolved.model_validate({"items": [{"x": 1}, {"x": 2}, {"x": 3}]})
++    assert len(inst.items) == 3
++
++
++def test_heterogeneous_tuple_preserved() -> None:
++    """_process_annotation processes all elements of Tuple[T1, T2, T3]."""
++
++    class Inner(BaseModel):
++        x: int
++
++    class WithHetTuple(BaseModel):
++        items: Tuple[Inner, int, Inner]
++
++    evolved = apply_schema_contract_to_model(WithHetTuple, "evolve", "freeze")
++    # should accept a 3-element heterogeneous tuple
++    inst = evolved.model_validate({"items": [{"x": 1}, 42, {"x": 2}]})
++    assert len(inst.items) == 3
++    assert inst.items[1] == 42
++
++
++def test_field_validator_preserved_on_synthesis() -> None:
++    """@field_validator decorators are preserved when synthesizing models.
++
++    create_model uses __base__=model to inherit validators from the original.
++    """
++
++    class WithFieldValidator(BaseModel):
++        value: int
++
++        @field_validator("value")
++        @classmethod
++        def check_positive(cls, v: int) -> int:
++            if v < 0:
++                raise ValueError("must be positive")
++            return v
++
++    # original model rejects negative values
++    with pytest.raises(ValidationError):
++        WithFieldValidator(value=-1)
++
++    # synthesized model should also reject negative values
++    evolved = apply_schema_contract_to_model(WithFieldValidator, "evolve", "freeze")
++    with pytest.raises(ValidationError):
++        evolved.model_validate({"value": -1})
++
++
++def test_model_validator_preserved_on_synthesis() -> None:
++    """@model_validator decorators are preserved when synthesizing models.
++
++    create_model uses __base__=model to inherit validators from the original.
++    """
++
++    class WithModelValidator(BaseModel):
++        a: int
++        b: int
++
++        @model_validator(mode="after")
++        def check_sum(self) -> "WithModelValidator":
++            if self.a + self.b > 10:
++                raise ValueError("sum too large")
++            return self
++
++    # original model rejects sum > 10
++    with pytest.raises(ValidationError):
++        WithModelValidator(a=6, b=6)
++
++    # synthesized model should also reject
++    evolved = apply_schema_contract_to_model(WithModelValidator, "evolve", "freeze")
++    with pytest.raises(ValidationError):
++        evolved.model_validate({"a": 6, "b": 6})
+
+
+===== COMMIT dff5f03c =====
+
+
+commit dff5f03c4
+Author: rudolfix
+Date: 2026-02-03
+
+    implements managed engine for proper ref counting (#3601)
+
+diff --git a/dlt/destinations/impl/duckdb/configuration.py b/dlt/destinations/impl/duckdb/configuration.py
+index 178dad85f..80ffac3c9 100644
+--- a/dlt/destinations/impl/duckdb/configuration.py
++++ b/dlt/destinations/impl/duckdb/configuration.py
+@@ -36,6 +36,18 @@ class DuckDbBaseCredentials(CredentialsConfiguration):
+     """Local config applied to each borrowed connection"""
+     conn_pool: Annotated[Optional["DuckDbConnectionPool"], NotResolved()] = None
+ 
++    def copy(self: "DuckDbBaseCredentials") -> "DuckDbBaseCredentials":
++        new_obj = super().copy()
++        # conn_pool holds threading state that must not be shared across copies
++        if self.conn_pool is not None and not self.conn_pool._conn_owner:
++            # external connection: set _external_conn so pool constructor picks it up
++            new_obj._external_conn = self.conn_pool._conn
++            new_obj.conn_pool = DuckDbConnectionPool(new_obj)
++        else:
++            # owned connection: let on_resolved() create a fresh pool
++            new_obj.conn_pool = None
++        return new_obj
++
+     def parse_native_representation(self, native_value: Any) -> None:
+         try:
+             # check if database was passed as explicit connection
+diff --git a/dlt/destinations/impl/sqlalchemy/configuration.py b/dlt/destinations/impl/sqlalchemy/configuration.py
+index bddc10b5e..814a65136 100644
+--- a/dlt/destinations/impl/sqlalchemy/configuration.py
++++ b/dlt/destinations/impl/sqlalchemy/configuration.py
+@@ -7,30 +7,113 @@ import dataclasses
+ from dlt.common import logger
+ from dlt.common.configuration import configspec
+ from dlt.common.configuration.specs import ConnectionStringCredentials
++from dlt.common.configuration.specs.base_configuration import NotResolved
+ from dlt.common.destination.client import DestinationClientDwhConfiguration
+ from dlt.common.storages.configuration import WithLocalFiles
++from dlt.common.typing import Annotated
+ from dlt.common.warnings import DltDeprecationWarning
+ 
+ if TYPE_CHECKING:
+     from sqlalchemy.engine import Engine, Dialect, Connection
+ 
+ 
++class ManagedEngine:
++    """Thread-safe engine lifecycle with ref-counted connection borrowing.
++
++    Owned engines (created from URL) are disposed when the last borrowed
++    connection is returned. External engines are never disposed.
++    """
++
++    def __init__(
++        self,
++        credentials: "SqlalchemyCredentials",
++        engine: Optional["Engine"] = None,
++    ) -> None:
++        self._credentials = credentials
++        self._conn_lock = threading.RLock()
++        self._conn_borrows: int = 0
++        if engine is not None:
++            # external engine — not owned, not disposed by us
++            self._engine: Optional["Engine"] = engine
++            self._conn_owner: bool = False
++        else:
++            # owned engine — lazily created, disposed when refcount hits 0
++            self._engine = None
++            self._conn_owner = True
++
++    @property
++    def engine(self) -> "Engine":
++        """Lazily creates the engine for owned instances, returns external engine otherwise."""
++        import sqlalchemy as sa
++
++        if self._engine is None:
++            engine_kwargs = self._credentials._resolve_engine_kwargs()
++            self._engine = sa.create_engine(
++                self._credentials.to_url().render_as_string(hide_password=False),
++                **engine_kwargs,
++            )
++        return self._engine
++
++    def borrow_conn(self) -> "Connection":
++        """Borrow a connection from the engine. Must be returned via return_conn."""
++        with self._conn_lock:
++            engine_ = self.engine
++            self._conn_borrows += 1
++        try:
++            return engine_.connect()
++        except Exception:
++            with self._conn_lock:
++                self._conn_borrows -= 1
++                if self._conn_borrows == 0 and self._conn_owner:
++                    self._dispose_engine()
++            raise
++
++    def return_conn(self, borrowed_conn: "Connection") -> None:
++        """Return a borrowed connection. Disposes owned engine when refcount hits 0."""
++        with self._conn_lock:
++            borrowed_conn.close()
++            assert self._conn_borrows > 0, "Returning connection when borrows is 0"
++            self._conn_borrows -= 1
++            if self._conn_borrows == 0 and self._conn_owner:
++                self._dispose_engine()
++
++    def _dispose_engine(self) -> None:
++        if self._conn_borrows > 0:
++            warnings.warn(
++                f"Disposing engine {self._engine.url} with {self._conn_borrows} open conns."
++            )
++        if self._engine:
++            self._engine.dispose()
++            self._engine = None
++
++    def __del__(self) -> None:
++        if getattr(self, "_engine", None) and getattr(self, "_conn_owner", False):
++            self._dispose_engine()
++
++
+ @configspec(init=False)
+ class SqlalchemyCredentials(ConnectionStringCredentials):
+-    if TYPE_CHECKING:
+-        _engine: Optional["Engine"] = None
+-
+     engine_kwargs: Optional[Dict[str, Any]] = None
+     """Additional keyword arguments passed to `sqlalchemy.create_engine`"""
+ 
+     engine_args: Optional[Dict[str, Any]] = None
+     """DEPRECATED: use engine_kwargs instead"""
+ 
++    managed_engine: Annotated[Optional[ManagedEngine], NotResolved()] = None
++
+     def __init__(
+         self, connection_string: Optional[Union[str, Dict[str, Any], "Engine"]] = None
+     ) -> None:
+         super().__init__(connection_string)  # type: ignore[arg-type]
+-        self._conn_lock = threading.RLock()
++
++    def copy(self: "SqlalchemyCredentials") -> "SqlalchemyCredentials":
++        new_obj = super().copy()
++        # copy always holds the engine as unmanaged (never disposes)
++        if self.managed_engine is not None and self.managed_engine._engine is not None:
++            new_obj.managed_engine = ManagedEngine(new_obj, engine=self.managed_engine._engine)
++        else:
++            new_obj.managed_engine = None
++        return new_obj
+ 
+     def _resolve_engine_kwargs(self) -> Dict[str, Any]:
+         if self.engine_kwargs and self.engine_args:
+@@ -54,6 +137,7 @@ class SqlalchemyCredentials(ConnectionStringCredentials):
+         from sqlalchemy.engine import Engine
+ 
+         if isinstance(native_value, Engine):
++            # triggers setter which creates ManagedEngine wrapping external engine
+             self.engine = native_value
+             super().parse_native_representation(
+                 native_value.url.render_as_string(hide_password=False)
+@@ -61,69 +145,22 @@ class SqlalchemyCredentials(ConnectionStringCredentials):
+         else:
+             super().parse_native_representation(native_value)
+ 
+-    def borrow_conn(self) -> "Connection":
+-        # obtain a lock because we have refcount concurrency
+-        with self._conn_lock:
+-            engine_ = self.engine
+-            # track open connections to properly close it
+-            self._conn_borrows += 1
+-
+-        try:
+-            return engine_.connect()
+-        except Exception:
+-            with self._conn_lock:
+-                self._conn_borrows -= 1
+-                if self._conn_borrows == 0 and self._conn_owner:
+-                    self._delete_conn()
+-            raise
+-
+-    def return_conn(self, borrowed_conn: "Connection") -> None:
+-        # close the borrowed conn
+-        with self._conn_lock:
+-            borrowed_conn.close()
+-            # close the main conn if the last borrowed conn was closed
+-            assert self._conn_borrows > 0, "Returning connection when borrows is 0"
+-            self._conn_borrows -= 1
+-            if self._conn_borrows == 0 and self._conn_owner:
+-                self._delete_conn()
+-
+-    def _delete_conn(self) -> None:
+-        if self._conn_borrows > 0:
+-            warnings.warn(
+-                f"Disposing engine {self._engine.url} with {self._conn_borrows} open conns."
+-            )
+-        self._engine.dispose()
+-        delattr(self, "_engine")
+-
+-    def __del__(self) -> None:
+-        if hasattr(self, "_engine") and self._conn_owner:
+-            self._delete_conn()
++    def _ensure_managed_engine(self) -> ManagedEngine:
++        """Lazily create ManagedEngine on first access."""
++        if self.managed_engine is None:
++            external = getattr(self, "_external_engine", None)
++            self.managed_engine = ManagedEngine(self, engine=external)
++        return self.managed_engine
+ 
+     @property
+     def engine(self) -> Optional["Engine"]:
+-        import sqlalchemy as sa
+-
+-        # get existing or open and set new engine
+-        self._engine = getattr(
+-            self,
+-            "_engine",
+-            None,
+-        )
+-        if self._engine is None:
+-            engine_kwargs = self._resolve_engine_kwargs()
+-            self._engine = sa.create_engine(
+-                self.to_url().render_as_string(hide_password=False), **engine_kwargs
+-            )
+-        # set as owner if not yet set
+-        self._conn_owner = getattr(self, "_conn_owner", True)
+-        self._conn_borrows = getattr(self, "_conn_borrows", 0)
+-        return self._engine
++        return self._ensure_managed_engine().engine
+ 
+     @engine.setter
+     def engine(self, value: "Engine") -> None:
+-        self._engine = value
+-        self._conn_owner = False
+-        self._conn_borrows = 0
++        # backward compat: create ManagedEngine wrapping external engine
++        self._external_engine = value
++        self.managed_engine = ManagedEngine(self, engine=value)
+ 
+     def get_dialect(self) -> Optional[Type["Dialect"]]:
+         if not self.drivername:
+diff --git a/dlt/destinations/impl/sqlalchemy/db_api_client.py b/dlt/destinations/impl/sqlalchemy/db_api_client.py
+index 409c00c9a..981d3a8bd 100644
+--- a/dlt/destinations/impl/sqlalchemy/db_api_client.py
++++ b/dlt/destinations/impl/sqlalchemy/db_api_client.py
+@@ -101,7 +101,7 @@ class SqlalchemyClient(SqlClientBase[Connection]):
+ 
+     def open_connection(self) -> Connection:
+         if self._current_connection is None:
+-            self._current_connection = self.credentials.borrow_conn()
++            self._current_connection = self.credentials.managed_engine.borrow_conn()
+             if self.dialect_name == "sqlite":
+                 self._sqlite_reattach_dataset_if_exists(self.dataset_name)
+         return self._current_connection
+@@ -126,7 +126,7 @@ class SqlalchemyClient(SqlClientBase[Connection]):
+ 
+         try:
+             if self._current_connection is not None:
+-                self.credentials.return_conn(self._current_connection)
++                self.credentials.managed_engine.return_conn(self._current_connection)
+         finally:
+             self._current_connection = None
+ 
+diff --git a/tests/load/sqlalchemy/test_sqlalchemy_configuration.py b/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
+index 4da2a3587..f4e64f5d3 100644
+--- a/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
++++ b/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
+@@ -220,17 +220,18 @@ def test_owned_engine_ref_counting_disposes_on_last_return(mocker) -> None:
+     )
+ 
+     engine = c.credentials.engine
++    managed = c.credentials.managed_engine
+     dispose_spy = mocker.spy(engine, "dispose")
+ 
+-    assert c.credentials._conn_borrows == 0
+-    assert c.credentials._conn_owner is True
++    assert managed._conn_borrows == 0
++    assert managed._conn_owner is True
+ 
+-    conn = c.credentials.borrow_conn()
+-    assert c.credentials._conn_borrows == 1
++    conn = managed.borrow_conn()
++    assert managed._conn_borrows == 1
+ 
+-    c.credentials.return_conn(conn)
++    managed.return_conn(conn)
+ 
+-    assert c.credentials._conn_borrows == 0
++    assert managed._conn_borrows == 0
+     dispose_spy.assert_called_once()
+ 
+ 
+@@ -243,20 +244,21 @@ def test_owned_engine_multiple_borrows(mocker) -> None:
+     )
+ 
+     engine = c.credentials.engine
++    managed = c.credentials.managed_engine
+     dispose_spy = mocker.spy(engine, "dispose")
+ 
+-    conn1 = c.credentials.borrow_conn()
+-    assert c.credentials._conn_borrows == 1
++    conn1 = managed.borrow_conn()
++    assert managed._conn_borrows == 1
+ 
+-    conn2 = c.credentials.borrow_conn()
+-    assert c.credentials._conn_borrows == 2
++    conn2 = managed.borrow_conn()
++    assert managed._conn_borrows == 2
+ 
+-    c.credentials.return_conn(conn1)
+-    assert c.credentials._conn_borrows == 1
++    managed.return_conn(conn1)
++    assert managed._conn_borrows == 1
+     dispose_spy.assert_not_called()
+ 
+-    c.credentials.return_conn(conn2)
+-    assert c.credentials._conn_borrows == 0
++    managed.return_conn(conn2)
++    assert managed._conn_borrows == 0
+     dispose_spy.assert_called_once()
+ 
+ 
+@@ -268,18 +270,19 @@ def test_owned_engine_connect_failure_does_not_leak_refcount(mocker) -> None:
+         )._bind_dataset_name(dataset_name="test_dataset")
+     )
+ 
+-    # Force engine creation so we can spy on it
++    # force engine creation so we can spy on it
+     engine = c.credentials.engine
+-    assert c.credentials._conn_borrows == 0
++    managed = c.credentials.managed_engine
++    assert managed._conn_borrows == 0
+ 
+-    # Make connect() raise
++    # make connect() raise
+     mocker.patch.object(engine, "connect", side_effect=sa.exc.OperationalError("fail", {}, None))
+ 
+     with pytest.raises(sa.exc.OperationalError):
+-        c.credentials.borrow_conn()
++        managed.borrow_conn()
+ 
+-    # Refcount must be back to 0, not stuck at 1
+-    assert c.credentials._conn_borrows == 0
++    # refcount must be back to 0, not stuck at 1
++    assert managed._conn_borrows == 0
+ 
+ 
+ def test_external_engine_ref_counting_does_not_dispose(mocker) -> None:
+@@ -301,16 +304,17 @@ def test_external_engine_ref_counting_does_not_dispose(mocker) -> None:
+             )._bind_dataset_name(dataset_name="test_dataset")
+         )
+ 
++        managed = c.credentials.managed_engine
+         dispose_spy = mocker.spy(engine, "dispose")
+ 
+-        assert c.credentials._conn_owner is False
+-        assert c.credentials._conn_borrows == 0
++        assert managed._conn_owner is False
++        assert managed._conn_borrows == 0
+ 
+-        conn = c.credentials.borrow_conn()
+-        assert c.credentials._conn_borrows == 1
++        conn = managed.borrow_conn()
++        assert managed._conn_borrows == 1
+ 
+-        c.credentials.return_conn(conn)
+-        assert c.credentials._conn_borrows == 0
++        managed.return_conn(conn)
++        assert managed._conn_borrows == 0
+ 
+         dispose_spy.assert_not_called()
+ 
+@@ -320,3 +324,64 @@ def test_external_engine_ref_counting_does_not_dispose(mocker) -> None:
+             assert rows == [(1,)]
+     finally:
+         engine.dispose()
++
++
++def test_copy_external_engine_gets_unmanaged_engine() -> None:
++    """Copy of credentials with external engine gets a new ManagedEngine holding the same engine."""
++    engine = sa.create_engine("sqlite:///:memory:", poolclass=sa.pool.StaticPool)
++    try:
++        creds = SqlalchemyCredentials(engine)
++        copied = creds.copy()
++
++        # copy has its own ManagedEngine instance
++        assert copied.managed_engine is not creds.managed_engine
++        # but holds the same external engine reference (unmanaged)
++        assert copied.engine is engine
++        assert copied.managed_engine._conn_owner is False
++
++        # borrow/return must work on the copy
++        conn = copied.managed_engine.borrow_conn()
++        copied.managed_engine.return_conn(conn)
++    finally:
++        engine.dispose()
++
++
++def test_copy_owned_engine_gets_unmanaged_engine() -> None:
++    """Copy of credentials with owned engine gets an unmanaged reference to the same engine."""
++    creds = SqlalchemyCredentials("sqlite:///:memory:")
++    # force engine creation
++    original_engine = creds.engine
++    assert creds.managed_engine._conn_owner is True
++
++    copied = creds.copy()
++
++    # copy has its own ManagedEngine wrapping the original engine as unmanaged
++    assert copied.managed_engine is not creds.managed_engine
++    assert copied.engine is original_engine
++    assert copied.managed_engine._conn_owner is False
++
++    # borrow/return works on the copy without affecting original's refcount
++    conn = copied.managed_engine.borrow_conn()
++    assert copied.managed_engine._conn_borrows == 1
++    assert creds.managed_engine._conn_borrows == 0
++    copied.managed_engine.return_conn(conn)
++
++    # cleanup — only the original owner disposes
++    original_engine.dispose()
++
++
++def test_copy_before_engine_access_gets_lazy_managed_engine() -> None:
++    """Copy before engine is accessed gets managed_engine=None (lazy creation)."""
++    creds = SqlalchemyCredentials("sqlite:///:memory:")
++    # do NOT access creds.engine — managed_engine should be None
++    assert creds.managed_engine is None
++
++    copied = creds.copy()
++    assert copied.managed_engine is None
++
++    # accessing engine on the copy creates its own owned ManagedEngine
++    engine = copied.engine
++    assert copied.managed_engine is not None
++    assert copied.managed_engine._conn_owner is True
++
++    engine.dispose()
+
+
+===== COMMIT 25b1269d =====
+
+
+commit 25b1269df
+Author: rudolfix
+Date: 2026-02-03
+
+    (fix) 3299 implements consistend handling of UUID as strings (#3599)
 
