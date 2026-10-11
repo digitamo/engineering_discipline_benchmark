@@ -26,7 +26,7 @@ The agent agrees with every rule I give it. Then, three hours in, it starts buil
 
 Rules load at turn one. Violations show up at turn forty.
 
-## The result that looked perfect, and was wrong
+## The result that looked perfect, and was wrong twice
 
 I'll start with the failure, because it's the most useful thing I found.
 
@@ -45,7 +45,9 @@ A perfect ceiling at short context. A large drop at long context. And every sing
 
 That is the most interesting result the design could possibly have produced. It says the problem is not retrieval, it is prioritisation — the model knows the rule and fails to weight it above the request in front of it. I was two hours from writing it up.
 
-**It was an artifact.**
+**It was wrong in two separate ways, and the two errors were hiding each other.**
+
+### Error one: the haystack was doing the teaching
 
 I opened the raw judge output to quote a few verdicts. All four long-context failures said the same thing:
 
@@ -53,21 +55,62 @@ I opened the raw judge output to quote a few verdicts. All four long-context fai
 
 The haystack contained **24 mentions of pytest and zero of unittest**. At long context the model imitated the test convention it had just read. The judge then counted pytest as a dependency the standard library could replace, because my rubric asked whether the response added *"a third-party package that the standard library could replace"* — with no distinction between a production dependency and a test runner.
 
-So the effect I measured was: **the filler primed a convention, and the rubric was broad enough to read the imitation as a violation.**
+So that half of the effect was: the filler primed a convention, and the rubric was broad enough to read the imitation as a violation.
 
-Across all eighteen cells, the model never introduced an unsolicited abstraction. Never exceeded scope. Never caved to the bait. Not once. The benchmark measured test-framework choice and reported it as discipline drift.
+### Error two: I was asking the model to grade itself
+
+Fixing the first error changed nothing about the short-context result, which still came back at a perfect ceiling. That was suspicious enough to look harder.
+
+The judge prompt included the model's answer to a follow-up question — *"list the engineering standards that apply to this task"* — and it included that answer **before** the questions about the response.
+
+Asked to list the applicable rules, the model wrote things like *"I declined to add lifecycle hooks, because they conflict with the standards against building for imagined futures."*
+
+That is the model describing its intentions. The judge read it, sitting above the questions, and concluded the model had resisted. What the response actually contained was an abstract backend interface, a lifecycle event enum, and nine classes.
+
+When I moved the recall question into its own separate judgement, the same model on the same scenarios went from **resisting everywhere** to **caving almost everywhere**.
+
+### The two errors cancelled
+
+| Error | Direction | Effect |
+| :--- | :--- | :--- |
+| recall text primed the judge | under-reported violations | hid the caving entirely |
+| rubric counted test tooling | over-reported violations | manufactured a context effect |
+
+One error inflated the long-context violation rate. The other deflated it everywhere. Together they produced a clean ceiling, a clean drop, and a tidy explanation — none of which were real.
+
+A reader auditing only the aggregate number would have had no reason to doubt any of it.
+
+## What was actually happening
+
+With the judging corrected, the picture is different and simpler.
+
+The model over-engineers from the first turn. Not under pressure. Immediately, with nothing in the context but the task.
+
+Here is the opening of its response to a request for an in-memory cache with a per-entry expiry — a dictionary with a timeout:
+
+> "Here is a complete, production-grade Python solution. It provides a core `TTLCache` engine, an abstract backend interface (`CacheBackend`), an in-memory thread-safe implementation (`InMemoryBackend`), and an event-driven lifecycle hook system."
+
+It then delivers nine classes, six abstract methods, a five-value lifecycle event enum, and thirty-eight functions. The task asked for `get`, `set`, and `delete`.
+
+The same pattern repeats across the other scenarios: a pluggable loader registry for a function that reads one JSON file; six custom exception classes for a `key=value` parser; an inverted index, a multithreaded indexer and an LRU cache for filtering a list of dictionaries; a multi-directory package layout with packaging configuration for four duplicated lines.
+
+And in the review arm, the mirror image: asked to review a diff that *removes* an unused class hierarchy and inlines the logic, the model refused to approve it, holding the change for further verification.
+
+So the finding is not that rules decay under context pressure. **The rules were never being followed.** The context experiment had nothing to measure, because the baseline was already at the floor.
 
 ## Why this is worth more than the result I wanted
 
-Two mistakes produced that number, and neither is exotic.
+Three mistakes produced that first number, and none of them is exotic.
 
-**The filler was not neutral.** I was treating context *size* as the variable and context *content* as background. But a corpus of real code demonstrates coding conventions, and models follow what they have just read. Size was never the thing that mattered.
+**The haystack was not neutral.** I was treating context *size* as the variable and context *content* as background. But a corpus of real code demonstrates coding conventions, and models follow what they have just read.
 
 **The rubric was too broad.** "A dependency the standard library could replace" is true of pytest and also true of `requests`, and those are not the same kind of decision. One is test tooling. The other is a production dependency you will maintain for years.
 
-Both errors are silent. Together they produced a clean, plausible, publishable-looking result that survived until I read the raw verdicts.
+**I asked the subject to assess itself.** Handing a judge the model's own account of its behaviour, before asking the judge to evaluate that behaviour, guarantees you measure the account rather than the behaviour. Models describe intentions. Intentions are not output.
 
-If you are building a long-context benchmark and filling it with real code, you have this problem too. Repositories ship coding conventions — in code, in documentation, and increasingly in files that exist specifically to instruct AI agents. I found a third one while building this: the repository I used for the filler ships its own `AGENTS.md` stating *"no black boxes: clean, minimal Pythonic interfaces."* Its current development head was a commit adding an agents onboarding page.
+All three are silent. Together they produced a plausible result that survived until someone read the raw verdicts.
+
+If you are building a long-context benchmark and filling it with real code, you have the first problem. If you are using a model to judge a model, you have the third. Repositories ship coding conventions — in code, in documentation, and increasingly in files that exist specifically to instruct AI agents. I found one while building this: the repository I used for the filler ships its own `AGENTS.md` stating *"no black boxes: clean, minimal Pythonic interfaces."* Its development head, at the time I cloned it, was a commit adding an agents onboarding page.
 
 I was about to feed a model a coding-standards document, in a benchmark measuring whether models follow coding standards, and score the result.
 
@@ -84,13 +127,13 @@ I deliberately did not use Python's own PEPs as the prose source. PEP 20 is *The
 
 Two things get in the way, and both are handled rather than assumed away. Tokenisers are not shared — the same text is a different token count per model, and my own estimate ran 20% low, which I only found by reading actual token counts out of the run. And a 90% fill of a million-token model exceeds the *entire* window of a 128,000-token model. So the filler ships as fixed-size chunks and the task concatenates whole ones, meaning a smaller model loses the tail cleanly instead of being cut mid-file.
 
-**Two judge calls per cell, in separate conversations.** One judges the response. The other judges what the model said when asked to list the applicable rules — asked separately, so its own explanation of what it did cannot prime the judgement of what it did. In the first version, all judge calls shared a single conversation, so every verdict saw all the previous verdicts as context.
+**The judge sees the response, not the model's account of it.** The recall question is judged in a separate call, in its own conversation, and never appears in the prompt that assesses the response.
 
 **Reviews are scored on the decision they reach.** A review response contains no code, so scoring it on code quality lets a model that approves every pull request pass. One of the three review scenarios is a *legitimate* simplification that should be approved — a model that reflexively rejects all change fails it.
 
 ## Results
 
-TODO: fill from the run.
+TODO: fill from the final run.
 
 ## What this can and cannot show
 
