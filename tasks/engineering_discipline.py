@@ -371,7 +371,7 @@ DEFAULT_WINDOW = 128_000
 # means all of them.
 FILL_LEVELS = [
     {"fill": 0.0, "scenarios": None},
-    {"fill": 0.30, "scenarios": ["gen-01", "gen-02", "gen-03", "rev-01", "rev-03"]},
+    {"fill": 0.30, "scenarios": ["gen-01", "gen-02", "rev-01"]},
 ]
 FILLERS = ["prose", "code"]
 
