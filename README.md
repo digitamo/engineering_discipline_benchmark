@@ -60,6 +60,7 @@ kaggle b t models       # models your token can reach
 │   ├── sync_prompt.py              regenerate the markdown copy of the standards
 │   ├── pilot.py                    small local run
 │   ├── analyze.py                  read results from a run artifact
+│   ├── test_scoring.py             scoring tests, no model or quota needed
 │   └── wait_for_quota.sh           poll until quota returns, then run
 │
 ├── data/
@@ -122,8 +123,11 @@ tokens, and `scripts/analyze.py` prints both so the error stays visible.
 ## Running
 
 ```bash
-# iterate locally against a cheap model
+# scoring tests first: no model, no quota, catches control-flow bugs
 source scripts/kbench-env.sh
+python3 scripts/test_scoring.py
+
+# iterate locally against a cheap model
 python3 scripts/pilot.py
 
 # push, with the filler dataset attached
