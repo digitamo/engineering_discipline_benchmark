@@ -60,6 +60,7 @@ kaggle b t models       # models your token can reach
 │   ├── sync_prompt.py              regenerate the markdown copy of the standards
 │   ├── pilot.py                    small local run
 │   ├── analyze.py                  read results from a run artifact
+│   ├── cost_model.py               estimate what a run costs on the proxy
 │   ├── test_scoring.py             scoring tests, no model or quota needed
 │   ├── litellm_bridge.py           path bridge so the library can reach LiteLLM
 │   ├── run_local.sh                run against LiteLLM, bypassing the proxy
@@ -171,31 +172,37 @@ every judge verdict — is recovered from the run artifact.
 
 ### What a run costs
 
-Measured on a real deep cell (30% fill of a million-token window):
+Rates on the Kaggle model proxy, derived from the reservation figures rather
+than assumed: **input $0.38/M, output $3.75/M** for gemini-3.7-flash.
 
-| Component | Tokens | Share |
-| :--- | ---: | ---: |
-| The task request, carrying the context | ~316,000 | 50% |
-| The recall request, re-carrying the context | ~316,000 | 50% |
-| Judge call | ~5,000 | 1% |
+The proxy reserves per request as `input_tokens + max_output_tokens`, and refuses
+a request *before* sending it when the reservation exceeds the remaining balance.
+Output is capped in the task file for that reason.
 
-**The second context-carrying request is the cost, not the judging.** Dropping
-the judge would save about 1%. The recall question is asked only when a cell
-violated, because "recalled the rule and broke it anyway" is impossible
-otherwise — so a passing cell makes one request instead of two.
+`scripts/cost_model.py` models the configured sweep:
 
-Two other levers, in order of effect:
+| Fill | Scenarios | Cells |
+| ---: | ---: | ---: |
+| 0% | 9 | 9 |
+| 30% | 3 × 2 fillers | 6 |
+| 60% | 3 × 2 fillers | 6 |
+| 90% | 3 × 2 fillers | 6 |
+| | | **27** |
 
-- **Fill fraction.** Cost scales linearly with it. A 30% fill is ~300,000 tokens
-  per request; a 90% fill is ~900,000.
-- **Scenario subset at the deep fill.** Set in `FILL_LEVELS` in the task file.
+About **$4.86** per run, or **$9.76** in the worst case where every cell violates
+— a violation triggers a second context-carrying request for the recall question.
 
-The model proxy reserves quota per request from input tokens plus maximum
-output, and refuses a request *before* sending it when the reservation exceeds
-the remaining balance. Output is capped in the task file for that reason.
+Two things that are not obvious:
 
-A ~900,000-token request is accepted by the model proxy and answered in around
-twenty seconds, verified directly.
+**A push is one run, not two.** Task creation executes the task, and that run is
+scored, so a single push populates the leaderboard. `kaggle b t run` is only
+needed to add further models. Removing the `__main__` block does not help: the
+task then reports `Kernel_Without_Run` and cannot be run at all.
+
+**A rejected request costs nothing.** The 90% code cells are expected to fail
+with `ContextWindowExceededError` because code tokenises less efficiently than
+prose and crosses the real window. Verified against a local run: those cells
+consumed zero tokens and are excluded from the rate rather than scored.
 
 ### CLI gotchas
 
@@ -285,7 +292,7 @@ taken, and no number from it should be quoted.
 | :--- | :--- | :--- |
 | **A published Kaggle leaderboard entry** | the platform proxy refuses every request; the reservation for even a baseline cell exceeds the balance | quota to return; `scripts/wait_for_quota.sh` pushes and runs automatically when it does. Local runs via `scripts/run_local.sh` give the measurement meanwhile, but they cannot populate the leaderboard |
 | **More than one subject model** | only Gemini 3.7 Flash has been measured | run locally with `SUBJECT=` per model. `scripts/run_local.sh` takes it as an argument |
-| **The 90% code filler** | the request exceeds the model's real window. Code tokenises less efficiently than prose, so the character-based estimate under-represents it and the bracket overflowed at ~961,000 estimated tokens | lower the code bracket to ~85%, or measure actual tokens before assembling |
+| **The 90% code filler** | the request exceeds the model's real window. Code tokenises less efficiently than prose, so the character-based estimate under-represents it. Verified locally: the cells fail with `ContextWindowExceededError` and consume no tokens | lower the code bracket to ~85%, or measure actual tokens before assembling |
 | **The precedence ablation** | the variant was written, then removed as dead code during the rewrite | re-add `SYSTEM_PROMPT_PRECEDENCE` and run both; answers whether stating precedence explicitly helps |
 | **A no-bait control arm** | every generation scenario is always baited, so bait susceptibility is not computable | add unbaited twins; without the contrast, over-engineering cannot be attributed to the bait |
 | **The self-generated context arm** | the most faithful simulation of a real session, and the most expensive | seed the model, let it elaborate over turns until the window is full, then ask the task |
