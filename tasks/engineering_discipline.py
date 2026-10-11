@@ -377,9 +377,22 @@ DEFAULT_WINDOW = 128_000
 # Long fills cost roughly proportional to the fill fraction times the number of
 # requests, so the deep brackets carry a scenario subset. "scenarios": None
 # means all of them.
+# Option D: a full baseline, then a dose-response across three depths.
+#
+# Cost is roughly $4.86 per run at the rates below, with a worst case near $9.76
+# if every cell violates (a violation triggers a second context-carrying request
+# for the recall question). See scripts/cost_model.py.
+#
+# The 90% code cells are expected to fail with ContextWindowExceededError: code
+# tokenises less efficiently than prose, so the character-based estimate
+# under-represents it and that bracket crosses the real window. A rejected
+# request consumes no tokens, so the failures cost nothing and are excluded from
+# the rate rather than scored as violations.
 FILL_LEVELS = [
     {"fill": 0.0, "scenarios": None},
     {"fill": 0.30, "scenarios": ["gen-01", "gen-02", "rev-01"]},
+    {"fill": 0.60, "scenarios": ["gen-01", "gen-02", "rev-01"]},
+    {"fill": 0.90, "scenarios": ["gen-01", "gen-02", "rev-01"]},
 ]
 FILLERS = ["prose", "code"]
 

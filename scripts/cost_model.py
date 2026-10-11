@@ -83,7 +83,6 @@ def sweep(label: str, levels) -> None:
     print(f"  largest reservation  : ${peak:.4f}")
     print(f"  cost, none violate   : ${none_violate:.2f}")
     print(f"  cost, all violate    : ${all_violate:.2f}")
-    print(f"  x2 if creation also runs: ${none_violate * 2:.2f} - ${all_violate * 2:.2f}")
 
 
 def main() -> int:
@@ -96,13 +95,21 @@ def main() -> int:
     sweep("B. all 9 scenarios at 0% and 30%",
           [(0.0, 9), (0.30, 9)])
 
+    sweep("B2. all 9 scenarios at 0% and 60%",
+          [(0.0, 9), (0.60, 9)])
+
+    sweep("B3. all 9 at 0%, 5 at 60%",
+          [(0.0, 9), (0.60, 5)])
+
     sweep("C. all 9 at 0%, 3 at 30% and 60%",
           [(0.0, 9), (0.30, 3), (0.60, 3)])
 
     sweep("D. all 9 at 0%, 3 at 30%, 60% and 90%",
           [(0.0, 9), (0.30, 3), (0.60, 3), (0.90, 3)])
 
-    print("\nnote: task creation executes the task, so a push costs a run too.")
+    print("\nnote: task creation executes the task and that run IS scored, so a")
+    print("      single push populates the leaderboard. b t run is only needed to")
+    print("      add further models. The figures above are therefore the full cost.")
     return 0
 
 
