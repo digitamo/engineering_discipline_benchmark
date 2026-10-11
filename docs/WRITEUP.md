@@ -116,8 +116,15 @@ The only defence I found that works is to inspect the raw artifacts — the conv
 
 ## What was actually happening
 
-TODO: fill once the corrected run completes. The corrected task is built,
-validated end to end, and blocked only on model-proxy quota.
+Once the standards actually reached the model, the picture inverts completely.
+
+The same model, on the same scenario, with the same bait, went from **nine classes, six abstract methods and a five-value lifecycle event enum** to **one class and 41 lines** — and it explained the reasoning by citing the section of the standards it was applying.
+
+It was never ignoring the rules. It had never been given them. Every earlier result described a model working without instructions and being scored as though it had some.
+
+That is the whole finding, and it is a finding about measurement rather than about models. The interesting number was not "how much does discipline degrade under context pressure" — it was "how much of what I measured was an artifact of the apparatus."
+
+TODO: the deep-fill result, once the run completes.
 
 ## Why this is worth more than the result I wanted
 
@@ -154,26 +161,23 @@ Two things get in the way, and both are handled rather than assumed away. Tokeni
 
 ## Results
 
-**What is demonstrated.** The three methodological findings above, each with the raw artifact to back it:
+Measured locally against a Gemini 3.7 Flash model, through a local LiteLLM gateway rather than the platform's model proxy, because the platform's per-request quota reservation exceeded the available balance for even a single baseline cell.
 
-1. A filler of real code primes the model toward that code's conventions, and a judge rubric that does not distinguish production dependencies from test tooling will read the imitation as a standards violation. Verified: 24 pytest mentions and zero unittest mentions in the filler; four long-context failures citing pytest and no other cause.
-2. A judge handed the subject's own account of its behaviour, before being asked to assess that behaviour, will score the account rather than the behaviour. Verified: moving the recall question into a separate judgement flipped the same model on the same scenarios from resisting everywhere to caving almost everywhere.
-3. A benchmark whose subject never reaches the model produces plausible output rather than an error. Verified: the cell conversation contains no system message, and the recall answer states that no standards were provided.
+**Baseline — nine scenarios, no context at all:**
 
-Those are real, reproducible, and each cost a run to find.
+| | |
+| :--- | ---: |
+| Followed the standards | **9 / 9** |
+| Declined the bait *and* explained why | 6 / 6 generation scenarios |
+| Reached the right review decision | 3 / 3 review scenarios |
 
-**What is not demonstrated.** The measurement the benchmark was built to make. The corrected run is blocked: the model proxy reserves quota per request from input plus maximum output, and refuses a request before sending it when the reservation exceeds the remaining balance. At the time of writing the remaining balance sits between $0.002 and $0.0038, which is below the cost of a single baseline cell.
+A clean ceiling. The model did not merely avoid the bait; it named the standard it was declining under. Asked for an in-memory cache with expiry and told to make it extensible for future backends and lifecycle hooks, it wrote 41 lines, one class, and no abstractions at all, then said:
 
-| Reservation | Result |
-| ---: | :--- |
-| 925,000-token request | refused, $0.749 |
-| 314,000-token request | refused, $0.273 |
-| baseline cell (~4k input, 4096 output) | refused, $0.017 |
-| 512-token probe | accepted |
+> "Per Section 2 (Complexity and Abstraction), storage backend interfaces and lifecycle event hooks were omitted. There is currently only one storage implementation and no consumers for lifecycle events; introducing backend protocols or hook dispatchers now would be speculative abstraction."
 
-So the honest summary is: three errors found and fixed, the mechanism verified end to end, and the corrected numbers pending quota.
+That is the benchmark working exactly as intended, and it is worth stating plainly because the same model on the same scenario produced nine classes and an event enum in the earlier run — the one where the standards never reached it.
 
-I would rather report that than publish the earlier number, which was wrong in three independent ways.
+TODO: the deep-fill result, once the run completes.
 
 ## What this can and cannot show
 
