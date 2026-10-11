@@ -49,8 +49,10 @@ export LLMS_AVAILABLE="${SUBJECT},${JUDGE}"
 
 case "$MODE" in
   baseline) LEVELS='[{"fill": 0.0, "scenarios": null}]' ;;
-  deep)     LEVELS='[{"fill": 0.30, "scenarios": ["gen-01","gen-02","rev-01"]}]' ;;
-  full)     LEVELS='[{"fill": 0.0, "scenarios": null}, {"fill": 0.30, "scenarios": ["gen-01","gen-02","rev-01"]}]' ;;
+  # deep and full use the task's configured FILL_LEVELS, so the script cannot
+  # drift from what the published task actually runs.
+  deep)     LEVELS="" ;;
+  full)     LEVELS="" ;;
   *) echo "unknown mode: $MODE (baseline|deep|full)" >&2; exit 1 ;;
 esac
 
@@ -62,7 +64,10 @@ sys.path.insert(0, "tasks")
 import engineering_discipline as benchmark
 import kaggle_benchmarks as kbench
 
-benchmark.FILL_LEVELS = json.loads(sys.argv[1])
+override = sys.argv[1] if len(sys.argv) > 1 else ""
+if override:
+    benchmark.FILL_LEVELS = json.loads(override)
+print(f"[run_local] fills: {[int(l['fill'] * 100) for l in benchmark.FILL_LEVELS]}")
 benchmark.engineering_discipline.run(llm=kbench.llm, judge_llm=kbench.judge_llm)
 PY
 
