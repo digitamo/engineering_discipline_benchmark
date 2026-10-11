@@ -90,8 +90,8 @@ def main() -> int:
     print(f"window: {WINDOW:,} tokens, max output {MAX_OUTPUT}")
 
     # The configured sweep. Keep this in step with FILL_LEVELS in the task file.
-    sweep("configured: 9 at 0%, 3 scenarios x 2 fillers at 30%, 60%, 90%",
-          [(0.0, 9), (0.30, 3), (0.60, 3), (0.90, 3)])
+    sweep("configured: 9 at 0%, 3 scenarios x 2 fillers at 40% and 70%",
+          [(0.0, 9), (0.40, 3), (0.70, 3)])
 
     print("\nA push is one run, not two: task creation executes the task and that")
     print("run is scored, so it populates the leaderboard by itself.")

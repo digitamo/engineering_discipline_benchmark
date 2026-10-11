@@ -376,15 +376,18 @@ DEFAULT_WINDOW = 128_000
 # Long fills cost roughly proportional to the fill fraction times the number of
 # requests, so the deep brackets carry a scenario subset. "scenarios": None
 # means all of them.
-# A full baseline, then a dose-response across three depths. Costs about $4.86
-# per run; see scripts/cost_model.py. The 90% code cells are expected to fail
-# with ContextWindowExceededError, because code tokenises less efficiently than
-# prose. A rejected request consumes no tokens.
+# A full baseline, then a dose-response at two depths. Costs about $3.13 per
+# run; see scripts/cost_model.py.
+#
+# 70% is the ceiling for the code filler, not a round number. Code tokenises at
+# roughly 1.3x what the character-based estimate assumes, so it exhausts the
+# window far earlier than prose: 75% and above are refused with
+# ContextWindowExceededError while prose is still accepted at 90%. Verified by
+# sending each filler at each level. A refused request consumes no tokens.
 FILL_LEVELS = [
     {"fill": 0.0, "scenarios": None},
-    {"fill": 0.30, "scenarios": ["gen-01", "gen-02", "rev-01"]},
-    {"fill": 0.60, "scenarios": ["gen-01", "gen-02", "rev-01"]},
-    {"fill": 0.90, "scenarios": ["gen-01", "gen-02", "rev-01"]},
+    {"fill": 0.40, "scenarios": ["gen-01", "gen-02", "rev-01"]},
+    {"fill": 0.70, "scenarios": ["gen-01", "gen-02", "rev-01"]},
 ]
 FILLERS = ["prose", "code"]
 

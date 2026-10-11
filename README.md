@@ -136,7 +136,7 @@ locally against a LiteLLM gateway instead, no quota applies.
 
 ```bash
 ./scripts/run_local.sh baseline     # all nine scenarios, no context
-./scripts/run_local.sh deep         # three scenarios at 30% of the window
+./scripts/run_local.sh deep         # three scenarios at 40% and 70%
 ./scripts/run_local.sh full         # both
 SUBJECT=gemini/gemini-3.8-flash-medium ./scripts/run_local.sh baseline
 ```
@@ -181,13 +181,12 @@ Output is capped in the task file for that reason.
 | Fill | Scenarios | Cells |
 | ---: | ---: | ---: |
 | 0% | 9 | 9 |
-| 30% | 3 × 2 fillers | 6 |
-| 60% | 3 × 2 fillers | 6 |
-| 90% | 3 × 2 fillers | 6 |
-| | | **27** |
+| 40% | 3 × 2 fillers | 6 |
+| 70% | 3 × 2 fillers | 6 |
+| | | **21** |
 
-About **$4.86** per run, or **$9.76** in the worst case where every cell violates
-— a violation triggers a second context-carrying request for the recall question.
+About **$3.13** per run, or **$6.29** in the worst case where every cell violates
+(a violation triggers a second context-carrying request for the recall question).
 
 Two things that are not obvious:
 
@@ -196,10 +195,12 @@ scored, so a single push populates the leaderboard. `kaggle b t run` is only
 needed to add further models. Removing the `__main__` block does not help: the
 task then reports `Kernel_Without_Run` and cannot be run at all.
 
-**A rejected request costs nothing.** The 90% code cells are expected to fail
-with `ContextWindowExceededError` because code tokenises less efficiently than
-prose and crosses the real window. Verified against a local run: those cells
-consumed zero tokens and are excluded from the rate rather than scored.
+**The deepest fill is 70%, and that is the code filler's ceiling rather than a
+round number.** Code tokenises at roughly 1.3x what the character-based estimate
+assumes, so it exhausts the window far earlier than prose: 75% and above are
+refused with `ContextWindowExceededError`, while prose is still accepted at 90%.
+Verified by sending each filler at each level. A refused request costs nothing,
+which is why the fills stop where both fillers still fit.
 
 ### CLI gotchas
 
@@ -284,7 +285,7 @@ taken, and no number from it should be quoted.
 | :--- | :--- | :--- |
 | **A published Kaggle leaderboard entry** | the platform proxy refuses every request; the reservation for even a baseline cell exceeds the balance | quota to return; `scripts/wait_for_quota.sh` pushes and runs automatically when it does. Local runs via `scripts/run_local.sh` give the measurement meanwhile, but they cannot populate the leaderboard |
 | **More than one subject model** | only Gemini 3.7 Flash has been measured | run locally with `SUBJECT=` per model. `scripts/run_local.sh` takes it as an argument |
-| **The 90% code filler** | the request exceeds the model's real window. Code tokenises less efficiently than prose, so the character-based estimate under-represents it. Verified locally: the cells fail with `ContextWindowExceededError` and consume no tokens | lower the code bracket to ~85%, or measure actual tokens before assembling |
+| **Fills deeper than 70% for the code filler** | code tokenises at ~1.3x the character-based estimate, so it exhausts the window before prose does. Verified by sending each filler at each level: 75% and above are refused | calibrate `chars/4` per filler by reading `usage` from a known context. That would let both fillers reach 90% |
 | **The precedence ablation** | the variant was written, then removed as dead code during the rewrite | re-add `SYSTEM_PROMPT_PRECEDENCE` and run both; answers whether stating precedence explicitly helps |
 | **A no-bait control arm** | every generation scenario is always baited, so bait susceptibility is not computable | add unbaited twins; without the contrast, over-engineering cannot be attributed to the bait |
 | **The self-generated context arm** | the most faithful simulation of a real session, and the most expensive | seed the model, let it elaborate over turns until the window is full, then ask the task |
