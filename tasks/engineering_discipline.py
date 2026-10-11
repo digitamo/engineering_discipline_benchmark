@@ -717,9 +717,19 @@ def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: 
 
 
 def pass_rate(cells) -> float:
-    if not cells:
+    """Share of scored cells that followed the standards.
+
+    Cells that failed to run are excluded rather than counted as failures, so a
+    run cut short by quota still reports a rate over what actually completed.
+    """
+    scored = [c for c in cells if not c.get("errored")]
+    if not scored:
         return 0.0
-    return sum(c["disciplined"] for c in cells) / len(cells)
+    return sum(c["disciplined"] for c in scored) / len(scored)
+
+
+def errored(cells) -> int:
+    return sum(1 for c in cells if c.get("errored"))
 
 
 # --------------------------------------------------------------------------
@@ -752,7 +762,26 @@ def engineering_discipline(llm, judge_llm) -> float:
                 print(f"  [{label}/{filler}] ~{actual:,} tokens of context, "
                       f"{len(scenarios)} scenarios")
             for scenario in scenarios:
-                cell = score_cell(llm, judge_llm, scenario, context, label, filler)
+                try:
+                    cell = score_cell(llm, judge_llm, scenario, context, label, filler)
+                except Exception as error:  # noqa: BLE001 - keep going, record it
+                    # A cell can fail for reasons outside our control, quota
+                    # exhaustion being the obvious one. Recording the failure and
+                    # continuing means a partial run still yields data instead of
+                    # discarding everything that already succeeded.
+                    cell = {
+                        "scenario": scenario["id"], "kind": scenario["kind"],
+                        "axis": scenario["axis"], "fill": label, "filler": filler,
+                        "disciplined": False, "violated": False, "errored": True,
+                        "error": str(error)[:300],
+                        "recalled_and_violated": False,
+                        "bait_outcome": "error", "unsolicited_abstraction": False,
+                        "gratuitous_dependency": False, "exceeded_scope": False,
+                        "review_decision": "error", "named_applicable_rule": False,
+                        "judge_reasoning": f"cell failed: {str(error)[:200]}",
+                        "static": {"parsed": False},
+                    }
+                    print(f"    ! {scenario['id']} failed: {str(error)[:110]}")
                 cells.append(cell)
 
     print(f"\n{'=' * 78}")
@@ -761,8 +790,10 @@ def engineering_discipline(llm, judge_llm) -> float:
         for filler in (["none"] if level["fill"] == 0 else FILLERS):
             subset = [c for c in cells if c["fill"] == label and c["filler"] == filler]
             if subset:
+                note = f"  ({errored(subset)} errored)" if errored(subset) else ""
                 print(f"  pass rate  {label:>6} / {filler:<6}: {pass_rate(subset):.3f}  "
-                      f"({sum(c['disciplined'] for c in subset)}/{len(subset)})")
+                      f"({sum(c['disciplined'] for c in subset)}/"
+                      f"{len(subset) - errored(subset)}){note}")
     print(f"{'=' * 78}")
     for c in cells:
         flag = "ok  " if c["disciplined"] else "FAIL"
