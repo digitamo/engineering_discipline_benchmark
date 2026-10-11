@@ -65,14 +65,13 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
       kaggle b t download engineering-discipline -o ./runs 2>&1 | tail -2
       echo "[quota-watch] finished $(date -u +%H:%M:%S)"
 
-      # Publish only if the run actually produced data. Publishing a task whose
-      # cells all failed would put an empty or zero entry on the leaderboard.
-      if python3 scripts/analyze.py runs/engineering-discipline/**/*.run.json 2>/dev/null \
-           | grep -qE '\| [0-9]+\.[0-9]{3} \|'; then
+      # Publish only if the run actually produced verdicts. Publishing a task
+      # whose cells all failed would put an empty entry on the leaderboard.
+      if python3 scripts/analyze.py runs/engineering-discipline/**/*.run.json --has-data 2>/dev/null; then
         echo "[quota-watch] run produced data, publishing"
         kaggle b t publish engineering-discipline 2>&1 | tail -3
       else
-        echo "[quota-watch] no scored cells found; not publishing"
+        echo "[quota-watch] no scored cells; not publishing"
       fi
 
       python3 scripts/analyze.py runs/engineering-discipline/**/*.run.json 2>&1 | head -70

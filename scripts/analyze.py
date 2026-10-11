@@ -138,7 +138,9 @@ def load(path: Path) -> dict:
 
 
 def main() -> int:
-    paths = [Path(p) for p in sys.argv[1:]]
+    paths = [Path(p) for p in sys.argv[1:] if not p.startswith("--")]
+    check_only = "--has-data" in sys.argv
+
     if not paths:
         paths = [Path(p) for p in glob.glob("runs/**/*.run.json", recursive=True)]
     if not paths:
@@ -148,6 +150,15 @@ def main() -> int:
 
     runs = [load(p) for p in paths]
     runs = [r for r in runs if r["cells"]]
+
+    # --has-data exits 0 only if some cell actually produced a verdict. Used to
+    # decide whether a run is worth publishing: a run whose cells all failed
+    # would otherwise put an empty entry on the leaderboard.
+    if check_only:
+        scored = sum(1 for r in runs for c in r["cells"] if c.get("verdict"))
+        print(f"scored cells: {scored}")
+        return 0 if scored else 1
+
     if not runs:
         print("no scored cells found in the given artifacts", file=sys.stderr)
         return 1
