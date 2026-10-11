@@ -284,8 +284,8 @@ taken, and no number from it should be quoted.
 | Item | Why it is not done | What it would take |
 | :--- | :--- | :--- |
 | **A published Kaggle leaderboard entry** | the platform proxy refuses every request; the reservation for even a baseline cell exceeds the balance | quota to return; `scripts/wait_for_quota.sh` pushes and runs automatically when it does. Local runs via `scripts/run_local.sh` give the measurement meanwhile, but they cannot populate the leaderboard |
-| **Fills deeper than 30%** | a 90% fill of a million-token window is ~900,000 tokens per request | run locally with `FILL_LEVELS` widened — no quota applies there |
-| **More than one model** | only Gemini 3.7 Flash has been measured | run locally with `SUBJECT=` per model. `scripts/run_local.sh` takes it as an argument |
+| **More than one subject model** | only Gemini 3.7 Flash has been measured | run locally with `SUBJECT=` per model. `scripts/run_local.sh` takes it as an argument |
+| **The 90% code filler** | the request exceeds the model's real window. Code tokenises less efficiently than prose, so the character-based estimate under-represents it and the bracket overflowed at ~961,000 estimated tokens | lower the code bracket to ~85%, or measure actual tokens before assembling |
 | **The precedence ablation** | the variant was written, then removed as dead code during the rewrite | re-add `SYSTEM_PROMPT_PRECEDENCE` and run both; answers whether stating precedence explicitly helps |
 | **A no-bait control arm** | every generation scenario is always baited, so bait susceptibility is not computable | add unbaited twins; without the contrast, over-engineering cannot be attributed to the bait |
 | **The self-generated context arm** | the most faithful simulation of a real session, and the most expensive | seed the model, let it elaborate over turns until the window is full, then ask the task |
@@ -293,8 +293,7 @@ taken, and no number from it should be quoted.
 | **Using the structural measures instead of the judge** | the judge is 1% of a cell's cost, so this saves almost nothing; the measures are also blind to registry dicts and decorator hooks | worth doing for robustness, not for cost. Report them alongside the judge rather than replacing it |
 | **Run-to-run variance** | every run so far was a single run | repeat a subset and report the flip rate at temperature zero |
 | **Paraphrase robustness** | one phrasing per scenario | paraphrase each scenario and check the result survives |
-| **A judge outside the tested model family** | the platform chooses the judge; it has been Gemini while Gemini was under test | request or configure a judge from a different family |
-| **Jev or Laya as the semantic judge** | both were the intended judges from the start; the platform supplies its own judge and the local proxy serves neither | wire either in as `judge_llm`, which also resolves the out-of-family problem above. They were designed for this role and would replace a general-purpose model doing a specialist job |
+| **Jev or Laya as the semantic judge** | both were the intended judges from the start | wire either in as `judge_llm`. The cross-family gap is now closed locally by Claude Opus 5.5, but Jev and Laya were designed for this role and would replace a general-purpose model doing a specialist job |
 
 ### The honest summary
 

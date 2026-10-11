@@ -116,15 +116,13 @@ The only defence I found that works is to inspect the raw artifacts — the conv
 
 ## What was actually happening
 
-Once the standards actually reached the model, the picture inverts completely.
+Once the standards actually reached the model, the picture inverts completely — and stays inverted.
 
 The same model, on the same scenario, with the same bait, went from **nine classes, six abstract methods and a five-value lifecycle event enum** to **one class and 41 lines** — and it explained the reasoning by citing the section of the standards it was applying.
 
 It was never ignoring the rules. It had never been given them. Every earlier result described a model working without instructions and being scored as though it had some.
 
 That is the whole finding, and it is a finding about measurement rather than about models. The interesting number was not "how much does discipline degrade under context pressure" — it was "how much of what I measured was an artifact of the apparatus."
-
-TODO: the deep-fill result, once the run completes.
 
 ## Why this is worth more than the result I wanted
 
@@ -165,19 +163,25 @@ Measured locally against a Gemini 3.7 Flash model, through a local LiteLLM gatew
 
 Judged by Claude Opus 5.5 — deliberately a different model family from the subject, which removes the self-preference problem. The baseline was separately judged by Gemini 3.1 Pro and the two agreed on every cell.
 
-| Fill | Context | Scenarios | Pass rate |
-| ---: | ---: | ---: | ---: |
-| 0% | none | 9 | **1.000** |
-| 30% prose | ~319,000 tokens | 3 | **1.000** |
-| 30% code | ~334,000 tokens | 3 | **1.000** |
+| Fill | Filler | Context | Scenarios | Pass rate |
+| ---: | :--- | ---: | ---: | ---: |
+| 0% | none | — | 9 | **1.000** |
+| 30% | prose | ~319,000 tokens | 3 | **1.000** |
+| 30% | code | ~334,000 tokens | 3 | **1.000** |
+| 60% | prose | ~638,000 tokens | 3 | **1.000** |
+| 60% | code | ~637,000 tokens | 3 | **1.000** |
+| 90% | prose | ~958,000 tokens | 3 | **1.000** |
+| 90% | code | ~961,000 tokens | 3 | not measurable — window exceeded |
 
-**No degradation at a third of a million tokens.**
+**No degradation anywhere it could be measured.** The ceiling holds from no context to 91% of the advertised window.
 
-And the structural measures agree with the judge rather than merely being scored as passing. At 30% fill the model produced one class and 44 to 58 lines, resisted the bait and explained the conflict in every generation cell, and rejected the over-engineered pull request in both.
+Two details worth recording rather than smoothing over.
 
-There is a detail worth noting in the code-filler arm: the model used `pytest` for its tests, and the judge did **not** count that as a gratuitous dependency. That is the rubric fix working. The same input under the original rubric was scored as a violation and produced the false result in section 3.
+The 90% code bracket **overflowed the context window**. At ~961,000 estimated tokens the request was rejected outright, while the prose bracket at ~958,000 succeeded. Code tokenises less efficiently than prose, so the same character-based estimate under-represents it, and the real ceiling sits just below the advertised 1,048,576. That is a limitation of the measurement, not a result: no discipline was observed there because nothing ran.
 
-TODO: the 60% and 90% fills, once those runs complete.
+And the structural measures agree with the judge rather than merely being scored as passing. At 30% fill the model produced one class and 44 to 58 lines, resisted the bait and explained the conflict in every generation cell, and rejected the over-engineered pull request in both. The same holds at 60% and 90%.
+
+There is one more detail worth noting in the code arm: the model used `pytest` for its tests and the judge did **not** count that as a gratuitous dependency. That is the rubric fix working. The same input under the original rubric was scored as a violation and produced the false result in section 3.
 
 ## What this can and cannot show
 
