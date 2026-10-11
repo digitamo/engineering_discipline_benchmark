@@ -109,19 +109,6 @@ every single time.
 The benchmark measured test-framework choice and reported it as discipline
 drift.
 
-### 3.1 Why this is worth keeping
-
-This is the sharpest result the project has, and it is a result about
-benchmarking rather than about models.
-
-The filler was not neutral. It demonstrated coding conventions, and the model
-followed them. The judge had a rubric item broad enough to read that imitation
-as a violation. Neither error is exotic. Both produced a number that looked like
-a finding, and it survived until someone opened the raw verdicts.
-
-Any long-context benchmark that fills its context with real code has this
-problem. The failure is silent and the output looks like success.
-
 Two further defects surfaced alongside it, both now fixed:
 
 - **Judge conversations were shared.** Every judge call ran in one conversation,
