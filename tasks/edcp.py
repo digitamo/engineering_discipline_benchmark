@@ -460,13 +460,22 @@ HAYSTACK_CANDIDATES = (
 
 
 def load_haystack() -> str:
+    import glob
+
     for candidate in HAYSTACK_CANDIDATES:
         path = Path(candidate)
         if path.exists():
             return path.read_text(encoding="utf-8")
+
+    # The mount path is derived from the dataset slug and is not always what you
+    # expect, so search the input tree before giving up.
+    for match in sorted(glob.glob("/kaggle/input/**/code_high.txt", recursive=True)):
+        return Path(match).read_text(encoding="utf-8")
+
+    listing = sorted(glob.glob("/kaggle/input/**/*", recursive=True))[:60]
     raise RuntimeError(
-        "haystack not found. Push with -d <owner>/edcp-haystack, "
-        "or run scripts/build_corpus.py for local testing."
+        "haystack not found. Push with -d <owner>/edcp-haystack. "
+        f"/kaggle/input contains: {listing}"
     )
 
 
@@ -553,6 +562,36 @@ def edcp(llm, judge_llm) -> float:
         r = "rbv" if c["recalls_but_violates"] else "   "
         print(f"  {flag} {r} {c['bracket']:4} {c['id']:8} {c['verdict'].bait_outcome}")
     print(f"{'=' * 70}\n")
+
+    # Machine-readable summary. The leaderboard only records the float return
+    # value, so the per-cell detail is emitted here and recovered from the run
+    # logs by scripts/analyze.py.
+    import json as _json
+
+    summary = {
+        "dar_low": dar_low,
+        "dar_high": dar_high,
+        "delta_deg": dar_low - dar_high,
+        "recalls_but_violates": rbv,
+        "n_cells": len(cells),
+        "cells": [
+            {
+                "id": c["id"],
+                "bracket": c["bracket"],
+                "axis": c["axis"],
+                "disciplined": c["disciplined"],
+                "bait_outcome": c["verdict"].bait_outcome,
+                "unsolicited_abstraction": c["verdict"].unsolicited_abstraction,
+                "gratuitous_dependency": c["verdict"].gratuitous_dependency,
+                "exceeded_scope": c["verdict"].exceeded_scope,
+                "recalled_relevant_rule": c["verdict"].recalled_relevant_rule,
+                "recalls_but_violates": c["recalls_but_violates"],
+                "static": c["static"],
+            }
+            for c in cells
+        ],
+    }
+    print("EDCP_JSON " + _json.dumps(summary))
 
     return dar_high
 

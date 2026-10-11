@@ -45,7 +45,7 @@ LLMS_AVAILABLE=<slug>,<slug> # authorized for your token
 
 TARGET_REPO_URL=https://github.com/dlt-hub/dlt.git
 TARGET_REPO_PATH=./target_repo
-TARGET_REPO_COMMIT=c3215e99163eedda925726ab10be23399651727d
+TARGET_REPO_COMMIT=ff414a0a4abbae8413678ff0da6fc66533236cc9
 ```
 
 > **Quota gates the design, not engineering time.** Full 2×2×2 costs roughly 3M input tokens per model per repeat. Run `kaggle b quota` before committing to a matrix size. If forced to cut, cut repeats before control arms.
@@ -142,7 +142,7 @@ Unfiltered, the haystack coaches the model on the exact axis under test. Applied
 ### Pin chain
 
 ```
-dlt SHA c3215e99 → build script → Dataset version → task version
+dlt SHA ff414a0a → build script → Dataset version → task version
 ```
 
 Every link independently versioned. Re-run the build against the SHA and diff to verify.
@@ -187,6 +187,34 @@ p = Path("/kaggle/input/edcp-haystack/code_high.txt")
 if not p.exists():
     raise RuntimeError("haystack not attached — push with -d <owner>/edcp-haystack")
 ```
+
+### Verified environment facts
+
+Confirmed by running against the live proxy and platform, Oct 2026.
+
+| Fact | Detail |
+| :--- | :--- |
+| CLI version | `kaggle` 2.2.4; `b` subcommands present |
+| No `quota` subcommand | quota is web-UI only |
+| Task file | `-f` takes a **single file** — pushed tasks cannot import local modules |
+| Local proxy model count | **12**, and only one Claude (`anthropic/claude-sonnet-5@default`) |
+| Local proxy ID format | `provider/model`, e.g. `google/gemini-3.7-flash`, `openai/gpt-oss-120b` |
+| Platform catalog | `kaggle b t models` lists 47 — a different, larger set than the local proxy |
+| Judge resolution | `LLM_DEFAULT_JUDGE` → `LLM_DEFAULT_EVAL` → `LLM_DEFAULT` |
+| `b auth` writes 3 vars only | `MODEL_PROXY_URL`, `MODEL_PROXY_API_KEY`, `MODEL_PROXY_EXPIRY_TIME` |
+| `b auth` caches | re-running before expiry returns the same key and the same expiry timestamp |
+| Credential lifetime | ~1 hour |
+| Task creation runs the task | the notebook executes the task body during build, so a slow task is slow to push |
+| Return annotations | must be real types; `from __future__ import annotations` breaks inference |
+
+List the models the local proxy actually serves:
+
+```bash
+curl -s -H "Authorization: Bearer $MODEL_PROXY_API_KEY" "$MODEL_PROXY_URL" \
+  | python3 -c 'import json,sys; [print(m["id"]) for m in json.load(sys.stdin)["data"]]'
+```
+
+Note the proxy root is the models endpoint itself — `/v1/models` and `/models` both 404.
 
 ---
 
@@ -262,13 +290,27 @@ Either each row runs both brackets and returns the paired delta (Δ_deg on the b
 
 ## Models
 
-Observed on the proxy — confirm with `kaggle b t models`:
+Two different lists, and they are not the same:
 
-Claude Opus 5 / Sonnet 5 / Haiku 4.5 · GPT-6 Astra · GPT-5.6 Sol/Luna/Terra · GPT-5.5 · GPT-5.4 nano · gpt-oss-120b/20b · Gemini 3.1 Pro Preview / 3.7 Flash / 3.8 Flash / 3.1 Flash Lite · Gemma 4 31B/26B · DeepSeek-R1 · GLM-5 · Qwen3 Coder 480B · Qwen3 Next 80B Thinking
+**Local staging proxy (12)** — what `kbench.llm` can reach during development:
 
-**Pin dated slugs** (`claude-haiku-4-5-20251001`), never `@default` aliases — alias drift breaks reproducibility more reliably than sampling does.
+```
+anthropic/claude-sonnet-5@default   google/gemini-3.7-flash
+deepseek-ai/deepseek-r1-0528        google/gemini-3.5-flash
+google/gemini-3-flash-preview       google/gemini-3.6-flash
+google/gemini-3.1-flash-lite        google/gemini-3.5-flash-lite
+ibm/granite-4.0-h-small             openai/gpt-5.4-nano-2026-03-17
+openai/gpt-oss-120b                 qwen/qwen3-next-80b-a3b-instruct
+```
 
-Known issues: Grok 404s on proxy slugs; Qwen rate-limits under sustained load.
+**Platform catalog (47)** — what `kaggle b t run -m <slug>` accepts, via `kaggle b t models`:
+Claude Opus 5 / Sonnet 5.5 / Haiku 5.5, GPT-6 Astra / Sol / Luna, GPT-5.6 Sol / Luna / Terra,
+Gemini 3.8 / 3.7 / 3.6 Flash, Gemma 4 31B / 26B, DeepSeek-R1, GLM-5, Grok 4.6,
+Qwen3 Coder 480B, Qwen3 Next 80B Thinking, and others.
+
+**Pin dated slugs** (`claude-haiku-4-5-20251001`), never `@default` aliases — alias drift
+breaks reproducibility more reliably than sampling does. Known issues: Grok 404s on some
+proxy slugs; Qwen rate-limits under sustained load.
 
 ---
 

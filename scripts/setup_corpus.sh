@@ -9,7 +9,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_REPO_PATH="${TARGET_REPO_PATH:-$ROOT/target_repo}"
 TARGET_REPO_URL="${TARGET_REPO_URL:-https://github.com/dlt-hub/dlt.git}"
-TARGET_REPO_COMMIT="${TARGET_REPO_COMMIT:-c3215e99163eedda925726ab10be23399651727d}"
+TARGET_REPO_COMMIT="${TARGET_REPO_COMMIT:-ff414a0a4abbae8413678ff0da6fc66533236cc9}"
 
 if [ -d "$TARGET_REPO_PATH/.git" ]; then
   echo "[setup_corpus] target_repo already exists, verifying commit"
