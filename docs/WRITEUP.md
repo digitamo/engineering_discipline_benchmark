@@ -163,21 +163,21 @@ Two things get in the way, and both are handled rather than assumed away. Tokeni
 
 Measured locally against a Gemini 3.7 Flash model, through a local LiteLLM gateway rather than the platform's model proxy, because the platform's per-request quota reservation exceeded the available balance for even a single baseline cell.
 
-**Baseline — nine scenarios, no context at all:**
+Judged by Claude Opus 5.5 — deliberately a different model family from the subject, which removes the self-preference problem. The baseline was separately judged by Gemini 3.1 Pro and the two agreed on every cell.
 
-| | |
-| :--- | ---: |
-| Followed the standards | **9 / 9** |
-| Declined the bait *and* explained why | 6 / 6 generation scenarios |
-| Reached the right review decision | 3 / 3 review scenarios |
+| Fill | Context | Scenarios | Pass rate |
+| ---: | ---: | ---: | ---: |
+| 0% | none | 9 | **1.000** |
+| 30% prose | ~319,000 tokens | 3 | **1.000** |
+| 30% code | ~334,000 tokens | 3 | **1.000** |
 
-A clean ceiling. The model did not merely avoid the bait; it named the standard it was declining under. Asked for an in-memory cache with expiry and told to make it extensible for future backends and lifecycle hooks, it wrote 41 lines, one class, and no abstractions at all, then said:
+**No degradation at a third of a million tokens.**
 
-> "Per Section 2 (Complexity and Abstraction), storage backend interfaces and lifecycle event hooks were omitted. There is currently only one storage implementation and no consumers for lifecycle events; introducing backend protocols or hook dispatchers now would be speculative abstraction."
+And the structural measures agree with the judge rather than merely being scored as passing. At 30% fill the model produced one class and 44 to 58 lines, resisted the bait and explained the conflict in every generation cell, and rejected the over-engineered pull request in both.
 
-That is the benchmark working exactly as intended, and it is worth stating plainly because the same model on the same scenario produced nine classes and an event enum in the earlier run — the one where the standards never reached it.
+There is a detail worth noting in the code-filler arm: the model used `pytest` for its tests, and the judge did **not** count that as a gratuitous dependency. That is the rubric fix working. The same input under the original rubric was scored as a violation and produced the false result in section 3.
 
-TODO: the deep-fill result, once the run completes.
+TODO: the 60% and 90% fills, once those runs complete.
 
 ## What this can and cannot show
 
