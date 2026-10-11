@@ -818,8 +818,23 @@ def engineering_discipline(llm, judge_llm) -> float:
         "cells": cells,
     }))
 
-    deepest = max(level["fill"] for level in FILL_LEVELS)
-    return pass_rate([c for c in cells if c["fill"] == f"{int(deepest * 100)}pct"])
+    scored = [c for c in cells if not c.get("errored")]
+    if not scored:
+        # Returning 0.0 here would read as "the model failed every scenario".
+        # Nothing was measured, so say so rather than publish a number.
+        raise RuntimeError(
+            f"no cell completed: all {len(cells)} failed. First error: "
+            f"{cells[0].get('error', 'unknown')[:200]}"
+        )
+
+    # Return the pass rate at the deepest fill that actually produced data, so a
+    # run cut short reports what it measured rather than an empty zero.
+    for level in sorted(FILL_LEVELS, key=lambda level: -level["fill"]):
+        label = f"{int(level['fill'] * 100)}pct"
+        subset = [c for c in scored if c["fill"] == label]
+        if subset:
+            return pass_rate(subset)
+    return pass_rate(scored)
 
 
 if __name__ == "__main__":
