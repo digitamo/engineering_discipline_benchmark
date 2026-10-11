@@ -143,7 +143,54 @@ The two partly cancelled, which is why the result looked so plausible. A reader
 auditing only the aggregate number would have found a clean ceiling, a clean
 drop, and a tidy explanation.
 
-### 3.2 Why this is worth keeping
+### 3.2 The third error: the rules were never delivered
+
+The two errors above are measurement errors. The third is a delivery error, and
+it is the one that invalidated everything that came before it.
+
+When the task file was restructured, the call that opens a conversation lost its
+`system_instructions` argument. The standards were still defined at the top of
+the file, still referenced by the documentation, and still quoted in the judge
+prompt. They were simply never sent to the model.
+
+Every run in this section measured a model that had been given no rules at all.
+
+Nothing about the output looked wrong. The model answered the task. The judge
+judged the answer. The numbers were coherent, and the story they told — that
+models over-engineer from the first turn, with no context pressure needed — was
+interesting enough to be worth writing up.
+
+It was visible in exactly one place, and only if you looked for it. Asked to list
+the standards that applied, the model said there were none:
+
+> "The assistant explicitly stated that no engineering standards or instructions
+> were provided."
+
+The judge reported that as a failure to recall the rules, which is what it looks
+like from inside the scoring logic. It is actually a report that the rules were
+never delivered.
+
+The conversation record settles it. The cell conversation contains a user
+message and an assistant message and nothing else — no system message, no
+standards.
+
+| Error | Class | Effect |
+| :--- | :--- | :--- |
+| recall text primed the judge | measurement | hid the caving |
+| rubric counted test tooling | measurement | manufactured a context effect |
+| standards never delivered | delivery | the benchmark measured nothing it claimed to |
+
+A guard now checks, before every cell, that the standards are present in the
+conversation, and fails loudly if they are not. It was verified in both
+directions: it fires when the standards are absent and passes when they are
+present.
+
+The general lesson is the one this whole section keeps repeating. A benchmark
+whose subject is missing produces plausible output. It does not crash. The model
+will answer whatever it is asked, and a judge will score whatever it is given,
+and both will look fine.
+
+### 3.3 Why this is worth keeping
 
 This is the sharpest result the project has, and it is a result about
 benchmarking rather than about models.
