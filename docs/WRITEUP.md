@@ -3,7 +3,8 @@
 *This is a submission for the [Kaggle Benchmarking Challenge](https://dev.to/challenges/kaggle-2026-09-23).*
 
 Published benchmark: [kaggle.com/benchmarks/tasks/digitamo/engineering-discipline](https://kaggle.com/benchmarks/tasks/digitamo/engineering-discipline)  
-Fillers dataset: [kaggle.com/datasets/digitamo/engineering-discipline-haystack](https://kaggle.com/datasets/digitamo/engineering-discipline-haystack)
+Fillers dataset: [kaggle.com/datasets/digitamo/engineering-discipline-haystack](https://kaggle.com/datasets/digitamo/engineering-discipline-haystack)  
+Source code: [github.com/digitamo/engineering_discipline_benchmark](https://github.com/digitamo/engineering_discipline_benchmark)
 
 ---
 
@@ -43,30 +44,25 @@ Fills stop at 70%. Python code tokenizes at ~1.3 times standard character-based 
 
 ---
 
-## Methodological Autopsy: How Benchmark Design Fails
+## Catching Three Flaws in the Benchmark
 
-The initial run yielded an apparently clean degradation curve: 1.000 adherence at baseline falling to 0.556 at 130k tokens. Every failure flagged a model that cited the exact rule it had just broken.
+The first run showed a clean degradation curve: 1.000 at baseline dropping to 0.556 at 130k tokens. Every failure flagged a model that cited the exact rule it just broke.
 
-The result was an artifact of three independent errors:
+It looked real, but three hidden bugs had produced it:
 
-### 1. Convention Priming and Rubric Scope
-The code filler contained 24 references to `pytest` and zero to `unittest`. The model adopted the test framework demonstrated in its context. The judge rubric penalized any non-standard-library dependency without distinguishing production requirements from test tooling. The model had not abandoned architectural discipline; it simply imitated context conventions.
+1. **Convention priming:** The code filler used `pytest`. The model copied it, and an over-broad rubric treated the test tool as an illegal dependency.
+2. **Self-assessment bias:** The judge read the model's self-justification before grading the code. It believed the model's promise to stay simple, missing that the output had nine classes and an event hook enum.
+3. **Missing system prompt:** During a refactor, the `system_instructions` argument was dropped from the chat call. The model never saw the rules.
 
-### 2. Self-Assessment Contamination
-The judge prompt originally included the model's self-reported reasoning before the evaluation rubric. When asked why it declined an extensibility hook, the model stated adherence to simplicity standards. The judge evaluated stated intent rather than delivered code, overlooking that the response contained nine classes and an event registry. Isolating the recall query into a separate conversation reversed the outcome from uniform compliance to widespread failure.
+The first two bugs masked each other. Priming the judge with the model's intent hid baseline failures, while the broad rubric invented context errors.
 
-### 3. Delivery Omission
-During task refactoring, the `system_instructions` argument was omitted from chat session initialization. The standards were defined in code and referenced in judge prompts, but never passed to the subject model. The model was not defying constraints; it was operating unconstrained.
-
-Errors 1 and 2 masked each other: the biased judge suppressed baseline violations, while the broad rubric generated false context-induced failures.
-
-A verification guard (`verify_standards_delivered()`) now halts execution if instructions are absent from the active session. Flawed benchmarks rarely crash; they produce plausible metrics that survive until raw conversation artifacts are audited.
+A runtime guard (`verify_standards_delivered()`) now stops execution if instructions are missing. Broken benchmarks rarely crash. They produce plausible numbers until you inspect the raw transcripts.
 
 ---
 
 ## Empirical Results
 
-The full sweep was evaluated on `gemini-3.7-flash` (1M window) using `claude-opus-5.5` as judge to prevent intra-family evaluation bias. Due to Kaggle proxy quota reservation constraints, this sweep was executed via LiteLLM.
+The full sweep evaluated `gemini-3.7-flash` (1M window) judged by `claude-opus-5.5` to avoid family bias. I ran this locally after running out of Kaggle proxy quota, but I plan to re-run the sweep on the platform and share the public leaderboard once quota resets.
 
 | Context Fill | Filler Type | Tokens | Scenarios | Adherence Rate |
 |---:|:---|---:|---:|---:|
@@ -99,7 +95,7 @@ Synthetic prompts isolate and measure these variables within platform constraint
 
 ## Reproduction
 
-All task definitions, corpus generators, and scoring tests are in the repository:
+The full codebase, task definitions, corpus generators, and scoring tests are available in the [benchmark repository](https://github.com/digitamo/engineering_discipline_benchmark):
 
 ```bash
 # Verify environment and execute local scoring tests
