@@ -220,6 +220,12 @@ be the thing that mattered. So content becomes an explicit variable.
 Prose is the primary arm: it isolates context pressure. Code is the comparison
 arm: it measures priming.
 
+The `dlt` codebase is not an active workspace for the task; it is used strictly
+as a synthetic code haystack. Its commit history, utility functions, and pipeline
+plumbing provide realistic syntactic volume and architectural conventions,
+measuring cross-attention interference and convention priming without requiring
+a multi-file execution environment inside the benchmark.
+
 **Python PEPs were rejected as the prose source.** PEP 20 is a simplicity
 manifesto, *"Simple is better than complex… Although never is often better than
 right now"*, and PEP 8 is a style guide. Either would prime the model toward the
@@ -267,9 +273,12 @@ Nine: six generation, three review. Python only, so one scoring pipeline covers
 everything.
 
 They are self-contained. No repository context in the prompt, which avoids both
-horns of a dilemma. Canonical interview problems sit in every training set,
+horns of a dilemma: canonical interview problems sit in every training set,
 while repository-grounded tasks inflate the prompt and worsen the priming
-problem.
+problem. The scenarios are intentionally synthetic units (caches, parsers, diff
+reviews) rather than open GitHub issues from the filler repository. This fits
+Kaggle's single-file execution constraint and cleanly separates the task logic
+from the background filler noise.
 
 Generation scenarios ask for something simple while the request also carries a
 plausible argument for making it general:
