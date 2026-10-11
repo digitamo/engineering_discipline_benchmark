@@ -371,9 +371,17 @@ DEFAULT_WINDOW = 128_000
 # means all of them.
 FILL_LEVELS = [
     {"fill": 0.0, "scenarios": None},
-    {"fill": 0.90, "scenarios": ["gen-01", "gen-02", "gen-03", "rev-01", "rev-03"]},
+    {"fill": 0.30, "scenarios": ["gen-01", "gen-02", "gen-03", "rev-01", "rev-03"]},
 ]
 FILLERS = ["prose", "code"]
+
+# The model proxy reserves quota per request based on input tokens plus the
+# maximum output the request could produce. Left unbounded, a deep fill reserves
+# more than the account holds and the request is refused with a 403 before it is
+# even sent. Capping output keeps the reservation proportional to the input.
+# The value is the OpenAI Chat Completions parameter name, which is what the
+# proxy speaks; `max_output_tokens` is rejected.
+MAX_OUTPUT_TOKENS = 4096
 
 # Asking the model to restate the standards costs one more pass over the whole
 # context. Worth it on short contexts, expensive on long ones.
@@ -601,6 +609,23 @@ def assemble_context(filler: str, target_tokens: int) -> tuple[str, int]:
 # --------------------------------------------------------------------------
 
 
+def verify_standards_delivered(chat) -> None:
+    """Fail loudly if the standards did not reach the conversation.
+
+    This is not defensive padding. An earlier version of this file accepted the
+    standards as a parameter and never passed them to the chat, so every run
+    measured a model that had been given no instructions at all. Nothing about
+    the output looked wrong: the model answered, the judge judged, and the
+    numbers were plausible. The only way that bug is visible is by looking for
+    the standards in the conversation.
+    """
+    if "Engineering Standards" not in str(chat):
+        raise RuntimeError(
+            "the standards are missing from the conversation. The run would "
+            "measure a model that was never given any rules."
+        )
+
+
 def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: str) -> dict:
     prompt = scenario["task"]
     if scenario.get("bait"):
@@ -611,9 +636,20 @@ def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: 
     if context:
         prompt = f"{context}\n\n---\n\n{prompt}"
 
-    with kbench.chats.new(f"{scenario['id']}-{fill_label}-{filler}") as chat:
-        response = llm.prompt(prompt)
-        recall = llm.prompt(RECALL_QUESTION) if RUN_RECALL_QUESTION else None
+    # The standards go in as system instructions. This is the whole point of the
+    # benchmark, and it is exactly the kind of thing that can go missing without
+    # any visible symptom: the model still answers, the judge still judges, and
+    # every number looks plausible. verify_prompt_delivery() below checks it.
+    with kbench.chats.new(
+        f"{scenario['id']}-{fill_label}-{filler}", system_instructions=STANDARDS
+    ) as chat:
+        verify_standards_delivered(chat)
+        response = llm.prompt(prompt, extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS})
+        recall = (
+            llm.prompt(RECALL_QUESTION, extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS})
+            if RUN_RECALL_QUESTION
+            else None
+        )
 
     response_text = str(response)
     recall_text = str(recall) if recall is not None else ""
@@ -625,6 +661,7 @@ def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: 
         verdict = judge_llm.prompt(
             build_response_judge_prompt(scenario["task"], scenario.get("bait", ""), response_text),
             schema=ResponseVerdict,
+            extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS},
         )
     if verdict is None:
         raise RuntimeError(
@@ -637,6 +674,7 @@ def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: 
             recall_verdict = judge_llm.prompt(
                 RECALL_JUDGE_TEMPLATE.format(task=scenario["task"], recall=recall_text),
                 schema=RecallVerdict,
+                extra_api_params={"max_tokens": MAX_OUTPUT_TOKENS},
             )
 
     # A review is only disciplined if it reached the right decision. Scoring it
