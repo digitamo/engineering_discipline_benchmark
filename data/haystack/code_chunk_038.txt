@@ -1,0 +1,3123 @@
+diff --git a/dlt/common/data_writers/writers.py b/dlt/common/data_writers/writers.py
+index 42f44369a..18bc3b62f 100644
+--- a/dlt/common/data_writers/writers.py
++++ b/dlt/common/data_writers/writers.py
+@@ -414,12 +414,14 @@ class CsvWriter(DataWriter):
+         delimiter: str = ",",
+         include_header: bool = True,
+         quoting: CsvQuoting = "quote_needed",
++        lineterminator: str = "\n",
+         bytes_encoding: str = "utf-8",
+     ) -> None:
+         super().__init__(f, caps)
+         self.include_header = include_header
+         self.delimiter = delimiter
+         self.quoting: CsvQuoting = quoting
++        self.lineterminator = lineterminator
+         self.writer: csv.DictWriter[str] = None
+         self.bytes_encoding = bytes_encoding
+ 
+@@ -443,6 +445,7 @@ class CsvWriter(DataWriter):
+             dialect=csv.unix_dialect,
+             delimiter=self.delimiter,
+             quoting=quoting,
++            lineterminator=self.lineterminator,
+         )
+         if self.include_header:
+             self.writer.writeheader()
+diff --git a/dlt/common/destination/configuration.py b/dlt/common/destination/configuration.py
+index a07fdd945..67eada920 100644
+--- a/dlt/common/destination/configuration.py
++++ b/dlt/common/destination/configuration.py
+@@ -10,6 +10,7 @@ class CsvFormatConfiguration(BaseConfiguration):
+     delimiter: str = ","
+     include_header: bool = True
+     quoting: CsvQuoting = "quote_needed"
++    lineterminator: str = "\n"
+ 
+     # read options
+     on_error_continue: bool = False
+diff --git a/docs/website/docs/dlt-ecosystem/file-formats/csv.md b/docs/website/docs/dlt-ecosystem/file-formats/csv.md
+index a91ff42b1..d83068d0b 100644
+--- a/docs/website/docs/dlt-ecosystem/file-formats/csv.md
++++ b/docs/website/docs/dlt-ecosystem/file-formats/csv.md
+@@ -29,7 +29,7 @@ Internally, we use two implementations:
+ * separators are commas
+ * quotes are **"** and are escaped as **""**
+ * `NULL` values are both empty strings and empty tokens as in the example below
+-* UNIX new lines are used
++* UNIX new lines (`"\n"`) are used by default
+ * dates are represented as ISO 8601
+ * quoting style is "when needed"
+ 
+@@ -51,6 +51,7 @@ with standard settings:
+ 
+ * `delimiter`: change the delimiting character (default: ',')
+ * `include_header`: include the header row (default: True)
++* `lineterminator`: specify the string used to terminate lines (default: `\n` - UNIX line endings, use `\r\n` for Windows line endings)
+ * `quoting`: controls when quotes should be generated around field values. Available options:
+ 
+     - `quote_needed` (default): quote only values that need quoting, i.e., non-numeric values
+@@ -72,6 +73,7 @@ with standard settings:
+ delimiter="|"
+ include_header=false
+ quoting="quote_all"
++lineterminator="\r\n"
+ ```
+ 
+ Or using environment variables:
+@@ -80,8 +82,11 @@ Or using environment variables:
+ NORMALIZE__DATA_WRITER__DELIMITER=|
+ NORMALIZE__DATA_WRITER__INCLUDE_HEADER=False
+ NORMALIZE__DATA_WRITER__QUOTING=quote_all
++NORMALIZE__DATA_WRITER__LINETERMINATOR=$"\r\n"
+ ```
+ 
++Note the `"$"` prefix before `"\r\n"` to escape the newline character when using environment variables.
++
+ ### Destination settings
+ A few additional settings are available when copying `csv` to destination tables:
+ * **on_error_continue** - skip lines with errors (only Snowflake)
+diff --git a/tests/libs/test_csv_writer.py b/tests/libs/test_csv_writer.py
+index 64e33d671..cc7e72bc1 100644
+--- a/tests/libs/test_csv_writer.py
++++ b/tests/libs/test_csv_writer.py
+@@ -25,7 +25,7 @@ from tests.cases import (
+     TABLE_ROW_ALL_DATA_TYPES,
+     arrow_table_all_data_types,
+ )
+-from tests.utils import TestDataItemFormat
++from tests.utils import TestDataItemFormat, custom_environ
+ 
+ 
+ def test_csv_arrow_writer_all_data_fields() -> None:
+@@ -311,3 +311,26 @@ def test_csv_writer_quoting_parameters(quoting: CsvQuoting) -> None:
+ 
+         mock_writer_instance.writeheader.assert_called_once()
+         mock_writer_instance.writerows.assert_called_once_with(test_data)
++
++
++@pytest.mark.parametrize(
++    "test_case",
++    [
++        {"lineterminator": "\n", "expected": b'"col1"\n"value1"\n"value2"\n'},
++        {"lineterminator": "\r\n", "expected": b'"col1"\r\n"value1"\r\n"value2"\r\n'},
++    ],
++)
++def test_csv_lineterminator(test_case: Dict[str, str]) -> None:
++    lineterminator = test_case["lineterminator"]
++    expected = test_case["expected"]
++
++    schema: TTableSchemaColumns = {"col1": {"name": "col1", "data_type": "text"}}
++    data = [{"col1": "value1"}, {"col1": "value2"}]
++
++    with custom_environ({"DATA_WRITER__LINETERMINATOR": lineterminator}):
++        with get_writer(CsvWriter, disable_compression=True) as writer:
++            writer.write_data_item(data, schema)
++
++        with open(writer.closed_files[0].file_path, "rb") as f:
++            content = f.read()
++            assert content == expected
+
+
+===== COMMIT 526a6307 =====
+
+
+commit 526a6307c
+Author: Bayees
+Date: 2025-07-18
+
+    [databricks] Addi comment, tags and pk/fk constraints configurable via hints (#2674)
+
+diff --git a/dlt/destinations/adapters.py b/dlt/destinations/adapters.py
+index 8ccef494f..055d1dabf 100644
+--- a/dlt/destinations/adapters.py
++++ b/dlt/destinations/adapters.py
+@@ -8,6 +8,7 @@ from dlt.destinations.impl.synapse.synapse_adapter import synapse_adapter
+ from dlt.destinations.impl.clickhouse.clickhouse_adapter import clickhouse_adapter
+ from dlt.destinations.impl.athena.athena_adapter import athena_adapter, athena_partition
+ from dlt.destinations.impl.postgres.postgres_adapter import postgres_adapter
++from dlt.destinations.impl.databricks.databricks_adapter import databricks_adapter
+ 
+ __all__ = [
+     "weaviate_adapter",
+@@ -20,4 +21,5 @@ __all__ = [
+     "athena_adapter",
+     "athena_partition",
+     "postgres_adapter",
++    "databricks_adapter",
+ ]
+diff --git a/dlt/destinations/impl/databricks/configuration.py b/dlt/destinations/impl/databricks/configuration.py
+index 6b7ead7b1..0dcac58d2 100644
+--- a/dlt/destinations/impl/databricks/configuration.py
++++ b/dlt/destinations/impl/databricks/configuration.py
+@@ -143,6 +143,9 @@ class DatabricksClientConfiguration(DestinationClientDwhWithStagingConfiguration
+     keep_staged_files: Optional[bool] = True
+     """Tells if to keep the files in internal (volume) stage"""
+ 
++    """Whether PRIMARY KEY or FOREIGN KEY constrains should be created"""
++    create_indexes: bool = False
++
+     def __str__(self) -> str:
+         """Return displayable destination location"""
+         if self.credentials:
+diff --git a/dlt/destinations/impl/databricks/databricks.py b/dlt/destinations/impl/databricks/databricks.py
+index 4606b4fe6..cb7631e93 100644
+--- a/dlt/destinations/impl/databricks/databricks.py
++++ b/dlt/destinations/impl/databricks/databricks.py
+@@ -1,6 +1,6 @@
+ import os
+-from typing import Optional, Sequence, List, cast
+-from urllib.parse import urlparse, urlunparse
++from typing import Dict, Optional, Sequence, List, cast, Union
++from urllib.parse import urlparse
+ 
+ from dlt.common.configuration.specs.azure_credentials import (
+     AzureServicePrincipalCredentialsWithoutDefaults,
+@@ -18,7 +18,7 @@ from dlt.common.configuration.specs import (
+     AwsCredentialsWithoutDefaults,
+     AzureCredentialsWithoutDefaults,
+ )
+-from dlt.common.exceptions import TerminalValueError
++from dlt.common.schema.utils import get_columns_names_with_prop
+ from dlt.common.storages.configuration import ensure_canonical_az_url
+ from dlt.common.storages.file_storage import FileStorage
+ from dlt.common.storages.fsspec_filesystem import (
+@@ -26,10 +26,19 @@ from dlt.common.storages.fsspec_filesystem import (
+     S3_PROTOCOLS,
+     GCS_PROTOCOLS,
+ )
+-from dlt.common.schema import TColumnSchema, Schema
++from dlt.destinations.impl.databricks.databricks_adapter import (
++    CLUSTER_HINT,
++    TABLE_COMMENT_HINT,
++    TABLE_TAGS_HINT,
++    COLUMN_COMMENT_HINT,
++    COLUMN_TAGS_HINT,
++)
++from dlt.common.schema import TColumnSchema, Schema, TTableSchema, TColumnHint
+ from dlt.common.schema.typing import TColumnType
+ from dlt.common.storages import FilesystemConfiguration, fsspec_from_config
+ from dlt.common.utils import uniq_id
++from dlt.common import logger
++from dlt.common.data_writers.escape import escape_databricks_literal
+ from dlt.destinations.job_client_impl import SqlJobClientWithStagingDataset
+ from dlt.destinations.exceptions import LoadJobTerminalException
+ from dlt.destinations.impl.databricks.configuration import DatabricksClientConfiguration
+@@ -37,10 +46,17 @@ from dlt.destinations.impl.databricks.sql_client import DatabricksSqlClient
+ from dlt.destinations.sql_jobs import SqlMergeFollowupJob
+ from dlt.destinations.job_impl import ReferenceFollowupJobRequest
+ from dlt.destinations.utils import is_compression_disabled
++from dlt.destinations.impl.databricks.typing import TDatabricksColumnHint
+ 
+ SUPPORTED_BLOB_STORAGE_PROTOCOLS = AZURE_BLOB_STORAGE_PROTOCOLS + S3_PROTOCOLS + GCS_PROTOCOLS
+ 
+ 
++SUPPORTED_HINTS: Dict[TDatabricksColumnHint, str] = {
++    "primary_key": "PRIMARY KEY",
++    "foreign_key": "FOREIGN KEY",
++}
++
++
+ class DatabricksLoadJob(RunnableLoadJob, HasFollowupJobs):
+     def __init__(
+         self,
+@@ -303,6 +319,18 @@ class DatabricksClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
+         self.config: DatabricksClientConfiguration = config
+         self.sql_client: DatabricksSqlClient = sql_client  # type: ignore[assignment, unused-ignore]
+         self.type_mapper = self.capabilities.get_type_mapper()
++        self.active_hints = (
++            cast(Dict[TColumnHint, str], SUPPORTED_HINTS) if self.config.create_indexes else {}
++        )
++
++    def _get_column_def_sql(self, column: TColumnSchema, table: PreparedTableSchema = None) -> str:
++        column_def_sql = super()._get_column_def_sql(column, table)
++
++        if column.get(COLUMN_COMMENT_HINT) or column.get("description"):
++            comment = column.get(COLUMN_COMMENT_HINT) or column.get("description")
++            escaped_comment = escape_databricks_literal(comment)
++            column_def_sql = f"{column_def_sql} COMMENT {escaped_comment}"
++        return column_def_sql
+ 
+     def create_load_job(
+         self, table: PreparedTableSchema, file_path: str, load_id: str, restore: bool = False
+@@ -329,6 +357,40 @@ class DatabricksClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
+             "ADD COLUMN\n" + ",\n".join(self._get_column_def_sql(c, table) for c in new_columns)
+         ]
+ 
++    def _get_constraints_sql(
++        self,
++        table_name: str,
++        new_columns: Sequence[TColumnSchema],
++        generate_alter: bool,
++    ) -> str:
++        constraints_sql = ""
++
++        partial: TTableSchema = {
++            "name": table_name,
++            "columns": {c["name"]: c for c in new_columns},
++        }
++
++        if self.config.create_indexes:
++            # Adding primary key constraint
++            pk_columns = get_columns_names_with_prop(partial, "primary_key")
++
++            if pk_columns:
++                logger.info(f"Creating PRIMARY KEY constraint for table {table_name}")
++                if generate_alter:
++                    logger.warning(
++                        f"PRIMARY KEY on {table_name} constraint cannot be added in ALTER TABLE and"
++                        " is ignored"
++                    )
++                else:
++                    quoted_pk_cols = ", ".join(
++                        self.sql_client.escape_column_name(col) for col in pk_columns
++                    )
++                    constraints_sql += f",\nPRIMARY KEY ({quoted_pk_cols})"
++
++            return constraints_sql
++
++        return ""
++
+     def _get_table_update_sql(
+         self,
+         table_name: str,
+@@ -336,14 +398,89 @@ class DatabricksClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
+         generate_alter: bool,
+         separate_alters: bool = False,
+     ) -> List[str]:
++        table = self.prepare_load_table(table_name)
+         sql = super()._get_table_update_sql(table_name, new_columns, generate_alter)
++        qualified_name = self.sql_client.make_qualified_table_name(table_name)
+ 
+         cluster_list = [
+-            self.sql_client.escape_column_name(c["name"]) for c in new_columns if c.get("cluster")
++            self.sql_client.escape_column_name(c["name"])
++            for c in new_columns
++            if c.get("cluster") or c.get(CLUSTER_HINT, False)
+         ]
+ 
+         if cluster_list:
+-            sql[0] = sql[0] + "\nCLUSTER BY (" + ",".join(cluster_list) + ")"
++            sql.append(f"ALTER TABLE {qualified_name} CLUSTER BY (" + ",".join(cluster_list) + ")")
++
++        if table.get(TABLE_COMMENT_HINT) or table.get("description"):
++            comment = table.get(TABLE_COMMENT_HINT) or table.get("description")
++            escaped_comment = escape_databricks_literal(comment)
++            sql.append(f"COMMENT ON TABLE {qualified_name} IS {escaped_comment}")
++
++        if table.get(TABLE_TAGS_HINT):
++            table_tags = cast(List[Union[str, Dict[str, str]]], table.get(TABLE_TAGS_HINT))
++            for tag in table_tags:
++                if isinstance(tag, str):
++                    escaped_tag = escape_databricks_literal(tag)
++                    sql.append(f"ALTER TABLE {qualified_name} SET TAGS ({escaped_tag})")
++                elif isinstance(tag, dict):
++                    (key, value), *rest = tag.items()
++                    escaped_key = escape_databricks_literal(key)
++                    escaped_value = escape_databricks_literal(value)
++                    sql.append(
++                        f"ALTER TABLE {qualified_name} SET TAGS ({escaped_key}={escaped_value})"
++                    )
++
++        column_tag_list = [
++            (self.sql_client.escape_column_name(c["name"]), c.get(COLUMN_TAGS_HINT))
++            for c in new_columns
++            if c.get(COLUMN_TAGS_HINT)
++        ]
++
++        if column_tag_list:
++            for column_name, column_tags in column_tag_list:
++                column_tags_typed = cast(List[Union[str, Dict[str, str]]], column_tags)
++                for column_tag in column_tags_typed:
++                    if isinstance(column_tag, str):
++                        escaped_tag = escape_databricks_literal(column_tag)
++                        sql.append(
++                            f"ALTER TABLE {qualified_name} ALTER COLUMN {column_name} SET TAGS"
++                            f" ({escaped_tag})"
++                        )
++                    elif isinstance(column_tag, dict):
++                        (key, value), *rest = column_tag.items()
++                        escaped_key = escape_databricks_literal(key)
++                        escaped_value = escape_databricks_literal(value)
++                        sql.append(
++                            f"ALTER TABLE {qualified_name} ALTER COLUMN {column_name} SET TAGS"
++                            f" ({escaped_key}={escaped_value})"
++                        )
++
++        return sql
++
++    def _get_table_post_update_sql(
++        self,
++        table: TTableSchema,
++    ) -> List[str]:
++        sql: List[str] = []
++        table_name = table["name"]
++
++        # add foreign key constraints
++        references = table.get("references")
++        if references:
++            logger.info(f"Creating FOREIGN KEY constraint for table {table_name}")
++            for reference in references:
++                quoted_fk_cols = ", ".join(
++                    self.sql_client.escape_column_name(col) for col in reference.get("columns")
++                )
++                quoted_reference_cols = ", ".join(
++                    self.sql_client.escape_column_name(col)
++                    for col in reference.get("referenced_columns")
++                )
++                sql.append(
++                    f"ALTER TABLE {self.sql_client.make_qualified_table_name(table_name)} ADD"
++                    f" FOREIGN KEY ({quoted_fk_cols}) REFERENCES"
++                    f" {self.sql_client.make_qualified_table_name(reference.get('referenced_table'))}({quoted_reference_cols})"
++                )
+ 
+         return sql
+ 
+diff --git a/dlt/destinations/impl/databricks/databricks_adapter.py b/dlt/destinations/impl/databricks/databricks_adapter.py
+new file mode 100644
+index 000000000..c0dabbe86
+--- /dev/null
++++ b/dlt/destinations/impl/databricks/databricks_adapter.py
+@@ -0,0 +1,129 @@
++from typing import Any, Optional, Literal, Dict, List, Union, cast
++
++from dlt.common.schema.typing import TTableSchemaColumns
++from dlt.common.typing import TColumnNames
++from dlt.destinations.utils import get_resource_for_adapter
++from dlt.extract import DltResource
++from dlt.extract.items import TTableHintTemplate
++from dlt.destinations.impl.databricks.typing import TDatabricksTableSchemaColumns
++
++
++CLUSTER_HINT: Literal["x-databricks-cluster"] = "x-databricks-cluster"
++TABLE_COMMENT_HINT: Literal["x-databricks-table-comment"] = "x-databricks-table-comment"
++TABLE_TAGS_HINT: Literal["x-databricks-table-tags"] = "x-databricks-table-tags"
++COLUMN_COMMENT_HINT: Literal["x-databricks-column-comment"] = "x-databricks-column-comment"
++COLUMN_TAGS_HINT: Literal["x-databricks-column-tags"] = "x-databricks-column-tags"
++
++
++def databricks_adapter(
++    data: Any,
++    cluster: TColumnNames = None,
++    table_comment: Optional[str] = None,
++    table_tags: Optional[List[Union[str, Dict[str, str]]]] = None,
++    column_hints: Optional[TDatabricksTableSchemaColumns] = None,
++) -> DltResource:
++    """
++    Prepares data for loading into Databricks.
++
++    This function takes data, which can be raw or already wrapped in a DltResource object,
++    and prepares it for Databricks by optionally specifying clustering and table description.
++
++    Args:
++        data (Any): The data to be transformed.
++            This can be raw data or an instance of DltResource.
++            If raw data is provided, the function will wrap it into a `DltResource` object.
++        cluster (TColumnNames, optional): A column name or list of column names to cluster the Databricks table by.
++        table_comment (str, optional): A description for the Databricks table.
++        table_tags (List[Union[str, Dict[str, str]]], optional): A list of tags for the Databricks table.
++            Can contain a mix of strings and key-value pairs as dictionaries.
++            Example: ["production", {"environment": "prod"}, "employees"]
++        column_hints (TTableSchemaColumns, optional): A dictionary of column hints.
++            Each key is a column name, and the value is a dictionary of hints.
++            The supported hints are:
++            - `column_comment` - adds a comment to the column. Supports basic markdown format [basic-syntax](https://www.markdownguide.org/cheat-sheet/#basic-syntax).
++            - `column_tags` - adds tags to the column. Supports a list of strings and/or key-value pairs.
++
++    Returns:
++        A `DltResource` object that is ready to be loaded into Databricks.
++
++    Raises:
++        ValueError: If any hint is invalid or none are specified.
++
++    Examples:
++        >>> data = [{"name": "Marcel", "description": "Raccoon Engineer", "date_hired": 1700784000}]
++        >>> databricks_adapter(data, cluster="date_hired", table_comment="Employee Data",
++        ...     table_tags=["production", {"environment": "prod"}, "employees"])
++    """
++    resource = get_resource_for_adapter(data)
++
++    additional_table_hints: Dict[str, TTableHintTemplate[Any]] = {}
++    additional_column_hints: TDatabricksTableSchemaColumns = {}
++
++    if cluster:
++        if isinstance(cluster, str):
++            cluster = [cluster]
++        if not isinstance(cluster, list):
++            raise ValueError(
++                "`cluster` must be a list of column names or a single column name as a string."
++            )
++        for column_name in cluster:
++            additional_column_hints[column_name] = {"name": column_name, CLUSTER_HINT: True}  # type: ignore[typeddict-unknown-key]
++
++    if column_hints:
++        for column_name, hints in column_hints.items():
++            if column_name not in additional_column_hints:
++                additional_column_hints[column_name] = {"name": column_name}
++
++            # cast to a generic dict to access keys not in TColumnSchema
++            hints_dict = cast(Dict[str, Any], hints)
++            if "column_comment" in hints_dict:
++                additional_column_hints[column_name][COLUMN_COMMENT_HINT] = hints_dict[  # type: ignore[typeddict-unknown-key]
++                    "column_comment"
++                ]
++            if "column_tags" in hints_dict:
++                column_tags = hints_dict["column_tags"]
++                if not isinstance(column_tags, list):
++                    raise ValueError(
++                        "`column_tags` must be a list of strings and/or key-value pairs."
++                    )
++                for tag in column_tags:
++                    if isinstance(tag, str):
++                        continue
++                    if isinstance(tag, dict) and len(tag) == 1:
++                        # Ensure the dictionary has exactly one key-value pair
++                        continue
++                    raise ValueError(
++                        "Each tag must be either a string or a dictionary with a single key-value"
++                        " pair."
++                    )
++                additional_column_hints[column_name][COLUMN_TAGS_HINT] = column_tags  # type: ignore[typeddict-unknown-key]
++
++    if table_comment:
++        if not isinstance(table_comment, str):
++            raise ValueError(
++                "`table_comment` must be string representing Databricks table description."
++            )
++        additional_table_hints[TABLE_COMMENT_HINT] = table_comment
++
++    if table_tags:
++        if not isinstance(table_tags, list):
++            raise ValueError("`table_tags` must be a list of strings and/or key-value pairs.")
++        for tag in table_tags:
++            if isinstance(tag, str):
++                continue
++            elif isinstance(tag, dict) and len(tag) == 1:
++                # Ensure the dictionary has exactly one key-value pair
++                continue
++            else:
++                raise ValueError(
++                    "Each tag must be either a string or a dictionary with a single key-value pair."
++                )
++
++        additional_table_hints[TABLE_TAGS_HINT] = table_tags
++
++    resource.apply_hints(
++        columns=cast(TTableSchemaColumns, additional_column_hints),
++        additional_table_hints=additional_table_hints,
++    )
++
++    return resource
+diff --git a/dlt/destinations/impl/databricks/factory.py b/dlt/destinations/impl/databricks/factory.py
+index 7420f71d4..ce7a59750 100644
+--- a/dlt/destinations/impl/databricks/factory.py
++++ b/dlt/destinations/impl/databricks/factory.py
+@@ -157,6 +157,7 @@ class databricks(Destination[DatabricksClientConfiguration, "DatabricksClient"])
+         destination_name: str = None,
+         environment: str = None,
+         staging_volume_name: str = None,
++        create_indexes: bool = False,
+         **kwargs: Any,
+     ) -> None:
+         """Configure the Databricks destination to use in a pipeline.
+@@ -171,6 +172,7 @@ class databricks(Destination[DatabricksClientConfiguration, "DatabricksClient"])
+             destination_name (str, optional): Name of the destination, can be used in config section to differentiate between multiple of the same type
+             environment (str, optional): Environment of the destination
+             staging_volume_name (str, optional): Name of the staging volume to use
++            create_indexes (bool, optional): Whether PRIMARY KEY or FOREIGN KEY constrains should be created
+             **kwargs (Any): Additional arguments passed to the destination config
+         """
+         super().__init__(
+@@ -180,6 +182,7 @@ class databricks(Destination[DatabricksClientConfiguration, "DatabricksClient"])
+             destination_name=destination_name,
+             environment=environment,
+             staging_volume_name=staging_volume_name,
++            create_indexes=create_indexes,
+             **kwargs,
+         )
+ 
+diff --git a/dlt/destinations/impl/databricks/typing.py b/dlt/destinations/impl/databricks/typing.py
+new file mode 100644
+index 000000000..ee846d887
+--- /dev/null
++++ b/dlt/destinations/impl/databricks/typing.py
+@@ -0,0 +1,12 @@
++from typing import Optional, List, Dict, Union, Literal
++from dlt.common.schema.typing import TColumnSchema, TColumnHint
++
++TDatabricksColumnHint = Union[TColumnHint, Literal["foreign_key"]]
++
++
++class TDatabricksColumnSchema(TColumnSchema, total=False):
++    column_comment: Optional[str]
++    column_tags: Optional[List[Union[str, Dict[str, str]]]]
++
++
++TDatabricksTableSchemaColumns = Dict[str, TDatabricksColumnSchema]
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/databricks.md b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+index fc5b0d5dd..07cae57de 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/databricks.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+@@ -321,7 +321,7 @@ print(pipeline.dataset().pokemon.df())
+ - The volume is used as a **temporary location** to store files before loading.
+ 
+ :::caution Module conflict
+-When using dlt within Databricks Notebooks, you may encounter naming conflicts with Databricks' built-in Delta Live Tables (DLT) module.  
++When using dlt within Databricks Notebooks, you may encounter naming conflicts with Databricks' built-in Delta Live Tables (DLT) module.
+ To avoid these conflicts, follow the steps in the [Troubleshooting section](#troubleshooting) below.
+ :::
+ 
+@@ -333,6 +333,33 @@ keep_staged_files = false
+ ```
+ :::
+ 
++## Supported hints
++
++### Supported table hints
++
++Databricks supports the following table hints:
++
++- `description` - Uses the description to add comment to the table. This can also be done by using the adapter parameter `table_comment`.
++
++Databricks supports the following column hints:
++
++- `primary_key` - adds a primary key constraint to the column in Unity Catalog.
++- `description` - adds a description to the column. This can also be done by using the adapter parameter `table_comment`.
++- `references` - adds a foreign key constraint to the column in Unity Catalog.
++- `not_null` - adds a not null constraint to the column.
++- `cluster` - adds a clustering constraint to the column. This can also be done by using the adapter parameter `cluster`.
++
++:::note
++If you want to enforce constraints on the tables, you can set the `create_indexes` option to `true`. This will add PRIMARY KEY and FOREIGN KEY constraints to the tables if the hints primary key and references are set.
++```toml
++[destination.databricks]
++# Add PRIMARY KEY and FOREIGN KEY constraints to tables
++create_indexes=true
++```
++:::
++
++For additional hints specific to Databricks, see the [Databricks adapter](#databricks-adapter) section.
++
+ ## Staging support
+ 
+ Databricks supports both Amazon S3, Azure Blob Storage, and Google Cloud Storage as staging locations. `dlt` will upload files in Parquet format to the staging location and will instruct Databricks to load data from there.
+@@ -488,6 +515,59 @@ This destination fully supports [dlt state sync](../../general-usage/state#synci
+ We enable Databricks to identify that the connection is created by `dlt`.
+ Databricks will use this user agent identifier to better understand the usage patterns associated with dlt integration. The connection identifier is `dltHub_dlt`.
+ 
++## Databricks adapter
++
++You can use the `databricks_adapter` function to add Databricks-specific hints to a resource. These hints influence how data is loaded into Databricks tables, such as adding comments and tags. Hints can be defined at both the column level and table level.
++
++The adapter updates the DltResource with metadata about the destination column and table DDL options.
++
++### Supported hints
++
++- `table_comment`: adds a comment to the table. Supports basic markdown format [basic-syntax](https://www.markdownguide.org/cheat-sheet/#basic-syntax).
++- `table_tags`: adds tags to the table. Supports a list of strings and/or key-value pairs.
++- `column_hints`
++  - `column_comment`: adds a comment to the column. Supports basic markdown format [basic-syntax](https://www.markdownguide.org/cheat-sheet/#basic-syntax).
++  - `column_tags`: adds tags to the column. Supports a list of strings and/or key-value pairs.
++
++### Use an adapter to apply hints to a resource
++
++Here is an example of how to use the `databricks_adapter` function to apply hints to a resource on both the column level and table level:
++
++```py
++import dlt
++from dlt.destinations.adapters import databricks_adapter
++
++@dlt.resource(
++    columns=[
++        {"name": "event_date", "data_type": "date"},
++        {"name": "user_id", "data_type": "bigint"},
++        # Other columns.
++    ]
++)
++def event_data():
++    yield from [
++        {"event_date": datetime.date.today() + datetime.timedelta(days=i)} for i in range(100)
++    ]
++
++# Apply table and column options.
++databricks_adapter(
++    event_data,
++
++    # Table level options.
++    table_comment="Dummy event data.",
++    table_tags=["pii", {"cost_center": "12345"}],
++
++    # Column level options.
++    column_hints={
++        "event_date": {"column_comment": "The date of the event"},
++        "user_id": {
++            "column_comment": "The id of the user",
++            "column_tags": ["pii", {"cost_center": "12345"}]
++        },
++    },
++)
++```
++
+ ## Troubleshooting
+ Use the following steps to avoid conflicts with Databricks' built-in Delta Live Tables (DLT) module and enable dltHub integration.
+ 
+@@ -501,7 +581,7 @@ To ensure compatibility with the dltHub's dlt package in Databricks, add an `ini
+ # move Databricks' dlt package to a different folder name
+ mv /databricks/spark/python/dlt/ /databricks/spark/python/dlt_dbricks
+ 
+-# Replace all mentions of `dlt` with `dlt_dbricks` so that Databricks' dlt 
++# Replace all mentions of `dlt` with `dlt_dbricks` so that Databricks' dlt
+ # can be used as `dlt_dbricks` in the notebook instead
+ find /databricks/spark/python/dlt_dbricks/ -type f -exec sed -i 's/from dlt/from dlt_dbricks/g' {} \;
+ 
+@@ -543,7 +623,7 @@ This ensures the dlt package from dltHub is used instead of the built-in Databri
+ :::caution
+ It is best practice to use an `init.sh` script.
+ 
+-Modifying `sys.meta_path` or `sys.modules` is fragile and may break after Databricks updates, potentially causing unexpected issues. 
++Modifying `sys.meta_path` or `sys.modules` is fragile and may break after Databricks updates, potentially causing unexpected issues.
+ If this workaround is necessary, validate your setup after each platform upgrade.
+ :::
+ 
+diff --git a/tests/.dlt/config.toml b/tests/.dlt/config.toml
+index aa06d98df..758923f9d 100644
+--- a/tests/.dlt/config.toml
++++ b/tests/.dlt/config.toml
+@@ -12,4 +12,8 @@ bucket_url_r2="s3://dlt-ci-test-bucket"
+ # use "/" as root path
+ bucket_url_gdrive="gdrive://15eC3e5MNew2XAIefWNlG8VlEa0ISnnaG"
+ bucket_url_sftp="sftp://localhost/data"
+-memory="memory:///m"
+\ No newline at end of file
++memory="memory:///m"
++
++[destination.databricks]
++# Add PRIMARY KEY and FOREIGN KEY constraints to tables
++create_indexes=true
+\ No newline at end of file
+diff --git a/tests/load/databricks/test_databricks_adapter.py b/tests/load/databricks/test_databricks_adapter.py
+new file mode 100644
+index 000000000..2545f726e
+--- /dev/null
++++ b/tests/load/databricks/test_databricks_adapter.py
+@@ -0,0 +1,234 @@
++from typing import Iterator, Dict, Any, cast
++import pytest
++
++import dlt
++from dlt.common.utils import uniq_id
++from dlt.destinations.adapters import databricks_adapter
++from dlt.destinations.impl.databricks.databricks_adapter import (
++    CLUSTER_HINT,
++)
++from tests.load.utils import (
++    destinations_configs,
++    DestinationTestConfiguration,
++)
++
++# mark all tests as essential, do not remove
++pytestmark = pytest.mark.essential
++
++
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(default_sql_configs=True, subset=["databricks"]),
++    ids=lambda x: x.name,
++)
++def test_databricks_hints(
++    destination_config: DestinationTestConfiguration,
++) -> None:
++    pipeline = destination_config.setup_pipeline(f"databricks_{uniq_id()}", dev_mode=True)
++
++    @dlt.resource(
++        columns={"some_int": {"data_type": "bigint", "nullable": False}},
++        primary_key="some_int",
++    )
++    def demo_resource_primary() -> Iterator[Dict[str, int]]:
++        for i in range(10):
++            yield {
++                "some_int": i,
++            }
++
++    databricks_adapter(
++        demo_resource_primary,
++        table_comment="Dummy table comment",
++        table_tags=[{"environment": "dummy"}, "pii"],
++        column_hints={
++            "some_int": {
++                "column_comment": "Dummy column comment",
++                "column_tags": [{"environment": "dummy"}, "pii"],
++            }
++        },
++    )
++
++    @dlt.resource(
++        columns={"some_int_2": {"data_type": "bigint", "nullable": False}},
++        references=[
++            {
++                "referenced_table": "demo_resource_primary",
++                "columns": ["some_int_2"],
++                "referenced_columns": ["some_int"],
++            }
++        ],
++    )
++    def demo_resource_foreign() -> Iterator[Dict[str, int]]:
++        for i in range(10):
++            yield {
++                "some_int_2": i,
++            }
++
++    @dlt.source(max_table_nesting=0)
++    def demo_source():
++        return [demo_resource_primary, demo_resource_foreign]
++
++    pipeline.run(demo_source())
++
++    with pipeline.sql_client() as c:
++        with c.execute_query(f"""
++                SELECT tables.comment, table_tags.tag_name, table_tags.tag_value
++                FROM information_schema.tables
++                LEFT JOIN information_schema.table_tags ON tables.table_catalog = table_tags.catalog_name
++                    AND tables.table_schema = table_tags.schema_name
++                    AND tables.table_name = table_tags.table_name
++                WHERE tables.table_name = 'demo_resource_primary'
++                    AND tables.table_schema = '{pipeline.dataset_name}';
++            """) as cur:
++            rows = cur.fetchall()
++
++            assert all("Dummy table comment" in str(row[0]) for row in rows)
++            assert any("pii" in str(row[1]) for row in rows)
++            assert any("environment" in str(row[1]) and "dummy" in str(row[2]) for row in rows)
++
++        with c.execute_query(f"""
++                SELECT columns.comment, column_tags.tag_name, column_tags.tag_value, constraint_name
++                FROM information_schema.columns
++                LEFT JOIN information_schema.column_tags
++                    ON columns.table_catalog = column_tags.catalog_name
++                    AND columns.table_schema = column_tags.schema_name
++                    AND columns.table_name = column_tags.table_name
++                    AND columns.column_name = column_tags.column_name
++                LEFT JOIN information_schema.key_column_usage
++                    ON columns.table_catalog = key_column_usage.table_catalog
++                    AND columns.table_schema = key_column_usage.table_schema
++                    AND columns.table_name = key_column_usage.table_name
++                    AND columns.column_name = key_column_usage.column_name
++                WHERE columns.table_schema = '{pipeline.dataset_name}'
++                    AND columns.table_name = 'demo_resource_primary'
++                    AND columns.column_name NOT LIKE '\\_%';
++            """) as cur:
++            rows = cur.fetchall()
++
++            assert all("Dummy column comment" in str(row[0]) for row in rows)
++            assert any("environment" in str(row[1]) and "dummy" in str(row[2]) for row in rows)
++            assert any("pii" in str(row[1]) for row in rows)
++            assert any("demo_resource_primary_pk" in str(row[3]) for row in rows)
++
++        with c.execute_query(f"""
++                SELECT constraint_name
++                FROM information_schema.columns
++                LEFT JOIN information_schema.key_column_usage
++                    ON columns.table_catalog = key_column_usage.table_catalog
++                    AND columns.table_schema = key_column_usage.table_schema
++                    AND columns.table_name = key_column_usage.table_name
++                    AND columns.column_name = key_column_usage.column_name
++                WHERE columns.table_name = 'demo_resource_foreign'
++                    AND columns.column_name NOT LIKE '\\_%'
++                    AND columns.table_schema = '{pipeline.dataset_name}';
++            """) as cur:
++            rows = cur.fetchall()
++
++            assert any(
++                "demo_resource_foreign_demo_resource_primary_fk" in str(row[0]) for row in rows
++            )
++
++
++@pytest.mark.parametrize(
++    "invalid_table_tags",
++    [
++        123,  # not a list
++        [123],  # list with invalid element
++        [{"a": "b", "c": "d"}],  # dict with more than one key
++        [None],  # list with None
++        [[], {}],  # list with empty list and dict
++    ],
++)
++def test_databricks_adapter_invalid_table_tags(invalid_table_tags):
++    def dummy_resource():
++        yield {"some_int": 1}
++
++    # Should raise ValueError for invalid table_tags
++    with pytest.raises(ValueError):
++        databricks_adapter(dummy_resource, table_tags=invalid_table_tags)
++
++
++@pytest.mark.parametrize(
++    "invalid_column_tags",
++    [
++        123,  # not a list
++        [123],  # list with invalid element
++        [{"a": "b", "c": "d"}],  # dict with more than one key
++        [None],  # list with None
++        [[], {}],  # list with empty list and dict
++    ],
++)
++def test_databricks_adapter_invalid_column_tags(invalid_column_tags):
++    def dummy_resource():
++        yield {"some_int": 1}
++
++    with pytest.raises(ValueError):
++        databricks_adapter(
++            dummy_resource,
++            column_hints={"some_int": {"column_tags": invalid_column_tags}},
++        )
++
++
++def test_databricks_adapter_invalid_table_comment():
++    def dummy_resource():
++        yield {"some_int": 1}
++
++    # Should raise ValueError for non-string table_comment
++    with pytest.raises(ValueError):
++        databricks_adapter(dummy_resource, table_comment=123)  # type: ignore[arg-type]
++
++
++def test_databricks_adapter_invalid_cluster():
++    def dummy_resource():
++        yield {"some_int": 1}
++
++    # Should raise ValueError for invalid cluster type
++    with pytest.raises(ValueError):
++        databricks_adapter(dummy_resource, cluster=123)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(default_sql_configs=True, subset=["databricks"]),
++    ids=lambda x: x.name,
++)
++def test_databricks_adapter_special_characters(
++    destination_config: DestinationTestConfiguration,
++) -> None:
++    """Test that special characters in comments and tags are properly escaped"""
++    pipeline = destination_config.setup_pipeline(f"databricks_{uniq_id()}", dev_mode=True)
++
++    @dlt.resource(
++        columns={"some_int": {"data_type": "bigint", "nullable": False}},
++        primary_key="some_int",
++    )
++    def demo_resource_special() -> Iterator[Dict[str, int]]:
++        for i in range(5):
++            yield {"some_int": i}
++
++    # Test with special characters that could cause SQL injection
++    databricks_adapter(
++        demo_resource_special,
++        table_comment="O'Reilly's \"book\" on SQL; DROP TABLE users;--",
++        table_tags=[{"env": 'test\'s "env"'}],
++        column_hints={
++            "some_int": {
++                "column_comment": "User's ID with \"quotes\" and 'apostrophes'",
++                "column_tags": [{"type": 'user\'s "data"'}],
++            }
++        },
++    )
++
++    @dlt.source(max_table_nesting=0)
++    def demo_source():
++        return demo_resource_special
++
++    pipeline.run(demo_source())
++
++    # Verify that the special characters were properly handled and the table was created
++    with pipeline.sql_client() as c:
++        with c.execute_query(f"""
++                SELECT COUNT(*) FROM {pipeline.dataset_name}.demo_resource_special
++            """) as cur:
++            row = cur.fetchone()
++            assert row[0] == 5  # All rows should be loaded successfully
+
+
+===== COMMIT 49e5b764 =====
+
+
+commit 49e5b7644
+Author: Katharina Lenz
+Date: 2025-07-17
+
+    Update dlt+ pojects.md sources example (#2861)
+
+diff --git a/docs/website/docs/plus/features/projects.md b/docs/website/docs/plus/features/projects.md
+index 1d96cfec9..4b9c99adb 100644
+--- a/docs/website/docs/plus/features/projects.md
++++ b/docs/website/docs/plus/features/projects.md
+@@ -37,26 +37,51 @@ The main component of a dlt+ Project is the dlt manifest file (`dlt.yml`). It ma
+ ### Sources
+ 
+ This section lets you define sources either declaratively or by referencing an implementation from a Python module inside `sources/`. In the example below, two sources are declared:
+-1. a dlt REST API source whose parameters are passed within the manifest
+-2. a GitHub source defined in a function `source` whose source code inside `sources/github.py` is referenced
++1. a GitHub source defined in a function `source` whose source code inside `sources/github.py` is referenced
++2. a dlt REST API source whose parameters are passed within the manifest
+ 
+ ```yaml
+ sources:
+-  pokemon:
++  github:
++    type: github.github_reactions
++
++  pokemon_api:
+     type: rest_api
+     client:
+       base_url: https://pokeapi.co/api/v2/
+-    resource_defaults:
+-      endpoint:
+-        params:
+-          limit: 1000
++      paginator: auto
++      
+     resources:
+-      - pokemon
+-      - berry
++      - name: pokemon
++        primary_key: name
++      - name: berry
++        primary_key: name
++      - name: encounter_conditions
++        primary_key: name
++        endpoint:
++          path: encounter-condition
++          params:
++            offset:
++              type: incremental
++              cursor_path: name
++        write_disposition: append
++     
+ 
+-  github:
+-    type: github.source
+ ```
++
++* `type: rest_api` specifies the use of the built-in REST API source.
++* `client.base_url` sets the root URL for all API requests.
++* `paginator: auto` enables automatic detection and handling of pagination.
++* `resource_defaults`: Contains the default values to configure the dlt resources. This configuration is applied to all resources unless overridden by the resource-specific configuration.
++* Each item in `resources`defines an endpoint to extract. Simple entries like `pokemon`and `berry`will fetch from `/pokemon` and `/berry`, respectively.
++* The `encounter-condition` resource uses an advanced configuration:
++  * `path`: Point to the `/encounter-condition`endpoint.
++  * `params.offset`: Enables incremental loading using the `name` field as the cursor.
++  * `write_disposition`: append ensures new data is appended rather than overwriting previous loads.
++
++This setup provides a flexible, zero-code way to work with REST APIs and manage data extraction across multiple endpoints in a single source block.
++
++
+ :::tip
+ Source **type** is used to refer to the location in Python code where the `@dlt.source` decorated function is present. You can
+ always use a full path to a function name in a Python module, but we also support shorthand and relative notations. For example:
+@@ -67,6 +92,8 @@ If the **type** cannot be resolved, dlt+ will provide you with a detailed list o
+ so you can make required corrections.
+ :::
+ 
++
++
+ ### Destinations
+ 
+ The destinations section defines dlt destinations in a similar way to how you would define them in a pure Python dlt project. As with sources, you can also create a `destinations/` folder and reference custom implementations of destinations inside it.
+
+
+===== COMMIT 682e9004 =====
+
+
+commit 682e90049
+Author: David Scharf
+Date: 2025-07-17
+
+    make docs snippets tests use local secrets (#2903)
+
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 67b52899e..13b2be206 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -30,7 +30,6 @@ jobs:
+   test_docs_snippets:
+     name: test snippets in docs
+     uses: ./.github/workflows/test_docs_snippets.yml
+-    secrets: inherit
+   
+   lint:
+     name: lint on all python versions
+@@ -73,10 +72,15 @@ jobs:
+     uses: ./.github/workflows/test_tools_build_images.yml
+ 
+   #
+-  # Remote destination tests and docs snippets, needs secrets, 
++  # Remote destination tests and docs examples, needs secrets, 
+   # so we depend on authorize and forward secrets
+   #
+ 
++  test_examples:
++    name: test examples
++    needs: [lint, authorize_run_from_fork]
++    uses: ./.github/workflows/test_examples.yml
++    secrets: inherit
+ 
+   test_destinations_remote:
+     name: test remote destinations with secrets
+diff --git a/.github/workflows/test_docs_snippets.yml b/.github/workflows/test_docs_snippets.yml
+index 6dc8d644b..523016780 100644
+--- a/.github/workflows/test_docs_snippets.yml
++++ b/.github/workflows/test_docs_snippets.yml
+@@ -1,18 +1,15 @@
+ 
+-name: docs | snippets & examples
++name: docs | snippets
+ 
+ on:
+   workflow_call:
+   workflow_dispatch:
+ 
+ env:
+-  DLT_SECRETS_TOML: ${{ secrets.DLT_SECRETS_TOML }}
+ 
+   # RUNTIME__SENTRY_DSN: https://6f6f7b6f8e0f458a89be4187603b55fe@o1061158.ingest.sentry.io/4504819859914752
+   RUNTIME__LOG_LEVEL: ERROR
+ 
+-  # Slack hook for chess in production example
+-  RUNTIME__SLACK_INCOMING_HOOK: ${{ secrets.RUNTIME__SLACK_INCOMING_HOOK }}
+   # Path to local qdrant database
+   DESTINATION__QDRANT__CREDENTIALS__PATH: zendesk.qdb
+   # detect if the workflow is executed in a repo fork
+@@ -21,7 +18,7 @@ env:
+ jobs:
+ 
+   run_lint:
+-    name: docs | snippets & examples lint and test
++    name: docs | snippets
+     runs-on: ubuntu-latest
+ 
+     # Service containers to run with `container-job`
+@@ -80,18 +77,13 @@ jobs:
+       - name: Install dependencies
+         run: uv sync --extra duckdb --extra weaviate --extra parquet --extra qdrant --extra bigquery --extra postgres --extra lancedb  --extra s3 --extra workspace --group docs --group sentry-sdk --group ibis --group providers
+ 
+-      - name: create secrets.toml for examples
+-        run: pwd && echo "$DLT_SECRETS_TOML" > docs/examples/.dlt/secrets.toml
+-
+-      - name: create secrets.toml for snippets
+-        run: pwd && echo "$DLT_SECRETS_TOML" > docs/website/docs/.dlt/secrets.toml
++      - name: Create secrets.toml for snippets
++        run: |
++          cp tests/.dlt/dev.secrets.toml docs/website/docs/.dlt/secrets.toml
+ 
+       - name: Run linter and tests on snippets
+         run: make lint-and-test-snippets
+ 
+-      - name: Run linter and tests on examples
+-        run: make lint-and-test-examples
+-
+       - name: Test notebooks
+         run: cd docs/notebooks && make test
+ 
+diff --git a/.github/workflows/test_examples.yml b/.github/workflows/test_examples.yml
+new file mode 100644
+index 000000000..ee766fc92
+--- /dev/null
++++ b/.github/workflows/test_examples.yml
+@@ -0,0 +1,59 @@
++
++name: docs | examples
++
++on:
++  workflow_call:
++  workflow_dispatch:
++
++env:
++  DLT_SECRETS_TOML: ${{ secrets.DLT_SECRETS_TOML }}
++
++  # RUNTIME__SENTRY_DSN: https://6f6f7b6f8e0f458a89be4187603b55fe@o1061158.ingest.sentry.io/4504819859914752
++  RUNTIME__LOG_LEVEL: ERROR
++
++  # Slack hook for chess in production example
++  RUNTIME__SLACK_INCOMING_HOOK: ${{ secrets.RUNTIME__SLACK_INCOMING_HOOK }}
++  # Path to local qdrant database
++  DESTINATION__QDRANT__CREDENTIALS__PATH: zendesk.qdb
++
++jobs:
++
++  run_lint:
++    name: docs | test examples
++    runs-on: ubuntu-latest
++
++    steps:
++
++      - name: Check out
++        uses: actions/checkout@master
++        with:
++          ref: ${{ github.event.pull_request.head.sha || github.ref }}
++
++      - name: Start weaviate
++        run:  docker compose -f "tests/load/weaviate/docker-compose.yml" up -d
++
++      - name: Setup Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.10"
++
++      - name: Install uv
++        uses: astral-sh/setup-uv@v6
++        with:
++          python-version: "3.10"
++          activate-environment: true
++          enable-cache: true
++
++      - name: Install dlt-plus nightly devel build without cache
++        run: uv run pip install --upgrade --force-reinstall --no-cache-dir --pre dlt-plus
++
++      - name: Install dependencies
++        run: uv sync --extra duckdb --extra weaviate --extra parquet --extra qdrant --extra bigquery --extra postgres --extra lancedb  --extra s3 --extra workspace --group docs --group sentry-sdk --group ibis --group providers
++
++      - name: create secrets.toml for examples
++        run: pwd && echo "$DLT_SECRETS_TOML" > docs/examples/.dlt/secrets.toml
++
++      - name: Run linter and tests on examples
++        run: make lint-and-test-examples
++
++
+diff --git a/docs/examples/custom_naming/custom_naming.py b/docs/examples/custom_naming/custom_naming.py
+index 74feeb13e..96dc0f806 100644
+--- a/docs/examples/custom_naming/custom_naming.py
++++ b/docs/examples/custom_naming/custom_naming.py
+@@ -33,9 +33,8 @@ if __name__ == "__main__":
+ 
+     # create postgres destination with a custom naming convention. pass sql_cs_latin2 as module
+     # NOTE: ql_cs_latin2 is case sensitive and postgres accepts UNICODE letters in identifiers
+-    dest_ = dlt.destinations.postgres(
+-        "postgresql://loader:loader@localhost:5432/dlt_data", naming_convention=sql_cs_latin2
+-    )
++    dest_ = dlt.destinations.postgres(naming_convention=sql_cs_latin2)
++
+     # run a pipeline
+     pipeline = dlt.pipeline(
+         pipeline_name="sql_cs_latin2_pipeline",
+diff --git a/docs/tools/prepare_examples_tests.py b/docs/tools/prepare_examples_tests.py
+index 9e573a4b0..d028f5510 100644
+--- a/docs/tools/prepare_examples_tests.py
++++ b/docs/tools/prepare_examples_tests.py
+@@ -21,8 +21,6 @@ MAIN_CLAUSE = 'if __name__ == "__main__":'
+ TEST_HEADER = """
+ import pytest
+ 
+-from tests.utils import skipifgithubfork
+-
+ """
+ 
+ 
+@@ -70,7 +68,6 @@ if __name__ == "__main__":
+             # convert the main clause to a test function
+             if line.startswith(MAIN_CLAUSE):
+                 main_clause_found = True
+-                processed_lines.append("@skipifgithubfork")  # skip on forks
+                 if example not in SKIP_FORK_EXAMPLES:
+                     processed_lines.append("@pytest.mark.forked")  # run on forked-subprocess
+                 processed_lines.append(f"def test_{example}():")
+
+
+===== COMMIT ea144755 =====
+
+
+commit ea1447554
+Author: David Scharf
+Date: 2025-07-17
+
+    deploy docs on push to master (#2902)
+
+diff --git a/.github/workflows/tools_deploy_docs.yml b/.github/workflows/tools_deploy_docs.yml
+index 283db532a..e37de9d4c 100644
+--- a/.github/workflows/tools_deploy_docs.yml
++++ b/.github/workflows/tools_deploy_docs.yml
+@@ -4,6 +4,9 @@ on:
+   schedule:
+     - cron:  '0 2 * * *'
+   workflow_dispatch:
++  push:
++    branches:
++      - master
+ 
+ env:
+   NETLIFY_DOCS_PRODUCTION_DEPLOY_HOOK: ${{ secrets.NETLIFY_DOCS_PRODUCTION_DEPLOY_HOOK }}
+
+
+===== COMMIT adaea502 =====
+
+
+commit adaea502f
+Author: David Scharf
+Date: 2025-07-16
+
+    enable pretty urls (#2878)
+
+diff --git a/docs/website/netlify.toml b/docs/website/netlify.toml
+index 4cf2a0623..d367ce6ae 100644
+--- a/docs/website/netlify.toml
++++ b/docs/website/netlify.toml
+@@ -1,3 +1,6 @@
++[build.processing.html]
++pretty_urls = true
++
+ [[redirects]]
+ from = "/"
+ to = "/docs/intro"
+
+
+===== COMMIT 85c196d2 =====
+
+
+commit 85c196d23
+Author: Anton Burnashev
+Date: 2025-07-16
+
+    Fix logger.isEnabledFor() TypeError (#2882)
+
+diff --git a/dlt/common/logger.py b/dlt/common/logger.py
+index 634e30580..90365d1ce 100644
+--- a/dlt/common/logger.py
++++ b/dlt/common/logger.py
+@@ -2,27 +2,44 @@ import contextlib
+ import logging
+ import traceback
+ from logging import LogRecord, Logger
+-from typing import Any, Mapping, Iterator, Protocol
++from typing import Any, Mapping, Iterator, Protocol, Callable
+ 
+ LOGGER: Logger = None
++_MESSAGE_LOGGING_METHODS = {
++    "debug",
++    "info",
++    "warning",
++    "warn",
++    "error",
++    "critical",
++    "exception",
++    "fatal",
++}
+ 
+ 
+ class LogMethod(Protocol):
+-    def __call__(self, msg: str, *args: Any, **kwds: Any) -> None: ...
++    def __call__(self, *args: Any, **kwds: Any) -> Any: ...
+ 
+ 
+ def __getattr__(name: str) -> LogMethod:
+     """Forwards log method calls (debug, info, error etc.) to LOGGER"""
+ 
+-    def wrapper(msg: str, *args: Any, **kwargs: Any) -> None:
+-        if LOGGER:
++    def wrapper(*args: Any, **kwargs: Any) -> Any:
++        if LOGGER is None:
++            return None
++
++        target: Callable[..., Any] = getattr(LOGGER, name)
++
++        if name in _MESSAGE_LOGGING_METHODS:
+             # skip stack frames when displaying log so the original logging frame is displayed
+             stacklevel = 2
+             if name == "exception":
+                 # exception has one more frame
+                 stacklevel = 3
+-            getattr(LOGGER, name)(msg, *args, **kwargs, stacklevel=stacklevel)
++            kwargs["stacklevel"] = stacklevel
++        return target(*args, **kwargs)
+ 
++    wrapper.__name__ = name
+     return wrapper
+ 
+ 
+diff --git a/dlt/sources/helpers/rest_client/client.py b/dlt/sources/helpers/rest_client/client.py
+index 749fb3121..d7b77c4f7 100644
+--- a/dlt/sources/helpers/rest_client/client.py
++++ b/dlt/sources/helpers/rest_client/client.py
+@@ -148,8 +148,7 @@ class RESTClient:
+         return self.session.send(prepared_request, **send_kwargs)
+ 
+     def _log_request(self, request: Request, prepared_url: str) -> None:
+-        # XXX: Use logger.isEnabledFor(logging.DEBUG) once dlt logger is fixed
+-        if logger.log_level() == "DEBUG":
++        if logger.isEnabledFor(logging.DEBUG):
+             logger.debug(
+                 f"Making {request.method.upper()} request to {request.url}"
+                 f" with params={request.params}, json={request.json},"
+diff --git a/tests/common/configuration/test_configuration.py b/tests/common/configuration/test_configuration.py
+index d792b0864..c4d2cdc31 100644
+--- a/tests/common/configuration/test_configuration.py
++++ b/tests/common/configuration/test_configuration.py
+@@ -1716,7 +1716,7 @@ def test_warn_when_resolving_placeholders(
+             # verify
+             assert value == placeholder_value
+             assert mock_warning.call_count == 1
+-            msg = mock_warning.call_args[0][0]
++            msg = mock_warning.call_args[1]["msg"]
+             assert "Placeholder value encountered when resolving config or secret" in msg
+             assert key in msg
+             assert str(placeholder_value) in msg
+diff --git a/tests/common/runtime/test_logging.py b/tests/common/runtime/test_logging.py
+index d588880b7..7bff9c081 100644
+--- a/tests/common/runtime/test_logging.py
++++ b/tests/common/runtime/test_logging.py
+@@ -158,6 +158,20 @@ def test_double_log_init(environment: DictStrStr, mocker: MockerFixture) -> None
+     assert logger.LOGGER.name == "dlt"
+ 
+ 
++@pytest.mark.forked
++def test_logger_isEnabledFor(environment: DictStrStr) -> None:
++    import logging
++
++    c = PureBasicConfiguration()
++    c.log_level = "INFO"
++    init_test_logging(c)
++
++    # Test that isEnabledFor properly proxied in dlt.common.logger
++    # and not raises TypeError
++    assert logger.isEnabledFor(logging.INFO)
++    assert logger.isEnabledFor(logging.DEBUG) is False
++
++
+ def test_cleanup(environment: DictStrStr) -> None:
+     # this must happen after all forked tests (problems with tests teardowns in other tests)
+     pass
+
+
+===== COMMIT c6a3dd05 =====
+
+
+commit c6a3dd058
+Author: Alena Astrakhantseva
+Date: 2025-07-11
+
+    Update sidebars.js (#2864)
+
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index dd4d807d5..a79258093 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -57,19 +57,6 @@ const sidebars = {
+         'release-notes/1.12.1',
+       ]
+     },
+-    {
+-      type: 'category',
+-      label: 'Release highlights',
+-      link: {
+-        type: 'generated-index',
+-        title: 'Release highlights',
+-        slug: '/release-highlights',
+-        keywords: ['release notes, release highlights'],
+-      },
+-      items: [
+-        'release-notes/1.12.1',
+-      ]
+-    },
+     {
+       type: 'category',
+       label: 'Core concepts',
+@@ -587,4 +574,4 @@ blog:
+     'general-usage/data-enrichments/url-parser-data-enrichment'
+   ]
+ },
+-*/
+\ No newline at end of file
++*/
+
+
+===== COMMIT 21dc0bdc =====
+
+
+commit 21dc0bdc5
+Author: Thierry Jean
+Date: 2025-07-16
+
+    feat: autocompletion added for dataset and relation (#2891)
+
+diff --git a/dlt/destinations/dataset/dataset.py b/dlt/destinations/dataset/dataset.py
+index 0b58c93d7..73c3c1e46 100644
+--- a/dlt/destinations/dataset/dataset.py
++++ b/dlt/destinations/dataset/dataset.py
+@@ -76,6 +76,14 @@ class ReadableDBAPIDataset(Dataset):
+             self._ensure_schema()
+         return self._schema
+ 
++    @property
++    def tables(self) -> list[str]:
++        # return only completed tables
++        return self.schema.data_table_names() + self.schema.dlt_table_names()
++
++    def _ipython_key_completions_(self) -> list[str]:
++        return self.tables
++
+     @property
+     def sqlglot_schema(self) -> SQLGlotSchema:
+         # NOTE: no cache for now, it is probably more expensive to compute the current schema hash
+@@ -202,12 +210,14 @@ class ReadableDBAPIDataset(Dataset):
+     def table(self, table_name: str, table_type: Literal["ibis"]) -> IbisTable: ...
+ 
+     def table(self, table_name: str, table_type: Literal["relation", "ibis"] = "relation") -> Any:
+-        # dataset only provides access to tables known in dlt schema, direct query may cirumvent this
+-        if table_name not in self.schema.tables.keys():
++        # dataset only provides access to tables known in dlt schema, direct query may circumvent this
++        available_tables = self.tables
++        if table_name not in available_tables:
++            # TODO: raise TableNotFound
+             raise ValueError(
+                 f"Table `{table_name}` not found in schema `{self.schema.name}` of dataset"
+                 f" `{self.dataset_name}`. Available table(s):"
+-                f" {', '.join(self.schema.tables.keys())}"
++                f" {', '.join(available_tables)}"
+             )
+ 
+         if table_type == "ibis":
+@@ -266,11 +276,23 @@ class ReadableDBAPIDataset(Dataset):
+ 
+     def __getitem__(self, table_name: str) -> Relation:
+         """access of table via dict notation"""
+-        return self.table(table_name)
+-
+-    def __getattr__(self, table_name: str) -> Relation:
+-        """access of table via property notation"""
+-        return self.table(table_name)
++        if table_name not in self.tables:
++            raise KeyError(
++                f"Table `{table_name}` not found on dataset. Available tables: `{self.tables}`"
++            )
++        try:
++            return self.table(table_name)
++        # TODO: expect TableNotFound in the future
++        except ValueError as exc:
++            raise KeyError(table_name, str(exc))
++
++    def __getattr__(self, name: str) -> Any:
++        """Retrieve a `Relation` with `name` and raise `AttributeError` when not found"""
++        try:
++            return self.table(name)
++        # TODO: expect TableNotFound in the future
++        except ValueError as exc:
++            raise AttributeError(name, str(exc))
+ 
+     def __enter__(self) -> Self:
+         """Context manager used to open and close sql client and internal connection"""
+diff --git a/dlt/destinations/dataset/relation.py b/dlt/destinations/dataset/relation.py
+index a86f97c77..e1d889f69 100644
+--- a/dlt/destinations/dataset/relation.py
++++ b/dlt/destinations/dataset/relation.py
+@@ -182,6 +182,13 @@ class ReadableDBAPIRelation(Relation, WithSqlClient):
+     def schema(self, new_value: TTableSchema) -> None:
+         raise NotImplementedError("Schema may not be set")
+ 
++    @property
++    def columns(self) -> list[str]:
++        return list(self.schema.get("columns", {}).keys())
++
++    def _ipython_key_completions_(self) -> list[str]:
++        return self.columns
++
+     #
+     # WithSqlClient interface
+     #
+@@ -464,17 +471,21 @@ class ReadableDBAPIRelation(Relation, WithSqlClient):
+     def __getitem__(self, columns: Sequence[str]) -> Self:
+         # NOTE remember that `issubclass(str, Sequence) is True`
+         if isinstance(columns, str):
++            columns = [columns]
++        elif not isinstance(columns, Sequence):
+             raise TypeError(
+-                f"Received invalid value `columns={columns}` of type"
+-                f" {type(columns).__name__}`. Valid types are: ['Sequence[str]']"
++                f"Received value `{columns=:}` of type `{type(columns).__name__}`."
++                " Valid types are: `[Sequence[str]]`"
+             )
+-        elif isinstance(columns, Sequence):
+-            return self.select(*columns)
+ 
+-        raise TypeError(
+-            f"Received invalid value `columns={columns}` of type"
+-            f" {type(columns).__name__}`. Valid types are: ['Sequence[str]']"
+-        )
++        unknown_columns = [col for col in columns if col not in self.columns]
++        if unknown_columns:
++            raise KeyError(
++                f"Columns `{unknown_columns}` not found on dataset. Available columns:"
++                f" {self.columns}"
++            )
++
++        return self.select(*columns)
+ 
+     #
+     # Builtins
+diff --git a/tests/destinations/test_readable_dbapi_dataset.py b/tests/destinations/test_readable_dbapi_dataset.py
+index 887d0e556..c1de94245 100644
+--- a/tests/destinations/test_readable_dbapi_dataset.py
++++ b/tests/destinations/test_readable_dbapi_dataset.py
+@@ -5,16 +5,15 @@ import dlt
+ import pytest
+ 
+ import dlt.destinations.dataset
+-from dlt.destinations.dataset.exceptions import (
+-    ReadableRelationUnknownColumnException,
+-)
+ from dlt.transformations.exceptions import LineageFailedException
+ from dlt.common.schema.schema import Schema
++from dlt.common.schema.typing import LOADS_TABLE_NAME, VERSION_TABLE_NAME
+ from dlt.common.schema.utils import new_table
+ from dlt.destinations.dataset.dataset import ReadableDBAPIDataset, ReadableDBAPIRelation
+ 
+ 
+-def test_query_builder() -> None:
++@pytest.fixture
++def mock_dataset() -> ReadableDBAPIDataset:
+     s = Schema("my_schema")
+     t = new_table(
+         "my_table",
+@@ -24,7 +23,6 @@ def test_query_builder() -> None:
+         ],
+     )
+     s.update_table(t)
+-
+     dataset = cast(
+         ReadableDBAPIDataset,
+         dlt.destinations.dataset.dataset(
+@@ -33,8 +31,23 @@ def test_query_builder() -> None:
+             schema=s,
+         ),
+     )
++    return dataset
++
++
++def test_dataset_autocompletion(mock_dataset: ReadableDBAPIDataset):
++    expected_suggestions = ["my_table", LOADS_TABLE_NAME, VERSION_TABLE_NAME]
++    suggestions = mock_dataset._ipython_key_completions_()
++    assert set(expected_suggestions) == set(suggestions)
++
++
++def test_relation_autocompletion(mock_dataset: ReadableDBAPIDataset):
++    expected_suggestions = ["col1", "col2"]
++    suggestions = mock_dataset["my_table"]._ipython_key_completions_()  # type: ignore[attr-defined]
++    assert set(expected_suggestions) == set(suggestions)
+ 
+-    relation = cast(ReadableDBAPIRelation, dataset.my_table)
++
++def test_query_builder(mock_dataset: ReadableDBAPIDataset) -> None:
++    relation = cast(ReadableDBAPIRelation, mock_dataset.my_table)
+ 
+     # default query for a table
+     assert (
+@@ -85,12 +98,10 @@ def test_copy_and_chaining() -> None:
+         ),
+     )
+ 
+-    dataset.schema.tables["items"] = {
+-        "columns": {
+-            "one": {"data_type": "text", "name": "one"},
+-            "two": {"data_type": "json", "name": "two"},
+-        }
+-    }
++    dataset.schema.tables["items"] = new_table(
++        "items",
++        columns=[{"data_type": "text", "name": "one"}, {"data_type": "json", "name": "two"}],
++    )
+ 
+     # create relation and set some stuff on it
+     relation = cast(ReadableDBAPIRelation, dataset.items)
+@@ -118,15 +129,21 @@ def test_computed_schema_columns() -> None:
+         "pipeline_dataset",
+     )
+ 
+-    with pytest.raises(ValueError):
++    # missing attribute should raise Attribute error
++    with pytest.raises(AttributeError):
+         dataset.items
+ 
+-    dataset.schema.tables["items"] = {
+-        "columns": {
+-            "one": {"data_type": "text", "name": "one"},
+-            "two": {"data_type": "json", "name": "two"},
+-        }
+-    }
++    # missing key should raise KeyError
++    with pytest.raises(KeyError):
++        dataset["items"]
++
++    with pytest.raises(ValueError):
++        dataset.table("items")
++
++    dataset.schema.tables["items"] = new_table(
++        "items",
++        columns=[{"data_type": "text", "name": "one"}, {"data_type": "json", "name": "two"}],
++    )
+ 
+     # now add columns
+     relation = dataset.items
+@@ -139,14 +156,14 @@ def test_computed_schema_columns() -> None:
+ 
+     # when selecting only one column, computing schema columns will only show that one
+     assert relation.select("one").columns_schema == {"one": {"data_type": "text", "name": "one"}}
++    assert relation["one"].columns_schema == {"one": {"data_type": "text", "name": "one"}}
++    assert relation[["one"]].columns_schema == {"one": {"data_type": "text", "name": "one"}}
+ 
+     # selecting unknown column fails
+-
+-    # TODO: add correct exception
+-    import sqlglot
+-
+-    with pytest.raises(LineageFailedException):
+-        relation[["unknown_columns"]].compute_columns_schema()  # type: ignore
++    with pytest.raises(KeyError):
++        relation[["unknown_columns"]]
++    with pytest.raises(KeyError):
++        relation["unknown_columns"]
+ 
+ 
+ def test_changing_relation_with_query() -> None:
+diff --git a/tests/load/test_read_interfaces.py b/tests/load/test_read_interfaces.py
+index 2972d74fd..635ae95bd 100644
+--- a/tests/load/test_read_interfaces.py
++++ b/tests/load/test_read_interfaces.py
+@@ -747,6 +747,12 @@ def test_column_selection(populated_pipeline: Pipeline) -> None:
+     assert list(data_frame.columns.values) == columns
+     assert len(data_frame.index) == 5
+ 
++    # test single column indexer
++    arrow_table = table_relationship["other_decimal"].limit(1).arrow()
++    assert arrow_table.column_names == ["other_decimal"]
++    assert arrow_table.num_rows == 1
++
++    # test multiple column indexer
+     columns = ["decimal", "other_decimal"]
+     arrow_table = table_relationship[columns].head().arrow()
+     assert arrow_table.column_names == columns
+@@ -963,8 +969,19 @@ def test_min_max(populated_pipeline: Pipeline) -> None:
+     ids=lambda x: x.name,
+ )
+ def test_unknown_table_access(populated_pipeline: Pipeline) -> None:
+-    with pytest.raises(ValueError, match="Table `unknown_table` not found in schema"):
+-        populated_pipeline.dataset().unknown_table
++    match = "Table `unknown_table` not found"
++    dataset = populated_pipeline.dataset()
++
++    # missing attribute should raise Attribute error
++    with pytest.raises(AttributeError, match=match):
++        dataset.unknown_table
++
++    # missing key should raise KeyError
++    with pytest.raises(KeyError, match=match):
++        dataset["unknown_table"]
++
++    with pytest.raises(ValueError, match=match):
++        dataset.table("unknown_table")
+ 
+ 
+ @pytest.mark.no_load
+@@ -1038,15 +1055,30 @@ def test_ibis_expression_relation(populated_pipeline: Pipeline) -> None:
+         .order_by("id")
+         .limit(20)
+     )
+-    table = dataset(joined_table).fetchall()
++    relation = dataset(joined_table)
++    table = relation.fetchall()
+     assert len(table) == 20
+     assert list(table[0]) == [0, 0]
+     assert list(table[5]) == [5, 10]
+     assert list(table[10]) == [10, 20]
++    # verify computed columns
++    assert (
++        list(relation.columns_schema.keys())
++        == relation.columns  # type: ignore[attr-defined]
++        == relation._ipython_key_completions_()  # type: ignore[attr-defined]
++        == ["id", "double_id"]
++    )
+ 
+     # check aggregate of first 20 items
+-    agg_table = items_table.order_by("id").limit(20).aggregate(sum_id=items_table.id.sum())
+-    assert dataset(agg_table).fetchone()[0] == reduce(lambda a, b: a + b, range(20))
++    agg_query = items_table.order_by("id").limit(20).aggregate(sum_id=items_table.id.sum())
++    agg_relation = dataset(agg_query)
++    assert agg_relation.fetchone()[0] == reduce(lambda a, b: a + b, range(20))
++    assert (
++        list(agg_relation.columns_schema.keys())
++        == agg_relation.columns  # type: ignore[attr-defined]
++        == agg_relation._ipython_key_completions_()  # type: ignore[attr-defined]
++        == ["sum_id"]
++    )
+ 
+     # check filtering
+     filtered_table = items_table.filter(items_table.id < 10)
+
+
+===== COMMIT d2f62cbf =====
+
+
+commit d2f62cbfb
+Author: rudolfix
+Date: 2025-07-15
+
+    fixes range_start=open in incremental (#2873)
+
+diff --git a/dlt/common/destination/dataset.py b/dlt/common/destination/dataset.py
+index ac683b9b2..00b3dc160 100644
+--- a/dlt/common/destination/dataset.py
++++ b/dlt/common/destination/dataset.py
+@@ -20,7 +20,7 @@ import sqlglot.expressions as sge
+ from sqlglot.schema import Schema as SQLGlotSchema
+ from sqlglot.expressions import ExpOrStr as SqlglotExprOrStr
+ 
+-from dlt.common.typing import Self
++from dlt.common.typing import Self, TSortOrder
+ from dlt.common.schema.schema import Schema
+ from dlt.common.schema.typing import TTableSchema, TTableSchemaColumns
+ from dlt.common.libs.sqlglot import TSqlGlotDialect
+@@ -243,12 +243,12 @@ class Relation(DataAccess, Protocol):
+         """
+         ...
+ 
+-    def order_by(self, column_name: str, direction: Literal["asc", "desc"] = "asc") -> Self:
++    def order_by(self, column_name: str, direction: TSortOrder = "asc") -> Self:
+         """Returns a new relation with the given order by clause applied.
+ 
+         Args:
+             column_name (str): The column to order by.
+-            direction (Literal["asc", "desc"], optional): The direction to order by. Defaults to "asc".
++            direction (TSortOrder, optional): The direction to order by: "asc"/"desc". Defaults to "asc".
+ 
+         Returns:
+             Self: A copy of the relation with the order by clause applied.
+diff --git a/dlt/destinations/dataset/relation.py b/dlt/destinations/dataset/relation.py
+index 1c341873e..a86f97c77 100644
+--- a/dlt/destinations/dataset/relation.py
++++ b/dlt/destinations/dataset/relation.py
+@@ -28,7 +28,7 @@ from dlt.common.destination.dataset import Relation, TFilterOperation
+ 
+ from dlt.common.libs.sqlglot import to_sqlglot_type, build_typed_literal, TSqlGlotDialect
+ from dlt.common.schema.typing import TTableSchemaColumns, TTableSchema
+-from dlt.common.typing import Self
++from dlt.common.typing import Self, TSortOrder
+ from dlt.common.exceptions import ValueErrorWithKnownValues
+ from dlt.transformations import lineage
+ from dlt.destinations.sql_client import SqlClientBase, WithSqlClient
+@@ -323,7 +323,11 @@ class ReadableDBAPIRelation(Relation, WithSqlClient):
+         rel.compute_columns_schema()
+         return rel
+ 
+-    def order_by(self, column_name: str, direction: Literal["asc", "desc"] = "asc") -> Self:
++    def order_by(self, column_name: str, direction: TSortOrder = "asc") -> Self:
++        if direction not in ["asc", "desc"]:
++            raise ValueError(
++                f"`{direction}` is an invalid sort order, allowed values are: `asc` and `desc`"
++            )
+         order_expr = sge.Ordered(
+             this=sge.Column(
+                 this=sge.to_identifier(column_name, quoted=True),
+diff --git a/dlt/extract/incremental/__init__.py b/dlt/extract/incremental/__init__.py
+index ae1efe79d..3a10ca1ed 100644
+--- a/dlt/extract/incremental/__init__.py
++++ b/dlt/extract/incremental/__init__.py
+@@ -543,7 +543,8 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
+         )
+         return transformer
+ 
+-    def _get_transformer(self, items: TDataItems) -> IncrementalTransform:
++    def _get_transform(self, items: TDataItems) -> IncrementalTransform:
++        """Gets transform implementation that handles particular data item type"""
+         # Assume list is all of the same type
+         for item in items if isinstance(items, list) else [items]:
+             if is_arrow_item(item):
+@@ -558,7 +559,7 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
+         # example: MaterializedEmptyList
+         if rows is None or (isinstance(rows, list) and len(rows) == 0):
+             return rows
+-        transformer = self._get_transformer(rows)
++        transformer = self._get_transform(rows)
+         if isinstance(rows, list):
+             rows = [
+                 item
+@@ -576,7 +577,7 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
+         # writing back state
+         self._cached_state["last_value"] = transformer.last_value
+ 
+-        if not transformer.deduplication_disabled:
++        if transformer.boundary_deduplication:
+             # compute hashes for new last rows
+             # NOTE: object transform uses last_rows to pass rows to dedup, arrow computes
+             #  hashes directly
+diff --git a/dlt/extract/incremental/transform.py b/dlt/extract/incremental/transform.py
+index 91e2edf3c..3a34e4467 100644
+--- a/dlt/extract/incremental/transform.py
++++ b/dlt/extract/incremental/transform.py
+@@ -76,13 +76,14 @@ class IncrementalTransform:
+         self.end_value = end_value
+         self.last_rows: List[TDataItem] = []
+         self.last_value_func = last_value_func
+-        self.primary_key = primary_key
+         self.unique_hashes = unique_hashes
+         self.start_unique_hashes = set(unique_hashes)
+         self.on_cursor_value_missing = on_cursor_value_missing
+         self.lag = lag
+         self.range_start = range_start
+         self.range_end = range_end
++        # NOTE: self.primary_key is a property
++        self.primary_key = primary_key
+ 
+         # compile jsonpath
+         self._compiled_cursor_path = compile_path(cursor_path)
+@@ -97,11 +98,6 @@ class IncrementalTransform:
+         primary_key: Optional[TTableHintTemplate[TColumnNames]],
+     ) -> str:
+         try:
+-            assert not self.deduplication_disabled, (
+-                f"{self.resource_name}: Attempt to compute unique values when deduplication is"
+-                " disabled"
+-            )
+-
+             if primary_key:
+                 return digest128(json.dumps(resolve_column_value(primary_key, row), sort_keys=True))
+             elif primary_key is None:
+@@ -129,8 +125,7 @@ class IncrementalTransform:
+             row_value = pendulum.instance(row_value).in_tz("UTC")
+         return row_value
+ 
+-    @property
+-    def deduplication_disabled(self) -> bool:
++    def compute_deduplication_disabled(self) -> bool:
+         """Skip deduplication when length of the key is 0 or if lag is applied."""
+         # disable deduplication if end value is set - state is not saved
+         if self.range_start == "open":
+@@ -141,7 +136,16 @@ class IncrementalTransform:
+         if self.lag and self.last_value_func in (min, max):
+             return True
+         # disable deduplication if primary_key = ()
+-        return isinstance(self.primary_key, (list, tuple)) and len(self.primary_key) == 0
++        return isinstance(self._primary_key, (list, tuple)) and len(self._primary_key) == 0
++
++    @property
++    def primary_key(self) -> Optional[TTableHintTemplate[TColumnNames]]:
++        return self._primary_key
++
++    @primary_key.setter
++    def primary_key(self, value: str) -> None:
++        self._primary_key = value
++        self.boundary_deduplication = not self.compute_deduplication_disabled()
+ 
+ 
+ class JsonIncremental(IncrementalTransform):
+@@ -224,7 +228,11 @@ class JsonIncremental(IncrementalTransform):
+                     type(row_value).__name__,
+                     str(ex),
+                 ) from ex
+-        check_values = (row_value,) + ((last_value,) if last_value is not None else ())
++        if last_value is None:
++            check_values: Tuple[Any, ...] = (row_value,)
++        else:
++            check_values = (row_value, last_value)
++
+         try:
+             new_value = last_value_func(check_values)
+         except Exception as ex:
+@@ -239,39 +247,43 @@ class JsonIncremental(IncrementalTransform):
+             ) from ex
+         # new_value is "less" or equal to last_value (the actual max)
+         if last_value == new_value:
+-            if self.range_start == "open":
+-                # We only want greater than last_value
+-                return None, False, False
+             # use func to compute row_value into last_value compatible
+             processed_row_value = last_value_func((row_value,))
++
++            if self.range_start == "open" and processed_row_value == self.start_value:
++                # We only want greater than start_value
++                return None, False, False
++
+             # skip the record that is not a start_value or new_value: that record was already processed
+-            check_values = (row_value,) + (
+-                (self.start_value,) if self.start_value is not None else ()
+-            )
++            if self.start_value is None:
++                check_values = (row_value,)
++            else:
++                check_values = (row_value, self.start_value)
+             new_value = last_value_func(check_values)
+             # Include rows == start_value but exclude "lower"
+             # new_value is "less" or equal to start_value (the initial max)
+             if new_value == self.start_value:
+                 # if equal there's still a chance that item gets in
+                 if processed_row_value == self.start_value:
+-                    if not self.deduplication_disabled:
+-                        unique_value = self.compute_unique_value(row, self.primary_key)
++                    if self.boundary_deduplication:
++                        unique_value = self.compute_unique_value(row, self._primary_key)
+                         # if unique value exists then use it to deduplicate
+                         if unique_value in self.start_unique_hashes:
+                             return None, True, False
+                 else:
+-                    # smaller than start value: gets out
++                    # "smaller" than start value: gets out
+                     return None, True, False
+ 
+             # we store row id for all records with the current "last_value" in state and use it to deduplicate
+-            if processed_row_value == last_value:
++            if processed_row_value == last_value and self.boundary_deduplication:
+                 # add new hash only if the record row id is same as current last value
+                 self.last_rows.append(row)
+         else:
+             self.last_value = new_value
+-            # store rows with "max" values to compute hashes after processing full batch
+-            self.last_rows = [row]
+-            self.unique_hashes = set()
++            if self.boundary_deduplication:
++                # store rows with "max" values to compute hashes after processing full batch
++                self.last_rows = [row]
++                self.unique_hashes = set()
+ 
+         return row, False, False
+ 
+@@ -308,7 +320,7 @@ class ArrowIncremental(IncrementalTransform):
+         if not unique_columns:
+             return []
+         rows = item.select(unique_columns).to_pylist()
+-        return [self.compute_unique_value(row, self.primary_key) for row in rows]
++        return [self.compute_unique_value(row, self._primary_key) for row in rows]
+ 
+     def compute_unique_values_with_index(
+         self, item: "TAnyArrowItem", unique_columns: List[str]
+@@ -318,7 +330,7 @@ class ArrowIncremental(IncrementalTransform):
+         indices = item[self._dlt_index].to_pylist()
+         rows = item.select(unique_columns).to_pylist()
+         return [
+-            (index, self.compute_unique_value(row, self.primary_key))
++            (index, self.compute_unique_value(row, self._primary_key))
+             for index, row in zip(indices, rows)
+         ]
+ 
+@@ -339,7 +351,7 @@ class ArrowIncremental(IncrementalTransform):
+         if is_pandas:
+             tbl = pandas_to_arrow(tbl)
+ 
+-        primary_key = self.primary_key(tbl) if callable(self.primary_key) else self.primary_key
++        primary_key = self._primary_key(tbl) if callable(self._primary_key) else self._primary_key
+         if primary_key:
+             # create a list of unique columns
+             if isinstance(primary_key, str):
+@@ -420,7 +432,7 @@ class ArrowIncremental(IncrementalTransform):
+             keep_filter = self.last_value_compare(tbl[cursor_path], start_value_scalar)
+             start_out_of_range = bool(pa.compute.any(pa.compute.invert(keep_filter)).as_py())
+             tbl = tbl.filter(keep_filter)
+-            if not self.deduplication_disabled:
++            if self.boundary_deduplication:
+                 # Deduplicate after filtering old values
+                 tbl = self._add_unique_index(tbl)
+                 # Remove already processed rows where the cursor is equal to the start value
+@@ -446,7 +458,7 @@ class ArrowIncremental(IncrementalTransform):
+             ).as_py()
+         ):  # Last value has changed
+             self.last_value = row_value
+-            if not self.deduplication_disabled:
++            if self.boundary_deduplication:
+                 # Compute unique hashes for all rows equal to row value
+                 self.unique_hashes = set(
+                     self.compute_unique_values(
+@@ -454,7 +466,7 @@ class ArrowIncremental(IncrementalTransform):
+                         unique_columns,
+                     )
+                 )
+-        elif self.last_value == row_value and not self.deduplication_disabled:
++        elif self.last_value == row_value and self.boundary_deduplication:
+             # last value is unchanged, add the hashes
+             self.unique_hashes.update(
+                 set(
+diff --git a/tests/common/runners/test_runners.py b/tests/common/runners/test_runners.py
+index 3c7bc3adf..e948751f9 100644
+--- a/tests/common/runners/test_runners.py
++++ b/tests/common/runners/test_runners.py
+@@ -189,7 +189,7 @@ def lock_del_task():
+ 
+ 
+ def test_pool_runner_shutdown_timeout() -> None:
+-    pool = runner.TimeoutThreadPoolExecutor(max_workers=4, timeout=1.01)
++    pool = runner.TimeoutThreadPoolExecutor(max_workers=4, timeout=1.1)
+ 
+     t0 = time.perf_counter()
+ 
+diff --git a/tests/extract/test_incremental.py b/tests/extract/test_incremental.py
+index 841d9d6d0..45a1af197 100644
+--- a/tests/extract/test_incremental.py
++++ b/tests/extract/test_incremental.py
+@@ -22,14 +22,17 @@ from dlt.common.configuration.specs.base_configuration import (
+     BaseConfiguration,
+     configspec,
+ )
++from dlt.common.incremental.typing import TIncrementalRange
+ from dlt.common.json import json
+ from dlt.common.pendulum import pendulum, timedelta
+ from dlt.common.pipeline import NormalizeInfo, StateInjectableContext
+ from dlt.common.schema.schema import Schema
++from dlt.common.typing import TSortOrder
+ from dlt.common.utils import chunks, digest128, uniq_id
+ 
+ from dlt.extract import DltSource
+ from dlt.extract.incremental import Incremental, IncrementalResourceWrapper
++from dlt.extract.pipe import Pipe
+ from dlt.extract.state import resource_state
+ from dlt.extract.incremental.exceptions import (
+     IncrementalCursorInvalidCoercion,
+@@ -3894,27 +3897,41 @@ def test_incremental_column_hint_cursor_is_not_column(use_dict: bool):
+ 
+ @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+ @pytest.mark.parametrize("last_value_func", [min, max])
+-def test_start_range_open(item_type: TestDataItemFormat, last_value_func: Any) -> None:
++@pytest.mark.parametrize("row_order", [True, False])
++@pytest.mark.parametrize("range_start", ["open", "closed"])
++def test_start_range(
++    item_type: TestDataItemFormat,
++    last_value_func: Any,
++    row_order: bool,
++    range_start: TIncrementalRange,
++) -> None:
+     data_range: Iterable[int] = range(1, 12)
+     if last_value_func == max:
+         initial_value = 5
+-        # Only items higher than inital extracted
+-        expected_items = list(range(6, 12))
+-        order_dir = "ASC"
++        if range_start == "open":
++            # Only items higher than initial extracted
++            expected_items = list(range(6, 12))
++        else:
++            expected_items = list(range(5, 12))
++        order_dir: TSortOrder = "asc"
+     elif last_value_func == min:
+         data_range = reversed(data_range)  # type: ignore[call-overload]
+         initial_value = 5
+-        # Only items lower than inital extracted
+-        expected_items = list(reversed(range(1, 5)))
+-        order_dir = "DESC"
++        if range_start == "open":
++            # Only items lower than initial extracted
++            expected_items = list(reversed(range(1, 5)))
++        else:
++            expected_items = list(reversed(range(1, 6)))
++        order_dir = "desc"
+ 
+     @dlt.resource
+     def some_data(
+         updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
+             "updated_at",
+             initial_value=initial_value,
+-            range_start="open",
++            range_start=range_start,
+             last_value_func=last_value_func,
++            row_order="asc" if row_order else None,
+         ),
+     ) -> Any:
+         data = [{"updated_at": i} for i in data_range]
+@@ -3923,17 +3940,101 @@ def test_start_range_open(item_type: TestDataItemFormat, last_value_func: Any) -
+     pipeline = dlt.pipeline(pipeline_name=uniq_id(), destination="duckdb")
+     pipeline.run(some_data())
+ 
+-    with pipeline.sql_client() as client:
+-        items = [
+-            row[0]
+-            for row in client.execute_sql(
+-                f"SELECT updated_at FROM some_data ORDER BY updated_at {order_dir}"
+-            )
+-        ]
++    items = [
++        row[0]
++        for row in pipeline.dataset()
++        .some_data.order_by("updated_at", order_dir)
++        .select("updated_at")
++        .fetchall()
++    ]
++    assert items == expected_items
+ 
++
++@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
++@pytest.mark.parametrize("last_value_func", [min, max])
++@pytest.mark.parametrize("row_order", [True, False])
++@pytest.mark.parametrize("range_start", ["open", "closed"])
++def test_start_range_monotonic(
++    item_type: TestDataItemFormat,
++    last_value_func: Any,
++    row_order: bool,
++    range_start: TIncrementalRange,
++) -> None:
++    data_range: Iterable[int] = [0, 0, 1, 1, 1, 1, 2, 2]
++    if last_value_func == max:
++        initial_value = 0
++        if range_start == "open":
++            # all equal items must be included
++            expected_items: Iterable[int] = [1, 1, 1, 1, 2, 2]
++        else:
++            expected_items = data_range
++        order_dir: TSortOrder = "asc"
++    elif last_value_func == min:
++        data_range = list(reversed(data_range))  # type: ignore[call-overload]
++        initial_value = 2
++        if range_start == "open":
++            expected_items = [1, 1, 1, 1, 0, 0]
++        else:
++            expected_items = data_range
++        order_dir = "desc"
++
++    @dlt.resource
++    def some_data(
++        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
++            "updated_at",
++            initial_value=initial_value,
++            range_start=range_start,
++            last_value_func=last_value_func,
++            row_order="asc" if row_order else None,
++        ),
++    ) -> Any:
++        data = [{"updated_at": i} for i in data_range]
++        yield data_to_item_format(item_type, data)
++
++    pipeline = dlt.pipeline(pipeline_name=uniq_id(), destination="duckdb")
++    pipeline.run(some_data())
++
++    items = [
++        row[0]
++        for row in pipeline.dataset()
++        .some_data.order_by("updated_at", order_dir)
++        .select("updated_at")
++        .fetchall()
++    ]
+     assert items == expected_items
+ 
+ 
++@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
++@pytest.mark.parametrize("last_value_func", [min, max])
++@pytest.mark.parametrize("row_order", [True, False])
++def test_start_range_equal_values(
++    item_type: TestDataItemFormat, last_value_func: Any, row_order: bool
++) -> None:
++    data_range: Iterable[int] = [1, 1, 1, 1]
++    if last_value_func == max:
++        initial_value = 1
++    elif last_value_func == min:
++        initial_value = 1
++
++    @dlt.resource
++    def some_data(
++        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
++            "updated_at",
++            initial_value=initial_value,
++            range_start="open",
++            last_value_func=last_value_func,
++            row_order="asc" if row_order else None,
++        ),
++    ) -> Any:
++        data = [{"updated_at": i} for i in data_range]
++        yield data_to_item_format(item_type, data)
++
++    pipeline = dlt.pipeline(pipeline_name=uniq_id(), destination="duckdb")
++    pipeline.run(some_data())
++    # no rows loaded
++    assert "some_data" not in pipeline.last_trace.last_normalize_info.row_counts
++
++
+ @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+ def test_start_range_open_no_deduplication(item_type: TestDataItemFormat) -> None:
+     @dlt.source
+@@ -3960,17 +4061,39 @@ def test_start_range_open_no_deduplication(item_type: TestDataItemFormat) -> Non
+     assert state["unique_hashes"] == []
+ 
+ 
++def test_primary_key_disables_deduplication() -> None:
++    incremental = dlt.sources.incremental[int]("updated_at")
++    incremental._cached_state = {"unique_hashes": [], "initial_value": None, "last_value": None}
++    assert incremental._get_transform({}).boundary_deduplication is True
++    incremental.primary_key = ()
++    assert incremental._get_transform({}).boundary_deduplication is False
++
++
+ @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+ @pytest.mark.parametrize("last_value_func", [min, max])
+-def test_end_range_closed(item_type: TestDataItemFormat, last_value_func: Any) -> None:
++@pytest.mark.parametrize("row_order", [True, False])
++@pytest.mark.parametrize("range_end", ["open", "closed"])
++def test_end_range(
++    item_type: TestDataItemFormat,
++    last_value_func: Any,
++    row_order: bool,
++    range_end: TIncrementalRange,
++) -> None:
+     values = [5, 10]
+-    expected_items = list(range(5, 11))
+     if last_value_func == max:
+-        order_dir = "ASC"
++        order_dir: TSortOrder = "asc"
++        if range_end == "open":
++            expected_items = list(range(5, 10))
++        else:
++            expected_items = list(range(5, 11))
+     elif last_value_func == min:
+         values = list(reversed(values))
+-        expected_items = list(reversed(expected_items))
+-        order_dir = "DESC"
++        if range_end == "open":
++            expected_items = list(range(10, 5, -1))
++        else:
++            expected_items = list(range(10, 4, -1))
++        # expected_items = list(reversed(expected_items))
++        order_dir = "desc"
+ 
+     @dlt.resource
+     def some_data(
+@@ -3978,8 +4101,9 @@ def test_end_range_closed(item_type: TestDataItemFormat, last_value_func: Any) -
+             "updated_at",
+             initial_value=values[0],
+             end_value=values[1],
+-            range_end="closed",
++            range_end=range_end,
+             last_value_func=last_value_func,
++            row_order="asc" if row_order else None,
+         ),
+     ) -> Any:
+         data = [{"updated_at": i} for i in range(1, 12)]
+@@ -3988,15 +4112,74 @@ def test_end_range_closed(item_type: TestDataItemFormat, last_value_func: Any) -
+     pipeline = dlt.pipeline(pipeline_name=uniq_id(), destination="duckdb")
+     pipeline.run(some_data())
+ 
+-    with pipeline.sql_client() as client:
+-        items = [
+-            row[0]
+-            for row in client.execute_sql(
+-                f"SELECT updated_at FROM some_data ORDER BY updated_at {order_dir}"
+-            )
+-        ]
++    items = [
++        row[0]
++        for row in pipeline.dataset()
++        .some_data.order_by("updated_at", order_dir)
++        .select("updated_at")
++        .fetchall()
++    ]
++    assert items == expected_items
+ 
+-    # Includes values 5-10 inclusive
++
++@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
++@pytest.mark.parametrize("last_value_func", [min, max])
++@pytest.mark.parametrize("row_order", [True, False])
++@pytest.mark.parametrize("range_end", ["open", "closed"])
++def test_end_range_monotonic(
++    item_type: TestDataItemFormat,
++    last_value_func: Any,
++    row_order: bool,
++    range_end: TIncrementalRange,
++) -> None:
++    values = [0.0, 2.0]
++    # insert 2.1 to simulate unordered source
++    data_range: Iterable[float] = [0.0, 0.0, 1.0, 1.0, 2.1, 1.5, 1.5, 2.0, 2.0]
++    # random.shuffle(data_range)
++    if last_value_func == max:
++        order_dir: TSortOrder = "asc"
++        if range_end == "open":
++            expected_items = [0.0, 0.0, 1.0, 1.0, 1.5, 1.5]
++        else:
++            expected_items = sorted(data_range)[:-1]
++    elif last_value_func == min:
++        values = list(reversed(values))
++        if range_end == "open":
++            expected_items = [2.0, 2.0, 1.5, 1.5, 1.0, 1.0]
++        else:
++            expected_items = list(reversed(sorted(data_range)[:-1]))
++        order_dir = "desc"
++
++    @dlt.resource
++    def some_data(
++        updated_at: dlt.sources.incremental[float] = dlt.sources.incremental(
++            "updated_at",
++            initial_value=values[0],
++            end_value=values[1],
++            range_end=range_end,
++            last_value_func=last_value_func,
++            row_order="asc" if row_order else None,
++        ),
++    ) -> Any:
++        range_ = data_range
++        # order source when needed
++        if row_order:
++            range_ = sorted(range_, reverse=last_value_func == min)
++        # yield item by item
++        for i in range_:
++            data = {"updated_at": i}
++            yield data_to_item_format(item_type, [data])
++
++    pipeline = dlt.pipeline(pipeline_name=uniq_id(), destination="duckdb")
++    pipeline.run(some_data())
++
++    items = [
++        row[0]
++        for row in pipeline.dataset()
++        .some_data.order_by("updated_at", order_dir)
++        .select("updated_at")
++        .fetchall()
++    ]
+     assert items == expected_items
+ 
+ 
+
+
+===== COMMIT 983a33e6 =====
+
+
+commit 983a33e6b
+Author: David Scharf
+Date: 2025-07-15
+
+    Run full linter step on docs changes, bump marimo min version, enable marimo tests for python 3.13 (#2884)
+
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 5c63e3c28..67b52899e 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -35,12 +35,12 @@ jobs:
+   lint:
+     name: lint on all python versions
+     needs: get_docs_changes
+-    if: needs.get_docs_changes.outputs.changes_outside_docs == 'true'
+     uses: ./.github/workflows/lint.yml
+ 
+   test_common:
+     name: run common tests on all python versions and OSes
+-    needs: lint
++    needs: [lint, get_docs_changes]
++    if: needs.get_docs_changes.outputs.changes_outside_docs == 'true'
+     uses: ./.github/workflows/test_common.yml
+ 
+   #
+diff --git a/.github/workflows/test_common.yml b/.github/workflows/test_common.yml
+index 491221ac8..da67e992d 100644
+--- a/.github/workflows/test_common.yml
++++ b/.github/workflows/test_common.yml
+@@ -127,24 +127,21 @@ jobs:
+       # test pipeline dashboard app, does not work with python 3.13
+       - name: Install dlt with duckdb and dashboard
+         # note: this also tests the workspace extra installation
+-        run: uv sync ${{ matrix.uv_sync_args }} --extra duckdb --extra workspace --group sentry-sdk --group pipeline --group sources --group ibis --group dashboard-tests
+-        if: matrix.python-version != '3.13'
+-
++        run: uv sync ${{ matrix.uv_sync_args }} --extra duckdb --extra workspace --group sentry-sdk --group pipeline --group sources --group dashboard-tests
+       - name: Install playwright
+         run: playwright install
+-        if: matrix.python-version != '3.13'
+ 
+       # Run pipeline dashboard unit tests
+       - name: Run pipeline dashboard unit tests
+         run: |
+           pytest tests/helpers/dashboard
+-        if: matrix.python-version != '3.13' && matrix.python-version != '3.9'
++        if: matrix.python-version != '3.9'
+ 
+       # Run pipeline dashboard e2e tests (does not pass with python 3.9, does not pass on windows (playwright does not work somehow), does not pass on python 3.13 (ibis not available))
+       - name: Run dashboard e2e
+         run: |
+           marimo run --headless dlt/helpers/dashboard/dlt_dashboard.py -- -- --pipelines_dir _storage/.dlt/pipelines/ --with_test_identifiers true & pytest --browser chromium tests/e2e
+-        if: matrix.python-version != '3.13' && matrix.python-version != '3.9' && matrix.os != 'windows-latest'
++        if: matrix.python-version != '3.9' && matrix.os != 'windows-latest'
+   
+   matrix_job_required_check:
+     name: common | common tests
+diff --git a/pyproject.toml b/pyproject.toml
+index 88afa9f13..20434231f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -188,7 +188,7 @@ workspace = [
+     "pyarrow>=18.0.0 ; python_version >= '3.13'",
+     "pandas>2.1 ; python_version >= '3.12'",
+     "pandas<2.1 ; python_version < '3.12'",
+-    "marimo>=0.14.0",
++    "marimo>=0.14.5",
+ ]
+ 
+ [project.urls]
+diff --git a/uv.lock b/uv.lock
+index 72341dc3f..7b2d4f5bf 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2301,7 +2301,7 @@ requires-dist = [
+     { name = "ibis-framework", extras = ["duckdb"], marker = "python_full_version >= '3.10' and extra == 'workspace'", specifier = ">=10.5.0" },
+     { name = "jsonpath-ng", specifier = ">=1.5.3" },
+     { name = "lancedb", marker = "python_full_version < '3.13' and extra == 'lancedb'", specifier = ">=0.22.0" },
+-    { name = "marimo", marker = "extra == 'workspace'", specifier = ">=0.14.0" },
++    { name = "marimo", marker = "extra == 'workspace'", specifier = ">=0.14.5" },
+     { name = "orjson", marker = "sys_platform != 'emscripten'", specifier = ">=3.10.1" },
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.6.7,!=3.9.11,!=3.9.12,!=3.9.13,!=3.9.14,!=3.10.1,<4" },
+     { name = "packaging", specifier = ">=21.1" },
+
+
+===== COMMIT 9ba5681d =====
+
+
+commit 9ba5681d9
+Author: Anton Burnashev
+Date: 2025-07-15
+
+    rest_api: Redact secrets in logs, add configurable response body in errors (#2867)
+
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index e847eee35..ecbebb511 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -45,7 +45,7 @@ jobs:
+         run: |
+           export PATH=$PATH:"/c/Program Files/usr/bin" # needed for Windows
+           make lint
+-      
++
+       - name: Check that cli docs are up to date
+         run: make check-cli-docs
+         if: ${{ matrix.python-version == '3.11' }}
+diff --git a/dlt/common/configuration/specs/runtime_configuration.py b/dlt/common/configuration/specs/runtime_configuration.py
+index 9ec2b4cc9..b01594b73 100644
+--- a/dlt/common/configuration/specs/runtime_configuration.py
++++ b/dlt/common/configuration/specs/runtime_configuration.py
+@@ -35,6 +35,10 @@ class RuntimeConfiguration(BaseConfiguration):
+     config_files_storage_path: str = "/run/config/"
+     """Platform connection"""
+     dlthub_dsn: Optional[TSecretStrValue] = None
++    http_show_error_body: bool = False
++    """Include HTTP response body in raised exceptions/logs. Default is False"""
++    http_max_error_body_length: int = 8192
++    """Maximum length of HTTP error response body to include in logs/exceptions"""
+ 
+     __section__: ClassVar[str] = "runtime"
+ 
+diff --git a/dlt/sources/helpers/rest_client/client.py b/dlt/sources/helpers/rest_client/client.py
+index c6e66bbba..749fb3121 100644
+--- a/dlt/sources/helpers/rest_client/client.py
++++ b/dlt/sources/helpers/rest_client/client.py
+@@ -1,3 +1,4 @@
++import logging
+ from typing import (
+     Iterator,
+     Optional,
+@@ -7,20 +8,23 @@ from typing import (
+     TypeVar,
+     Iterable,
+     cast,
++    Callable,
+ )
+ import copy
+ from urllib.parse import urlparse
+ from requests import Session as BaseSession  # noqa: I251
+-from requests import Response, Request
++from requests import Response, Request, HTTPError
+ from requests.auth import AuthBase
+ 
+ from dlt.common import jsonpath, logger
++from dlt.common.configuration import resolve_configuration
++from dlt.common.configuration.specs.runtime_configuration import RuntimeConfiguration
+ 
+ from .typing import HTTPMethodBasic, HTTPMethod, Hooks
+ from .paginators import BasePaginator
+ from .detector import PaginatorFactory, find_response_page_data
+ from .exceptions import IgnoreResponseException, PaginatorNotFound
+-
++from .redaction import sanitize_url
+ from .utils import join_url
+ 
+ 
+@@ -62,6 +66,8 @@ class RESTClient:
+         session (BaseSession): HTTP session for making requests.
+         paginator_factory (Optional[PaginatorFactory]): Factory for creating paginator instances,
+             used for detecting paginators.
++        config (Optional[RuntimeConfiguration]): Runtime configuration for HTTP error handling.
++            If not provided, will resolve from the global configuration.
+     """
+ 
+     def __init__(
+@@ -73,10 +79,12 @@ class RESTClient:
+         data_selector: Optional[jsonpath.TJsonPath] = None,
+         session: BaseSession = None,
+         paginator_factory: Optional[PaginatorFactory] = None,
++        config: Optional[RuntimeConfiguration] = None,
+     ) -> None:
+         self.base_url = base_url
+         self.headers = headers
+         self.auth = auth
++        self._config = config or resolve_configuration(RuntimeConfiguration())
+ 
+         if session:
+             # If the `session` is provided (for example, an instance of
+@@ -124,14 +132,10 @@ class RESTClient:
+         )
+ 
+     def _send_request(self, request: Request, **kwargs: Any) -> Response:
+-        logger.info(
+-            f"Making {request.method.upper()} request to {request.url}"
+-            f" with params={request.params}, json={request.json}"
+-            f" with headers={request.headers}"
+-        )
+-
+         prepared_request = self.session.prepare_request(request)
+ 
++        self._log_request(request, prepared_request.url)
++
+         send_kwargs = self.session.merge_environment_settings(
+             prepared_request.url,
+             kwargs.pop("proxies", {}),
+@@ -143,6 +147,18 @@ class RESTClient:
+         send_kwargs.update(**kwargs)  #  type: ignore[call-arg]
+         return self.session.send(prepared_request, **send_kwargs)
+ 
++    def _log_request(self, request: Request, prepared_url: str) -> None:
++        # XXX: Use logger.isEnabledFor(logging.DEBUG) once dlt logger is fixed
++        if logger.log_level() == "DEBUG":
++            logger.debug(
++                f"Making {request.method.upper()} request to {request.url}"
++                f" with params={request.params}, json={request.json},"
++                f" headers={request.headers}"
++            )
++        else:
++            sanitized_url = sanitize_url(prepared_url)
++            logger.info(f"Making {request.method.upper()} request to {sanitized_url}")
++
+     def request(self, path: str = "", method: HTTPMethod = "GET", **kwargs: Any) -> Response:
+         prepared_request = self._create_request(
+             path_or_url=path,
+@@ -218,7 +234,7 @@ class RESTClient:
+         # HTTP error status codes. This is a fallback to handle errors
+         # unless explicitly overridden in the provided hooks.
+         if "response" not in hooks:
+-            hooks["response"] = [raise_for_status]
++            hooks["response"] = [self._create_response_handler()]
+ 
+         request = self._create_request(
+             path_or_url=path,
+@@ -290,6 +306,18 @@ class RESTClient:
+             logger.info(f"Detected single page data at path: '{path}' type: {type(data).__name__}")
+         return data_selector
+ 
++    def _create_response_handler(self) -> Callable[[Response, Any, Any], None]:
++        def handler(response: Response, *args: Any, **kwargs: Any) -> None:
++            return _dlt_raise_for_status(
++                response,
++                self._config.http_show_error_body,
++                self._config.http_max_error_body_length,
++                *args,
++                **kwargs,
++            )
++
++        return handler
++
+     def detect_paginator(self, response: Response, data: Any) -> BasePaginator:
+         """Detects a paginator for the response and returns it.
+ 
+@@ -324,6 +352,48 @@ class RESTClient:
+         return paginator
+ 
+ 
++def _dlt_raise_for_status(
++    response: Response, show_error_body: bool, max_error_body_length: int, *args: Any, **kwargs: Any
++) -> None:
++    """Custom raise_for_status that sanitizes URLs and includes response body.
++
++    Args:
++        response: The response object to check
++        show_error_body: Whether to show the error body
++        max_error_body_length: The maximum length of the error body to show
++
++    Raises:
++        HTTPError: If the response status code indicates an error
++    """
++    if response.status_code >= 400:
++        safe_url = sanitize_url(response.url)
++
++        body_text = ""
++
++        if show_error_body and response.text:
++            body_text = response.text
++            if len(body_text) > max_error_body_length:
++                body_text = body_text[:max_error_body_length] + "… (truncated)"
++
++        reason = _decode_reason(response.reason)
++        error_type_string = "Client" if response.status_code < 500 else "Server"
++
++        msg = f"{response.status_code} {error_type_string} Error: {reason} for url: {safe_url}"
++        if body_text:
++            msg += f"\nResponse: {body_text}"
++
++        raise HTTPError(msg, response=response)
++
++
++def _decode_reason(reason: Any) -> Any:
++    if isinstance(reason, bytes):
++        try:
++            return reason.decode("utf-8")
++        except UnicodeDecodeError:
++            return reason.decode("iso-8859-1")
++    return reason
++
++
+ def raise_for_status(response: Response, *args: Any, **kwargs: Any) -> None:
+     response.raise_for_status()
+ 
+diff --git a/dlt/sources/helpers/rest_client/redaction.py b/dlt/sources/helpers/rest_client/redaction.py
+new file mode 100644
+index 000000000..54f380b67
+--- /dev/null
++++ b/dlt/sources/helpers/rest_client/redaction.py
+@@ -0,0 +1,37 @@
++from typing import Optional, Set
++from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
++
++SENSITIVE_PARAMS = {
++    "api_key",
++    "token",
++    "key",
++    "access_token",
++    "apikey",
++    "api-key",
++    "access-token",
++    "secret",
++    "password",
++    "pwd",
++    "client_secret",
++}
++
++
++def sanitize_url(url: str, sensitive: Optional[Set[str]] = None) -> str:
++    """Sanitizes a URL by replacing sensitive query parameters with '***'.
++
++    Args:
++        url: The URL to sanitize
++        sensitive: Set of parameter names to redact (if not provided,
++            uses the default set: SENSITIVE_PARAMS)
++
++    Returns:
++        str: The sanitized URL
++    """
++    if not sensitive:
++        sensitive = SENSITIVE_PARAMS
++
++    parsed = urlsplit(url)
++    qs = parse_qsl(parsed.query, keep_blank_values=True)
++    qs = [(k, "***" if k.lower() in {s.lower() for s in sensitive} else v) for k, v in qs]
++    new_query = urlencode(qs, safe="*")  # Don't encode asterisks
++    return urlunsplit(parsed._replace(query=new_query))
+diff --git a/dlt/sources/rest_api/__init__.py b/dlt/sources/rest_api/__init__.py
+index 2843f559a..b7d2d3c4f 100644
+--- a/dlt/sources/rest_api/__init__.py
++++ b/dlt/sources/rest_api/__init__.py
+@@ -25,6 +25,7 @@ from dlt.sources.helpers.rest_client.auth import (
+     OAuth2ClientCredentials,
+ )
+ from dlt.sources.helpers.rest_client.typing import HTTPMethodBasic
++from dlt.sources.helpers.rest_client.redaction import SENSITIVE_PARAMS
+ from .typing import (
+     AuthConfig,
+     ClientConfig,
+@@ -55,15 +56,7 @@ from .utils import check_connection  # noqa: F401
+ 
+ PARAM_TYPES: List[ParamBindType] = ["incremental", "resolve"]
+ MIN_SECRET_MASKING_LENGTH = 3
+-SENSITIVE_KEYS: List[str] = [
+-    "token",
+-    "api_key",
+-    "username",
+-    "password",
+-    "access_token",
+-    "client_id",
+-    "client_secret",
+-]
++SENSITIVE_KEYS: List[str] = list(SENSITIVE_PARAMS) + ["username", "client_id"]
+ 
+ 
+ @decorators.source
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
+index 9cf587100..7bfdbd3d7 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
+@@ -1305,7 +1305,31 @@ If you encounter issues while running the pipeline, enable [logging](../../../ru
+ RUNTIME__LOG_LEVEL=INFO python my_script.py
+ ```
+ 
+-This also provides details on the HTTP requests.
++This also provides details on the HTTP requests. If you want to see even more details, you can enable the HTTP error response bodies.
++
++### Viewing HTTP error response bodies
++
++By default, HTTP error response bodies are not included in error messages to keep logs concise. However, during development or debugging, you may want to see the full error response from the API.
++
++To enable error response bodies in logs and exceptions in your `config.toml` file:
++
++```toml
++[runtime]
++http_show_error_body = true
++```
++
++Or set via environment variables:
++```sh
++export RUNTIME__HTTP_SHOW_ERROR_BODY=true
++```
++
++### Automatic secret redaction in logs
++
++The REST API source automatically redacts sensitive query parameters in URLs when logging or raising errors. The following parameter names are automatically considered sensitive and will be replaced with `***`:
++
++- `api_key`, `token`, `key`, `access_token`, `apikey`, `api-key`, `access-token`
++- `secret`, `password`, `pwd`, `client_secret`
++- `username`, `client_id`
+ 
+ ### Configuration issues
+ 
+diff --git a/docs/website/docs/general-usage/http/rest-client.md b/docs/website/docs/general-usage/http/rest-client.md
+index 8e1f92162..33447c3a0 100644
+--- a/docs/website/docs/general-usage/http/rest-client.md
++++ b/docs/website/docs/general-usage/http/rest-client.md
+@@ -695,8 +695,36 @@ request_timeout = 120  # Timeout in seconds
+ request_max_retry_delay = 30  # Cap exponential delay to 30 seconds
+ ```
+ 
++### URL sanitization and secret protection
++
++The RESTClient automatically sanitizes URLs in logs and error messages to prevent exposure of sensitive information. Query parameters with the following names are automatically redacted:
++
++- `api_key`, `token`, `key`, `access_token`, `apikey`, `api-key`, `access-token`
++- `secret`, `password`, `pwd`, `client_secret`
++
++For example, a URL like `https://api.example.com/data?api_key=secret123&page=1` will appear in logs as `https://api.example.com/data?api_key=***&page=1`.
++
++
+ ## Troubleshooting
+ 
++### Debugging HTTP error responses
++
++When debugging API issues, you may need to see the full error response body. By default, error response bodies are not included in exceptions to keep error messages concise.
++
++To enable error response bodies:
++
++```toml
++[runtime]
++http_show_error_body = true
++http_max_error_body_length = 8192  # Maximum characters (default: 8192)
++```
++
++Example error with response body enabled:
++```text
++HTTPError: 400 Client Error: Bad Request for url: https://api.example.com/data?api_key=***
++Response body: {"error": "Invalid date format", "code": "INVALID_DATE", "field": "start_date"}
++```
++
+ ### `RESTClient.get()` and `RESTClient.post()` methods
+ 
+ These methods work similarly to the [get()](https://docs.python-requests.org/en/latest/api/#requests.get) and [post()](https://docs.python-requests.org/en/latest/api/#requests.post) functions from the Requests library. They return a [Response](https://docs.python-requests.org/en/latest/api/#requests.Response) object that contains the response data.
+diff --git a/tests/common/configuration/test_configuration.py b/tests/common/configuration/test_configuration.py
+index 1f63a4208..d792b0864 100644
+--- a/tests/common/configuration/test_configuration.py
++++ b/tests/common/configuration/test_configuration.py
+@@ -758,6 +758,8 @@ def test_configuration_is_mutable_mapping(environment: Any, env_provider: Config
+         "request_max_retry_delay": 300,
+         "config_files_storage_path": "storage",
+         "dlthub_dsn": None,
++        "http_show_error_body": False,
++        "http_max_error_body_length": 8192,
+         "secret_value": None,
+     }
+     assert dict(_SecretCredentials()) == expected_dict
+diff --git a/tests/sources/helpers/rest_client/test_client.py b/tests/sources/helpers/rest_client/test_client.py
+index 30749995d..e2f71d2be 100644
+--- a/tests/sources/helpers/rest_client/test_client.py
++++ b/tests/sources/helpers/rest_client/test_client.py
+@@ -544,3 +544,138 @@ class TestRESTClient:
+         )
+         response = rest_client.get("https://my.url", headers={"Accept": "my/mimetype"})
+         assert response.json() == expected
++
++
++class TestSecretRedaction:
++    def test_sanitize_url_basic(self):
++        from dlt.sources.helpers.rest_client.redaction import sanitize_url
++
++        # Test basic API key redaction
++        url = "https://api.example.com/endpoint?api_key=secret123&other=value"
++        sanitized = sanitize_url(url)
++        assert sanitized == "https://api.example.com/endpoint?api_key=***&other=value"
++
++    def test_sanitize_url_multiple_secrets(self):
++        from dlt.sources.helpers.rest_client.redaction import sanitize_url
++
++        # Test multiple sensitive parameters
++        url = "https://api.example.com/endpoint?token=abc123&api_key=xyz789&data=public"
++        sanitized = sanitize_url(url)
++        assert sanitized == "https://api.example.com/endpoint?token=***&api_key=***&data=public"
++
++    def test_sanitize_url_case_insensitive(self):
++        from dlt.sources.helpers.rest_client.redaction import sanitize_url
++
++        # Test case insensitive matching
++        url = "https://api.example.com/endpoint?API_KEY=secret&Token=xyz&ACCESS_TOKEN=abc"
++        sanitized = sanitize_url(url)
++        assert (
++            sanitized == "https://api.example.com/endpoint?API_KEY=***&Token=***&ACCESS_TOKEN=***"
++        )
++
++    def test_sanitize_url_no_secrets(self):
++        from dlt.sources.helpers.rest_client.redaction import sanitize_url
++
++        # Test URL without sensitive parameters
++        url = "https://api.example.com/endpoint?page=1&limit=10&sort=asc"
++        sanitized = sanitize_url(url)
++        assert sanitized == url
++
++    def test_sanitize_url_empty_values(self):
++        from dlt.sources.helpers.rest_client.redaction import sanitize_url
++
++        # Test with empty values
++        url = "https://api.example.com/endpoint?api_key=&token=&other=value"
++        sanitized = sanitize_url(url)
++        assert sanitized == "https://api.example.com/endpoint?api_key=***&token=***&other=value"
++
++    def test_sanitize_url_fragment_and_path(self):
++        from dlt.sources.helpers.rest_client.redaction import sanitize_url
++
++        # Test URL with fragment and complex path
++        url = "https://api.example.com/v2/resource/123?api_key=secret#section"
++        sanitized = sanitize_url(url)
++        assert sanitized == "https://api.example.com/v2/resource/123?api_key=***#section"
++
++    def test_dlt_raise_for_status_with_sanitized_url(self):
++        from dlt.sources.helpers.rest_client.client import _dlt_raise_for_status
++
++        # Create a mock response with sensitive URL
++        response = Response()
++        response.status_code = 404
++        response.reason = "Not Found"
++        response.url = "https://api.example.com/endpoint?api_key=secret123"
++        response._content = b"Resource not found"
++
++        with pytest.raises(HTTPError) as exc_info:
++            _dlt_raise_for_status(response, show_error_body=False, max_error_body_length=0)
++
++        error_msg = str(exc_info.value)
++        assert "api_key=***" in error_msg
++        assert "api_key=secret123" not in error_msg
++        assert "404 Client Error: Not Found" in error_msg
++        assert "Resource not found" not in error_msg
++
++    def test_dlt_raise_for_status_truncates_long_body(self):
++        from dlt.sources.helpers.rest_client.client import _dlt_raise_for_status
++
++        # Create response with long body
++        response = Response()
++        response.status_code = 500
++        response.reason = "Internal Server Error"
++        response.url = "https://api.example.com/endpoint"
++        response._content = b"Error: " + b"x" * 10000
++
++        with pytest.raises(HTTPError) as exc_info:
++            _dlt_raise_for_status(response, show_error_body=True, max_error_body_length=8192)
++
++        error_msg = str(exc_info.value)
++        assert "(truncated)" in error_msg
++
++    def test_dlt_raise_for_status_no_error_on_success(self):
++        from dlt.sources.helpers.rest_client.client import _dlt_raise_for_status
++
++        response = Response()
++        response.status_code = 200
++        response.reason = "OK"
++        response.url = "https://api.example.com/endpoint?api_key=secret"
++
++        # Should not raise any exception
++        _dlt_raise_for_status(response, show_error_body=False, max_error_body_length=0)
++
++    def test_dlt_raise_for_status_with_body_enabled(self):
++        from dlt.sources.helpers.rest_client.client import _dlt_raise_for_status
++
++        response = Response()
++        response.status_code = 500
++        response.reason = "Internal Server Error"
++        response.url = "https://api.example.com/endpoint"
++        response._content = (
++            b'{"error": "Database connection failed", "detail": "Connection timeout"}'
++        )
++
++        with pytest.raises(HTTPError) as exc_info:
++            _dlt_raise_for_status(response, show_error_body=True, max_error_body_length=8192)
++
++        error_msg = str(exc_info.value)
++        assert "Database connection failed" in error_msg
++        assert "Connection timeout" in error_msg
++
++    def test_dlt_raise_for_status_with_body_disabled(self):
++        from dlt.sources.helpers.rest_client.client import _dlt_raise_for_status
++
++        response = Response()
++        response.status_code = 404
++        response.reason = "Not Found"
++        response.url = "https://api.example.com/endpoint"
++        response._content = (
++            b'{"error": "Resource not found", "detail": "Item with ID 123 not found"}'
++        )
++
++        with pytest.raises(HTTPError) as exc_info:
++            _dlt_raise_for_status(response, show_error_body=False, max_error_body_length=8192)
++
++        error_msg = str(exc_info.value)
++        assert "Resource not found" not in error_msg  # No body included
++        assert "Item with ID 123" not in error_msg
++        assert "404 Client Error: Not Found" in error_msg  # Still has status and URL
+diff --git a/tests/sources/rest_api/integration/test_offline.py b/tests/sources/rest_api/integration/test_offline.py
+index 88100b061..d03d4fc63 100644
+--- a/tests/sources/rest_api/integration/test_offline.py
++++ b/tests/sources/rest_api/integration/test_offline.py
+@@ -1510,3 +1510,98 @@ def test_client_headers_are_not_interpolated(mock_api_server):
+     assert request_call.headers["X-Static-Header"] == "static-value"
+     assert request_call.headers["X-Not-Interpolated"] == "{resources.posts.id}"
+     assert request_call.headers["X-Escaped"] == "{{literal_braces}}"
++
++
++def test_secret_redaction_in_logs_and_errors(mock_api_server, mocker):
++    from dlt.sources.helpers.rest_client.client import RESTClient
++
++    mock_api_server.get("https://api.example.com/data", json=[{"id": 1, "data": "test"}])
++
++    # Mock logger
++    log_messages = []
++    original_log = RESTClient._send_request.__globals__["logger"].info
++
++    def capture_log(msg, *args):
++        log_messages.append(msg % args if args else msg)
++        original_log(msg, *args)
++
++    mocker.patch.object(
++        RESTClient._send_request.__globals__["logger"], "info", side_effect=capture_log
++    )
++
++    # API keys in URL should be redacted in logs
++    source = rest_api_source(
++        {
++            "client": {
++                "base_url": "https://api.example.com",
++            },
++            "resources": [
++                {
++                    "name": "protected_resource",
++                    "endpoint": {
++                        "path": "data",
++                        "params": {
++                            "api_key": "super_secret_key_12345",
++                            "token": "another_secret_token",
++                            "public_param": "visible_value",
++                        },
++                    },
++                }
++            ],
++        }
++    )
++
++    list(source.with_resources("protected_resource").add_limit(1))
++
++    assert any("api_key=***" in msg for msg in log_messages)
++    assert any("token=***" in msg for msg in log_messages)
++    assert any("public_param=visible_value" in msg for msg in log_messages)
++
++    assert not any("super_secret_key_12345" in msg for msg in log_messages)
++    assert not any("another_secret_token" in msg for msg in log_messages)
++
++
++def test_secret_redaction_in_http_errors(mock_api_server):
++    mock_api_server.get(
++        "https://api.example.com/missing", status_code=404, text="Resource not found"
++    )
++
++    source = rest_api_source(
++        {
++            "client": {
++                "base_url": "https://api.example.com",
++            },
++            "resources": [
++                {
++                    "name": "error_resource",
++                    "endpoint": {
++                        "path": "missing",
++                        "params": {
++                            "api_key": "secret_api_key_xyz",
++                            "access_token": "secret_token_abc",
++                            "normal_param": "public_value",
++                        },
++                    },
++                }
++            ],
++        }
++    )
++
++    with pytest.raises(PipelineStepFailed) as exc_info:
++        pipeline = dlt.pipeline(
++            pipeline_name="test_pipeline",
++            destination="duckdb",
++        )
++        pipeline.run(source.with_resources("error_resource").add_limit(1))
++
++    error_str = str(exc_info.value)
++    assert "api_key=***" in error_str
++    assert "access_token=***" in error_str
++    assert "normal_param=public_value" in error_str
++
++    # Check that actual secrets are not exposed
++    assert "secret_api_key_xyz" not in error_str
++    assert "secret_token_abc" not in error_str
++
++    assert "404" in error_str
++    assert "Resource not found" not in error_str
+
+
+===== COMMIT 011f15b8 =====
+
+
+commit 011f15b80
+Author: Fran Lozano
+Date: 2025-07-14
+
+    Adds documentation for column subset selection (#2869)
+
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/advanced.md b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/advanced.md
+index 3a4cbcb8e..1a211fd93 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/advanced.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/advanced.md
+@@ -140,6 +140,26 @@ print(read_table.compute_table_schema())
+ 
+ You can call `remove_nullability_adapter` from your custom table adapter if you need to combine both.
+ 
++### Selecting a subset of columns
++
++You can use `table_adapter_callback` to select only specific columns from a table by removing unwanted columns from the table definition.
++
++```py
++from dlt.sources.sql_database import sql_database
++
++def table_adapter_callback(table):
++    if table.name == 'my_table':
++        columns_to_keep = ['id', 'name', 'email']
++        for col in list(table._columns):
++            if col.name not in columns_to_keep:
++                table._columns.remove(col)
++    return table
++
++source = sql_database(
++    table_names=["my_table"],
++    table_adapter_callback=table_adapter_callback
++)
++```
+ 
+ ## Configuring with TOML or environment variables
+ You can set most of the arguments of `sql_database()` and `sql_table()` directly in the TOML files or as environment variables. `dlt` automatically injects these values into the pipeline script.
+
+
+===== COMMIT 5b6caec8 =====
+
+
+commit 5b6caec8e
+Author: Thierry Jean
+Date: 2025-07-14
+
+    fix/protocol-and-abc-typing (#2870)
+

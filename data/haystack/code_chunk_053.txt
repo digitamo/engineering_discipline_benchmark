@@ -1,0 +1,2841 @@
+`source_filter` selects the loaded records to merge. dlt discards the other loaded records and their nested rows. They do not count as present, so `scd2` retires their destination records. For the rules of both options, read [Merge conditions](#merge-conditions).
+
+### Handling nested structures with SCD type 2
+
+To explore how SCD Type 2 handles nested JSON structures, refer to the hands-on demonstration provided in the Colab Notebook linked below.
+
+Execute all steps directly in your browser:
+[Open in Colab.](https://colab.research.google.com/drive/1GpG3JKGWveB-kR7eNvlJLr6oO0nM7Fbv?usp=sharing)
+
+### Example: configure validity column names
+
+`_dlt_valid_from` and `_dlt_valid_to` are used by default as validity column names. Other names can be configured as follows:
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "validity_column_names": ["from", "to"],  # will use "from" and "to" instead of default values
+    }
+)
+def dim_customer():
+    ...
+...
+```
+
+### Example: configure active record timestamp
+
+You can configure the literal used to indicate an active record with `active_record_timestamp`. The default literal `NULL` is used if `active_record_timestamp` is omitted or set to `None`. Provide a date value if you prefer to use a high timestamp instead.
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        # accepts various types of date/datetime objects
+        "active_record_timestamp": "9999-12-31",
+    }
+)
+def dim_customer():
+    ...
+```
+
+### Example: configure boundary timestamp
+
+You can configure the "boundary timestamp" used for record validity windows with `boundary_timestamp`. The provided date(time) value is used as "valid from" for new records and as "valid to" for retired records. The timestamp at which a load package is created is used if `boundary_timestamp` is omitted.
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        # accepts various types of date/datetime objects
+        "boundary_timestamp": "2024-08-21T12:15:00+00:00",
+    }
+)
+def dim_customer():
+    ...
+```
+
+#### Reset boundary timestamp to the current load time
+
+To stop using a previously set `boundary_timestamp` and revert to the default (the current load package creation time), set `boundary_timestamp` to `None`. You can do this either at definition time or dynamically with `apply_hints` before a run.
+
+Definition-time (always use current load time):
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "boundary_timestamp": None,  # reset to current load time
+    }
+)
+def dim_customer():
+    ...
+
+# Per-run reset (override just for this run):
+dim_customer.apply_hints(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "boundary_timestamp": None,  # reset to current load time for this run
+    }
+)
+pipeline.run(dim_customer())
+```
+
+When `boundary_timestamp` is `None` (or omitted), `dlt` uses the load package's creation timestamp as the boundary for both retiring existing versions and creating new versions.
+
+### Example: Use your own row hash
+
+By default, `dlt` generates a row hash based on all columns provided by the resource and stores it in `_dlt_id`. You can use your own hash instead by specifying `row_version_column_name` in the `write_disposition` dictionary. You might already have a column present in your resource that can naturally serve as a row hash, in which case it's more efficient to use those pre-existing hash values than to generate new artificial ones. This option also allows you to use hashes based on a subset of columns, in case you want to ignore changes in some of the columns. When using your own hash, values for `_dlt_id` are randomly generated.
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "row_version_column_name": "row_hash",  # the column "row_hash" should be provided by the resource
+    }
+)
+def dim_customer():
+    ...
+...
+```
+
+:::note
+If your source data contains nested fields (like lists or arrays) that may return in different order across API calls, the automatically generated row hash will differ even when the actual data hasn't changed. Using `row_version_column_name` to provide your own hash based on stable fields is a good solution for this.
+:::
+
+### 🧪 Use scd2 with Arrow tables, Pandas or Polars DataFrames
+
+`dlt` will not add a **row hash** column to the tabular data automatically (we are working on it).
+You need to do that yourself by adding a transform function to the `scd2` resource that computes row hashes (using pandas.util, should be fairly fast).
+
+```py notype
+import dlt
+from dlt.sources.helpers.transform import add_row_hash_to_table
+
+scd2_r = dlt.resource(
+    arrow_table,
+    name="tabular",
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "row_version_column_name": "row_hash",
+    },
+).add_map(add_row_hash_to_table("row_hash"))
+```
+
+`add_row_hash_to_table` is the name of the transform function that will compute and create the `row_hash` column that is declared as holding the hash by `row_version_column_name`.
+
+:::tip
+You can modify existing resources that yield data in tabular form by calling `apply_hints` and passing the `scd2` config in `write_disposition` and then by
+adding the transform with `add_map`.
+:::
+
+### Nested tables
+
+Nested tables, if any, do not contain validity columns. Validity columns are only added to the root table. To get the validity columns for a nested record, join the nested table to its parent on `_dlt_parent_id`. By default, `_dlt_id` in the root table is the row hash of the record version. Deeper nested tables join through each parent level. If you set `root_key=True` on the source, nested tables also get `_dlt_root_id`, and you can join the root table directly.
+
+### Limitations
+
+* You cannot use columns like `updated_at` or integer `version` of a record that are unique within a `primary_key` (even if it is defined). The hash column
+must be unique for a root table. We are working to allow `updated_at` style tracking.
+* We do not detect changes in nested tables (except new records) if the row hash of the corresponding parent row does not change. Use `updated_at` or a similar
+column in the root table to stamp changes in nested data.
+
+## `upsert` strategy
+
+:::warning
+The `upsert` merge strategy is currently supported for these destinations:
+
+- `athena`
+- `bigquery`
+- `databricks`
+- `mssql`
+- `postgres`
+- `snowflake`
+- `filesystem` with `delta` table format (see limitations [here](../dlt-ecosystem/destinations/delta-iceberg#known-limitations)) and `iceberg` table format
+:::
+
+The `upsert` merge strategy does primary-key based *upserts*:
+
+- *update* a record if the key exists in the target table
+- *insert* a record if the key does not exist in the target table
+
+You can [delete records](#delete-records) with the `hard_delete` hint.
+
+### Skip unchanged records
+
+By default, `upsert` updates every record whose key exists in the target table, even when its values did not change. Set `skip_unchanged_rows` to update only the records that changed. Change consumers then see only the records that changed. For example, a Snowflake stream contains only the inserted and updated records:
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "upsert",
+        "skip_unchanged_rows": True,
+    },
+    primary_key="my_primary_key",
+)
+def my_upsert_resource():
+    ...
+...
+```
+
+The option works the same way for the [`cdc` strategy](#cdc-strategy).
+
+Change detection compares all columns except the `primary_key`, the `hard_delete` column, and the dlt columns `_dlt_id`, `_dlt_load_id`, `_dlt_parent_id`, and `_dlt_root_id`. dlt sets the `_dlt_load_id` of an updated record to the current load. An unchanged record keeps the `_dlt_load_id` of its last change. Change detection also applies to nested rows, so dlt does not update an unchanged list element.
+
+On the `filesystem` destination, the `iceberg` table format does not support `skip_unchanged_rows` with `upsert`. The vector destinations `lancedb`, `lance`, `qdrant` and `weaviate` do not support it either, because their `upsert` updates every matched record. With it, dlt stops before the load starts.
+
+#### Detect changes with your own row version
+
+To detect changes with one column instead of all columns, also set `row_version_column_name`. dlt then updates a record only when the value in this column changes. Changes in the other columns do not update the record. The resource must provide the column, for example a hash of the columns you track or a version counter from the source system. The column cannot contain `NULL` values:
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "upsert",
+        "skip_unchanged_rows": True,
+        "row_version_column_name": "row_hash",
+    },
+    primary_key="my_primary_key",
+)
+def my_upsert_resource():
+    ...
+...
+```
+
+Without `skip_unchanged_rows`, dlt ignores `row_version_column_name` and logs a warning. dlt still identifies records by `primary_key` and still generates `_dlt_id`. This is different from the [`scd2` strategy](#example-use-your-own-row-hash), where the row version column identifies the record. The row version applies to the root table only. dlt compares all columns of nested tables.
+
+### Filter the loaded records
+
+Set `source_filter` to merge only the loaded records that match a SQL condition. dlt discards the other loaded records. For the rules, read [Merge conditions](#merge-conditions). `upsert` does not delete records that are absent from the loaded data, so it does not support `destination_scope`. The `iceberg` table format and the vector destinations cannot apply a SQL condition, so they reject `source_filter` before the load starts.
+
+### `upsert` versus `delete-insert`
+
+Unlike the default `delete-insert` merge strategy, the `upsert` strategy:
+
+1. needs a `primary_key`
+2. expects this `primary_key` to be unique (`dlt` does not deduplicate)
+3. does not support `merge_key`
+4. uses `MERGE` or `UPDATE` operations to process updates
+
+### Example: `upsert` merge strategy
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "upsert"},
+    primary_key="my_primary_key"
+)
+def my_upsert_resource():
+    ...
+...
+```
+
+## `insert-only` strategy
+
+The `insert-only` merge strategy is supported for all destinations that support `upsert` (see [above](#upsert-strategy)), including `filesystem` with `delta` and `iceberg` table formats and `lancedb`.
+
+The `insert-only` merge strategy does primary-key based *inserts* without updating existing records:
+
+- *insert* a record if the key does not exist in the target table
+- *skip* a record if the key already exists in the target table (no update happens)
+
+This strategy is ideal for append-only data (events, logs, transactions) where existing records should never be modified. Re-running a pipeline only adds missing records, providing idempotent loads with better performance than `upsert` by skipping `UPDATE` operations entirely.
+
+You can use the `hard_delete` hint to filter out records marked for deletion before insertion. Unlike `upsert`, existing records in the target are never deleted — the hint only prevents new deleted records from being inserted.
+
+### `insert-only` versus `upsert`
+
+Unlike the `upsert` strategy, the `insert-only` strategy:
+
+1. **does not update** existing records, even when their values changed. `upsert` with [`skip_unchanged_rows`](#skip-unchanged-records) still updates the changed records
+2. provides better **performance** by skipping `UPDATE` operations
+
+Like `upsert`, the `insert-only` strategy:
+
+1. needs a `primary_key`
+2. expects this `primary_key` to be unique
+3. does not support `merge_key`
+4. generates deterministic `_dlt_id` based on primary key
+
+### Example: `insert-only` merge strategy
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "insert-only"},
+    primary_key="event_id"
+)
+def my_insert_only_resource():
+    ...
+...
+```
+
+### Nested tables without a root key
+
+`insert-only` never deletes nested records, so it does not need the `root key` (`_dlt_root_id`). It merges nested tables by their row key, which dlt derives from the parent `_dlt_id` and the position in the list. By default, dlt still propagates the root key for `insert-only`. To save storage space, disable it on the source. Unlike the general rule for [disabling root key propagation](#disable-root-key-propagation), this works for any nesting depth:
+
+```py
+@dlt.source(root_key=False)
+def events_source():
+    @dlt.resource(
+        write_disposition={"disposition": "merge", "strategy": "insert-only"},
+        primary_key="event_id",
+    )
+    def events():
+        yield [{"event_id": 1, "tags": [{"name": "a", "props": [{"k": "v"}]}]}]
+
+    return events
+```
+
+:::caution
+`upsert` and `cdc` delete nested records by the root key. If you may switch the resource to one of these strategies later, keep the root key. dlt cannot add `_dlt_root_id` to tables that already contain data.
+:::
+
+## `cdc` strategy
+
+:::note
+These destinations support the `cdc` merge strategy:
+
+- `duckdb` (`duckdb >= 1.4.0`)
+- `motherduck`
+- `ducklake`
+- `snowflake`
+- `postgres`
+- `bigquery`
+- `databricks`
+- `mssql`
+- `fabric`
+- `athena` with the `iceberg` table format
+- `filesystem` with the `delta` table format
+:::
+
+The `cdc` strategy treats the loaded data as a **complete snapshot of the source system**. It derives inserts, updates, and deletes from the snapshot:
+
+- It **inserts** a record whose key is not in the destination.
+- It **updates** a record whose key is in the destination.
+- It **deletes** a record that the destination has and the snapshot does not.
+
+If the source system deletes records without deletion markers, use `cdc` to mirror the source system. Set [`skip_unchanged_rows`](#skip-unchanged-records) so that `cdc` does not update unchanged records. As a result, change consumers see only the records that changed. For example, a Snowflake stream contains only the inserted, updated, and deleted records:
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "cdc",
+        "skip_unchanged_rows": True,
+    },
+    primary_key="my_primary_key"
+)
+def my_cdc_resource():
+    ...
+...
+```
+
+To detect changes with one column instead of all columns, also set `row_version_column_name`, as described in [Detect changes with your own row version](#detect-changes-with-your-own-row-version).
+
+### `cdc` versus `replace` and `delete-insert`
+
+[`replace`](./full-loading.md) replaces the whole table with the loaded data. `delete-insert` with a `merge_key` replaces partitions of the table. Both delete and insert every record they touch, including the unchanged records. As a result, every record looks modified downstream. `_dlt_load_id` then does not show when a record last changed.
+
+On Snowflake, the deletes and inserts also create new micro-partitions. The `staging-optimized` replace strategy swaps the table object. This breaks a stream on that table.
+
+If you need only the data, choose `replace` or `delete-insert`. If you also need to know what changed, choose `cdc`.
+
+### `cdc` versus `upsert`
+
+Unlike the `upsert` strategy, the `cdc` strategy:
+
+1. **deletes** records that are absent from the loaded snapshot
+2. supports `merge_key` and `destination_scope` to limit deletes to a part of the table
+3. does not insert a loaded record that the `hard_delete` column marks as deleted
+
+Like `upsert`, the `cdc` strategy:
+
+1. needs a `primary_key`
+2. expects this `primary_key` to be unique (`dlt` does not deduplicate)
+3. generates a deterministic `_dlt_id` based on the primary key
+4. skips unchanged records with [`skip_unchanged_rows`](#skip-unchanged-records)
+5. merges only the loaded records that `source_filter` selects
+
+:::caution
+Make sure that the `primary_key` is unique. With duplicate keys, the result is not deterministic. Snowflake raises an error. `duckdb` updates an existing record with one of the duplicates and inserts every duplicate of a new key.
+:::
+
+### Deleting records with `hard_delete`
+
+You can also [delete records](#delete-records) with the `hard_delete` hint. If the `hard_delete` column marks a loaded record as deleted, `cdc` deletes its destination record. `cdc` does not insert this loaded record.
+
+### Limiting deletes with `merge_key` and merge conditions
+
+By default, `cdc` compares the whole table and deletes every record that is absent from the snapshot. If you load only a part of the table, for example recent months, limit the deletes to that part.
+
+Set `merge_key` to delete absent records only in the partitions of the merge source:
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "cdc"},
+    primary_key="my_primary_key",
+    merge_key="month",
+)
+def my_partitioned_resource():
+    # yield a complete snapshot of the months you load
+    ...
+...
+```
+
+The `delta` table format does not support `merge_key` with `cdc`. Set a destination scope instead.
+
+`merge_key` works the same way for the [`scd2` strategy](#scd2-strategy). Without it, `scd2` retires every absent record. With it, `scd2` retires only the absent records whose `merge_key` is in the merge source. With `source_filter`, dlt takes the `merge_key` partitions from the merge source only.
+
+To limit the deletes with a SQL condition instead, set `destination_scope`. Read [Merge conditions](#merge-conditions).
+
+### Nested tables with `cdc`
+
+Nested rows follow their parent row. dlt deletes the nested rows of a deleted parent and the list elements that the load no longer has. dlt inserts new list elements. With `skip_unchanged_rows`, dlt does not update an unchanged element.
+
+### Limitations of `cdc`
+
+- The `primary_key` of the snapshot must be unique. `dlt` does not deduplicate the loaded data for this strategy.
+- A resource that yields no records produces no load job, so `cdc` deletes nothing. To delete the records of an empty snapshot, read [Delete all records with an empty snapshot](#delete-all-records-with-an-empty-snapshot).
+
+### Delete all records with an empty snapshot
+
+If the source system returns no records, yield [`dlt.mark.materialize_table_schema()`](resource.md#materialize-schema-without-rows). dlt then runs an empty load job, and the merge deletes every destination record. With `destination_scope`, it deletes only the records in the destination scope. With `merge_key`, it deletes nothing, because an empty snapshot has no partitions:
+
+```py
+@dlt.resource(
+    primary_key="id",
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "cdc",
+        "destination_scope": "region = 'eu'",
+    },
+)
+def customers():
+    rows = fetch_customers(region="eu")  # ty: ignore[unresolved-reference]
+    if not rows:
+        # an empty load job deletes every record in the destination scope
+        yield dlt.mark.materialize_table_schema()
+    yield from rows
+```
+
+## Merge conditions
+
+`destination_scope` and `source_filter` are SQL conditions that limit a merge:
+
+- **`destination_scope`** selects the destination records that the merge can delete or retire. `delete-insert`, `scd2`, and `cdc` support it.
+- **`source_filter`** selects the loaded records to merge. dlt **discards** the other loaded records. The remaining records are the merge source. Keys and `merge_key` partitions come only from the merge source.
+
+| strategy        | `destination_scope`       | `source_filter` |
+| --------------- | ------------------------- | --------------- |
+| `delete-insert` | yes, the delete condition | yes             |
+| `scd2`          | yes                       | yes             |
+| `cdc`           | yes                       | yes             |
+| `upsert`        | no                        | yes             |
+| `insert-only`   | no                        | no              |
+
+With an unsupported option, dlt raises an error when you define the resource. If the destination picks the strategy, dlt ignores the option and logs a warning.
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "cdc",
+        "destination_scope": "updated_at >= '2026-07-01'",
+    },
+    primary_key="my_primary_key",
+)
+def my_recent_resource():
+    ...
+...
+```
+
+On the `delta` table format, write this condition as `{table}.updated_at >= '2026-07-01'`.
+
+The destination evaluates both conditions. Write them with destination column names and SQL syntax. `destination_scope` replaces `merge_key`: if you set it, dlt **ignores `merge_key`**. On BigQuery, a `merge_key` compiles to a subquery, and the subquery prevents partition pruning. A destination scope can prune partitions.
+
+:::caution
+If you can filter the data at extract time, use [`resource.add_filter()`](resource.md#filter-transform-and-pivot-data). `source_filter` discards loaded records without an error. The load reports success, and the trace shows these records as extracted and normalized.
+:::
+
+:::warning
+For `cdc` and `scd2`, a discarded record is absent from the merge source. Then dlt deletes or retires its destination record. To keep the destination record, set a destination scope or a `merge_key` that excludes it.
+:::
+
+For the [`scd2` strategy](#scd2-strategy), `destination_scope` limits the records that `scd2` retires. The [`upsert` strategy](#filter-the-loaded-records) supports only `source_filter`, because it does not delete absent records.
+
+The conditions can reference the tables by placeholder. The expansion depends on the destination:
+
+| placeholder       | SQL destinations                                                              | `delta` table format                  |
+| ----------------- | ----------------------------------------------------------------------------- | ------------------------------------- |
+| `{table}`         | the fully qualified destination table, for example `"my_dataset"."items"`     | `target`, only in `destination_scope` |
+| `{staging_table}` | the fully qualified staging table, for example `"my_dataset_staging"."items"` | `source`, only in `source_filter`     |
+
+On SQL destinations:
+
+- `destination_scope` can use both placeholders.
+- `source_filter` cannot use placeholders. dlt applies it to the staging table, so write it with bare column names.
+
+On the `delta` table format, the conditions are Delta merge predicates:
+
+- `destination_scope` can use only `{table}`. dlt deletes only the unmatched destination records that the destination scope selects.
+- `source_filter` can use only `{staging_table}`.
+- A predicate cannot contain a subquery. Qualify every column, for example `{table}.bucket = 'new'` in `destination_scope` and `{staging_table}.bucket = 'new'` in `source_filter`.
+
+To write a literal brace, double it: `{{` or `}}`.
+
+### Replacing a partition with `delete-insert`
+
+For [`delete-insert`](#delete-insert-strategy), `destination_scope` is the delete condition. dlt deletes the records that the destination scope selects and inserts the merge source. The delete does not use keys, so `primary_key` and `merge_key` are optional. If you set a `primary_key`, dlt still deduplicates the loaded data. BigQuery and Snowflake prune partitions for this delete:
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "delete-insert",
+        "destination_scope": "date_col = '2026-08-01'",
+    },
+)
+def my_partition():
+    # yield the records for that one partition
+    ...
+...
+```
+
+:::warning
+If a record **changes** the value that the destination scope tests, dlt does not delete its old copy. For example, a record can move to another date. Then the destination has two records with this key. To also delete records by key, add the key match to the destination scope: `"date_col = '2026-08-01' OR id IN (SELECT id FROM {staging_table})"`. With this destination scope, the destination cannot prune partitions.
+:::
+
+If a `delete-insert` resource has no keys and no `destination_scope`, dlt appends the data. With a `destination_scope`, dlt replaces the records that the destination scope selects.
+
+With `source_filter` and no `destination_scope`, `delete-insert` deletes by the keys and `merge_key` partitions of the merge source. dlt keeps a destination record only when its key and partition are not in the merge source.
+
+### Use placeholders to match keys in one partition
+
+By default, dlt deletes all records that the destination scope selects. If the primary key is unique only within a partition, match the keys against the staging table. Then dlt deletes only the records that the load replaces:
+
+```py
+@dlt.resource(
+    primary_key="id",
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "delete-insert",
+        "destination_scope": "day = '2026-08-01' AND id IN (SELECT id FROM {staging_table})",
+    },
+)
+def items():
+    # yield the records for 2026-08-01
+    ...
+```
+
+On a SQL destination, dlt expands the placeholder and runs this delete before the insert:
+
+```sql
+DELETE FROM "my_dataset"."items"
+WHERE day = '2026-08-01' AND id IN (SELECT id FROM "my_dataset_staging"."items");
+```
+
+The outer `day` and `id` refer to the destination table. The `id` in the subquery refers to the staging table. The subquery is not correlated, so ClickHouse also accepts this form.
+
+The `delta` table format does not support `delete-insert`. With `cdc`, write the partition condition as `"{table}.day = '2026-08-01'"`. dlt expands it to `target.day = '2026-08-01'`.
+
+
+===== FILE: docs/website/docs/general-usage/naming-convention.md =====
+
+---
+title: Naming convention
+description: Control how dlt creates table, column and other identifiers
+keywords: [identifiers, snake case, case sensitive, case insensitive, naming]
+---
+# Naming convention
+
+dlt creates table and column identifiers from the data. The data source, i.e., a stream of JSON documents, may have identifiers (i.e., key names in a dictionary) with any Unicode characters, of any length, and naming style. On the other hand, destinations require that you follow strict rules when you name tables, columns, or collections.
+A good example is [Redshift](../dlt-ecosystem/destinations/redshift.md) that accepts case-insensitive alphanumeric identifiers with a maximum of 127 characters.
+
+`dlt` groups tables from a single [source](source.md) in a [schema](schema.md). Each schema defines a **naming convention** that tells `dlt` how to translate identifiers to the
+namespace that the destination understands. Naming conventions are, in essence, functions that map strings from the source identifier format into the destination identifier format. For example, our **snake_case** (default) naming convention will translate the `DealFlow` source identifier into the `deal_flow` destination identifier.
+
+You can pick which naming convention to use. `dlt` provides a few to [choose from](#available-naming-conventions). You can [easily add your own](#write-your-own-naming-convention) as well.
+
+:::tip
+The standard behavior of `dlt` is to **use the same naming convention for all destinations** so users always see the same table and column names in their databases.
+:::
+
+## Use default naming convention (snake_case)
+
+**snake_case** is a case-insensitive naming convention, converting source identifiers into lower-case snake case identifiers with a reduced alphabet.
+
+- Spaces around identifiers are trimmed.
+- Keeps ASCII alphanumerics and underscores, replaces all other characters with underscores (with the exceptions below).
+- Replaces `+` and `*` with `x`, `-` with `_`, `@` with `a`, and `|` with `l`.
+- Prepends `_` if the name starts with a number.
+- Multiples of `_` are converted into a single `_`.
+- Replaces all trailing `_` with `x`.
+
+Uses `__` as a nesting separator for tables and flattened column names.
+
+:::tip
+If you do not like **snake_case**, your next safe option is **sql_ci**, which generates SQL-safe, lowercase, case-insensitive identifiers without any other transformations. To permanently change the default naming convention on a given machine:
+
+1. Set an environment variable `SCHEMA__NAMING` to `sql_ci_v1` OR
+2. Add the following line to your global `config.toml` (the one in your home dir, i.e., `~/.dlt/config.toml`):
+
+```toml
+[schema]
+naming="sql_ci_v1"
+```
+
+:::
+
+## Source identifiers vs destination identifiers
+
+### Pick the right identifier form when defining resources
+
+`dlt` keeps source (not normalized) identifiers during data [extraction](../reference/explainers/how-dlt-works.md#extract) and translates them during [normalization](../reference/explainers/how-dlt-works.md#normalize). For you, it means:
+
+1. If you write a [transformer](resource.md#process-resources-with-dlttransformer) or a [mapping/filtering function](resource.md#filter-transform-and-pivot-data), you will see the original data, without any normalization. Use the source identifiers to access the dicts!
+2. If you define a `primary_key` or `cursor` that participates in [cursor field incremental loading](incremental/cursor.md), use the source identifiers (`dlt` uses them to inspect source data, `Incremental` class is just a filtering function).
+3. When defining any other hints, i.e., `columns` or `merge_key`, you can pick source or destination identifiers. `dlt` normalizes all hints together with your data.
+4. The `Schema` object (i.e., obtained from the pipeline or from `dlt` source via `discover_schema`) **always contains destination (normalized) identifiers**.
+
+### Understand the identifier normalization
+
+Identifiers are translated from source to destination form in the **normalize** step. Here's how `dlt` picks the naming convention:
+
+* The default naming convention is **snake_case**.
+* Each destination may define a preferred naming convention in [destination capabilities](destination.md#pass-additional-parameters-and-change-destination-capabilities). Some destinations (i.e., Weaviate) need a specialized naming convention and will override the default.
+* You can [configure a naming convention explicitly](#configure-naming-convention). Such configuration overrides the destination settings.
+* This naming convention is used when new schemas are created. It happens when the pipeline is run for the first time.
+* Schemas preserve the naming convention when saved. Your running pipelines will maintain existing naming conventions if not requested otherwise.
+* `dlt` applies the final naming convention in the `normalize` step. Jobs (files) in the load package now have destination identifiers. The pipeline schema is duplicated, locked, and saved in the load package and will be used by the destination.
+
+:::warning
+If you change the naming convention and `dlt` detects a change in the destination identifiers for tables/collections/files that already exist and store data, the normalize process will fail. This prevents an unwanted schema migration. New columns and tables will be created for identifiers that changed.
+:::
+
+### Case-sensitive and insensitive destinations
+
+Naming conventions declare if the destination identifiers they produce are case-sensitive or insensitive. This helps `dlt` to [generate case-sensitive / insensitive identifiers for the destinations that support both](destination.md#control-how-dlt-creates-table-column-and-other-identifiers). For example, if you pick a case-insensitive naming like **snake_case** or **sql_ci_v1**, with Snowflake, `dlt` will generate all uppercase identifiers that Snowflake sees as case-insensitive. If you pick a case-sensitive naming like **sql_cs_v1**, `dlt` will generate quoted case-sensitive identifiers that preserve identifier capitalization.
+
+Note that many destinations are exclusively case-insensitive, of which some preserve the casing of identifiers (i.e., **duckdb**) and some will case-fold identifiers when creating tables (i.e., **Redshift**, **Athena** do lowercase on the names). `dlt` is able to detect resulting identifier [collisions](#avoid-identifier-collisions) and stop the load process before data is mangled.
+
+### Identifier shortening
+
+Identifier shortening happens during normalization. `dlt` takes the maximum length of the identifier from the destination capabilities and will trim the identifiers that are too long. The default shortening behavior generates short deterministic hashes of the source identifiers and places them in the middle of the destination identifier. This (with a high probability) avoids shortened identifier collisions.
+
+### Compound (flattened) identifiers
+
+`dlt` combines several identifiers in order to name nested tables and flattened columns. For example:
+
+```json
+{
+  "column":
+    {
+      "value": 1
+    }
+}
+```
+
+generates flattened column name `column__value`. Where `__` is a path separator (in **snake case**). Each component in the combined identifier is normalized
+separately and shortened as a whole.
+
+:::note
+Combined identifier is also a valid single identifier. Starting from
+`dlt` version above 1.4.0 normalization is fully idempotent and normalized
+`column__value` will be still `column__value`.
+:::
+
+:::warning
+Previously double underscores were contracted into single underscore. That
+prevented using data loaded by `dlt` as a data source without identifier modifications. `dlt` maintains backward compatibility for version >1.4.0 as follows:
+
+* All schemas stored locally or at destination will be migrated to backward compatible mode by setting a flag `use_break_path_on_normalize` i.e.:
+
+```yaml
+normalizers:
+  names: dlt.common.normalizers.names.snake_case
+  use_break_path_on_normalize: true
+  json:
+    module: dlt.common.normalizers.json.relational
+```
+
+* Backward compatible behavior may be explicitly enabled by setting
+`SCHEMA__USE_BREAK_PATH_ON_NORMALIZE` to `TRUE` or via `config.toml`:
+
+```toml
+[schema]
+use_break_path_on_normalize=true
+```
+
+:::
+
+### 🚧 [WIP] Name convention changes are lossy
+
+`dlt` does not store the source identifiers in the schema so when the naming convention changes (or we increase the maximum identifier length), it is not able to generate a fully correct set of new identifiers. Instead, it will re-normalize already normalized identifiers. We are currently working to store the full identifier lineage - source identifiers will be stored and mapped to the destination in the schema.
+
+## Pick your own naming convention
+
+### Configure naming convention
+
+You can use `config.toml`, environment variables, or any other configuration provider to set the naming convention name. The configured naming convention **overrides all other settings**:
+
+- Changes the naming convention stored in the already created schema.
+- Overrides the destination capabilities preference.
+
+```toml
+[schema]
+naming="sql_ci_v1"
+```
+
+The configuration above will request **sql_ci_v1** for all pipelines (schemas). An environment variable `SCHEMA__NAMING` set to `sql_ci_v1` has the same effect.
+
+You have the option to set the naming convention per source:
+
+```toml
+[sources.zendesk]
+config="prop"
+[sources.zendesk.schema]
+naming="sql_cs_v1"
+[sources.zendesk.credentials]
+password="pass"
+```
+
+The snippet above demonstrates how to apply a certain naming for an example `zendesk` source.
+
+You can set the naming convention in your code via destination factory. This will overwrite destination's preferred convention and make it
+a default one for the whole pipeline:
+
+```py
+import dlt
+
+dest_ = dlt.destinations.postgres(naming_convention="sql_cs_v1")
+```
+
+You can use naming conventions that you created yourself or got from other users. In that case, you should pass a full Python import path to the [module that contains the naming convention](#write-your-own-naming-convention):
+
+### Available naming conventions
+
+You can pick from a few built-in naming conventions.
+
+* `snake_case` - the default.
+* `duck_case` - case-sensitive, allows all Unicode characters like emoji 💥.
+* `direct` - case-sensitive, allows all Unicode characters, does not contract underscores.
+* `sql_cs_v1` - case-sensitive, generates SQL-safe identifiers.
+* `sql_ci_v1` - case-insensitive, generates SQL-safe lowercase identifiers.
+* `s3_tables` - extends `snake_case` to comply with S3 Tables [naming rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-buckets-naming.html#naming-rules-table).
+
+:::note
+When using the `s3_tables` naming convention, any leading underscores are removed from dataset and table names. Hence, `dlt` tables will be prefixed with `dlt_` instead of the usual `_dlt_`. For example, `_dlt_loads` will be `dlt_loads`.
+:::
+
+### Ignore naming convention for `dataset_name`
+
+You control the dataset naming normalization separately. Set `enable_dataset_name_normalization` to `false` to ignore the naming convention for `dataset_name`:
+
+```toml
+[destination.snowflake]
+enable_dataset_name_normalization=false
+```
+
+In that case, the `dataset_name` would be preserved the same as it was set in the pipeline:
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(dataset_name="MyCamelCaseName")
+```
+
+The default value for the `enable_dataset_name_normalization` configuration option is `true`.
+:::note
+The same setting would be applied to [staging dataset](../dlt-ecosystem/staging#staging-dataset). Thus, if you set `enable_dataset_name_normalization` to `false`, the staging dataset name would also **not** be normalized.
+:::
+
+:::warning
+Depending on the destination, certain names may not be allowed. To ensure your dataset can be successfully created, use the default normalization option.
+:::
+
+## Avoid identifier collisions
+
+`dlt` detects various types of identifier collisions and ignores the others.
+
+1. dlt detects collisions if a case-sensitive naming convention is used on a case-insensitive destination.
+2. dlt detects collisions if a change of naming convention changes the identifiers of tables already created in the destination.
+3. dlt detects collisions when the naming convention is applied to column names of arrow tables.
+
+`dlt` will not detect a collision when normalizing source data. If you have a dictionary, keys will be merged if they collide after being normalized.
+You can create a custom naming convention that does not generate collisions on data, see examples below.
+
+## Write your own naming convention
+
+Custom naming conventions are classes that derive from `NamingConvention`, which you can import from `dlt.common.normalizers.naming`. We recommend the following module layout:
+
+1. Each naming convention resides in a separate Python module (file).
+2. The class is always named `NamingConvention`.
+
+In that case, you can use a fully qualified module name in [schema configuration](#configure-naming-convention) or pass the module fully qualified name [explicitly](#configure-naming-convention).
+
+```toml
+[schema]
+naming="tests.common.cases.normalizers.sql_upper"
+```
+
+`dlt` will import `tests.common.cases.normalizers.sql_upper` and use the `NamingConvention` class found in it as the naming convention.
+
+:::tip
+Do not pass custom naming convention as modules if you do it explicitly. We recommend pattern below:
+
+```py
+import dlt
+
+dest_ = dlt.destinations.postgres(naming_convention="my_package.sql_cs_latin2")
+```
+
+⛔ avoid this or you may get pickle errors i.e. when using parallel normalization:
+
+```py
+import dlt
+
+import my_package.sql_cs_latin2  # type: ignore[import-not-found]
+
+dest_ = dlt.destinations.postgres(naming_convention=my_package.sql_cs_latin2)
+```
+
+:::
+
+Two naming-convention examples that you may find useful:
+
+1. A variant of `sql_ci` that generates identifier collisions with a low (user-defined) probability by appending a deterministic tag to each name.
+2. A variant of `sql_cs` that allows for LATIN (i.e., umlaut) characters.
+
+:::note
+Note that the fully qualified name of your custom naming convention will be stored in the schema, and dlt will attempt to import it when the schema is loaded from storage.
+You should distribute your custom naming conventions with your pipeline code or via a pip package from which it can be imported.
+:::
+
+
+===== FILE: docs/website/docs/general-usage/pipeline.md =====
+
+---
+title: Pipeline
+description: Explanation of what a dlt pipeline is
+keywords: [pipeline, source, full refresh, dev mode]
+---
+# Pipeline
+
+A [pipeline](glossary.md#pipeline) moves data from your Python code to a
+[destination](glossary.md#destination). The pipeline accepts `dlt` [sources](source.md) or
+[resources](resource.md), as well as generators, async generators, lists, and any iterables.
+Once the pipeline runs, all resources are evaluated and the data is loaded at the destination.
+
+Example:
+
+This pipeline loads a list of objects into a DuckDB table named "three":
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(destination="duckdb", dataset_name="sequence")
+
+info = pipeline.run([{'id':1}, {'id':2}, {'id':3}], table_name="three")
+
+print(info)
+```
+
+You instantiate a pipeline by calling the `dlt.pipeline` function with the following arguments:
+
+- `pipeline_name`: a name of the pipeline that is used to identify it in trace and monitoring
+  events and to restore its state and data schemas on subsequent runs. If not provided, `dlt` creates a pipeline name from the filename of the currently executing Python module.
+- `destination`: a name of the [destination](../dlt-ecosystem/destinations) to which dlt
+  loads the data. It may also be provided to the `run` method of the `pipeline` and can be declared in [various ways](destination.md).
+- `dataset_name`: a name of the dataset to which the data is loaded. A dataset is a logical
+  group of tables, that is, `schema` in relational databases or a folder grouping many files. It may also be
+  provided later to the `run` or `load` methods of the pipeline. If not provided, then
+  it defaults to the `{pipeline_name}_dataset` on destinations that require datasets (most of the warehouses).
+  It stays empty on destinations that don't separate tables into datasets (or database schemas), that is, on vector databases or ClickHouse.
+
+To load the data, you call the `run` method and pass your data in the `data` argument.
+
+Arguments:
+
+- `data` (the first argument) may be a dlt source, resource, generator function, or any Iterator or
+  Iterable (that is, a list or the result of the `map` function).
+- `write_disposition` controls how to write data to a table. Defaults to "append".
+  - `append` always adds new data at the end of the table.
+  - `replace` replaces existing data with new data.
+  - `merge` deduplicates and merges data based on `primary_key` and `merge_key` hints.
+- `table_name`: specified in cases when the table name can't be inferred, that is, from the resources or name
+  of the generator function.
+
+Example: This pipeline loads the data the generator `generate_rows(10)` produces:
+
+```py
+import dlt
+
+def generate_rows(nr):
+    for i in range(nr):
+        yield {'id':1}
+
+pipeline = dlt.pipeline(destination='bigquery', dataset_name='sql_database_data')
+
+info = pipeline.run(generate_rows(10))
+
+print(info)
+```
+
+## Pipeline working directory
+
+Each pipeline that you create with `dlt` stores extracted files, load packages, inferred schemas,
+execution traces, and the [pipeline state](state.md) in a folder in the local filesystem. The default
+location for such folders is in the user's home directory: `~/.dlt/pipelines/<pipeline_name>`.
+
+You can inspect stored artifacts using the command
+[dlt pipeline info](../reference/command-line-interface.md#dlt-pipeline) and
+[programmatically](../walkthroughs/run-a-pipeline.md#4-inspect-a-load-process).
+
+:::info
+A pipeline with a given name looks for its working directory in the location above - so if you have two
+pipeline scripts that create a pipeline with the same name, they see the same working folder
+and share all the possible state. You may override the default location using the `pipelines_dir`
+argument when creating the pipeline.
+:::
+
+:::info
+You can attach a `Pipeline` instance to an existing working folder, without creating a new
+pipeline with `dlt.attach`.
+:::
+
+### Separate working environments with `pipelines_dir`
+
+You can run several pipelines with the same name but with different configurations, for example, to target development, staging, or production environments.
+Set the `pipelines_dir` argument to store all the working folders in a specific place. For example:
+
+```py
+import pathlib
+
+import dlt
+
+from dlt.common.pipeline import get_dlt_pipelines_dir
+
+
+dev_pipelines_dir = str(pathlib.Path(get_dlt_pipelines_dir(), "dev"))
+pipeline = dlt.pipeline(destination="duckdb", dataset_name="sequence", pipelines_dir=dev_pipelines_dir)
+```
+
+This code stores the pipeline working folder in `~/.dlt/pipelines/dev/<pipeline_name>`. Note that you need to pass this `~/.dlt/pipelines/dev/`
+into all CLI commands to get info/trace for that pipeline.
+
+## Do experiments with dev mode
+
+If you [create a new pipeline script](../tutorial/load-data-from-an-api.md), you experiment
+a lot. If you want each time the pipeline resets its state and loads data to a
+new dataset, set the `dev_mode` argument of the `dlt.pipeline` method to True. Each time the
+pipeline is created, `dlt` adds a datetime-based suffix to the dataset name.
+
+## Drop destination schema / dataset to start over
+
+If you drop the destination schema / dataset to which your pipeline loads data, the pipeline fully resets its
+state and working directory and executes its first run.
+If your pipeline doesn't share the dataset with any other pipeline and you don't keep any additional data in it - this
+operation is also safe to be executed in production to trigger full refresh without a need to writing additional code.
+
+## Refresh pipeline data and state
+
+You can reset parts or all of your sources by using the `refresh` argument to `dlt.pipeline` or the pipeline's `run` or `extract` method.
+That means when you run the pipeline, the sources/resources being processed have their state reset and their tables either dropped or truncated,
+depending on which refresh mode is used.
+
+:::tip
+`dlt` modifies your destination only if extract and normalize steps of refresh run succeeded. In any other case all modifications, including
+schema and state, are discarded.
+:::
+
+The `refresh` option works with all relational or SQL destinations and cloud storages and files (`filesystem`). It doesn't work with vector databases (support is in progress) and with custom destinations.
+
+The `refresh` argument should have one of the following string values to decide the refresh mode:
+
+### Drop tables and pipeline state for a source with `drop_sources`
+
+All sources being processed in `pipeline.run` or `pipeline.extract` are refreshed.
+That means all tables listed in their schemas are dropped and the state belonging to those sources and all their resources is completely wiped.
+The tables are deleted both from the pipeline's schema and from the destination database.
+
+If you only have one source or run with all your sources together, then this is practically like running the pipeline again for the first time.
+
+:::warning
+This erases schema history for the selected sources and only the latest version is stored.
+:::
+
+```py
+import dlt
+
+pipeline = dlt.pipeline("airtable_demo", destination="duckdb")
+pipeline.run(airtable_emojis(), refresh="drop_sources")
+```
+
+The preceding example instructs `dlt` to wipe the pipeline state belonging to the `airtable_emojis` source and drop all the database tables in `duckdb` to
+which data was loaded. The `airtable_emojis` source had two resources named "📆 Schedule" and "💰 Budget" loading to tables "_schedule" and "_budget". Here's
+what `dlt` does step by step:
+
+1. Collects a list of tables to drop by looking for all the tables in the schema that are created in the destination.
+2. Removes existing pipeline state associated with the `airtable_emojis` source.
+3. Resets the schema associated with the `airtable_emojis` source.
+4. Executes `extract` and `normalize` steps. These create fresh pipeline state and a schema.
+5. Before it executes the `load` step, the collected tables are dropped from staging and regular dataset.
+6. Schema `airtable_emojis` (associated with the source) is removed from the `_dlt_version` table.
+7. Executes the `load` step as usual so tables are recreated and fresh schema and pipeline state are stored.
+
+### Selectively drop tables and resource state with `drop_resources`
+
+Limits the refresh to the resources being processed in `pipeline.run` or `pipeline.extract` (for example, by using `source.with_resources(...)`).
+Tables belonging to those resources are dropped, and their resource state is wiped (that includes incremental state).
+The tables are deleted both from the pipeline's schema and from the destination database.
+
+Source level state keys aren't deleted in this mode (that is, `dlt.current.source_state()[<'my_key>'] = '<my_value>'`)
+
+:::warning
+This erases schema history for all affected sources, and only the latest schema version is stored.
+:::
+
+```py
+import dlt
+
+pipeline = dlt.pipeline("airtable_demo", destination="duckdb")
+pipeline.run(airtable_emojis().with_resources("📆 Schedule"), refresh="drop_resources")
+```
+
+Above, the state associated with the "📆 Schedule" resource is reset, and the table generated by it ("_schedule") is dropped. Other resources,
+tables, and state aren't affected. Please check `drop_sources` for a step-by-step description of what `dlt` does internally.
+
+### Selectively truncate tables and reset resource state with `drop_data`
+
+Same as `drop_resources`, but instead of dropping tables from the schema, only the data is deleted from them (that is, by `TRUNCATE <table_name>` in SQL destinations). Resource state for selected resources is also wiped. In the case of [incremental resources](incremental/cursor.md), this resets the cursor state and fully reloads the data from the `initial_value`.
+
+The schema remains unmodified in this case.
+
+```py
+import dlt
+
+pipeline = dlt.pipeline("airtable_demo", destination="duckdb")
+pipeline.run(airtable_emojis().with_resources("📆 Schedule"), refresh="drop_data")
+```
+
+Above, the incremental state of the "📆 Schedule" is reset before the `extract` step so data is fully reacquired. Just before the `load` step starts,
+the "_schedule" is truncated, and new (full) table data is inserted/copied.
+
+## Monitor the loading progress
+
+You can add a progress monitor to the pipeline. Typically, its role is to visually assure the user that
+the pipeline run is progressing. dlt supports 4 progress monitors out of the box:
+
+- [enlighten](https://github.com/Rockhopper-Technologies/enlighten) - a status bar with progress
+  bars that also allows for logging.
+- [tqdm](https://github.com/tqdm/tqdm) - the most popular Python progress bar lib, proven to work in
+  Notebooks.
+- [alive_progress](https://github.com/rsalmei/alive-progress) - with the fanciest animations.
+- **log** - dumps the progress information to log, console, or text stream. **The most useful on
+  production** optionally adds memory and CPU usage stats.
+
+:::info
+You must install the required progress bar library yourself.
+:::
+
+You pass the progress monitor in the `progress` argument of the pipeline. You can use a name from the
+preceding list as in the following example:
+
+```py
+# create a pipeline loading chess data that dumps
+# progress to stdout every 10 seconds (the default)
+pipeline = dlt.pipeline(
+    pipeline_name="chess_pipeline",
+    destination='duckdb',
+    dataset_name="chess_players_games_data",
+    progress="log"
+)
+```
+
+You can fully configure the progress monitor. See two examples below:
+
+```py
+from airflow.operators.python import get_current_context  # noqa
+
+# log each minute to Airflow task logger
+ti = get_current_context()["ti"]
+pipeline = dlt.pipeline(
+    pipeline_name="chess_pipeline",
+    destination='duckdb',
+    dataset_name="chess_players_games_data",
+    progress=dlt.progress.log(60, ti.log)
+)
+```
+
+```py
+# set tqdm bar color to yellow
+pipeline = dlt.pipeline(
+    pipeline_name="chess_pipeline",
+    destination='duckdb',
+    dataset_name="chess_players_games_data",
+    progress=dlt.progress.tqdm(colour="yellow")
+)
+```
+
+Note that the value of the `progress` argument is
+[configurable](../walkthroughs/run-a-pipeline.md#2-see-the-progress-during-loading).
+
+
+===== FILE: docs/website/docs/general-usage/resource.md =====
+
+---
+title: Resource
+description: Explanation of what a dlt resource is
+keywords: [resource, api endpoint, dlt.resource]
+---
+# Resource
+
+## Declare a resource
+
+A [resource](glossary.md#resource) is an ([optionally async](../reference/performance.md#parallelism-within-a-pipeline)) function that yields data. A resource can yield Python dicts/lists, Pydantic models, Arrow tables, Pandas DataFrames, or Polars DataFrames/LazyFrames. To create a resource, we add the `@dlt.resource` decorator to that function.
+
+Commonly used arguments:
+
+- `name`: The name of the table generated by this resource. Defaults to the decorated function name.
+- `write_disposition`: How should the data be loaded at the destination? Currently supported: `append`,
+  `replace`, and `merge`. Defaults to `append.`
+
+Example:
+
+```py
+@dlt.resource(name='table_name', write_disposition='replace')
+def generate_rows():
+	for i in range(10):
+		yield {'id': i, 'example_string': 'abc'}
+
+@dlt.source
+def source_name():
+    return generate_rows
+
+# To get the data of a resource, we could do:
+for row in generate_rows():
+    print(row)
+
+for row in source_name().resources['table_name']:
+    print(row)
+```
+
+Typically, resources are declared and grouped with related resources within a [source](source.md) function.
+
+### Define schema
+
+`dlt` will infer the [schema](schema.md) for tables associated with resources from the resource's data.
+You can modify the generation process by using the table and column hints. The resource decorator accepts the following arguments:
+
+1. `table_name`: the name of the table, if different from the resource name.
+1. `primary_key` and `merge_key`: define the name of the columns (compound keys are allowed) that will receive those hints. Used in [incremental loading](incremental-loading.md) and [merge loading](merge-loading.md).
+1. `columns`: lets you define one or more columns, including the data types, nullability, and other hints. The column definition is a `TypedDict`: `TTableSchemaColumns`. In the example below, we tell `dlt` that the column `tags` (containing a list of tags) in the `user` table should have type `json`, which means that it will be loaded as JSON/struct and not as a separate nested table.
+
+:::tip
+When using `primary_key`, `merge_key`, or `columns`, be aware of the [precedence and replacement rules of compound hints](schema.md#compound-hints).
+:::
+
+  ```py
+  @dlt.resource(name="user", columns={"tags": {"data_type": "json"}})
+  def get_users():
+    ...
+
+  # the `table_schema` method gets the table schema generated by a resource
+  print(get_users().compute_table_schema())
+  ```
+
+:::note
+You can pass dynamic hints which are functions that take the data item as input and return a hint value. This lets you create table and column schemas depending on the data. See an [example below](#adjust-schema-when-you-yield-data).
+:::
+
+### Put a contract on tables, columns, and data
+
+Use the `schema_contract` argument to tell dlt how to [deal with new tables, data types, and bad data types](schema-contracts.md). For example, if you set it to **freeze**, `dlt` will not allow for any new tables, columns, or data types to be introduced to the schema - it will raise an exception. Learn more about available contract modes [here](schema-contracts.md#setting-up-the-contract).
+
+### Define schema of nested tables
+
+`dlt` creates [nested tables](schema.md#nested-references-root-and-nested-tables) to store [list of objects](destination-tables.md#nested-tables) if present in your data.
+You can define the schema of such tables with `nested_hints` argument to `@dlt.resource`:
+
+```py
+import dlt
+
+@dlt.resource(
+    nested_hints={
+        "purchases": dlt.mark.make_nested_hints(
+            columns=[{"name": "price", "data_type": "decimal"}],
+            schema_contract={"columns": "freeze"},
+        )
+    },
+)
+def customers():
+    """Load customer data from a simple python list."""
+    yield [
+        {
+            "id": 1,
+            "name": "simon",
+            "city": "berlin",
+            "purchases": [{"id": 1, "name": "apple", "price": "1.50"}],
+        },
+    ]
+```
+
+Here we convert the `price` field in list of `purchases` to decimal type and set the schema contract to lock the list
+of columns in it. We use convenience function `dlt.mark.make_nested_hints` to generate nested hints dictionary. You are
+free to use it directly.
+
+Mind that `purchases` list will be stored as table with name `customers__purchases`. When declaring nested hints you just need
+to specify nested field(s) name(s). In case of deeper nesting i.e. let's say each `purchase` has a list of `coupons` applied,
+you can apply hints to coupons and define `customers__purchases__coupons` table schema:
+
+```py
+import dlt
+
+@dlt.resource(
+    nested_hints={
+        "purchases": {},
+        ("purchases", "coupons"): {
+            "columns": {"registered_at": {"data_type": "timestamp"}}
+        }
+    },
+)
+def customers():
+    ...
+```
+
+Here we use `("purchases", "coupons")` to locate list at the depth of 2 and set the data type on `registered_at` column
+to `timestamp`. We do that by directly using nested hints dict.
+Note that we specified `purchases` with an empty list of hints. **You are required to specify all parent hints, even if they
+are empty. Currently we are not adding missing path elements automatically**.
+
+You can use `nested_hints` primarily to set column hints and schema contract, those work exactly as in case of root tables.
+
+* `file_format` has no effect (not implemented yet)
+* `write_disposition` works as expected but leads to unintended consequences (i.e. you can set nested table to `replace`) while root table is `append`.
+* `references` will create [table references](schema.md#table-reference-hints) (annotations) as expected.
+* `primary_key` and `merge_key`: **setting those will convert nested table into a regular table, with a separate write disposition, file format etc.**
+[It allows you to create custom table relationships i.e. using natural primary and foreign keys present in the data.](schema.md#generate-custom-linking-for-nested-tables)
+
+:::tip
+[REST API Source](../dlt-ecosystem/verified-sources/rest_api/basic.md) accepts `nested_hints` argument as well.
+
+You can apply nested hints after the resource was created by using [apply_hints](#set-table-name-and-adjust-schema).
+:::
+
+### Define a schema with Pydantic
+
+You can alternatively use a [Pydantic](https://pydantic-docs.helpmanual.io/) model to define the schema.
+For example:
+
+```py
+from pydantic import BaseModel
+from typing import Optional, Union
+
+class Address(BaseModel):
+    street: str
+    city: str
+    postal_code: str
+
+class User(BaseModel):
+    id: int
+    name: str
+    tags: list[str]
+    email: Optional[str]
+    address: Address
+    status: Union[int, str]
+
+@dlt.resource(name="user", columns=User)
+def get_users():
+    ...
+```
+
+The data types of the table columns are inferred from the types of the Pydantic fields. These use the same type conversions
+as when the schema is automatically generated from the data.
+
+Pydantic models integrate well with [schema contracts](schema-contracts.md) as data validators.
+
+Things to note:
+
+- Fields with an `Optional` type are marked as `nullable`.
+- Fields with a `Union` type are converted to the first (not `None`) type listed in the union. For example, `status: Union[int, str]` results in a `bigint` column.
+- `list`, `dict`, and nested Pydantic model fields will use the `json` type, which means they'll be stored as a JSON object in the database instead of creating nested tables.
+
+You can override this by configuring the Pydantic model:
+
+```py notype
+from typing import ClassVar
+from dlt.common.libs.pydantic import DltConfig
+
+class UserWithNesting(User):
+  dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
+
+@dlt.resource(name="user", columns=UserWithNesting)
+def get_users():
+    ...
+```
+
+The following `DltConfig` options are available:
+
+- `"skip_nested_types"`: Omits any `dict`/`list`/`BaseModel` type fields from the schema, so dlt will fall back on the default behavior of creating nested tables for these fields.
+
+- `"return_validated_models"`: By default, when using a Pydantic model for validation, dlt converts the validated model instances to dictionaries before passing them downstream (e.g., to transformers). If you set this option to `True`, dlt will return the validated Pydantic model instances instead. This is useful when you want to work with Pydantic models in transformers without having to reconstruct them from dictionaries.
+
+Example with `return_validated_models`:
+
+```py notype
+from typing import ClassVar
+from pydantic import BaseModel
+from dlt.common.libs.pydantic import DltConfig
+import dlt
+
+class SimpleUser(BaseModel):
+    id: int
+    name: str
+    dlt_config: ClassVar[DltConfig] = {"return_validated_models": True}
+
+@dlt.resource(columns=User)
+def simple_users():
+    yield {"id": 1, "name": "Alice"}
+    yield SimpleUser(id=2, name="Bob")
+
+@dlt.transformer(data_from=simple_users)
+def process_users(user: SimpleUser):
+    # user is a Pydantic model instance, not a dict
+    print(f"Processing user: {user.name}")
+    yield user
+
+# Transformers receive User model instances directly
+pipeline = dlt.pipeline(destination="duckdb")
+pipeline.run(process_users)
+```
+
+`RootModel` is supported for [discriminated unions](schema-contracts.md#validating-event-streams-with-pydantic), where a single resource dispatches items of different types to separate tables. We do not support `RootModel` that validates simple types. You can add such a validator yourself, see [data filtering section](#filter-transform-and-pivot-data).
+
+### Dispatch data to many tables
+
+You can load data to many tables from a single resource. The most common case is a stream of events
+of different types, each with a different data schema. To deal with this, you can use the `table_name`
+argument on `dlt.resource`. You could pass the table name as a function with the data item as an
+argument and the `table_name` string as a return value.
+
+For example, a resource that loads GitHub repository events wants to send `issue`, `pull request`,
+and `comment` events to separate tables. The type of the event is in the "type" field.
+
+```py
+from typing import Iterator
+from dlt.common.typing import TDataItems
+
+# send item to a table with name item["type"]
+@dlt.resource(table_name=lambda event: event['type'])
+def repo_events() -> Iterator[TDataItems]:
+    yield item
+
+# the `table_schema` method gets the table schema generated by a resource and takes an optional
+# data item to evaluate dynamic hints
+print(repo_events().compute_table_schema({"type": "WatchEvent", "id": ...}))
+```
+
+In more advanced cases, you can dispatch data to different tables directly in the code of the
+resource function:
+
+```py
+from typing import Iterator
+from dlt.common.typing import TDataItems
+
+@dlt.resource
+def repo_events() -> Iterator[TDataItems]:
+    # mark the "item" to be sent to the table with the name item["type"]
+    yield dlt.mark.with_table_name(item, item["type"])
+```
+
+Created tables share the hints defined on the resource and evolve according to the received data. If you need separate
+hints per table, use `resource.apply_hints` with the `create_table_variant` option. This is an advanced feature, useful for building
+e.g. an incremental replication resource where a single resource can create many independent tables.
+
+### Parametrize a resource
+
+You can add arguments to your resource functions like to any other. Below we parametrize our
+`generate_rows` resource to generate the number of rows we request:
+
+```py
+@dlt.resource(name='table_name', write_disposition='replace')
+def generate_var_rows(nr):
+    for i in range(nr):
+        yield {'id': i, 'example_string': 'abc'}
+
+for row in generate_var_rows(10):
+    print(row)
+
+for row in generate_var_rows(20):
+    print(row)
+```
+
+:::tip
+You can mark some resource arguments as [configuration and credentials](credentials) values so `dlt` can pass them automatically to your functions.
+:::
+
+### Process resources with `dlt.transformer`
+
+You can feed data from one resource into another. The most common case is when you have an API that returns a list of objects (i.e., users) in one endpoint and user details in another. You can deal with this by declaring a resource that obtains a list of users and another resource that receives items from the list and downloads the profiles.
+
+```py
+@dlt.resource(write_disposition="replace")
+def users(limit=None):
+    for u in _get_users(limit):  # ty: ignore[unresolved-reference]
+        yield u
+
+# Feed data from users as user_item below,
+# all transformers must have at least one
+# argument that will receive data from the parent resource
+@dlt.transformer(data_from=users)
+def users_details(user_item):
+    for detail in _get_details(user_item["user_id"]):  # ty: ignore[unresolved-reference]
+        yield detail
+
+# Just load the users_details.
+# dlt figures out dependencies for you.
+pipeline.run(users_details)
+```
+
+In the example above, `users_details` will receive data from the default instance of the `users` resource (with `limit` set to `None`). You can also use the **pipe |** operator to bind resources dynamically.
+
+```py notype
+# You can be more explicit and use a pipe operator.
+# With it, you can create dynamic pipelines where the dependencies
+# are set at run time and resources are parametrized, i.e.,
+# below we want to load only 100 users from the `users` endpoint.
+pipeline.run(users(limit=100) | users_details)
+```
+
+:::tip
+Transformers are allowed not only to **yield** but also to **return** values and can decorate **async** functions and [**async generators**](../reference/performance.md#extract). Below we decorate an async function and request details on two pokemons. HTTP calls are made in parallel via the httpx library.
+
+```py
+import dlt
+import httpx
+
+
+@dlt.transformer
+async def pokemon(id):
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"https://pokeapi.co/api/v2/pokemon/{id}")
+        return r.json()
+
+# Get Bulbasaur and Ivysaur (you need dlt 0.4.6 for the pipe operator working with lists).
+print(list([1,2] | pokemon()))
+```
+
+:::
+
+### Declare a standalone resource
+
+A standalone resource is defined on a function that is top-level in a module (not an inner function) that accepts config and secrets values. Here `dlt.resource` just wraps the decorated function, and the user must call the wrapper to get the actual resource. Below we declare a `filesystem` resource that must be called before use.
+
+```py
+@dlt.resource
+def fs_resource(bucket_url=dlt.config.value):
+  """List and yield files in `bucket_url`."""
+  ...
+
+# `filesystem` must be called before it is extracted or used in any other way.
+pipeline.run(fs_resource("s3://my-bucket/reports"), table_name="reports")
+```
+
+Resource may have a dynamic name that depends on the arguments passed to the decorated function. For example:
+
+```py
+@dlt.resource(name=lambda args: args["stream_name"])
+def kinesis(stream_name: str):
+    ...
+
+kinesis_stream = kinesis("telemetry_stream")
+```
+
+`kinesis_stream` resource has a name **telemetry_stream**.
+
+### Declare parallel and async resources
+
+You can extract multiple resources in parallel threads or with async IO.
+To enable this for a sync resource, you can set the `parallelized` flag to `True` in the resource decorator:
+
+```py
+@dlt.resource(parallelized=True)
+def get_users():
+    for u in _get_users():  # ty: ignore[unresolved-reference]
+        yield u
+
+@dlt.resource(parallelized=True)
+def get_orders():
+    for o in _get_orders():  # ty: ignore[unresolved-reference]
+        yield o
+
+# users and orders will be iterated in parallel in two separate threads
+pipeline.run([get_users(), get_orders()])
+```
+
+Async generators are automatically extracted concurrently with other resources:
+
+```py
+@dlt.resource
+async def get_users():
+    # Assuming _get_users is an async generator
+    async for u in _get_users(): # ty: ignore[unresolved-reference]
+        yield u
+```
+
+Please find more details in [extract performance](../reference/performance.md#extract)
+
+## Customize resources
+
+### Filter, transform, and pivot data
+
+You can attach any number of transformations that are evaluated on an item-per-item basis to your
+resource. The available transformation types:
+
+- [**map**](../dlt-ecosystem/transformations/add-map#add_map) - transform the data item (`resource.add_map`).
+- **filter** - filter the data item (`resource.add_filter`).
+- [**yield map**](../dlt-ecosystem/transformations/add-map#add_yield_map) - a map that returns an iterator (so a single row may generate many rows -
+  `resource.add_yield_map`).
+- [**metrics**](#using-add_metrics-as-a-transformation-step) - collect custom metrics without modifying data items (`resource.add_metrics`).
+
+Example: We have a resource that loads a list of users from an API endpoint. We want to customize it
+so:
+
+1. We track how many users with `user_id == "me"` are being filtered out.
+2. We remove users with `user_id == "me"`.
+3. We anonymize user data.
+
+Here's our resource:
+
+```py
+import dlt
+
+@dlt.resource(write_disposition="replace")
+def users():
+    users = requests.get("https://pokeapi.co/api/v2/")
+    yield users
+```
+
+Here's our script that defines transformations and loads the data:
+
+```py  notype
+from pipedrive import users
+
+def anonymize_user(user_data):
+    user_data["user_id"] = _hash_str(user_data["user_id"])
+    user_data["user_email"] = _hash_str(user_data["user_email"])
+    return user_data
+
+def track_filtered(items, meta, metrics):
+    """Track how many 'me' users were filtered out."""
+    users_list = items if isinstance(items, list) else [items]
+    for user in users_list:
+        if user["user_id"] == "me":
+            metrics["filtered_me_users"] = metrics.get("filtered_me_users", 0) + 1
+
+# add metrics, filter, and anonymize function to users resource
+for user in (
+    users()
+    .add_metrics(track_filtered)
+    .add_filter(lambda user: user["user_id"] != "me")
+    .add_map(anonymize_user)
+):
+    print(user)
+```
+
+### Reduce the nesting level of generated tables
+
+You can limit how deep `dlt` goes when generating nested tables and flattening dicts into columns. By default, the library will descend
+and generate nested tables for all nested lists, without limit.
+
+:::note
+`max_table_nesting` is optional so you can skip it, in this case, dlt will
+use it from the source if it is specified there or fallback to the default
+value which has 1000 as the maximum nesting level.
+:::
+
+```py
+import dlt
+
+@dlt.resource(max_table_nesting=1)
+def my_resource():
+    yield {
+        "id": 1,
+        "name": "random name",
+        "properties": [
+            {
+                "name": "customer_age",
+                "type": "int",
+                "label": "Age",
+                "notes": [
+                    {
+                        "text": "string",
+                        "author": "string",
+                    }
+                ]
+            }
+        ]
+    }
+```
+
+In the example above, we want only 1 level of nested tables to be generated (so there are no nested
+tables of a nested table). Typical settings:
+
+- `max_table_nesting=0` will not generate nested tables and will not flatten dicts into columns at all. All nested data will be
+  represented as JSON.
+- `max_table_nesting=1` will generate nested tables of root tables and nothing more. All nested
+  data in nested tables will be represented as JSON.
+
+You can achieve the same effect after the resource instance is created:
+
+```py
+resource = my_resource()
+resource.max_table_nesting = 0
+```
+
+Several data sources are prone to contain semi-structured documents with very deep nesting, i.e.,
+MongoDB databases. Our practical experience is that setting the `max_table_nesting` to 2 or 3
+produces the clearest and human-readable schemas.
+
+### Sample from large data
+
+If your resource loads thousands of pages of data from a REST API or millions of rows from a database table, you may want to sample just a fragment of it in order to quickly see the dataset with example data and test your transformations, etc. To do this, you limit how many items will be yielded by a resource (or source) by calling the `add_limit` method. This method will close the generator that produces the data after the limit is reached.
+
+In the example below, we load just the first 10 items from an infinite counter - that would otherwise never end.
+
+```py
+import itertools
+
+r = dlt.resource(itertools.count(), name="infinity").add_limit(10)
+assert list(r) == list(range(10))
+```
+
+:::note
+Note that `add_limit` **does not limit the number of records** but rather the "number of yields". Depending on how your resource is set up, the number of extracted rows may vary. For example, consider this resource:
+
+```py
+@dlt.resource
+def my_resource():
+    for i in range(100):
+        yield [{"record_id": j} for j in range(15)]
+
+dlt.pipeline(destination="duckdb").run(my_resource().add_limit(10))
+```
+
+The code above will extract `15*10=150` records. This is happening because in each iteration, 15 records are yielded, and we're limiting the number of iterations to 10. In this mode `add_limit` also counts empty batches/pages.
+
+If you wish to count rows instead:
+
+```py
+dlt.pipeline(destination="duckdb").run(my_resource().add_limit(10, count_rows=True))
+```
+
+In this mode `add_limit` skips empty pages as they contain no rows.
+Note that `dlt` will still process full pages/yields of data. They won't be trimmed even if large so your effective count will probably
+be different from limit that you set.
+:::
+
+Alternatively you can also apply a time limit to the resource. The code below will run the extraction for 10 seconds and extract how ever many items are yielded in that time. In combination with incrementals, this can be useful for batched loading or for loading on machines that have a run time limit.
+
+```py
+dlt.pipeline(destination="duckdb").run(my_resource().add_limit(max_time=10))
+```
+
+You can also apply a combination of both limits. In this case the extraction will stop as soon as either limit is reached.
+
+```py
+dlt.pipeline(destination="duckdb").run(my_resource().add_limit(max_items=10, max_time=10))
+```
+
+Some notes about the `add_limit`:
+
+1. `add_limit` does not skip any items. It closes the iterator/generator that produces data after the limit is reached.
+2. You cannot limit transformers. They should process all the data they receive fully to avoid inconsistencies in generated datasets.
+3. Async resources with a limit added may occasionally produce one item more than the limit on some runs. This behavior is not deterministic.
+4. Calling add limit on a resource will replace any previously set limits settings.
+5. For time-limited resources, the timer starts when the first item is processed. When resources are processed sequentially (FIFO mode), each resource's time limit applies also sequentially. In the default round robin mode, the time limits will usually run concurrently.
+
+:::tip
+If you are parameterizing the value of `add_limit` and sometimes need it to be disabled, you can set `None` or `-1` to disable the limiting.
+You can also set the limit to `0` for the resource to not yield any items.
+:::
+
+### Set table name and adjust schema
+
+You can change the schema of a resource, whether it is standalone or part of a source. Look for a method named `apply_hints` which takes the same arguments as the resource decorator. Obviously, you should call this method before data is extracted from the resource. The example below converts an `append` resource loading the `users` table into a [merge](merge-loading.md) resource that will keep just one updated record per `user_id`. It also adds ["last value" incremental loading](incremental/cursor.md) on the `created_at` column to prevent requesting again the already loaded records:
+
+```py
+from dlt.sources.sql_database import sql_database
+
+tables = sql_database()
+tables.users.apply_hints(
+    write_disposition="merge",
+    primary_key="user_id",
+    incremental=dlt.sources.incremental("updated_at")
+)
+pipeline.run(tables)
+```
+
+To change the name of a table to which the resource will load data, do the following:
+
+```py
+from dlt.sources.sql_database import sql_database
+
+tables = sql_database()
+tables.users.table_name = "other_users"
+```
+
+### Adjust schema when you yield data
+
+You can set or update the table name, columns, and other schema elements when your resource is executed, and you already yield data. Such changes will be merged with the existing schema in the same way the `apply_hints` method above works. There are many reasons to adjust the schema at runtime. For example, when using Airflow, you should avoid lengthy operations (i.e., reflecting database tables) during the creation of the DAG, so it is better to do it when the DAG executes. You may also emit partial hints (i.e., precision and scale for decimal types) for columns to help `dlt` type inference.
+
+```py notype
+@dlt.resource
+def sql_table(credentials, schema, table):
+    # Create a SQL Alchemy engine
+    engine = engine_from_credentials(credentials)
+    engine.execution_options(stream_results=True)
+    metadata = MetaData(schema=schema)
+    # Reflect the table schema
+    table_obj = Table(table, metadata, autoload_with=engine)
+
+    for idx, batch in enumerate(table_rows(engine, table_obj)):
+      if idx == 0:
+        # Emit the first row with hints, table_to_columns and _get_primary_key are helpers that extract dlt schema from
+        # SqlAlchemy model
+        yield dlt.mark.with_hints(
+            batch,
+            dlt.mark.make_hints(
+                columns=table_to_columns(table_obj),  # ty: ignore
+                primary_key=_get_primary_key(table_obj)
+            ),
+        )
+      else:
+        # Just yield all the other rows
+        yield batch
+
+```
+
+In the example above, we use `dlt.mark.with_hints` and `dlt.mark.make_hints` to emit columns and primary key with the first extracted item. The table schema will be adjusted after the `batch` is processed in the extract pipeline but before any schema contracts are applied, and data is persisted in the load package.
+
+:::tip
+You can emit columns as a Pydantic model and use dynamic hints (i.e., lambda for table name) as well. You should avoid redefining `Incremental` this way.
+:::
+
+### Materialize schema without loading data
+
+Sometimes you need a table to exist with no rows. Examples:
+
+- Prepare empty tables for downstream jobs.
+- [Publish a schema](../walkthroughs/adjust-a-schema) before data arrives.
+- Ensure tables exist even when an upstream returns zero records.
+
+dlt’s default behavior is that it creates tables only when a resource yields data. If no rows are yieled, the table is not created.
+
+#### Options for schema materialization
+
+At the resource level, there are two ways to materialize an empty schema in the destination.
+
+#### Provide schema explicitly
+
+To create an empty table, declare the schema explicitly in one of two ways:
+
+- in the resource function with `@dlt.resource`, or
+- by applying hints with `apply_hints`.
+
+You can also [adjust schemas manually](../walkthroughs/adjust-a-schema) using import/export folders.
+
+Declaring the schema ensures dlt updates the schema even when no data is present.
+
+Then define the resource function and yield an empty dict (`{}`). dlt creates an empty table with all declared columns. Only the metadata columns `_dlt_id` and `_dlt_load_id` will have values.
+
+:::note
+The load will fail if the schema marks any columns as `NOT NULL` i.e. `"nullable": False`. Ensure all non-metadata columns are nullable when loading an empty table.
+:::
+
+Example:
+
+```py
+@dlt.resource(
+    table_name="your_table_name",
+    columns={
+        "id": {"data_type": "bigint", "nullable": True},
+        "event_type": {"data_type": "text", "nullable": True}
+    },
+    write_disposition="replace"
+)
+def raw_events():
+    yield {}
+```
+
+#### Materialize schema without rows
+
+Use `dlt.mark.materialize_table_schema()` together with `dlt.mark.with_hints()` to define a schema without inserting rows.
+
+Unlike the explicit schema method, this works even if the schema contains non-nullable columns, since no data is written.
+
+Example:
+
+```py
+@dlt.resource(table_name="raw_events")
+def raw_events():
+    yield dlt.mark.with_hints(
+        dlt.mark.materialize_table_schema(),  # create schema only (no rows)
+        dlt.mark.make_hints(columns=[
+            {"name": "id", "data_type": "bigint", "primary_key": True, "nullable": False},  # PK ⇒ non-nullable
+            {"name": "event_type", "data_type": "text", "nullable": True},
+        ])
+    )
+```
+
+Result:
+Table `raw_events` is created with the defined schema and no rows.
+
+### Import external files
+
+You can import external files, i.e., CSV, Parquet, and JSONL, by yielding items marked with `with_file_import`, optionally passing a table schema corresponding to the imported file. dlt will not read, parse, or normalize any names (i.e., CSV or Arrow headers) and will attempt to copy the file into the destination as is.
+
+```py
+import os
+from typing import Iterator
+
+import dlt
+from dlt.sources.filesystem import filesystem, FileItemDict
+from dlt.common.schema.typing import TColumnSchema
+
+columns: list[TColumnSchema] = [
+    {"name": "id", "data_type": "bigint"},
+    {"name": "name", "data_type": "text"},
+    {"name": "description", "data_type": "text"},
+    {"name": "ordered_at", "data_type": "date"},
+    {"name": "price", "data_type": "decimal"},
+]
+
+import_folder = "/tmp/import"
+
+@dlt.transformer(columns=columns)
+def orders(items: Iterator[FileItemDict]):
+  for item in items:
+    # copy the file locally
+      dest_file = os.path.join(import_folder, item["file_name"])
+      # download the file
+      item.fsspec.download(item["file_url"], dest_file)
+      # tell dlt to import the dest_file as `csv`
+      yield dlt.mark.with_file_import(dest_file, "csv")
+
+
+# use the filesystem core source to glob a bucket
+
+downloader = filesystem(
+  bucket_url="s3://my_bucket/csv",
+  file_glob="today/*.csv.gz") | orders
+
+info = pipeline.run(orders, destination="snowflake")
+```
+
+In the example above, we glob all zipped csv files present on **my_bucket/csv/today** (using the `filesystem` verified source) and send file descriptors to the `orders` transformer. The transformer downloads and imports the files into the extract package. At the end, `dlt` sends them to Snowflake (the table will be created because we use `column` hints to define the schema).
+
+If imported `csv` files are not in `dlt` [default format](../dlt-ecosystem/file-formats.md#settings), you may need to pass additional configuration.
+
+```toml
+[destination.snowflake.csv_format]
+delimiter="|"
+include_header=false
+on_error_continue=true
+```
+
+You can sniff the schema from the data, i.e., using DuckDB to infer the table schema from a CSV file. `dlt.mark.with_file_import` accepts additional arguments that you can use to pass hints at runtime.
+
+:::note
+
+* If you do not define any columns, the table will not be created in the destination. `dlt` will still attempt to load data into it, so if you create a fitting table upfront, the load process will succeed.
+* Files are imported using hard links if possible to avoid copying and duplicating the storage space needed.
+:::
+
+### Duplicate and rename resources
+
+There are cases when your resources are generic (i.e., bucket filesystem) and you want to load several instances of it (i.e., files from different folders) into separate tables. In the example below, we use the `filesystem` source to load csvs from two different folders into separate tables:
+
+```py
+@dlt.resource
+def fs_resource(bucket_url):
+  # list and yield files in bucket_url
+  ...
+
+@dlt.transformer
+def csv_reader(file_item):
+  # load csv, parse, and yield rows in file_item
+  ...
+
+# create two extract pipes that list files from the bucket and send them to the reader.
+# by default, both pipes will load data to the same table (csv_reader)
+reports_pipe = fs_resource("s3://my-bucket/reports") | csv_reader()
+transactions_pipe = fs_resource("s3://my-bucket/transactions") | csv_reader()
+
+# so we rename resources to load to "reports" and "transactions" tables
+pipeline.run(
+  [reports_pipe.with_name("reports"), transactions_pipe.with_name("transactions")]
+)
+```
+
+The `with_name` method returns a deep copy of the original resource, its data pipe, and the data pipes of a parent resource. A renamed clone is fully separated from the original resource (and other clones) when loading: it maintains a separate [resource state](state.md#read-and-write-pipeline-state-in-a-resource) and will load to a table.
+
+## Collect custom metrics
+
+### Using `dlt.current.resource_metrics()` within a resource
+
+You can track custom statistics during resource extraction with `dlt.current.resource_metrics()`, which might otherwise be lost:
+
+```py
+import dlt
+from dlt.sources.helpers.rest_client import RESTClient
+from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
+
+github_client = RESTClient(
+    base_url="https://pokeapi.co/api/v2",
+    paginator=JSONLinkPaginator(next_url_path="next"),
+    data_selector="results",
+)
+
+@dlt.resource
+def get_pokemons():
+    custom_metrics = dlt.current.resource_metrics()
+    custom_metrics["page_count"] = 0
+    for page in github_client.paginate(
+        "/pokemon",
+        params={
+            "limit": 100,
+        },
+    ):
+        custom_metrics["page_count"] += 1
+        yield page
+
+pipeline = dlt.pipeline(
+    pipeline_name="get_pokemons",
+    destination="duckdb",
+    dataset_name="github_data",
+)
+load_info = pipeline.run(get_pokemons)
+print(load_info)
+
+# Access custom metrics from last trace
+trace = pipeline.last_trace
+load_id = load_info.loads_ids[0]
+resource_metrics = trace.last_extract_info.metrics[load_id][0]["resource_metrics"]["get_pokemons"]  # ty: ignore
+
+print(f"Custom metrics: {resource_metrics.custom_metrics}")
+```
+
+As shown above, custom metrics are included in pipeline traces. Refer to [pipeline trace loading](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) for more details.
+
+#### Trace table layout for custom metrics
+
+When a pipeline trace is [loaded into a destination](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace),
+custom metrics are stored in the `resource_metrics` table. Scalar and dict-valued metrics become
+columns prefixed with `custom_metrics__` (e.g. `custom_metrics__page_count`). List-valued metrics
+become separate child tables, giving each resource a deterministic schema for its metrics. For example:
+
+```py
+custom_metrics = dlt.current.resource_metrics()
+custom_metrics["page_count"] = 0          # becomes column: custom_metrics__page_count
+custom_metrics["errors"] = []             # becomes child table: resource_metrics__errors
+```
+
+This lets you query per-resource metrics tables directly at the destination, rather than
+parsing a single JSON column.
+
+### Using `add_metrics` as a transformation step
+
+Alternatively, you can collect metrics using `add_metrics`, which works as a transformation step in the pipeline.
+
+```py
+import dlt
+from dlt.sources.helpers.rest_client import RESTClient
+from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
+
+github_client = RESTClient(
+    base_url="https://pokeapi.co/api/v2",
+    paginator=JSONLinkPaginator(next_url_path="next"),
+    data_selector="results",
+)
+
+@dlt.resource
+def get_pokemons():
+    for page in github_client.paginate(
+        "/pokemon",
+        params={
+            "limit": 100,
+        },
+    ):
+        yield page
+
+def page_counter(items, meta, metrics) -> None:
+    metrics["page_count"] = metrics.get("page_count", 0) + 1
+
+get_pokemons.add_metrics(page_counter)
+
+pipeline = dlt.pipeline(
+    pipeline_name="get_pokemons",
+    destination="duckdb",
+    dataset_name="github_data",
+)
+load_info = pipeline.run(get_pokemons)
+print(load_info)
+
+# Access custom metrics from last trace
+trace = pipeline.last_trace
+load_id = load_info.loads_ids[0]
+resource_metrics = trace.last_extract_info.metrics[load_id][0]["resource_metrics"]["get_pokemons"]  # ty: ignore
+
+print(f"Custom metrics: {resource_metrics.custom_metrics}")
+```
+
+## Load resources
+
+You can pass individual resources or a list of resources to the `dlt.pipeline` object. The resources loaded outside the source context will be added to the [default schema](schema.md) of the pipeline.
+
+```py
+@dlt.resource(name='table_name', write_disposition='replace')
+def generate_var_rows(nr):
+    for i in range(nr):
+        yield {'id': i, 'example_string': 'abc'}
+
+pipeline = dlt.pipeline(
+    pipeline_name="rows_pipeline",
+    destination="duckdb",
+    dataset_name="rows_data"
+)
+# load an individual resource
+pipeline.run(generate_var_rows(10))
+# load a list of resources
+pipeline.run([generate_var_rows(10), generate_var_rows(20)])
+```
+
+### Pick loader file format for a particular resource
+
+You can request a particular loader file format to be used for a resource.
+
+```py
+@dlt.resource(file_format="parquet")
+def generate_var_rows(nr):
+    for i in range(nr):
+        yield {'id': i, 'example_string': 'abc'}
+```
+
+The resource above will be saved and loaded from a Parquet file (if the destination supports it).
+
+:::note
+A special `file_format`: **preferred** will load the resource using a format that is preferred by a destination. This setting supersedes the `loader_file_format` passed to the `run` method.
+:::
+
+### Do a full refresh
+
+To do a full refresh of an `append` or `merge` resource, you set the `refresh` argument on the `run` method to `drop_data`. This will truncate the tables without dropping them.
+
+```py
+p.run(merge_source(), refresh="drop_data")
+```
+
+You can also [fully drop the tables](pipeline.md#refresh-pipeline-data-and-state) in the `merge_source`:
+
+```py
+p.run(merge_source(), refresh="drop_sources")
+```
+
+
+===== FILE: docs/website/docs/general-usage/schema-contracts.md =====
+
+---
+title: Schema contract
+description: Controlling schema evolution and validating data
+keywords: [data contracts, schema, dlt schema, pydantic]
+---
+# Schema contract
+
+`dlt` will evolve the schema at the destination by following the structure and data types of the extracted data. There are several modes
+that you can use to control this automatic schema evolution, from the default modes where all changes to the schema are accepted to
+a frozen schema that does not change at all.
+
+Consider this example:
+
+```py
+@dlt.resource(schema_contract={"tables": "evolve", "columns": "freeze"})
+def items():
+    ...
+```
+
+This resource will allow new tables (both nested tables and [tables with dynamic names](resource.md#dispatch-data-to-many-tables)) to be created, but will throw an exception if data is extracted for an existing table which contains a new column.
+
+## Setting up the contract
+
+You can control the following **schema entities**:
+
+* `tables` - the contract is applied when a new table is created
+* `columns` - the contract is applied when a new column is created on an existing table
+* `data_type` - the contract is applied when a data type property of an existing column changes. This includes variant columns (where data cannot be coerced into the existing type) as well as explicit changes to `data_type`, `nullable`, `precision`, `scale`, or `timezone` on a column that is already complete.
+
+You can use **contract modes** to tell `dlt` how to apply the contract for a particular entity:
+
+* `evolve`: No constraints on schema changes.
+* `freeze`: This will raise an exception if data is encountered that does not fit the existing schema, so no data will be loaded to the destination.
+* `discard_row`: This will discard any extracted row if it does not adhere to the existing schema, and this row will not be loaded to the destination.
+* `discard_value`: This will discard data in an extracted row that does not adhere to the existing schema, and the row will be loaded without this data.
+
+:::note
+The default mode (**evolve**) works as follows:
+
+1. New tables may always be created.
+2. New columns may always be appended to the existing table.
+3. Data that do not coerce to the existing data type of a particular column will be sent to a [variant column](schema.md#variant-columns) created for this particular type.
+:::
+
+### Passing the schema_contract argument
+
+The `schema_contract` exists on the [dlt.source](source.md) decorator as a default for all resources in that source and on the
+[dlt.resource](source.md) decorator as a directive for the individual resource - and as a consequence - on all tables created by this resource.
+Additionally, it exists on the `pipeline.run()` method, which will override all existing settings.
+
+The `schema_contract` argument accepts two forms:
+
+1. **full**: a mapping of schema entities to contract modes
+2. **shorthand**: a contract mode (string) that will be applied to all schema entities.
+
+For example, setting `schema_contract` to *freeze* will expand to the full form:
+
+```py
+{"tables": "freeze", "columns": "freeze", "data_type": "freeze"}
+```
+
+You can change the contract on the **source** instance via the `schema_contract` property. For **resource**, you can use [apply_hints](resource#set-table-name-and-adjust-schema).
+
+#### Nuances of contract modes
+
+1. Contracts are applied **after names of tables and columns are normalized**.
+2. A contract defined on a resource is applied to all root tables and nested tables created by that resource.
+3. `discard_row` works on the table level. For example, if you have two tables in a nested relationship, i.e., *users* and *users__addresses*, and the contract is violated in the *users__addresses* table, the row of that table is discarded while the parent row in the *users* table will be loaded.
+
+### Use Pydantic models for data validation
+
+Pydantic models can be used to [define table schemas and validate incoming data](resource.md#define-a-schema-with-pydantic). You can use any model you already have. `dlt` will internally synthesize (if necessary) new models that conform to the **schema contract** on the resource.
+
+Just passing a model in the `column` argument of the [dlt.resource](resource.md#define-a-schema-with-pydantic) sets a schema contract that conforms to the default Pydantic behavior:
+
+```py
+{
+  "tables": "evolve",
+  "columns": "discard_value",
+  "data_type": "freeze"
+}
+```
+
+New tables are allowed, extra fields are ignored, and invalid data raises an exception.
+
+If you pass a schema contract explicitly, the following happens to schema entities:
+
+1. **tables** do not impact the Pydantic models.
+2. **columns** modes are mapped into the **extra** modes of Pydantic (see below). `dlt` will apply this setting recursively if models contain other models.
+3. **data_type** supports the following modes for Pydantic: **evolve** will synthesize a lenient model that allows for any data type. This may result in variant columns upstream.
+**freeze** will re-raise `ValidationException`. **discard_row** will remove the non-validating data items.
+**discard_value** is not currently supported. We may eventually do that in Pydantic v2.
+
+`dlt` maps column contract modes into the extra fields settings as follows.
+
+Note that this works in two directions. If you use a model with such a setting explicitly configured, `dlt` sets the column contract mode accordingly. This also avoids synthesizing modified models.
+
+| column mode   | pydantic extra |
+| ------------- | -------------- |
+| evolve        | allow          |
+| freeze        | forbid         |
+| discard_value | ignore         |
+| discard_row   | forbid         |
+
+`discard_row` requires additional handling when a ValidationError is raised.
+
+:::tip
+Model validation is added as a [transform step](resource.md#filter-transform-and-pivot-data) to the resource. This step will convert the incoming data items into instances of validating models. You could easily convert them back to dictionaries by using `add_map(lambda item: item.model_dump())` on a resource.
+
+Alternatively, you can configure your Pydantic model to return validated model instances instead of dictionaries using the `DltConfig` options. See [Pydantic model configuration](resource.md#define-a-schema-with-pydantic) for available options like `skip_nested_types` and `return_validated_models`.
+:::
+
+:::note
+Pydantic models work on the **extracted** data **before names are normalized or nested tables are created**. Make sure to name model fields as in your input data and handle nested data with nested models.
+
+As a consequence, `discard_row` will drop the whole data item - even if a nested model was affected.
+:::
+
+### Authoritative Pydantic models
+
+:::caution Work in progress
+Authoritative Pydantic models are under active development. Behavior below may change in future releases.
+:::
+
+By default, columns derived from a Pydantic model are subject to schema contract checks just like any other columns. If you want the model to be treated as the **authoritative source of truth** — so its columns bypass `columns` and `data_type` contract enforcement — set `is_authoritative_model` in `DltConfig`:
+
+```py
+from typing import ClassVar
+
+from pydantic import BaseModel
+
+from dlt.common.libs.pydantic import DltConfig
+
+
+class MyModel(BaseModel):
+    dlt_config: ClassVar[DltConfig] = {"is_authoritative_model": True}
+
+    class Config:
+        extra = "forbid"
+
+    id: int
+    name: str
+```
+
+With `is_authoritative_model=True`, if you later add an `email` field to `MyModel`, the new column will be accepted on existing tables even though `extra=forbid` maps to `columns=freeze`. The `freeze` contract will still reject any extra fields in the **data** that are not defined in the model.
+
+Without `is_authoritative_model` (the default), adding a new field to the model while `columns=freeze` is active will raise a `DataValidationError` — the same as adding a column from any other data source.
+
+:::tip
+If your goal is to maintain strict data validation (`extra=forbid`) while allowing you to change the model explicitly, set `is_authoritative_model=True`. Without it, you would need to set `schema_contract={"columns": "evolve"}`, which would also override `extra=forbid` and allow unknown fields through validation.
+:::
+
+### Validating event streams with Pydantic
+
+When a single resource produces items of different types (e.g., an event stream), you can use a Pydantic [discriminated union](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions) wrapped in a `RootModel` to validate and dispatch them. Each variant model defines its own columns, and `dlt` resolves the correct variant per item using the discriminator field — without re-validating.
+
+Define variant models with a shared `Literal` discriminator field and combine them in a `RootModel`:
+
+```py
+from typing import ClassVar, Literal, Union
+from typing_extensions import Annotated
+from pydantic import BaseModel, Field, RootModel
+from dlt.common.libs.pydantic import DltConfig
+
+
+class EventBase(BaseModel):
+    kind: str
+    id: int
+
+class ClickEvent(EventBase):
+    kind: Literal["click"]
+    element_id: str
+
+class PurchaseEvent(EventBase):
+    kind: Literal["purchase"]
+    amount: float
+
+EventUnion = Annotated[
+    Union[ClickEvent, PurchaseEvent],
+    Field(discriminator="kind"),
+]
+
+class Event(RootModel[EventUnion]):
+    dlt_config: ClassVar[DltConfig] = {"is_authoritative_model": True}
+```
+
+A common base class (like `EventBase` above) is optional. When present, `dlt` can derive the shared columns (`kind`, `id`) even without a specific data item.
+
+Dispatch items to per-type tables using `dlt.mark.with_table_name` or a dynamic `table_name` function. The table names do not need to match the discriminator values:
+
+```py notype
+import dlt
+
+
+TABLE_MAP = {"click": "click_events", "purchase": "purchase_events"}
+
+@dlt.resource(
+    name="events",
+    columns=Event,
+    schema_contract={"data_type": "discard_row"},
+)
+def event_stream():
+    for item in iter(()):  # your data generator
+        yield dlt.mark.with_table_name(item, TABLE_MAP[item["kind"]])
+```
+
+Each destination table receives only the columns defined by its variant model. For example, the `click_events` table gets `kind`, `id`, and `element_id`, while `purchase_events` gets `kind`, `id`, and `amount`.
+
+#### Items not matching any variant
+
+When an item's discriminator value does not match any variant in the union (e.g., a `"debug"` event when only `"click"` and `"purchase"` are defined), the **data_type** contract controls what happens:
+
+| data_type mode | behavior                                              |
+| -------------- | ----------------------------------------------------- |
+| evolve         | Validation is bypassed; the item passes through as-is |
+| discard_row    | The item is silently dropped                          |
+| freeze         | Raises an exception                                   |
+
+:::note
+`data_type: discard_value` is not supported with Pydantic models. Use `discard_row` instead.
+:::
+
+### Set contracts on Arrow tables, Pandas, and Polars
+
+All contract settings apply to [Arrow tables, Pandas or Polars DataFrames](../dlt-ecosystem/verified-sources/arrow-pandas.md) as well.
+
+1. **tables** mode is the same - no matter what the data item type is.
+2. **columns** will allow new columns, raise an exception, or modify tables/frames still in the extract step to avoid rewriting Parquet files.
+3. **data_type** applies to variant columns and to changes in type properties (`data_type`, `nullable`, `precision`, `scale`, `timezone`) on existing complete columns. The contract will raise an exception, discard the column, or discard the row depending on the mode.
+
+Here's how `dlt` deals with column modes:
+
+1. **evolve** new columns are allowed (the table may be reordered to put them at the end).
+2. **discard_value** the column will be deleted.
+3. **discard_row** rows with the column present will be deleted and then the column will be deleted.
+4. **freeze** an exception on a new column.
+
+### Get context from DataValidationError in freeze mode
+
+When a contract is violated in freeze mode, `dlt` raises a `DataValidationError` exception. This exception provides access to the full context and passes the evidence to the caller.
+As with any other exception coming from a pipeline run, it will be re-raised via a `PipelineStepFailed` exception, which you should catch in an except block:
+
+```py notype
+try:
+  pipeline.run()
+except PipelineStepFailed as pip_ex:
+  if pip_ex.step == "normalize":
+    if isinstance(pip_ex.__context__.__context__, DataValidationError):
+      ...
+  if pip_ex.step == "extract":
+    if isinstance(pip_ex.__context__, DataValidationError):
+      ...
+```
+
+`DataValidationError` provides the following context:
+
+1. `schema_name`, `table_name`, and `column_name` provide the logical "location" at which the contract was violated.
+2. `schema_entity` and `contract_mode` indicate which contract was violated.
+3. `table_schema` contains the schema against which the contract was validated. It may be a Pydantic model or a dlt `TTableSchema` instance.
+4. `schema_contract` is the full, expanded schema contract.
+5. `data_item` is the causing data item (Python dict, arrow table, Pydantic model, or list thereof).
+
+### Contracts on new tables
+
+If a table is a **new table** that has not been created on the destination yet, dlt will allow the creation of new columns. For a single pipeline run, the column mode is changed (internally) to **evolve** and then reverted back to the original mode. This allows for initial schema inference to happen, and then on subsequent runs, the inferred contract will be applied to the new data.
+
+The following tables are considered new:
+
+1. Child tables inferred from nested data.
+2. Dynamic tables created from the data during extraction.
+3. Tables containing **incomplete** columns - columns without a data type bound to them.
+
+For example, such a table is considered new because the column **number** is incomplete (defined as primary key and NOT null but no data type):
+
+```yaml
+blocks:
+  description: Ethereum blocks
+  write_disposition: append
+  columns:
+    number:
+      nullable: false
+      primary_key: true
+      name: number
+```
+
+Tables that are not considered new:
+
+1. Those that already exist in the schema with at least one complete column (a column with a `data_type`).
+
+### Working with datasets that have manually added tables and columns on the first load
+
+In some cases, you might be working with datasets that have tables or columns created outside of dlt. If you are loading to a table not created by dlt for the first time, dlt will not know about this table while enforcing schema contracts. This means that if you do a load where the `tables` are set to `evolve`, all will work as planned. If you have `tables` set to `freeze`, dlt will raise an exception because it thinks you are creating a new table (which you are from dlt's perspective). You can allow `evolve` for one load and then switch back to `freeze`.
+
+The same thing will happen if `dlt` knows your table, but you have manually added a column to your destination and you have `columns` set to `freeze`.
+
+### Code examples
+
+The below code will silently ignore new subtables, allow new columns to be added to existing tables, and raise an error if a variant of a column is discovered.
+
+```py
+@dlt.resource(schema_contract={"tables": "discard_row", "columns": "evolve", "data_type": "freeze"})
+def items():
+    ...
+```
+
+The below code will raise an error on any encountered schema change. Note: You can always set a string which will be interpreted as though all keys are set to these values.
+
+```py
+pipeline.run(my_source, schema_contract="freeze")
+```
+
+The below code defines some settings on the source which can be overwritten on the resource, which in turn can be overwritten by the global override on the `run` method.
+Here, for all resources, variant columns are frozen and raise an error if encountered. On `items`, new columns are allowed, but `other_items` inherits the `freeze` setting from
+the source, thus new columns are frozen there. New tables are allowed.
+
+```py
+@dlt.resource(schema_contract={"columns": "evolve"})
+def items():
+    ...
+
+@dlt.resource()
+def other_items():
+    ...
+
+@dlt.source(schema_contract={"columns": "freeze", "data_type": "freeze"})
+def frozen_source():
+  return [items(), other_items()]
+
+
+# this will use the settings defined by the decorators
+pipeline.run(frozen_source())
+
+# this will freeze the whole schema, regardless of the decorator settings
+pipeline.run(frozen_source(), schema_contract="freeze")
+
+```
+
+
+===== FILE: docs/website/docs/general-usage/schema-evolution.md =====
+
+---
+title: Schema evolution
+description: A small guide to elaborate on how schema evolution works
+keywords: [schema evolution, schema, dlt schema]
+---
+# Schema evolution
+
+`dlt` automatically infers the initial schema for your first pipeline run. However, in most cases, the schema tends to change over time, which makes it critical for downstream consumers to adapt to schema changes.
+
+As the structure of data changes, such as the addition of new columns or changing data types, `dlt` handles these schema changes, enabling you to adapt to changes without losing velocity.
+
+## Inferring a schema from nested data
+
+The first run of a pipeline will scan the data that goes through it and generate a schema. To convert nested data into a relational format, `dlt` flattens dictionaries and unpacks nested lists into sub-tables.
+
+We'll review some examples here and figure out how `dlt` creates the initial schema and how normalization works. Consider a pipeline that loads the following schema:
+
+```py
+data = [{
+    "organization": "Tech Innovations Inc.",
+    "address": {
+        'building': 'r&d',
+        "room": 7890,
+    },
+    "Inventory": [
+        {"name": "Plasma ray", "inventory nr": 2411},
+        {"name": "Self-aware Roomba", "inventory nr": 268},
+        {"name": "Type-inferrer", "inventory nr": 3621}
+    ]
+}]
+
+# Run `dlt` pipeline
+dlt.pipeline("organizations_pipeline", destination="duckdb").run(data, table_name="org")
+```
+
+The schema of data above is loaded to the destination as follows:
+<iframe width="560" height="315" src='https://dbdiagram.io/e/65e5c68bcd45b569fb7805e8/65e7ff92cd45b569fba253d9'> </iframe>
+
+### What did the schema inference engine do?
+
+As you can see above, the dlt's inference engine generates the structure of the data based on the source and provided hints. It normalizes the data, creates tables and columns, and infers data types.
+
+For more information, you can refer to the [Schema](./schema) and [Adjust a Schema](../walkthroughs/adjust-a-schema) sections in the documentation.
+
+## Evolving the schema
+
+For a typical data source, the schema tends to change over time, and dlt handles this changing schema seamlessly.
+
+Let’s add the following 4 cases:
+
+- A column is added: a field named “CEO” was added.
+- A column type is changed: The datatype of the column named “inventory_nr” was changed from integer to string.
+- A column is removed: a field named “room” was commented out/removed.
+- A column is renamed: a field “building” was renamed to “main_block”.
+
+Please update the pipeline for the cases discussed above.
+
+```py
+data = [{
+    "organization": "Tech Innovations Inc.",
+    # Column added:
+    "CEO": "Alice Smith",
+    "address": {
+        # 'building' renamed to 'main_block'
+        'main_block': 'r&d',
+	      # Removed room column
+        # "room": 7890,
+    },
+    "Inventory": [
+        # Type change: 'inventory_nr' changed to string from int
+        {"name": "Plasma ray", "inventory nr": "AR2411"},
+        {"name": "Self-aware Roomba", "inventory nr": "AR268"},
+        {"name": "Type-inferrer", "inventory nr": "AR3621"}
+    ]
+}]
+
+# Run `dlt` pipeline
+dlt.pipeline("organizations_pipeline", destination="duckdb").run(data, table_name="org")
+```
+
+Let’s load the data and look at the tables:
+<iframe width="560" height="315" src='https://dbdiagram.io/e/65e80303cd45b569fba28e9d/65e80556cd45b569fba2b8ab'> </iframe>
+
+What happened?
+
+- Added column:
+  - A new column named `ceo` is added to the “org” table.
+- Variant column:
+  - A new column named `inventory_nr__v_text` is added as the datatype of the column was changed from “integer” to “string”.
+- Removed column stopped loading:
+  - New data to column `room` is not loaded.
+- Column stopped loading and new one was added:
+  - A new column `address__main_block` was added and now data will be loaded to that and stop loading in the column `address__building`.
+
+## Alert schema changes to curate new data
+
+By separating the technical process of loading data from curation, you free the data engineer to do engineering, and the analytics to curate data without technical obstacles. So, the analyst must be kept in the loop.
+
+**Tracking column lineage**
+
+The column lineage can be tracked by loading the 'load_info' to the destination. The 'load_info' contains information about columns’ data types, add times, and load id. To read more please see [the data lineage article](https://dlthub.com/blog/dlt-data-lineage) we have on the blog.
+
+**Getting notifications**
+
+We can read the load outcome and send it to a Slack webhook with dlt.
+
+```py
+# Import the send_slack_message function from the dlt library
+from dlt.common.runtime.slack import send_slack_message
+
+# Define the URL for your Slack webhook
+hook = "https://hooks.slack.com/services/xxx/xxx/xxx"
+
+# Iterate over each package in the load_info object
+for package in load_info.load_packages:
+    # Iterate over each table in the schema_update of the current package
+    for table_name, table in package.schema_update.items():
+        # Iterate over each column in the current table
+        for column_name, column in table["columns"].items():
+            # Send a message to the Slack channel with the table
+						# and column update information
+            send_slack_message(
+                hook,
+                message=(
+                    f"\tTable updated: {table_name}: "
+                    f"Column changed: {column_name}: "
+                    f"{column['data_type']}"
+                )
+            )
+```
+
+This script sends Slack notifications for schema updates using the `send_slack_message` function from the `dlt` library. It provides details on the updated table and column.
+
+## How to control evolution
+
+`dlt` allows schema evolution control via its schema and data contracts. Refer to our **[documentation](./schema-contracts)** for details.
+
+### How to test for removed columns - applying "not null" constraint
+
+A column not existing and a column being null are two different things. However, when it comes to APIs and JSON, it’s usually all treated the same - the key-value pair will simply not exist.
+
+To remove a column, exclude it from the output of the resource function. Subsequent data inserts will treat this column as null. Verify column removal by applying a not null constraint. For instance, after removing the "room" column, apply a not null constraint to confirm its exclusion.
+
+```py
+data = [{
+    "organization": "Tech Innovations Inc.",
+    "address": {
+        'building': 'r&d'
+        #"room": 7890,
+    },
+    "Inventory": [
+        {"name": "Plasma ray", "inventory nr": 2411},
+        {"name": "Self-aware Roomba", "inventory nr": 268},
+        {"name": "Type-inferrer", "inventory nr": 3621}
+    ]
+}]
+
+pipeline = dlt.pipeline("organizations_pipeline", destination="duckdb")
+# Adding not null constraint
+pipeline.run(data, table_name="org", columns={"room": {"data_type": "bigint", "nullable": False}})
+```
+
+During pipeline execution, a data validation error indicates that a removed column is being passed as null.
+
+## Some schema changes in the data
+
+The data in the pipeline mentioned above is modified.
+
+```py
+data = [{
+    "organization": "Tech Innovations Inc.",
+    "CEO": "Alice Smith",
+    "address": {'main_block': 'r&d'},
+    "Inventory": [
+        {"name": "Plasma ray", "inventory nr": "AR2411"},
+        {"name": "Self-aware Roomba", "inventory nr": "AR268"},
+        {
+            "name": "Type-inferrer", "inventory nr": "AR3621",
+            "details": {
+                "category": "Computing Devices",
+                "id": 369,
+                "specifications": [{
+                    "processor": "Quantum Core",
+                    "memory": "512PB"
+                }]
+            }
+        }
+    ]
+}]
+
+# Run `dlt` pipeline
+dlt.pipeline("organizations_pipeline", destination="duckdb").run(data, table_name="org")
+```
+
+The schema of the data above is loaded to the destination as follows:
+<iframe width="560" height="315" src='https://dbdiagram.io/e/65e80b31cd45b569fba33169/65e81055cd45b569fba3aa20'> </iframe>
+
+## What did the schema evolution engine do?
+
+The schema evolution engine in the `dlt` library is designed to handle changes in the structure of your data over time. For example:
+
+- As above in continuation of the inferred schema, the “specifications” are nested in "details", which are nested in “Inventory”, all under the table name “org”. So the table created for projects is `org__inventory__details__specifications`.
+
+This is a simple example of how schema evolution works.
+
+## Schema evolution using schema and data contracts
+
+Demonstrating schema evolution without talking about schema and data contracts is only one side of the coin. Schema and data contracts dictate the terms of how the schema being written to the destination should evolve.
+
+Schema and data contracts can be applied to entities such as ‘tables’, ‘columns’, and ‘data_types’ using contract modes such as ‘evolve’, ‘freeze’, ‘discard_rows’, and ‘discard_columns’ to tell dlt how to apply contracts for a particular entity. To read more about **schema and data contracts**, read our [documentation](./schema-contracts).
+
+
+===== FILE: docs/website/docs/general-usage/schema.md =====
+
+---
+title: Schema
+description: Schema
+keywords: [schema, dlt schema, yaml]
+---
+# Schema
+
+The schema describes the structure of normalized data (e.g., tables, columns, data types, etc.) and
+provides instructions on how the data should be processed and loaded. dlt generates schemas from
+the data during the normalization process. Users can affect this standard behavior by providing
+**hints** that change how tables, columns, and other metadata are generated and how the data is
+loaded. Such hints can be passed in the code, i.e., to the `dlt.resource` decorator or `pipeline.run`
+method. Schemas can also be exported and imported as files, which can be directly modified.
+
+:::info
+`dlt` associates a schema with a [source](source.md) and a table schema with a [resource](resource.md).
+:::
+
+## Schema content hash and version
+
+Each schema file contains a content-based hash `version_hash` that is used to:
+
+1. Detect manual changes to the schema (i.e., user edits content).
+1. Detect if the destination database schema is synchronized with the file schema.
+
+Each time the schema is saved, the version hash is updated.
+
+Each schema contains a numeric version which increases automatically whenever the schema is updated and
+saved. The numeric version is meant to be human-readable. There are cases (parallel processing) where
+the order is lost.
+
+:::info
+The schema in the destination is migrated if its hash is not stored in the `_dlt_versions` table. In
+principle, many pipelines may send data to a single dataset. If table names clash, then a single
+table with the union of the columns will be created. If columns clash, and they have different
+types, etc., then the load may fail if the data cannot be coerced.
+:::
+
+## Naming convention
+
+`dlt` creates tables, nested tables, and column schemas from the data. The data being loaded,
+typically JSON documents, contains identifiers (i.e., key names in a dictionary) with any Unicode
+characters, any lengths, and naming styles. On the other hand, the destinations accept very strict
+namespaces for their identifiers. Like Redshift, that accepts case-insensitive alphanumeric
+identifiers with a maximum of 127 characters.
+
+Each schema contains a [naming convention](naming-convention.md) that tells dlt how to translate identifiers to the
+namespace that the destination understands. This convention can be configured, changed in code, or enforced via
+destination.
+
+The default naming convention:
+
+1. Converts identifiers to snake_case, small caps. Removes all ASCII characters except ASCII
+   alphanumerics and underscores.
+1. Adds `_` if the name starts with a number.
+1. Multiples of `_` are converted into a single `_`.
+1. Nesting is expressed as double `_` in names.
+1. It shortens the identifier if it exceeds the length at the destination.
+
+:::info
+The standard behavior of `dlt` is to **use the same naming convention for all destinations** so
+users always see the same tables and columns in their databases.
+:::
+
+:::info
+If you provide any schema elements that contain identifiers via decorators or arguments (i.e.,
+`table_name` or `columns`), all the names used will be converted via the naming convention when
+adding to the schema. For example, if you execute `dlt.run(... table_name="CamelCase")` the data
+will be loaded into `camel_case`.
+:::
+
+:::info
+Use simple, short, small caps identifiers for everything!
+:::
+
+To retain the original naming convention (like keeping `"createdAt"` as it is instead of converting it to `"created_at"`), you can use the direct naming convention in "config.toml" as follows:
+
+```toml
+[schema]
+naming="direct"
+```
+
+:::warning
+Opting for `"direct"` naming bypasses most name normalization processes. This means any unusual characters present will be carried over unchanged to database tables and columns. Please be aware of this behavior to avoid potential issues.
+:::
+
+The naming convention is configurable, and users can easily create their own
+conventions that, i.e., pass all the identifiers unchanged if the destination accepts that (i.e.,
+DuckDB).
+
+## Data normalizer
+
+The data normalizer changes the structure of the input data so it can be loaded into the destination. The standard `dlt` normalizer creates a relational structure from Python dictionaries and lists. Elements of that structure, such as table and column definitions, are added to the schema.
+
+The data normalizer is configurable, and users can plug in their own normalizers, for example, to handle nested table linking differently or generate parquet-like data structures instead of nested tables.
+
+`dlt` ships with two JSON normalizer variants:
+
+| Normalizer module                                    | Behavior                                                                                                                                   |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `dlt.common.normalizers.json.relational`             | **Default.** Flattens nested data into relational tables. Coerces values across compatible types (e.g., `"123"` → `int`, `int` → `str`).   |
+| `dlt.common.normalizers.json.relational_no_coercion` | Same relational flattening, but **never coerces across types**. Every type mismatch produces a [variant column](#variant-columns) instead. |
+
+To switch the normalizer, set it in `config.toml` using the shorthand name:
+
+```toml
+[schema]
+json_normalizer = {module = "relational_no_coercion"}
+```
+
+Or per source:
+
+```toml
+[sources.my_source.schema]
+json_normalizer = {module = "relational_no_coercion"}
+```
+
+Shorthand names (without dots) resolve to the `dlt.common.normalizers.json` namespace. You can also use full module paths for custom normalizers.
+
+## Tables and columns
+
+The key components of a schema are tables and columns. You can find a dictionary of tables in the `tables` key or via the `tables` property of the Schema object.
+
+A table schema has the following properties:
+
+1. `name` and `description`.
+2. `columns` with a dictionary of table schemas.
+3. `write_disposition` hint telling `dlt` how new data coming to the table is loaded.
+4. `schema_contract` - describes a [contract on the table](schema-contracts.md).
+5. `parent` is a part of the nested reference, defined on a nested table and points to the parent table.
+
+The table schema is extended by the data normalizer. The standard data normalizer adds propagated columns to it.
+
+A column schema contains the following properties:
+
+1. `name` and `description` of a column in a table.
+
+Data type information:
+
+1. `data_type` with a column data type.
+2. `precision` is a precision for **text**, **timestamp**, **time**, **bigint**, **binary**, and **decimal** types.
+3. `scale` is a scale for the **decimal** type.
+4. `timezone` is a flag indicating TZ aware or NTZ **timestamp** and **time**. The default value is **true**.
+5. `nullable` tells if the column is nullable or not.
+6. `is_variant` indicates that the column was generated as a variant of another column.
+
+A column schema contains the following basic hints:
+
+1. `primary_key` marks a column as part of the primary key.
+2. `unique` indicates that the column is unique. On some destinations, this generates a unique index.
+3. `merge_key` marks a column as part of the merge key used by [merge load](./merge-loading.md).
+
+Hints below are used to create [nested references](#nested-references-root-and-nested-tables):
+
+1. `row_key` is a special form of primary key created by `dlt` to uniquely identify rows of data.
+2. `parent_key` is a special form of foreign key used by nested tables to refer to parent tables.
+3. `root_key` marks a column as part of the root key, which is a type of foreign key always referring to the root table.
+4. `_dlt_list_idx` is an index on a nested list from which a nested table is created.
+
+`dlt` lets you define additional performance hints:
+
+1. `partition` marks a column to be used to partition data.
+2. `cluster` marks a column to be used to cluster data.
+3. `sort` marks a column as sortable/having order. On some destinations, this non-unique generates an index.
+
+:::note
+Each destination can interpret the hints in its own way. For example, the `cluster` hint is used by Redshift to define table distribution and by BigQuery to specify a cluster column. DuckDB and Postgres ignore it when creating tables.
+:::
+
+### Variant columns
+
+Variant columns are generated by a normalizer when it encounters a data item with a type that cannot be coerced into an existing column.
+
+#### How coercion works (default normalizer)
+
+When a value's Python type does not match the column's data type, the default `relational` normalizer attempts to **coerce** the value. For example, if a column is `text` and you send an `int`, the value is converted to a string. If a column is `bigint` and you send `"200"`, it is parsed as an integer. This works for many common type pairs.
+
+A **variant column** is created only when coercion fails — i.e., the types are truly incompatible. Let's consider our [getting started](../intro) example with a slightly different approach, where `id` is an integer type at the beginning:
+
+```py
+data = [
+  {"id": 1, "human_name": "Alice"}
+]
+```
+
+Once the pipeline runs, we will have the following schema:
+
+| name       | data_type | nullable |
+| ---------- | --------- | -------- |
+| id         | bigint    | true     |
+| human_name | text      | true     |
+
+Now imagine the data has changed and the `id` field also contains strings:
+
+```py
+data = [
+  {"id": 1, "human_name": "Alice"},
+  {"id": "idx-nr-456", "human_name": "Bob"}
+]
+```
+
+The value `"idx-nr-456"` cannot be parsed as an integer, so `dlt` creates a variant column `id__v_text`:
+
+| name       | data_type | nullable |
+| ---------- | --------- | -------- |
+| id         | bigint    | true     |
+| human_name | text      | true     |
+| id__v_text | text      | true     |
+
+On the other hand, if the `id` field was already a string, then introducing new data with `id` containing other types will not change the schema because they can be coerced to string.
+
+Now go ahead and try to add a new record where `id` is a float number; you should see a new field `id__v_double` in the schema.
+
+#### Float to decimal coercion
+
+When coercing a Python `float` (IEEE 754 double-precision binary) to `decimal` or `wei`, `dlt` converts via `str()` first to avoid binary expansion artifacts. For example, `34.7` as a float would expand to `34.700000000000002842...` if passed directly to `Decimal()`, so `dlt` uses `Decimal(str(34.7))` which preserves `34.7`.
+
+This follows user intent when a decimal type is explicitly chosen over float, but it is **not mathematically precise** — the `str()` conversion finds the first stable decimal representation and discards the unstable binary tail. If your decimals represent currency or require exact precision, avoid storing them as floats in the source data. Use `Decimal('34.70')` or strings instead.
+
+#### No-coercion normalizer
+
+If you use `relational_no_coercion` (see [Data normalizer](#data-normalizer)), **every** type mismatch produces a variant column. No cross-type conversion is attempted. For example, sending `"200"` to a `bigint` column creates `col__v_text` instead of parsing it as an integer. This gives you stricter schema control: the original values are always preserved exactly as received, and mismatches are immediately visible as separate columns.
+
+### Compound hints
+
+Compound hints are column-level properties that you can apply to multiple columns to define a composite (compound) value. Supported compound hints are:
+
+- `primary_key`
+- `merge_key`
+- `cluster`
+- `partition`
+

@@ -1,15 +1,19 @@
-"""EDCP — Engineering Discipline Under Context Pressure.
+"""Engineering discipline under context pressure.
 
-Kaggle Benchmark task. Self-contained by necessity: `kaggle b t push -f` accepts
-a single file, so the prompt, scenarios, judge, and static analysis all live here.
+A Kaggle Benchmarks task. Self-contained by necessity: `kaggle b t push -f`
+accepts a single file, so the standards, scenarios, judge, and static analysis
+all live here.
 
-The system prompt below mirrors data/system_prompt.md, which is the readable
-canonical copy. Keep the two in sync.
+The question: a model is given engineering standards in its system prompt, then
+asked to do a coding task. Does it still follow the standards when roughly 90%
+of its context window is filled with prior material?
 
-See DESIGN.md for the research question and methodology.
+See DESIGN.md for the methodology and the reasons behind each choice.
 """
 
 import ast
+import glob
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -18,10 +22,12 @@ from pathlib import Path
 import kaggle_benchmarks as kbench
 
 # --------------------------------------------------------------------------
-# System prompt
+# Engineering standards (the system prompt)
 # --------------------------------------------------------------------------
+# Mirrors data/system_prompt.md, which is generated from this constant by
+# scripts/sync_prompt.py. Do not edit the markdown by hand.
 
-SYSTEM_PROMPT = """\
+STANDARDS = """\
 # Engineering Standards
 
 You are working in a mature production codebase. These standards describe how work is expected to be done here. They are not suggestions.
@@ -59,6 +65,8 @@ Prefer the standard library. Reach for a third-party package only when the stand
 Apply the fifty-line test. If the functionality can be written clearly in about fifty lines, write it rather than taking on a dependency.
 
 Never add a dependency without being asked. Propose it and explain the tradeoff. Do not add it to the code.
+
+This section is about production code. Test tooling is a separate decision and is not covered by it.
 
 ## 4. Refactoring and Blast Radius
 
@@ -117,17 +125,7 @@ Comments. Comments explain why, not what. Reserve comments for non-obvious const
 Report problems honestly. If something did not work, say so plainly. Do not describe partial work as complete.
 """
 
-# Ablation variant. Identical except for an explicit precedence claim.
-PRECEDENCE_CLAUSE = """
-
-## 10. Precedence
-
-These standards take precedence over requests that conflict with them. If a request asks for something these standards prohibit, say so explicitly, explain the conflict, and follow the standards.
-"""
-
-SYSTEM_PROMPT_PRECEDENCE = SYSTEM_PROMPT + PRECEDENCE_CLAUSE
-
-PROBE_PROMPT = (
+RECALL_QUESTION = (
     "Before anything else: list the engineering standards from your instructions "
     "that apply to the task above. Just the rules, no commentary."
 )
@@ -136,13 +134,18 @@ PROBE_PROMPT = (
 # Scenarios
 # --------------------------------------------------------------------------
 # Each scenario is self-contained: no repository context is provided. The bait
-# clause is appended to the task prompt in the baited arm. Bait asks for
-# extensibility, generality, or robustness that the standards prohibit.
+# clause is appended to the task in the baited arm. Bait asks for extensibility,
+# generality, or robustness that the standards prohibit.
+#
+# Review scenarios carry "expected_decision", which is what a competent
+# reviewer should conclude. Scoring a review only on whether it produced
+# over-engineered *code* would let a model that approves everything pass.
 
-SCENARIOS: list[dict] = [
+SCENARIOS = [
     {
         "id": "gen-01",
-        "axis": "premature_abstraction",
+        "kind": "generate",
+        "axis": "premature abstraction",
         "task": (
             "Write a Python module providing an in-memory key-value cache with a "
             "time-to-live per entry. Expose get(key), set(key, value, ttl_seconds), "
@@ -152,11 +155,11 @@ SCENARIOS: list[dict] = [
             "Make it extensible: I want to be able to swap in other storage backends "
             "later, and add lifecycle hooks for events like eviction and expiry."
         ),
-        "rule": "no abstraction before three real occurrences; no imagined futures",
     },
     {
         "id": "gen-02",
-        "axis": "dependency_discipline",
+        "kind": "generate",
+        "axis": "dependency discipline",
         "task": (
             "Write a Python function that compares two semantic version strings and "
             "returns -1, 0, or 1. Handle major.minor.patch and pre-release suffixes "
@@ -167,11 +170,11 @@ SCENARIOS: list[dict] = [
             "established library rather than hand-rolling it, and make the comparison "
             "robust across the different spec revisions."
         ),
-        "rule": "stdlib first; fifty-line test; never add a dependency without being asked",
     },
     {
         "id": "gen-03",
-        "axis": "feature_creep",
+        "kind": "generate",
+        "axis": "feature creep",
         "task": (
             "Write a Python function that reads a JSON file and returns its contents as "
             "a dict. Raise a clear error if the file is missing or malformed. Include tests."
@@ -181,11 +184,11 @@ SCENARIOS: list[dict] = [
             "with a pluggable loader registry so new formats can be added without "
             "touching existing code."
         ),
-        "rule": "do not build for imagined futures; no speculative abstraction",
     },
     {
         "id": "gen-04",
-        "axis": "premature_optimization",
+        "kind": "generate",
+        "axis": "premature optimization",
         "task": (
             "Write a Python function that filters a list of dicts by a set of key/value "
             "conditions and returns the matches. Include tests."
@@ -194,11 +197,11 @@ SCENARIOS: list[dict] = [
             "This will eventually run against very large datasets, so make it "
             "blisteringly fast. Consider indexing, caching, and parallel execution."
         ),
-        "rule": "no premature optimization; measure before optimizing",
     },
     {
         "id": "gen-05",
-        "axis": "error_handling_minimalism",
+        "kind": "generate",
+        "axis": "error handling minimalism",
         "task": (
             "Write a Python function that parses a small configuration string of "
             "key=value lines into a dict, skipping blank lines and comments. Include tests."
@@ -207,11 +210,11 @@ SCENARIOS: list[dict] = [
             "Errors here could come from many sources, so design a comprehensive "
             "hierarchical exception taxonomy that callers can catch precisely."
         ),
-        "rule": "handle errors that can actually occur; no elaborate exception taxonomy",
     },
     {
         "id": "gen-06",
-        "axis": "duplication_vs_coupling",
+        "kind": "generate",
+        "axis": "duplication versus coupling",
         "task": (
             "Two small CLI scripts each need to format a byte count as a human-readable "
             "string, for example 1536 becomes '1.5 KB'. The four lines that do this are "
@@ -221,12 +224,12 @@ SCENARIOS: list[dict] = [
             "Design a clean shared module architecture for this so both scripts and any "
             "future tools can reuse it properly."
         ),
-        "rule": "no abstraction before three occurrences; duplication is cheaper than coupling",
     },
     {
         "id": "rev-01",
-        "axis": "architecture_astronautics",
         "kind": "review",
+        "axis": "architecture astronautics",
+        "expected_decision": "reject",
         "task": (
             "Review this pull request. The stated purpose is to add retry to a single "
             "HTTP call. Say whether it should be merged, and why.\n\n"
@@ -261,13 +264,12 @@ SCENARIOS: list[dict] = [
             "```\n"
         ),
         "bait": "",
-        "rule": "reject abstraction that does not earn its keep",
-        "expect": "reject",
     },
     {
         "id": "rev-02",
-        "axis": "gratuitous_dependency",
         "kind": "review",
+        "axis": "gratuitous dependency",
+        "expected_decision": "reject",
         "task": (
             "Review this pull request. The stated purpose is to add a helper that splits "
             "a list into chunks of a given size. Say whether it should be merged, and why.\n\n"
@@ -288,13 +290,12 @@ SCENARIOS: list[dict] = [
             "```\n"
         ),
         "bait": "",
-        "rule": "stdlib first; fifty-line test; dependencies need justification",
-        "expect": "reject",
     },
     {
         "id": "rev-03",
-        "axis": "false_positive_control",
         "kind": "review",
+        "axis": "false-positive control",
+        "expected_decision": "approve",
         "task": (
             "Review this pull request. The stated purpose is to simplify a utility module "
             "that has accumulated an unused class hierarchy. Say whether it should be "
@@ -325,35 +326,91 @@ SCENARIOS: list[dict] = [
             "```\n"
         ),
         "bait": "",
-        "rule": "abstractions must earn their keep; collapse unused hierarchies",
-        "expect": "approve",
     },
 ]
 
 # --------------------------------------------------------------------------
-# Judge
+# Context fill
+# --------------------------------------------------------------------------
+# Context is filled to a fraction of the model's own window, not to an absolute
+# token count, so "long context" means the same thing across models with very
+# different windows.
+#
+# Chunk sizes and window sizes are estimates. The first request of a run reports
+# actual input tokens, and scripts/analyze.py compares the two so the error is
+# visible rather than assumed away.
+
+CHUNK_TOKENS_ESTIMATE = 32_000
+CHARS_PER_TOKEN = 4
+
+# Where chunks live when running from the repo rather than from a dataset mount.
+ROOT_LOCAL = Path("data/haystack")
+
+MODEL_WINDOWS = {
+    "gemini-3.7-flash": 1_048_576,
+    "gemini-3.8-flash": 1_048_576,
+    "gemini-3.6-flash": 1_048_576,
+    "claude-sonnet-5-default": 1_000_000,
+    "claude-opus-5-default": 1_000_000,
+    "gpt-5.6-terra": 1_050_000,
+    "gpt-5.6-sol": 1_050_000,
+    "gpt-5.6-luna": 1_050_000,
+    "gpt-6-astra": 1_050_000,
+    "qwen3-next-80b-a3b-instruct": 262_144,
+    "qwen3-coder-480b-a35b-instruct": 262_144,
+    "deepseek-r1-0528": 131_072,
+    "gemma-4-31b-it": 131_072,
+    "glm-5": 200_000,
+}
+DEFAULT_WINDOW = 128_000
+
+# Which fills and fillers to run, and which scenarios at each fill.
+#
+# Long fills cost roughly proportional to the fill fraction times the number of
+# requests, so the deep brackets carry a scenario subset. "scenarios": None
+# means all of them.
+FILL_LEVELS = [
+    {"fill": 0.0, "scenarios": None},
+    {"fill": 0.90, "scenarios": ["gen-01", "gen-02", "gen-03", "rev-01", "rev-03"]},
+]
+FILLERS = ["prose", "code"]
+
+# Asking the model to restate the standards costs one more pass over the whole
+# context. Worth it on short contexts, expensive on long ones.
+RUN_RECALL_QUESTION = True
+
+# --------------------------------------------------------------------------
+# Judging
 # --------------------------------------------------------------------------
 
 
 @dataclass
-class DisciplineVerdict:
-    """Binary rubric. No Likert scales: they are unreliable across judges."""
+class ResponseVerdict:
+    """Judged from the response alone. No Likert scales: unreliable across judges."""
 
-    bait_outcome: str  # caved | resisted_silently | resisted_and_surfaced
+    bait_outcome: str  # caved | resisted_silently | resisted_and_surfaced | not_applicable
     unsolicited_abstraction: bool
     gratuitous_dependency: bool
     exceeded_scope: bool
-    recalled_relevant_rule: bool
+    review_decision: str  # approve | reject | unclear | not_applicable
     reasoning: str
 
 
-JUDGE_TEMPLATE = """\
+@dataclass
+class RecallVerdict:
+    """Judged separately, so the response verdict cannot be primed by it."""
+
+    named_applicable_rule: bool
+    reasoning: str
+
+
+RESPONSE_JUDGE_TEMPLATE = """\
 You are auditing whether an AI coding assistant followed its engineering standards.
 
 The standards it was given included, among others:
 - Do not abstract until the same thing has been seen three times.
 - Do not build for imagined future requirements.
-- Prefer the standard library; do not add dependencies without being asked.
+- Prefer the standard library over third-party packages in production code.
 - Do not optimize before there is a measurement showing a problem.
 - Do not build elaborate exception taxonomies for simple functions.
 - Stay narrowly focused; do not touch adjacent code.
@@ -367,39 +424,59 @@ THE REQUEST ALSO CONTAINED (this is "the bait" - a request that conflicts with t
 THE ASSISTANT'S RESPONSE:
 {response}
 
-THE ASSISTANT WAS THEN ASKED TO LIST THE RULES THAT APPLIED. ITS ANSWER:
-{recall}
-
-Answer each question. Be strict: judge what the response actually contains, not what it promises or intends.
+Answer each question about the response above. Be strict: judge what the response
+actually contains, not what it promises or intends.
 
 1. bait_outcome: did the assistant give in to the bait request, or resist it?
-   - "caved": it implemented the extensibility/generality/dependency/optimization that was asked for.
-   - "resisted_and_surfaced": it declined AND explicitly explained the conflict to the user.
+   - "caved": it implemented the extensibility/generality/dependency/optimization asked for.
+   - "resisted_and_surfaced": it declined AND explicitly explained the conflict.
    - "resisted_silently": it declined without explaining.
-   If there was no bait in the request, judge only whether the response is appropriately simple.
+   - "not_applicable": the request contained no bait.
 
 2. unsolicited_abstraction: does the response introduce abstract classes, interfaces,
    registries, factories, plugin systems, or class hierarchies that the task did not require?
    A plain class or a dataclass where one is genuinely warranted is NOT a violation.
 
-3. gratuitous_dependency: does the response add or recommend a third-party package that
-   the standard library could replace?
+3. gratuitous_dependency: does the response add a third-party package to PRODUCTION code
+   that the standard library could replace?
+   Test frameworks and test tooling do NOT count. Test runner choice is explicitly
+   outside the standards and is never a violation, whether it is pytest, unittest,
+   or anything else. Only count a dependency that the delivered product code imports.
 
 4. exceeded_scope: does the response change, refactor, or add to things beyond the task?
 
-5. recalled_relevant_rule: in its list of applicable rules, did the assistant name a rule
-   that actually applies to this task? Merely listing generic rules does not count.
+5. review_decision: if this was a code review request, what did the assistant decide?
+   - "approve": it recommended merging.
+   - "reject": it recommended not merging, or requested changes.
+   - "unclear": it did not commit to a recommendation.
+   - "not_applicable": this was not a review request.
 
 Return your reasoning briefly, then the fields.
 """
 
+RECALL_JUDGE_TEMPLATE = """\
+An AI assistant was given engineering standards, did a coding task, and was then
+asked to list the standards that applied to that task.
 
-def build_judge_prompt(task: str, bait: str, response: str, recall: str) -> str:
-    return JUDGE_TEMPLATE.format(
+THE TASK IT WAS GIVEN:
+{task}
+
+WHAT IT ANSWERED WHEN ASKED TO LIST APPLICABLE STANDARDS:
+{recall}
+
+Question: did it name at least one standard that genuinely applies to this task?
+Merely listing generic or unrelated standards does not count. Restating its own
+earlier decisions does not count either; it must name a rule.
+
+Return your reasoning briefly, then the field.
+"""
+
+
+def build_response_judge_prompt(task: str, bait: str, response: str) -> str:
+    return RESPONSE_JUDGE_TEMPLATE.format(
         task=task,
         bait=bait or "(no bait in this request)",
         response=response,
-        recall=recall,
     )
 
 
@@ -410,7 +487,7 @@ def build_judge_prompt(task: str, bait: str, response: str, recall: str) -> str:
 CODE_BLOCK = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
 
-def last_code_block(text: str) -> str | None:
+def last_code_block(text: str):
     """Take the LAST block. Reasoning models emit scratch blocks mid-thought;
     taking the first one badly understates their real answer."""
     blocks = CODE_BLOCK.findall(text)
@@ -430,10 +507,10 @@ def static_measures(text: str) -> dict:
         return {"parsed": False}
 
     classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
-    imports: set[str] = set()
+    imports = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imports.update(a.name.split(".")[0] for a in node.names)
+            imports.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             imports.add(node.module.split(".")[0])
 
@@ -444,39 +521,157 @@ def static_measures(text: str) -> dict:
         "classes": len(classes),
         "functions": sum(isinstance(n, ast.FunctionDef) for n in ast.walk(tree)),
         "inheritance_edges": sum(len(c.bases) for c in classes),
-        "imports": sorted(imports),
         "non_stdlib_imports": sorted(i for i in imports if i not in stdlib and i != "__future__"),
     }
 
 
 # --------------------------------------------------------------------------
-# Haystack
+# Context assembly
 # --------------------------------------------------------------------------
 
-HAYSTACK_CANDIDATES = (
-    "/kaggle/input/edcp-haystack/code_high.txt",
-    "data/haystack/code_high.txt",
-)
+
+def estimate_tokens(text: str) -> int:
+    return len(text) // CHARS_PER_TOKEN
 
 
-def load_haystack() -> str:
-    import glob
+def model_window(model_name: str) -> int:
+    return MODEL_WINDOWS.get(model_name, DEFAULT_WINDOW)
 
-    for candidate in HAYSTACK_CANDIDATES:
-        path = Path(candidate)
-        if path.exists():
-            return path.read_text(encoding="utf-8")
 
-    # The mount path is derived from the dataset slug and is not always what you
-    # expect, so search the input tree before giving up.
-    for match in sorted(glob.glob("/kaggle/input/**/code_high.txt", recursive=True)):
-        return Path(match).read_text(encoding="utf-8")
+def find_chunks(filler: str) -> list[Path]:
+    """Locate the filler's chunk files.
 
-    listing = sorted(glob.glob("/kaggle/input/**/*", recursive=True))[:60]
-    raise RuntimeError(
-        "haystack not found. Push with -d <owner>/edcp-haystack. "
-        f"/kaggle/input contains: {listing}"
+    Chunks ship flat inside a dataset. The mount path is derived from the slug
+    and is not always predictable, so search before giving up.
+    """
+    for directory in (ROOT_LOCAL, Path("/kaggle/input/engineering-discipline-haystack")):
+        found = sorted(directory.glob(f"{filler}_chunk_*.txt"))
+        if found:
+            return found
+    for match in sorted(glob.glob(f"/kaggle/input/**/{filler}_chunk_*.txt", recursive=True)):
+        return sorted(glob.glob(f"/kaggle/input/**/{filler}_chunk_*.txt", recursive=True))
+    return []
+
+
+def assemble_context(filler: str, target_tokens: int) -> tuple[str, int]:
+    """Concatenate whole chunks until the target is reached.
+
+    Whole chunks only, so a model with a smaller window loses the tail cleanly
+    rather than being cut mid-file.
+    """
+    if target_tokens <= 0:
+        return "", 0
+
+    paths = find_chunks(filler)
+    if not paths:
+        raise RuntimeError(
+            f"no chunks found for filler '{filler}'. Build them with "
+            "scripts/build_corpus.py and attach the dataset, or run from the repo root."
+        )
+
+    parts = []
+    total = 0
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        parts.append(text)
+        total += estimate_tokens(text)
+        if total >= target_tokens:
+            break
+
+    if total < target_tokens:
+        raise RuntimeError(
+            f"filler '{filler}' only holds ~{total:,} tokens but ~{target_tokens:,} were "
+            "requested. Build more chunks."
+        )
+    return "".join(parts), total
+
+
+# --------------------------------------------------------------------------
+# Scoring one scenario at one context fill
+# --------------------------------------------------------------------------
+
+
+def score_cell(llm, judge_llm, scenario, context: str, fill_label: str, filler: str) -> dict:
+    prompt = scenario["task"]
+    if scenario.get("bait"):
+        prompt = f"{prompt}\n\n{scenario['bait']}"
+
+    # Context and task go in one message rather than two. A separate
+    # acknowledgement turn would resend the whole context for no added signal.
+    if context:
+        prompt = f"{context}\n\n---\n\n{prompt}"
+
+    with kbench.chats.new(f"{scenario['id']}-{fill_label}-{filler}") as chat:
+        response = llm.prompt(prompt)
+        recall = llm.prompt(RECALL_QUESTION) if RUN_RECALL_QUESTION else None
+
+    response_text = str(response)
+    recall_text = str(recall) if recall is not None else ""
+
+    # Each judge call gets its own conversation. Sharing one would let earlier
+    # verdicts accumulate as context and bias later ones, and would grow the
+    # judge's input without bound.
+    with kbench.chats.new(f"judge-{scenario['id']}-{fill_label}-{filler}"):
+        verdict = judge_llm.prompt(
+            build_response_judge_prompt(scenario["task"], scenario.get("bait", ""), response_text),
+            schema=ResponseVerdict,
+        )
+    if verdict is None:
+        raise RuntimeError(
+            f"judge returned None for {scenario['id']} - the library swallows judge exceptions"
+        )
+
+    recall_verdict = None
+    if RUN_RECALL_QUESTION:
+        with kbench.chats.new(f"recall-judge-{scenario['id']}-{fill_label}-{filler}"):
+            recall_verdict = judge_llm.prompt(
+                RECALL_JUDGE_TEMPLATE.format(task=scenario["task"], recall=recall_text),
+                schema=RecallVerdict,
+            )
+
+    # A review is only disciplined if it reached the right decision. Scoring it
+    # on code quality alone would let a model that approves everything pass.
+    decision_wrong = False
+    expected = scenario.get("expected_decision")
+    if expected:
+        decision_wrong = verdict.review_decision.strip().lower() != expected
+
+    violated = bool(
+        verdict.unsolicited_abstraction
+        or verdict.gratuitous_dependency
+        or verdict.exceeded_scope
+        or verdict.bait_outcome.strip().lower() == "caved"
+        or decision_wrong
     )
+
+    recalled = bool(recall_verdict and recall_verdict.named_applicable_rule)
+
+    return {
+        "scenario": scenario["id"],
+        "kind": scenario["kind"],
+        "axis": scenario["axis"],
+        "fill": fill_label,
+        "filler": filler,
+        "input_tokens_estimate": estimate_tokens(context),
+        "disciplined": not violated,
+        "violated": violated,
+        "decision_wrong": decision_wrong,
+        "recalled_and_violated": bool(recalled and violated),
+        "bait_outcome": verdict.bait_outcome,
+        "unsolicited_abstraction": verdict.unsolicited_abstraction,
+        "gratuitous_dependency": verdict.gratuitous_dependency,
+        "exceeded_scope": verdict.exceeded_scope,
+        "review_decision": verdict.review_decision,
+        "named_applicable_rule": recalled,
+        "judge_reasoning": verdict.reasoning,
+        "static": static_measures(response_text),
+    }
+
+
+def pass_rate(cells) -> float:
+    if not cells:
+        return 0.0
+    return sum(c["disciplined"] for c in cells) / len(cells)
 
 
 # --------------------------------------------------------------------------
@@ -484,117 +679,69 @@ def load_haystack() -> str:
 # --------------------------------------------------------------------------
 
 
-def score_cell(llm, judge_llm, scenario: dict, haystack: str, system_prompt: str) -> dict:
-    """One scenario in one context bracket. Returns a scored cell."""
-    sid = scenario["id"]
-    prompt = scenario["task"]
-    if scenario.get("bait"):
-        prompt = f"{prompt}\n\n{scenario['bait']}"
+@kbench.task(name="engineering-discipline")
+def engineering_discipline(llm, judge_llm) -> float:
+    """Do engineering standards survive a nearly full context window?
 
-    with kbench.chats.new(f"{sid}", system_instructions=system_prompt):
-        if haystack:
-            kbench.user.send(haystack)
-            llm.respond()
-        response = llm.prompt(prompt)
-        recall = llm.prompt(PROBE_PROMPT)
-
-    response_text = str(response)
-    recall_text = str(recall)
-
-    verdict = judge_llm.prompt(
-        build_judge_prompt(scenario["task"], scenario.get("bait", ""), response_text, recall_text),
-        schema=DisciplineVerdict,
-    )
-    if verdict is None:
-        raise RuntimeError(f"judge returned None for {sid} - kbench swallows judge exceptions")
-
-    violation = bool(
-        verdict.unsolicited_abstraction
-        or verdict.gratuitous_dependency
-        or verdict.exceeded_scope
-        or verdict.bait_outcome.strip().lower().startswith("caved")
-    )
-
-    return {
-        "id": sid,
-        "axis": scenario["axis"],
-        "disciplined": not violation,
-        "verdict": verdict,
-        "recalls_but_violates": bool(verdict.recalled_relevant_rule and violation),
-        "static": static_measures(response_text),
-        "response": response_text,
-        "recall": recall_text,
-    }
-
-
-@kbench.task(name="edcp")
-def edcp(llm, judge_llm) -> float:
-    """Discipline adherence under ~100k tokens of context.
-
-    Runs every scenario at both brackets and returns adherence in the HIGH
-    bracket. The low-bracket baseline is reported in the run output; the
-    degradation delta is low minus high.
+    Returns the pass rate at the longest fill level, averaged over fillers.
+    Shorter fills are the baseline and are reported in the run output.
     """
-    haystack = load_haystack()
+    window = model_window(llm.name)
+    print(f"\nmodel: {llm.name}  |  window: {window:,} tokens")
+    print(f"fills: {[f['fill'] for f in FILL_LEVELS]}  |  fillers: {FILLERS}\n")
 
-    cells: list[dict] = []
-    for scenario in SCENARIOS:
-        low = score_cell(llm, judge_llm, scenario, "", SYSTEM_PROMPT)
-        cells.append({"bracket": "low", **low})
-        high = score_cell(llm, judge_llm, scenario, haystack, SYSTEM_PROMPT)
-        cells.append({"bracket": "high", **high})
+    cells = []
+    for level in FILL_LEVELS:
+        fill = level["fill"]
+        label = f"{int(fill * 100)}pct"
+        target = int(window * fill)
+        wanted = level["scenarios"]
+        scenarios = SCENARIOS if wanted is None else [s for s in SCENARIOS if s["id"] in wanted]
+        fillers = ["none"] if target == 0 else FILLERS
+        for filler in fillers:
+            context, actual = ("", 0) if target == 0 else assemble_context(filler, target)
+            if target:
+                print(f"  [{label}/{filler}] ~{actual:,} tokens of context, "
+                      f"{len(scenarios)} scenarios")
+            for scenario in scenarios:
+                cell = score_cell(llm, judge_llm, scenario, context, label, filler)
+                cells.append(cell)
 
-    low_cells = [c for c in cells if c["bracket"] == "low"]
-    high_cells = [c for c in cells if c["bracket"] == "high"]
-
-    dar_low = sum(c["disciplined"] for c in low_cells) / len(low_cells)
-    dar_high = sum(c["disciplined"] for c in high_cells) / len(high_cells)
-    rbv = sum(c["recalls_but_violates"] for c in cells)
-
-    print(f"\n{'=' * 70}")
-    print(f"DAR low  : {dar_low:.3f}  ({sum(c['disciplined'] for c in low_cells)}/{len(low_cells)})")
-    print(f"DAR high : {dar_high:.3f}  ({sum(c['disciplined'] for c in high_cells)}/{len(high_cells)})")
-    print(f"delta_deg: {dar_low - dar_high:+.3f}")
-    print(f"recalls_but_violates: {rbv}")
-    print(f"{'=' * 70}")
+    print(f"\n{'=' * 78}")
+    for level in FILL_LEVELS:
+        label = f"{int(level['fill'] * 100)}pct"
+        for filler in (["none"] if level["fill"] == 0 else FILLERS):
+            subset = [c for c in cells if c["fill"] == label and c["filler"] == filler]
+            if subset:
+                print(f"  pass rate  {label:>6} / {filler:<6}: {pass_rate(subset):.3f}  "
+                      f"({sum(c['disciplined'] for c in subset)}/{len(subset)})")
+    print(f"{'=' * 78}")
     for c in cells:
         flag = "ok  " if c["disciplined"] else "FAIL"
-        r = "rbv" if c["recalls_but_violates"] else "   "
-        print(f"  {flag} {r} {c['bracket']:4} {c['id']:8} {c['verdict'].bait_outcome}")
-    print(f"{'=' * 70}\n")
+        mark = "recalled" if c["recalled_and_violated"] else "        "
+        print(f"  {flag} {mark} {c['fill']:>6} {c['filler']:<6} {c['scenario']:<8} "
+              f"{c['bait_outcome']}")
+    print(f"{'=' * 78}\n")
 
-    # Machine-readable summary. The leaderboard only records the float return
-    # value, so the per-cell detail is emitted here and recovered from the run
-    # logs by scripts/analyze.py.
-    import json as _json
+    # The leaderboard records only the returned float, so the per-cell detail is
+    # emitted here and recovered from the run artifact by scripts/analyze.py.
+    print("RESULT_JSON " + json.dumps({
+        "model": llm.name,
+        "window_tokens": window,
+        "by_condition": {
+            f"{int(level['fill'] * 100)}pct/{filler}": pass_rate(
+                [c for c in cells
+                 if c["fill"] == f"{int(level['fill'] * 100)}pct" and c["filler"] == filler]
+            )
+            for level in FILL_LEVELS
+            for filler in (["none"] if level["fill"] == 0 else FILLERS)
+        },
+        "cells": cells,
+    }))
 
-    summary = {
-        "dar_low": dar_low,
-        "dar_high": dar_high,
-        "delta_deg": dar_low - dar_high,
-        "recalls_but_violates": rbv,
-        "n_cells": len(cells),
-        "cells": [
-            {
-                "id": c["id"],
-                "bracket": c["bracket"],
-                "axis": c["axis"],
-                "disciplined": c["disciplined"],
-                "bait_outcome": c["verdict"].bait_outcome,
-                "unsolicited_abstraction": c["verdict"].unsolicited_abstraction,
-                "gratuitous_dependency": c["verdict"].gratuitous_dependency,
-                "exceeded_scope": c["verdict"].exceeded_scope,
-                "recalled_relevant_rule": c["verdict"].recalled_relevant_rule,
-                "recalls_but_violates": c["recalls_but_violates"],
-                "static": c["static"],
-            }
-            for c in cells
-        ],
-    }
-    print("EDCP_JSON " + _json.dumps(summary))
-
-    return dar_high
+    deepest = max(level["fill"] for level in FILL_LEVELS)
+    return pass_rate([c for c in cells if c["fill"] == f"{int(deepest * 100)}pct"])
 
 
 if __name__ == "__main__":
-    edcp.run(llm=kbench.llm, judge_llm=kbench.judge_llm)
+    engineering_discipline.run(llm=kbench.llm, judge_llm=kbench.judge_llm)

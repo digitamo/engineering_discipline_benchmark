@@ -1,0 +1,2381 @@
+
+
+===== COMMIT ff414a0a =====
+
+
+commit ff414a0a4
+Author: rudolfix
+Date: 2026-10-10
+
+    fix(extract): keep incremental step position when hints are re-applied or resource is cloned (#4540)
+
+diff --git a/dlt/extract/resource.py b/dlt/extract/resource.py
+index 6f4e407f1..7289cc146 100644
+--- a/dlt/extract/resource.py
++++ b/dlt/extract/resource.py
+@@ -514,9 +514,6 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
+             self._pipe.insert_step(item_transform, insert_at)
+         return self
+ 
+-    def _remove_incremental_step(self) -> None:
+-        self._pipe.remove_by_type(Incremental, IncrementalResourceWrapper)
+-
+     def set_incremental(
+         self, new_incremental: Union[Incremental[Any], IncrementalResourceWrapper]
+     ) -> Optional[Union[Incremental[Any], IncrementalResourceWrapper]]:
+@@ -532,26 +529,17 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
+             if resource_primary_key := self._hints.get("primary_key"):
+                 new_incremental.set_deduplication_key(resource_primary_key, from_hints=True)
+         incremental = self.incremental
+-        if incremental is not None:
+-            # if isinstance(new_incremental, Mapping):
+-            #     new_incremental = Incremental.ensure_instance(new_incremental)
+-
+-            if isinstance(new_incremental, IncrementalResourceWrapper):
+-                # Completely replace the wrapper
+-                self._remove_incremental_step()
+-                self.add_step(new_incremental)
+-            elif isinstance(incremental, IncrementalResourceWrapper):
+-                incremental.set_incremental(new_incremental, from_hints=True)
+-            else:
+-                self._remove_incremental_step()
+-                # re-add the step
+-                incremental = None
+-        if incremental is None:
+-            # if there's no wrapper add incremental as a transform
++        if isinstance(incremental, IncrementalResourceWrapper) and not isinstance(
++            new_incremental, IncrementalResourceWrapper
++        ):
++            incremental.set_incremental(new_incremental, from_hints=True)
++        else:
++            # replace the step in place so steps inserted after it keep their position
++            step_no = self._pipe.remove_by_type(Incremental, IncrementalResourceWrapper)
+             if new_incremental:
+                 if not isinstance(new_incremental, IncrementalResourceWrapper):
+                     new_incremental = Incremental.ensure_instance(new_incremental)
+-                self.add_step(new_incremental)
++                self.add_step(new_incremental, insert_at=step_no if step_no >= 0 else None)
+         return new_incremental
+ 
+     def _set_hints(
+@@ -731,15 +719,14 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
+     def _eject_config(self) -> bool:
+         """Unwraps the pipe generator step from config injection and incremental wrappers by restoring the original step.
+ 
+-        Removes the step with incremental wrapper. Should be used before a subsequent _inject_config is called on the
+-        same pipe to successfully wrap it with new incremental and config injection.
++        Should be used before a subsequent _inject_config is called on the same pipe to successfully wrap it with
++        new incremental and config injection. The incremental step stays in the pipe and is replaced in place.
+         Note that resources with bound arguments cannot be ejected.
+ 
+         """
+         if not self._pipe.is_empty and not self._args_bound:
+             orig_gen = getattr(self._pipe.gen, "__GEN__", None)
+             if orig_gen:
+-                self._remove_incremental_step()
+                 self._pipe.replace_gen(orig_gen)
+                 return True
+         return False
+diff --git a/tests/extract/test_incremental.py b/tests/extract/test_incremental.py
+index 711bfd1af..cb0ade7ff 100644
+--- a/tests/extract/test_incremental.py
++++ b/tests/extract/test_incremental.py
+@@ -29,7 +29,7 @@ from dlt.common.json import json
+ from dlt.common.pendulum import pendulum, timedelta
+ from dlt.common.pipeline import NormalizeInfo, StateInjectableContext
+ from dlt.common.schema.schema import Schema
+-from dlt.common.typing import TSortOrder, TDataItems
++from dlt.common.typing import TSortOrder, TDataItem, TDataItems
+ from dlt.common.utils import chunks, uniq_id
+ 
+ from dlt.extract import DltSource
+@@ -44,7 +44,7 @@ from dlt.extract.incremental.exceptions import (
+ )
+ from dlt.extract.incremental.lag import apply_lag
+ from dlt.extract.incremental.transform import ArrowIncremental
+-from dlt.extract.items_transform import ValidateItem
++from dlt.extract.items_transform import MapItem, MetricsItem, ValidateItem
+ from dlt.extract.resource import DltResource
+ from dlt.extract.utils import (
+     digest_dedup_value,
+@@ -2042,6 +2042,71 @@ def test_incremental_wrapper_on_clone_incremental() -> None:
+     assert r_4_clone.incremental is r_4.incremental
+ 
+ 
++def test_incremental_step_keeps_position() -> None:
++    """Steps inserted after incremental keep their place when hints are re-applied or resource is cloned"""
++    data = [{"id": 1, "updated_at": 1}, {"id": 2, "updated_at": 2}, {"id": 3, "updated_at": 3}]
++
++    @dlt.source
++    def my_source():
++        @dlt.resource
++        def events():
++            yield data
++
++        @dlt.resource
++        def events_arg(updated_at=dlt.sources.incremental("updated_at", initial_value=2)):
++            yield data
++
++        @dlt.resource
++        def events_cfg(api_key: str = "key"):
++            yield data
++
++        return events, events_arg, events_cfg
++
++    seen: List[int] = []
++
++    def collect(item: TDataItem) -> TDataItem:
++        seen.append(item["id"])
++        return item
++
++    def count_rows(items: TDataItems, meta: Any, metrics: Dict[str, Any]) -> None:
++        metrics["row_count"] = metrics.get("row_count", 0) + len(items)
++
++    p = dlt.pipeline(pipeline_name="p" + uniq_id())
++
++    # hints based incremental: pipeline.extract re-applies hints on a copy of the resource
++    r = my_source().events
++    r.apply_hints(incremental=dlt.sources.incremental("updated_at", initial_value=2))
++    r.add_map(collect, insert_at=len(r._pipe))
++    r.add_metrics(count_rows, insert_at=len(r._pipe))
++    steps = [type(s) for s in r._pipe.steps]
++    assert steps.index(Incremental) < steps.index(MapItem) < steps.index(MetricsItem)
++    r.apply_hints()
++    assert [type(s) for s in r._pipe.steps] == steps
++    info = p.extract(r)
++    assert seen == [2, 3]
++    resource_metrics = info.metrics[info.loads_ids[0]][0]["resource_metrics"]["events"]
++    assert resource_metrics.custom_metrics["row_count"] == 2
++    assert [type(s) for s in r.with_name("events_clone")._pipe.steps] == steps
++
++    # arg based incremental: clone ejects and re-injects the wrapper
++    r = my_source().events_arg
++    r.add_map(collect, insert_at=len(r._pipe))
++    steps = [type(s) for s in r._pipe.steps]
++    assert steps.index(IncrementalResourceWrapper) < steps.index(MapItem)
++    r_clone = r.with_name("events_arg_clone")
++    assert [type(s) for s in r_clone._pipe.steps] == steps
++    seen.clear()
++    p.extract(r_clone)
++    assert seen == [2, 3]
++
++    # hints based incremental on resource with config: clone ejects config wrapper
++    r = my_source().events_cfg
++    r.apply_hints(incremental=dlt.sources.incremental("updated_at", initial_value=2))
++    r_clone = r.with_name("events_cfg_clone")
++    assert isinstance(r_clone.incremental, Incremental)
++    assert [item["id"] for item in r_clone] == [2, 3]
++
++
+ def test_last_value_func_on_dict() -> None:
+     """Test last value which is a dictionary"""
+ 
+
+
+===== COMMIT 5084786a =====
+
+
+commit 5084786a4
+Author: Matt Faltyn
+Date: 2026-10-09
+
+    fix(destinations): match compound SCD2 merge keys exactly (#4245)
+
+diff --git a/dlt/destinations/impl/athena/athena.py b/dlt/destinations/impl/athena/athena.py
+index 6d680a169..512c695a6 100644
+--- a/dlt/destinations/impl/athena/athena.py
++++ b/dlt/destinations/impl/athena/athena.py
+@@ -132,14 +132,8 @@ class AthenaMergeJob(SqlMergeFollowupJob):
+         return sql, temp_table_name
+ 
+     @classmethod
+-    def gen_concat_sql(cls, columns: Sequence[str]) -> str:
+-        # Athena requires explicit casting
+-        columns = [f"CAST({c} AS VARCHAR)" for c in columns]
+-        return f"CONCAT({', '.join(columns)})"
+-
+-    @classmethod
+-    def requires_temp_table_for_delete(cls) -> bool:
+-        return True
++    def supports_alias_in_delete(cls) -> bool:
++        return False
+ 
+ 
+ class LfTagsManager:
+diff --git a/dlt/destinations/impl/clickhouse/clickhouse.py b/dlt/destinations/impl/clickhouse/clickhouse.py
+index 81f7877a1..e952fea3e 100644
+--- a/dlt/destinations/impl/clickhouse/clickhouse.py
++++ b/dlt/destinations/impl/clickhouse/clickhouse.py
+@@ -296,6 +296,20 @@ class ClickHouseMergeJob(SqlMergeFollowupJob):
+     def gen_update_table_prefix(cls, table_name: str) -> str:
+         return f"ALTER TABLE {table_name} UPDATE"
+ 
++    @classmethod
++    def gen_merge_key_present_clause(
++        cls,
++        table_name: str,
++        staging_root_table_name: str,
++        merge_keys: Sequence[str],
++        sql_client: SqlClientBase[Any],
++        source_filter: Optional[str] = None,
++    ) -> Optional[str]:
++        # mutations do not support correlated subqueries
++        if not merge_keys:
++            return None
++        return cls._gen_keys_in_staging_cond(staging_root_table_name, merge_keys, source_filter)
++
+     @classmethod
+     def requires_temp_table_for_delete(cls) -> bool:
+         return False
+diff --git a/dlt/destinations/impl/mssql/mssql.py b/dlt/destinations/impl/mssql/mssql.py
+index fb76697ad..70f91997f 100644
+--- a/dlt/destinations/impl/mssql/mssql.py
++++ b/dlt/destinations/impl/mssql/mssql.py
+@@ -54,35 +54,8 @@ class MsSqlStagingReplaceJob(SqlStagingReplaceFollowupJob):
+ 
+ class MsSqlMergeJob(SqlMergeFollowupJob):
+     @classmethod
+-    def gen_key_table_clauses(
+-        cls,
+-        root_table_name: str,
+-        staging_root_table_name: str,
+-        primary_keys: Sequence[str],
+-        merge_keys: Sequence[str],
+-        for_delete: bool,
+-        source_filter: Optional[str] = None,
+-    ) -> List[str]:
+-        """Generate sql clauses that may be used to select or delete rows in root table of destination dataset"""
+-        if for_delete:
+-            # MS SQL doesn't support alias in DELETE FROM
+-            key_clauses = cls._gen_key_table_clauses(primary_keys, merge_keys)
+-            key_cond = " OR ".join(
+-                [c.format(d=root_table_name, s=staging_root_table_name) for c in key_clauses]
+-            )
+-            return [
+-                f"FROM {root_table_name} WHERE EXISTS (SELECT 1 FROM"
+-                f" {staging_root_table_name} WHERE"
+-                f" {cls._gen_staging_rows_cond(key_cond, source_filter)})"
+-            ]
+-        return SqlMergeFollowupJob.gen_key_table_clauses(
+-            root_table_name,
+-            staging_root_table_name,
+-            primary_keys,
+-            merge_keys,
+-            for_delete,
+-            source_filter,
+-        )
++    def supports_alias_in_delete(cls) -> bool:
++        return False
+ 
+     @classmethod
+     def _to_temp_table(
+diff --git a/dlt/destinations/impl/redshift/redshift.py b/dlt/destinations/impl/redshift/redshift.py
+index 6288a4881..06499a76a 100644
+--- a/dlt/destinations/impl/redshift/redshift.py
++++ b/dlt/destinations/impl/redshift/redshift.py
+@@ -157,37 +157,8 @@ class RedshiftCopyFileLoadJob(CopyRemoteFileLoadJob):
+ 
+ class RedshiftMergeJob(SqlMergeFollowupJob):
+     @classmethod
+-    def gen_key_table_clauses(
+-        cls,
+-        root_table_name: str,
+-        staging_root_table_name: str,
+-        primary_keys: Sequence[str],
+-        merge_keys: Sequence[str],
+-        for_delete: bool,
+-        source_filter: Optional[str] = None,
+-    ) -> List[str]:
+-        """Generate sql clauses that may be used to select or delete rows in root table of destination dataset
+-
+-        A list of clauses may be returned for engines that do not support OR in subqueries. Like BigQuery
+-        """
+-        if for_delete:
+-            key_clauses = cls._gen_key_table_clauses(primary_keys, merge_keys)
+-            key_cond = " OR ".join(
+-                [c.format(d=root_table_name, s=staging_root_table_name) for c in key_clauses]
+-            )
+-            return [
+-                f"FROM {root_table_name} WHERE EXISTS (SELECT 1 FROM"
+-                f" {staging_root_table_name} WHERE"
+-                f" {cls._gen_staging_rows_cond(key_cond, source_filter)})"
+-            ]
+-        return SqlMergeFollowupJob.gen_key_table_clauses(
+-            root_table_name,
+-            staging_root_table_name,
+-            primary_keys,
+-            merge_keys,
+-            for_delete,
+-            source_filter,
+-        )
++    def supports_alias_in_delete(cls) -> bool:
++        return False
+ 
+ 
+ class RedshiftClient(InsertValuesJobClient, SupportsStagingDestination):
+diff --git a/dlt/destinations/impl/sqlalchemy/merge_job.py b/dlt/destinations/impl/sqlalchemy/merge_job.py
+index ed4a1a223..374873ae3 100644
+--- a/dlt/destinations/impl/sqlalchemy/merge_job.py
++++ b/dlt/destinations/impl/sqlalchemy/merge_job.py
+@@ -1,6 +1,5 @@
+ from functools import partial
+-from typing import Any, Dict, Sequence, Tuple, Optional, List, Union, cast
+-import operator
++from typing import Any, Dict, Sequence, Tuple, Optional, List, cast
+ from dlt.common.libs.sql_alchemy import sa
+ 
+ from dlt.common.typing import TAnyDateTime
+@@ -429,27 +428,21 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
+             return [sa.text(destination_scope)]
+         if not merge_keys:
+             return []
+-        root_merge_key_cols = [root_table_obj.c[key] for key in merge_keys]
+-        staging_merge_key_cols = [staging_root_table_obj.c[key] for key in merge_keys]
+-        present_keys = sa.select(cls._gen_concat_sqla(staging_merge_key_cols))
+-        # only rows of the merge source count as present
++        if len(merge_keys) == 1:
++            key = merge_keys[0]
++            present_keys = sa.select(staging_root_table_obj.c[key])
++            # only rows of the merge source count as present
++            if source_filter:
++                present_keys = present_keys.where(sa.text(source_filter))
++            return [root_table_obj.c[key].in_(present_keys)]
++        # a derived table applies the source filter, so its bare columns resolve only to staging
++        staging_rows: Any = staging_root_table_obj
+         if source_filter:
+-            present_keys = present_keys.where(sa.text(source_filter))
+-        return [cls._gen_concat_sqla(root_merge_key_cols).in_(present_keys)]
+-
+-    @classmethod
+-    def _gen_concat_sqla(
+-        cls, columns: Sequence[sa.Column]
+-    ) -> Union[sa.sql.elements.BinaryExpression, sa.Column]:
+-        # Use col1 + col2 + col3 ... to generate a dialect specific concat expression
+-        result = columns[0]
+-        if len(columns) == 1:
+-            return result
+-        # Cast because CONCAT is only generated for string columns
+-        result = sa.cast(result, sa.String)
+-        for col in columns[1:]:
+-            result = operator.add(result, sa.cast(col, sa.String))
+-        return result  # type: ignore[no-any-return]
++            staging_rows = (
++                sa.select(staging_root_table_obj).where(sa.text(source_filter)).subquery("s")
++            )
++        key_match = cls._generate_key_table_clauses([], merge_keys, root_table_obj, staging_rows)
++        return [sa.exists(sa.select(sa.literal(1)).select_from(staging_rows).where(key_match))]
+ 
+     @classmethod
+     def gen_scd2_sql(
+diff --git a/dlt/destinations/sql_jobs.py b/dlt/destinations/sql_jobs.py
+index 13e7d1ffe..95cf08c70 100644
+--- a/dlt/destinations/sql_jobs.py
++++ b/dlt/destinations/sql_jobs.py
+@@ -244,6 +244,16 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+         A list of clauses may be returned for engines that do not support OR in subqueries. Like BigQuery
+         """
+         key_clauses = cls._gen_key_table_clauses(primary_keys, merge_keys)
++        if for_delete and not cls.supports_alias_in_delete():
++            # the qualified table names prefix the columns
++            key_cond = " OR ".join(
++                [c.format(d=root_table_name, s=staging_root_table_name) for c in key_clauses]
++            )
++            return [
++                f"FROM {root_table_name} WHERE EXISTS (SELECT 1 FROM"
++                f" {staging_root_table_name} WHERE"
++                f" {cls._gen_staging_rows_cond(key_cond, source_filter)})"
++            ]
+         key_cond = " OR ".join([c.format(d="d", s="s") for c in key_clauses])
+         # only rows of the merge source match the keys
+         return [
+@@ -433,29 +443,69 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+         `condition`."""
+         return [f"{cls.gen_update_table_prefix(table_name)} {set_clause} WHERE {condition};"]
+ 
+-    @classmethod
+-    def gen_concat_sql(cls, columns: Sequence[str]) -> str:
+-        return f"CONCAT({', '.join(columns)})"
+-
+     @classmethod
+     def gen_merge_key_present_clause(
+         cls,
+-        merge_keys: Sequence[str],
++        table_name: str,
+         staging_root_table_name: str,
++        merge_keys: Sequence[str],
++        sql_client: SqlClientBase[Any],
+         source_filter: Optional[str] = None,
+     ) -> Optional[str]:
+-        """Generate a condition that selects the destination rows whose `merge_key` is in the
+-        merge source.
++        """Generate a condition that selects the rows of the destination table `table_name` whose
++        `merge_key` is in the merge source.
+ 
+         Returns `None` when the table has no merge keys.
+         """
+         if not merge_keys:
+             return None
+-        key = merge_keys[0] if len(merge_keys) == 1 else cls.gen_concat_sql(merge_keys)
+-        present = f"SELECT {key} FROM {staging_root_table_name}"
++        if len(merge_keys) == 1:
++            return cls._gen_keys_in_staging_cond(staging_root_table_name, merge_keys, source_filter)
++        return cls._gen_keys_exist_in_staging_cond(
++            table_name, staging_root_table_name, merge_keys, sql_client, source_filter
++        )
++
++    @classmethod
++    def _gen_keys_in_staging_cond(
++        cls,
++        staging_root_table_name: str,
++        key_columns: Sequence[str],
++        source_filter: Optional[str] = None,
++    ) -> str:
++        """Generate a condition that is true when `key_columns` of the destination row are in
++        the merge source. Not correlated.
++        """
++        keys = ", ".join(key_columns)
++        present = f"SELECT {keys} FROM {staging_root_table_name}"
+         if source_filter:
+             present += f" WHERE {source_filter}"
+-        return f"{key} IN ({present})"
++        if len(key_columns) > 1:
++            keys = f"({keys})"
++        return f"{keys} IN ({present})"
++
++    @classmethod
++    def _gen_keys_exist_in_staging_cond(
++        cls,
++        table_name: str,
++        staging_root_table_name: str,
++        key_columns: Sequence[str],
++        sql_client: SqlClientBase[Any],
++        source_filter: Optional[str] = None,
++    ) -> str:
++        """Generate a correlated `EXISTS` condition that is true when `key_columns` of a row of
++        the destination table `table_name` are in the merge source.
++        """
++        # a derived table applies the source filter, so bare columns resolve only to staging
++        staging_source = staging_root_table_name
++        if source_filter:
++            staging_source = f"(SELECT * FROM {staging_root_table_name} WHERE {source_filter})"
++        # the deleted or updated table has no alias, so its qualified name prefixes its columns.
++        # the qualifier may be the bare table name, which a staging alias of the same name shadows
++        alias = "s_" if table_name.casefold() == "s" else "s"
++        on_str = cls._gen_key_table_clauses([], key_columns)[0].format(
++            d=cls.gen_column_qualifier(table_name, sql_client), s=alias
++        )
++        return f"EXISTS (SELECT 1 FROM {staging_source} {alias} WHERE {on_str})"
+ 
+     @classmethod
+     def get_merge_conditions(
+@@ -478,12 +528,15 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+     @classmethod
+     def gen_merge_partition_clauses(
+         cls,
+-        merge_keys: Sequence[str],
++        table_name: str,
+         staging_root_table_name: str,
++        merge_keys: Sequence[str],
++        sql_client: SqlClientBase[Any],
+         source_filter: Optional[str],
+         destination_scope: Optional[str],
+     ) -> List[str]:
+-        """Generate conditions that select the destination rows that a merge can delete or retire.
++        """Generate conditions that select the rows of the destination table `table_name` that a
++        merge can delete or retire.
+ 
+         `destination_scope` replaces `merge_key`. Returns an empty list when the merge can delete
+         or retire rows in the whole table.
+@@ -492,7 +545,7 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+             # `merge_key` compiles to a subquery, which prevents partition pruning
+             return [destination_scope]
+         key_present = cls.gen_merge_key_present_clause(
+-            merge_keys, staging_root_table_name, source_filter
++            table_name, staging_root_table_name, merge_keys, sql_client, source_filter
+         )
+         return [key_present] if key_present else []
+ 
+@@ -504,13 +557,15 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+     @classmethod
+     def gen_absent_rows_cond(
+         cls,
+-        table_qualifier: str,
++        table_name: str,
+         staging_root_table_name: str,
+         match_columns: Sequence[str],
+         partition_clauses: Sequence[str],
++        sql_client: SqlClientBase[Any],
+         source_filter: Optional[str] = None,
+     ) -> str:
+-        """Generate a condition that selects the destination rows absent from the merge source."""
++        """Generate a condition that selects the rows of the destination table `table_name` absent
++        from the merge source."""
+         if len(match_columns) == 1:
+             # not correlated, so destinations without correlated subqueries accept it
+             column = match_columns[0]
+@@ -519,13 +574,10 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+                 present += f" WHERE {source_filter}"
+             conds = [f"{column} NOT IN ({present})"]
+         else:
+-            # a derived table applies the source filter, so bare columns resolve only to staging
+-            staging_source = staging_root_table_name
+-            if source_filter:
+-                staging_source = f"(SELECT * FROM {staging_root_table_name} WHERE {source_filter})"
+-            # the deleted or updated table has no alias, so its qualified name prefixes its columns
+-            on_str = " AND ".join([f"s.{c} = {table_qualifier}.{c}" for c in match_columns])
+-            conds = [f"NOT EXISTS (SELECT 1 FROM {staging_source} s WHERE {on_str})"]
++            exists_cond = cls._gen_keys_exist_in_staging_cond(
++                table_name, staging_root_table_name, match_columns, sql_client, source_filter
++            )
++            conds = [f"NOT {exists_cond}"]
+         conds.extend(partition_clauses)
+         return " AND ".join(conds)
+ 
+@@ -575,6 +627,11 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+         """
+         return False
+ 
++    @classmethod
++    def supports_alias_in_delete(cls) -> bool:
++        """Whether `DELETE FROM` accepts an alias of the deleted table."""
++        return True
++
+     @classmethod
+     def _escape_list(cls, list_: List[str], escape_id: Callable[[str], str]) -> List[str]:
+         return list(map(escape_id, list_))
+@@ -1079,14 +1136,20 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+         )
+         source_filter, destination_scope = cls.get_merge_conditions(root_table, sql_client)
+         partition_clauses = cls.gen_merge_partition_clauses(
+-            merge_keys, staging_root_table_name, source_filter, destination_scope
++            root_table["name"],
++            staging_root_table_name,
++            merge_keys,
++            sql_client,
++            source_filter,
++            destination_scope,
+         )
+ 
+         absent_cond = cls.gen_absent_rows_cond(
+-            cls.gen_column_qualifier(root_table["name"], sql_client),
++            root_table["name"],
+             staging_root_table_name,
+             primary_keys,
+             partition_clauses,
++            sql_client,
+             source_filter=source_filter,
+         )
+         # nested rows go first: their delete selects them through root rows that still exist
+@@ -1371,14 +1434,20 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+             escape_column_id,
+         )
+         partition_clauses = cls.gen_merge_partition_clauses(
+-            merge_keys, staging_root_table_name, source_filter, destination_scope
++            root_table["name"],
++            staging_root_table_name,
++            merge_keys,
++            sql_client,
++            source_filter,
++            destination_scope,
+         )
+         # `scd2` identifies records by row hash and retires only active records
+         retire_cond = cls.gen_absent_rows_cond(
+-            cls.gen_column_qualifier(root_table["name"], sql_client),
++            root_table["name"],
+             staging_root_table_name,
+             [hash_],
+             [is_active, *partition_clauses],
++            sql_client,
+             source_filter=source_filter,
+         )
+         # retired and active records can share a row hash
+diff --git a/docs/uv.lock b/docs/uv.lock
+index 896e13261..29b91909e 100644
+--- a/docs/uv.lock
++++ b/docs/uv.lock
+@@ -1044,6 +1044,7 @@ dev = [
+     { name = "requests-mock", specifier = ">=1.10.0,<2" },
+     { name = "ruff", specifier = ">=0.3.2,<0.4" },
+     { name = "sqlfluff", specifier = ">=2.3.2,<3" },
++    { name = "sqlglot", specifier = "<30.22" },
+     { name = "types-cachetools", specifier = ">=4.2.9" },
+     { name = "types-click", specifier = ">=7.1.8,<8" },
+     { name = "types-croniter", specifier = ">=6.0.0" },
+diff --git a/pyproject.toml b/pyproject.toml
+index 0320ba364..a80771cb0 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -285,6 +285,8 @@ dev = [
+     "types-paramiko>=3.5.0.20250708",
+     "griffe>=1.10.0",
+     "graphviz>=0.21",
++    # caps CI only: sqlglot 30.22 removed `infer_schema` from `qualify()`
++    "sqlglot<30.22",
+ ]
+ 
+ # NOTE: those dependencies are used to test built in sources
+diff --git a/tests/load/pipeline/test_merge_disposition.py b/tests/load/pipeline/test_merge_disposition.py
+index 664d7e344..18f090b71 100644
+--- a/tests/load/pipeline/test_merge_disposition.py
++++ b/tests/load/pipeline/test_merge_disposition.py
+@@ -1850,8 +1850,6 @@ def test_merge_arrow(
+     """Merges Arrow tables by `primary_key` or by `merge_key` only. Without a primary key there is
+     no `_dlt_id`, so destinations that delete through a temp table failed (#2248)."""
+     skip_if_unsupported_merge_strategy(destination_config, merge_strategy)
+-    if key_hint == "merge_key" and destination_config.destination_type == "athena":
+-        pytest.skip("Athena requires _dlt_id for merge (no correlated subquery support)")
+     hints: Any = {key_hint: "id"}
+ 
+     @dlt.resource(
+@@ -2242,6 +2240,8 @@ def test_cdc_composite_primary_key(
+         return merge_resource(
+             data,
+             "cdc",
++            # the staging alias must not shadow the root table
++            name="s",
+             primary_key=["region", "id"],
+             table_format=destination_config.table_format,
+             **options,
+@@ -2289,7 +2289,7 @@ def test_cdc_composite_primary_key(
+     # the source filter discards (us, 1), so cdc deletes its stored copy although (eu, 1) stays
+     if not source_filter:
+         expected.append(us_1)
+-    rows = load_tables_to_dicts(p, "items", exclude_system_cols=True)["items"]
++    rows = load_tables_to_dicts(p, "s", exclude_system_cols=True)["s"]
+     assert_records_as_set(rows, expected)
+ 
+ 
+@@ -2676,24 +2676,28 @@ def test_merge_key_source_filter(
+     strategy: TLoaderMergeStrategy,
+     conditions: Dict[str, str],
+ ) -> None:
+-    """Seeds four records in three buckets and reloads two of them with `merge_key` on the
+-    bucket, a source filter that discards one, and a destination scope. Checks which partitions
+-    the merge replaces."""
++    """Seeds five records in four partitions and reloads two of them with a compound `merge_key`
++    on bucket and shard, a source filter that discards one, and a destination scope. Checks which
++    partitions the merge replaces."""
+     skip_if_unsupported_merge_strategy(destination_config, strategy)
+ 
+     def events(data: List[StrAny], **options: Any) -> DltSource:
+-        return merge_resource(data, strategy, name="events", merge_key="bucket", **options)
++        return merge_resource(
++            data, strategy, name="events", merge_key=["bucket", "shard"], **options
++        )
+ 
+-    # seed four records in the buckets 'old', 'new' and 'mid'
++    # seed five records in the partitions 'old', 'new', 'mid' and ('ne', 'wa')
+     p = destination_config.setup_pipeline("merge_key_source_filter", dev_mode=True)
+     assert_load_info(
+         p.run(
+             events(
+                 [
+-                    {"id": 1, "bucket": "old", "value": 1},
+-                    {"id": 2, "bucket": "new", "value": 2},
+-                    {"id": 3, "bucket": "new", "value": 3},
+-                    {"id": 4, "bucket": "mid", "value": 4},
++                    {"id": 1, "bucket": "old", "shard": "a", "value": 1},
++                    {"id": 2, "bucket": "new", "shard": "a", "value": 2},
++                    {"id": 3, "bucket": "new", "shard": "a", "value": 3},
++                    {"id": 4, "bucket": "mid", "shard": "a", "value": 4},
++                    # concatenated, the key equals the key of partition ('new', 'a')
++                    {"id": 6, "bucket": "ne", "shard": "wa", "value": 6},
+                 ]
+             ),
+             **destination_config.run_kwargs,
+@@ -2704,20 +2708,27 @@ def test_merge_key_source_filter(
+     assert_load_info(
+         p.run(
+             events(
+-                [{"id": 2, "bucket": "new", "value": 22}, {"id": 5, "bucket": "mid", "value": 1}],
++                [
++                    {"id": 2, "bucket": "new", "shard": "a", "value": 22},
++                    {"id": 5, "bucket": "mid", "shard": "a", "value": 1},
++                ],
+                 **conditions,
+             ),
+             **destination_config.run_kwargs,
+         )
+     )
+ 
+-    # in all cases the merge replaces partition 'new' and keeps 1 in partition 'old'
+-    expected = [{"id": 1, "bucket": "old", "value": 1}, {"id": 2, "bucket": "new", "value": 22}]
++    # in all cases the merge replaces partition 'new' and keeps partitions 'old' and ('ne', 'wa')
++    expected = [
++        {"id": 1, "bucket": "old", "shard": "a", "value": 1},
++        {"id": 2, "bucket": "new", "shard": "a", "value": 22},
++        {"id": 6, "bucket": "ne", "shard": "wa", "value": 6},
++    ]
+     if not conditions:
+-        expected.append({"id": 5, "bucket": "mid", "value": 1})
++        expected.append({"id": 5, "bucket": "mid", "shard": "a", "value": 1})
+     elif "destination_scope" not in conditions:
+         # 5 is not in the merge source, so the merge does not replace partition 'mid'
+-        expected.append({"id": 4, "bucket": "mid", "value": 4})
++        expected.append({"id": 4, "bucket": "mid", "shard": "a", "value": 4})
+     # with the destination scope, the merge deletes partition 'mid' and inserts nothing
+     tables = load_tables_to_dicts(p, "events", exclude_system_cols=True)
+     assert_records_as_set(tables["events"], expected)
+diff --git a/tests/load/pipeline/test_scd2.py b/tests/load/pipeline/test_scd2.py
+index b730f6bf0..dc33c1ec7 100644
+--- a/tests/load/pipeline/test_scd2.py
++++ b/tests/load/pipeline/test_scd2.py
+@@ -873,6 +873,7 @@ def test_merge_key_compound_natural_key(
+     p = destination_config.setup_pipeline("abstract", dev_mode=True)
+ 
+     @dlt.resource(
++        name="s",  # the staging alias must not shadow the root table
+         merge_key=["first_name", "last_name"],
+         write_disposition={"disposition": "merge", "strategy": "scd2"},
+     )
+@@ -881,37 +882,51 @@ def test_merge_key_compound_natural_key(
+ 
+     # vary `first_name` type to test mixed compound `merge_key`
+     if key_type == "text":
+-        first_name = "John"
++        first_name: Any = "ab"
++        last_name = "c"
++        colliding_first_name: Any = "a"
++        colliding_last_name = "bc"
+     elif key_type == "bigint":
+-        first_name = 1  # type: ignore[assignment]
++        first_name = 12
++        last_name = "3"
++        colliding_first_name = 1
++        colliding_last_name = "23"
+     # load 1 — initial load
+     dim_snap = [
+-        {"first_name": first_name, "last_name": "Doe", "age": 20},
++        {"first_name": first_name, "last_name": last_name, "age": 20},
+         {"first_name": first_name, "last_name": "Dodo", "age": 20},
++        {
++            "first_name": colliding_first_name,
++            "last_name": colliding_last_name,
++            "age": 20,
++        },
+     ]
+     info = p.run(dim_test_compound(dim_snap), **destination_config.run_kwargs)
+     assert_load_info(info)
+-    assert load_table_counts(p, "dim_test_compound")["dim_test_compound"] == 2
+-    # both records should be active (i.e. not retired)
+-    assert [row[TO] for row in get_table(p, "dim_test_compound")] == [None, None]
++    assert load_table_counts(p, "s")["s"] == 3
++    # all records should be active (i.e. not retired)
++    assert [row[TO] for row in get_table(p, "s")] == [None, None, None]
+ 
+-    # load 2 — "Dodo" is absent, "Doe" has changed
++    # load 2 — "Dodo" and the colliding key are absent, while the first record has changed
+     dim_snap = [
+-        {"first_name": first_name, "last_name": "Doe", "age": 30},
++        {"first_name": first_name, "last_name": last_name, "age": 30},
+     ]
+     info = p.run(dim_test_compound(dim_snap), **destination_config.run_kwargs)
+     assert_load_info(info)
+-    assert load_table_counts(p, "dim_test_compound")["dim_test_compound"] == 3
++    assert load_table_counts(p, "s")["s"] == 4
+     ts3 = get_load_package_created_at(p, info)
+-    # "Doe" should now have two records (one retired, one active)
++    # the changed key should have two records, unrelated absent keys must stay active
+     expected: List[Dict[str, Any]] = [
+-        {"first_name": first_name, "last_name": "Doe", TO: ts3},
+-        {"first_name": first_name, "last_name": "Doe", TO: None},
++        {"first_name": first_name, "last_name": last_name, TO: ts3},
++        {"first_name": first_name, "last_name": last_name, TO: None},
+         {"first_name": first_name, "last_name": "Dodo", TO: None},
++        {
++            "first_name": colliding_first_name,
++            "last_name": colliding_last_name,
++            TO: None,
++        },
+     ]
+-    assert_records_as_set(
+-        get_rows(p, "dim_test_compound", ("first_name", "last_name", TO)), expected
+-    )
++    assert_records_as_set(get_rows(p, "s", ("first_name", "last_name", TO)), expected)
+ 
+ 
+ @pytest.mark.essential
+diff --git a/uv.lock b/uv.lock
+index c9a7406b6..5b4db2e4c 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2634,6 +2634,7 @@ dev = [
+     { name = "requests-mock" },
+     { name = "ruff" },
+     { name = "sqlfluff" },
++    { name = "sqlglot" },
+     { name = "types-cachetools" },
+     { name = "types-click" },
+     { name = "types-croniter" },
+@@ -2875,6 +2876,7 @@ dev = [
+     { name = "requests-mock", specifier = ">=1.10.0,<2" },
+     { name = "ruff", specifier = ">=0.3.2,<0.4" },
+     { name = "sqlfluff", specifier = ">=2.3.2,<3" },
++    { name = "sqlglot", specifier = "<30.22" },
+     { name = "types-cachetools", specifier = ">=4.2.9" },
+     { name = "types-click", specifier = ">=7.1.8,<8" },
+     { name = "types-croniter", specifier = ">=6.0.0" },
+
+
+===== COMMIT c75b59e4 =====
+
+
+commit c75b59e48
+Author: Martin Bach
+Date: 2026-10-08
+
+    docs(worker): single permanent redirects and real 404s (#4489)
+
+diff --git a/docs/website/README.md b/docs/website/README.md
+index 889445984..80fc2d309 100644
+--- a/docs/website/README.md
++++ b/docs/website/README.md
+@@ -120,6 +120,8 @@ Edit [`redirects.js`](redirects.js) — that file is the **devel** version's red
+ 
+ The compile step (see below) prefixes both fields with `/docs/devel/` when emitting the version-scoped output. So the entry above ends up matching the URL `/docs/devel/old/path` in production — exactly where the page lives in this version.
+ 
++A `from` path may only appear **once**. The worker resolves paths through a map where the first rule wins, so a second rule for the same `from` would never fire; `compile-redirects` fails the build on duplicates. To change where a path goes, edit the existing entry.
++
+ Pre-snapshotted versions (currently just `master`) have their own redirect files under `versioned_redirects/version-<v>.js`. Those are populated by `tools/update_versions.js`, which clones each tag and snapshots its `docs/website/redirects.js`. You don't edit those files by hand — to change `master`'s redirects, edit `redirects.js` on the `master` branch and push.
+ 
+ The lone catchall `{ from: "/", to: "/docs/devel/intro" }` is the exception: its `from` doesn't start with `/docs/`, so the compiler treats it as version-independent and passes it through unchanged.
+@@ -135,7 +137,7 @@ It rewrites each entry's leading `/docs/` to `/docs/<version-path>/` (devel →
+ 
+ ### Where the compiled file is used
+ 
+-- **Cloudflare worker (`worker.ts`)** — imports `redirects.compiled.js`. Wrangler bundles the import into the deployed worker. Exact pathname match per entry; no version-routing logic in the worker.
++- **Cloudflare worker (`worker.ts`)** — imports `redirects.compiled.js`. Wrangler bundles the import into the deployed worker. Exact pathname match per entry; no version-routing logic in the worker. Rules, trailing slashes and the legacy `/plus/` → `/hub/` forward are followed to the final target (see `worker-routing.mjs`), so a moved page answers with a single `301` instead of a chain. A chain that does not settle within 10 hops is left to the assets binding rather than redirected to a half-resolved path.
+ - **`scripts/verify-redirects.js`** — loads `redirects.compiled.js`, checks each `to` resolves to an HTML page in `build/docs/<rel>`, and **also recompiles in memory** from the per-version sources and diffs the result against the on-disk compiled file to guard against a stale compiled file.
+ 
+ 
+diff --git a/docs/website/biome.json b/docs/website/biome.json
+index 4b8d2a74f..2ad85bb47 100644
+--- a/docs/website/biome.json
++++ b/docs/website/biome.json
+@@ -4,8 +4,9 @@
+     "includes": [
+       "redirects.js",
+       "worker.ts",
+-      "tools/**/*.{js,ts}",
+-      "scripts/**/*.{js,ts}",
++      "worker-routing.mjs",
++      "tools/**/*.{js,ts,mjs}",
++      "scripts/**/*.{js,ts,mjs}",
+       "plugins/**/*.{js,ts}",
+       "sidebars.js",
+       "docusaurus.config.js",
+diff --git a/docs/website/redirects.js b/docs/website/redirects.js
+index 7e5022c13..7f067bdc2 100644
+--- a/docs/website/redirects.js
++++ b/docs/website/redirects.js
+@@ -331,23 +331,24 @@ const REDIRECTS = [
+   // the DataTalksClub zoomcamp). Without these they answer 404.
+   {
+     from: "/docs/general-usage/http/rest-client",
+-    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced",
++    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced#restclient",
+   },
+   {
+     from: "/docs/general-usage/http/requests",
+-    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced",
++    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced#requests-wrapper",
+   },
+   {
+     from: "/docs/general-usage/http/overview",
+-    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced",
++    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced#restclient",
+   },
+   {
+     from: "/docs/general-usage/dashboard",
+     to: "/docs/hub/ingestion/dashboard",
+   },
+   {
++    // the reference section landing page - the API reference has its own entry below
+     from: "/docs/reference",
+-    to: "/docs/api_reference/dlt/__init__",
++    to: "/docs/reference/command-line-interface",
+   },
+   {
+     from: "/docs/api_reference",
+@@ -395,7 +396,7 @@ const REDIRECTS = [
+   },
+   {
+     from: "/docs/dlt-ecosystem/transformations/dbt/dbt_cloud",
+-    to: "/docs/dlt-ecosystem/transformations/dbt",
++    to: "/docs/dlt-ecosystem/transformations/dbt#dbt-cloud",
+   },
+   {
+     from: "/docs/general-usage/dataset-access/",
+@@ -421,6 +422,72 @@ const REDIRECTS = [
+     from: "/docs/dlt-ecosystem/visualizations/understanding-the-tables",
+     to: "/docs/general-usage/destination-tables",
+   },
++  // pages that moved in earlier docs restructures and currently end on the
++  // not-found page (backlink crawl, Sept 2026)
++  {
++    from: "/docs/general-usage",
++    to: "/docs/general-usage/source",
++  },
++  {
++    from: "/docs/general-usage/dataset-access/streamlit",
++    to: "/docs/hub/cookbook/build-streamlit-dashboard",
++  },
++  {
++    from: "/docs/dlt-ecosystem/verified-sources/filesystem/advanced",
++    to: "/docs/dlt-ecosystem/verified-sources/filesystem",
++  },
++  {
++    from: "/docs/running-in-production",
++    to: "/docs/running-in-production/running",
++  },
++  {
++    from: "/docs/hub/features/data-access",
++    to: "/docs/general-usage/dataset-access/dataset",
++  },
++  {
++    from: "/docs/hub/features/quality/tests",
++    to: "/docs/hub/data-quality",
++  },
++  {
++    from: "/docs/hub/features/transformations/setup",
++    to: "/docs/hub/transformations",
++  },
++  {
++    from: "/docs/hub/features/project/overview",
++    to: "/docs/hub/pipeline-operations/overview",
++  },
++  {
++    from: "/docs/hub/features/project/source-configuration",
++    to: "/docs/hub/pipeline-operations/overview",
++  },
++  {
++    from: "/docs/hub/features/project/python-api",
++    to: "/docs/hub/pipeline-operations/overview",
++  },
++  {
++    from: "/docs/hub/getting-started/tutorial",
++    to: "/docs/hub/getting-started/introduction",
++  },
++  {
++    from: "/docs/hub/getting-started/advanced_tutorial",
++    to: "/docs/hub/getting-started/introduction",
++  },
++  {
++    from: "/docs/hub/core-concepts/profiles",
++    to: "/docs/hub/pipeline-operations/profiles",
++  },
++  {
++    from: "/docs/hub/production/pipeline-runner",
++    to: "/docs/hub/pipeline-operations/deployments",
++  },
++  {
++    from: "/docs/hub/production/observability",
++    to: "/docs/hub/pipeline-operations/monitoring",
++  },
++  {
++    from: "/docs/hub/getting-started/playground-workspace",
++    to: "/docs/hub/pipeline-operations/playground-workspace",
++  },
+ ];
+ 
+ module.exports = REDIRECTS;
+diff --git a/docs/website/tools/compile_redirects.js b/docs/website/tools/compile_redirects.js
+index c13b3d58d..393d36bee 100644
+--- a/docs/website/tools/compile_redirects.js
++++ b/docs/website/tools/compile_redirects.js
+@@ -137,6 +137,8 @@ function compile() {
+     for (const entry of g.entries) compiled.push(entry);
+   }
+ 
++  assertNoDuplicateSources(compiled);
++
+   return {
+     compiled,
+     groups: grouped,
+@@ -145,6 +147,26 @@ function compile() {
+   };
+ }
+ 
++/**
++ * Reject two rules for the same `from` path. The worker resolves a path with a
++ * map (first rule wins), so a duplicate silently disables the later rule.
++ */
++function assertNoDuplicateSources(entries) {
++  const targetsByFrom = new Map();
++  for (const entry of entries) {
++    const targets = targetsByFrom.get(entry.from);
++    if (targets) targets.push(entry.to);
++    else targetsByFrom.set(entry.from, [entry.to]);
++  }
++  const duplicates = [...targetsByFrom].filter(([, targets]) => targets.length > 1);
++  if (duplicates.length === 0) return;
++  const details = duplicates.map(([from, targets]) => `  ${from} -> ${targets.join(", ")}`).join("\n");
++  throw new Error(
++    `duplicate "from" paths in the redirect sources - the worker would only ever apply ` +
++      `the first rule for each. Edit the existing entry instead of adding a second one:\n${details}`,
++  );
++}
++
+ function renderEntry(entry) {
+   return `  {\n    from: ${JSON.stringify(entry.from)},\n    to: ${JSON.stringify(entry.to)}\n  },\n`;
+ }
+diff --git a/docs/website/worker-routing.mjs b/docs/website/worker-routing.mjs
+new file mode 100644
+index 000000000..e0a907d71
+--- /dev/null
++++ b/docs/website/worker-routing.mjs
+@@ -0,0 +1,82 @@
++// Pure routing helpers for the Cloudflare worker (worker.ts).
++//
++// Kept free of worker globals and of the generated redirect list so they can be
++// exercised directly by scripts/test-worker.js.
++
++// guards against a cycle in the redirect rules
++export const MAX_REDIRECT_HOPS = 10;
++
++// "/plus" as a whole path segment, so "/hub/ecosystem/snowflake_plus" is left alone
++const PLUS_SEGMENT = /\/plus(?=\/|$)/;
++
++// the version segment in a docs URL: "devel" or a release like "1.17.0"
++const VERSION_SEGMENT = /^(devel|\d+(\.\d+)*)$/;
++
++/**
++ * Match a top-level docs route across every version: "404" matches /docs/404,
++ * /docs/devel/404 and /docs/1.17.0/404, but not /docs/general-usage/404.
++ *
++ * @param {string} pathname
++ * @param {string} route path segment, without slashes
++ * @returns {boolean}
++ */
++export function isTopLevelDocsRoute(pathname, route) {
++  const segments = pathname.split("/").filter(Boolean);
++  if (segments[0] !== "docs") return false;
++  if (segments[segments.length - 1] !== route) return false;
++  if (segments.length === 2) return true;
++  // /docs/<version>/<route>
++  return segments.length === 3 && VERSION_SEGMENT.test(segments[1]);
++}
++
++/**
++ * Build the path resolver from a redirect list.
++ *
++ * The resolver follows redirect rules, trailing slashes and plus -> hub
++ * forwarding to the final path, so a moved page answers with one permanent
++ * redirect instead of a chain. It returns null when the path does not
++ * redirect, and also when the rules do not settle within MAX_REDIRECT_HOPS:
++ * redirecting to a half-resolved path would make the browser re-enter the
++ * cycle on the next request.
++ *
++ * @param {Array<{from: string, to: string}>} redirects
++ * @returns {(pathname: string) => {pathname: string, hash?: string} | null}
++ */
++export function createRedirectResolver(redirects) {
++  // first rule wins, same as a linear scan. Duplicate `from` paths are rejected
++  // by tools/compile_redirects.js, so this only guards against a stale build.
++  const targets = new Map();
++  for (const redirect of redirects) {
++    if (!targets.has(redirect.from)) targets.set(redirect.from, redirect.to);
++  }
++
++  return function resolveRedirect(pathname) {
++    let current = pathname;
++    let hash;
++    let settled = false;
++    for (let hop = 0; hop < MAX_REDIRECT_HOPS; hop++) {
++      const target = targets.get(current);
++      if (target !== undefined) {
++        // split off the fragment - URL.pathname would percent-encode a "#"
++        const [targetPath, targetHash] = target.split("#");
++        current = targetPath;
++        // a fragment only applies to the page it was written for, so a later
++        // hop drops the one an earlier hop added
++        hash = targetHash || undefined;
++      } else if (current.length > 1 && current.endsWith("/")) {
++        // the assets binding would answer this with a temporary 307
++        current = current.slice(0, -1);
++      } else if (PLUS_SEGMENT.test(current)) {
++        current = current.replace(PLUS_SEGMENT, "/hub");
++      } else {
++        settled = true;
++        break;
++      }
++    }
++    if (!settled) {
++      console.error(`redirect rules did not settle within ${MAX_REDIRECT_HOPS} hops for ${pathname}`);
++      return null;
++    }
++    return current === pathname && hash === undefined ? null : { pathname: current, hash };
++  };
++}
+diff --git a/docs/website/worker.ts b/docs/website/worker.ts
+index 2264fdb26..00a9ae492 100644
+--- a/docs/website/worker.ts
++++ b/docs/website/worker.ts
+@@ -2,6 +2,7 @@
+ import { instrument, type ResolveConfigFn } from "@microlabs/otel-cf-workers";
+ import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
+ import REDIRECTS from "./redirects.compiled.js";
++import { createRedirectResolver, isTopLevelDocsRoute } from "./worker-routing.mjs";
+ 
+ const ROUTE_404 = "/docs/404";
+ 
+@@ -15,49 +16,56 @@ async function notFound(request, env): Promise<Response> {
+   return new Response(page.body, { status: 404, headers });
+ }
+ 
++// the theme's search page marks itself noindex with `property="robots"`, which search
++// engines ignore; a response header is honoured. Matched per version, so /docs/search
++// and /docs/devel/search are both covered.
++const NOINDEX_ROUTES = ["search"];
++
++const resolveRedirect = createRedirectResolver(REDIRECTS);
++
+ const handler = {
+   async fetch(request, env, _ctx) {
+     const url = new URL(request.url);
+ 
+-    // forward plus requests to hub
+-    if (url.pathname.includes("/plus")) {
+-      url.pathname = url.pathname.replace("/plus", "/hub");
+-      return Response.redirect(url.toString(), 301);
+-    }
+-
+-    // handle redirects (a trailing-slash variant of a redirected path resolves
+-    // in one hop instead of two)
+-    const bare = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
+-    for (const redirect of REDIRECTS) {
+-      if (url.pathname === redirect.from || bare === redirect.from) {
+-        // split off the fragment - URL.pathname would percent-encode a "#"
+-        const [pathname, hash] = redirect.to.split("#");
+-        url.pathname = pathname;
+-        if (hash) url.hash = hash;
+-        return Response.redirect(url.toString(), 301);
+-      }
+-    }
+-
+-    // Trailing-slash URLs get a permanent redirect to the canonical path.
+-    // The assets layer (html_handling: drop-trailing-slash) answers them with
+-    // a 307, and a temporary redirect does not reliably consolidate links:
+-    // /docs/dlt-ecosystem/destinations/ alone has ~30 followed backlinks.
+-    if (bare !== url.pathname) {
+-      url.pathname = bare;
++    const redirect = resolveRedirect(url.pathname);
++    if (redirect) {
++      url.pathname = redirect.pathname;
++      if (redirect.hash) url.hash = redirect.hash;
+       return Response.redirect(url.toString(), 301);
+     }
+ 
+     // The 404 page is served in place, with a 404 status. It used to be a
+     // 301 to /docs/404, which answers 200, so every dead docs URL looked
+     // like a live page to crawlers (a soft 404) and inherited nothing.
+-    if (url.pathname === ROUTE_404 || url.pathname === `${ROUTE_404}/`) {
++    if (isTopLevelDocsRoute(url.pathname, "404")) {
+       return notFound(request, env);
+     }
+ 
+     const res = await env.ASSETS.fetch(request);
++
++    // never hand out a temporary redirect for a docs page. Only for safe methods:
++    // a 307 preserves the method, a 301 does not.
++    const isSafeMethod = request.method === "GET" || request.method === "HEAD";
++    if (isSafeMethod && (res.status === 302 || res.status === 307)) {
++      const location = res.headers.get("Location");
++      if (location) {
++        const target = new URL(location, url);
++        // the assets binding drops the query string when it canonicalises a path
++        if (!target.search) target.search = url.search;
++        return Response.redirect(target.toString(), 301);
++      }
++    }
++
++    // serve the not-found page with a real 404 status instead of redirecting to it
+     if (res.status === 404) {
+       return notFound(request, env);
+     }
++
++    if (NOINDEX_ROUTES.some((route) => isTopLevelDocsRoute(url.pathname, route))) {
++      const noindex = new Response(res.body, res);
++      noindex.headers.set("X-Robots-Tag", "noindex, follow");
++      return noindex;
++    }
+     return res; // unchanged response (transparent externally)
+   },
+ };
+
+
+===== COMMIT 1943db54 =====
+
+
+commit 1943db547
+Author: Martin Bach
+Date: 2026-10-08
+
+    Docs: add "Go further" links to the most-linked docs pages (#4494)
+
+diff --git a/docs/website/src/data/go-further.js b/docs/website/src/data/go-further.js
+new file mode 100644
+index 000000000..173dddf36
+--- /dev/null
++++ b/docs/website/src/data/go-further.js
+@@ -0,0 +1,154 @@
++/**
++ * "Go further" links shown at the end of selected docs pages.
++ *
++ * Keys are doc permalinks without the version segment, so "/docs/devel/intro" and
++ * "/docs/intro" both match "/docs/intro". A key ending in "/" is a prefix rule and
++ * matches every page below it; exact keys win over prefixes, and the longest prefix wins.
++ * Pages without a match render nothing.
++ *
++ * Links point at dlthub.com, which is a separate app on the same domain, so they must be
++ * absolute URLs. Check each one returns 200 before adding it.
++ */
++
++const LINKS = {
++  scd2Guide: {
++    label: "Slowly changing dimensions (SCD2) with dlt",
++    href: "https://dlthub.com/blog/scd2-and-incremental-loading",
++    description: "What SCD2 is, when to use it, and how to set it up in dlt.",
++  },
++  scd2NestedJson: {
++    label: "SCD2 on nested JSON: queries and cost",
++    href: "https://dlthub.com/blog/scd2-nested-json-data-cost-optimization",
++    description: "How nested data affects SCD2 queries and costs, with BigQuery numbers.",
++  },
++  practiceApis: {
++    label: "Free APIs to practice on",
++    href: "https://dlthub.com/blog/practice-api-sources",
++    description: "Public APIs you can use to try out REST API pipelines.",
++  },
++  context: {
++    label: "Source scaffolds for 10,000+ APIs",
++    href: "https://dlthub.com/context",
++    description: "Start a pipeline from a ready-made scaffold instead of from scratch.",
++  },
++  dlthub: {
++    label: "dltHub platform",
++    href: "https://dlthub.com/products/dlthub",
++    description: "Deploy, monitor and scale dlt pipelines.",
++  },
++  motherduckDemo: {
++    label: "dlt, dbt and MotherDuck in practice",
++    href: "https://dlthub.com/blog/dlt-motherduck-demo",
++    description: "A small, customizable data stack with dlt, dbt, DuckDB and MotherDuck.",
++  },
++  snowflake: {
++    label: "dlt and Snowflake",
++    href: "https://dlthub.com/partners/snowflake",
++    description: "How teams load production data into Snowflake with dlt.",
++  },
++  databricks: {
++    label: "dlt and Databricks",
++    href: "https://dlthub.com/partners/databricks",
++    description: "Custom sources, Unity Catalog, Delta and Iceberg with dlt.",
++  },
++  dbtSemanticLayer: {
++    label: "dlt and dbt for semantic modelling",
++    href: "https://dlthub.com/blog/dlt-dbt-semantic-layer",
++    description: "An end-to-end pipeline from dlt to dbt semantic models.",
++  },
++  transformations: {
++    label: "dltHub Transformations",
++    href: "https://dlthub.com/products/transformations",
++    description: "Model the data your pipelines load, starting from its schema.",
++  },
++  schemaEvolutionGuide: {
++    label: "Schema evolution in data pipelines",
++    href: "https://dlthub.com/blog/schema-evolution-guide",
++    description: "Common failure modes when source schemas change, and how dlt handles them.",
++  },
++  dataQuality: {
++    label: "Data quality in dltHub",
++    href: "https://dlthub.com/products/data-quality",
++    description: "Expectations, schema contracts and PII redaction on load.",
++  },
++  benchmark: {
++    label: "dltHub throughput benchmark",
++    href: "https://dlthub.com/blog/benchmark-dlthub",
++    description: "Measured GB per hour for Parquet, SQL, JSON and REST sources.",
++  },
++  sqlBenchmark: {
++    label: "SQL pipeline benchmark",
++    href: "https://dlthub.com/blog/sql-benchmark-saas",
++    description: "How data pipeline tools compare on SQL database loads.",
++  },
++  managedInfrastructure: {
++    label: "Managed infrastructure",
++    href: "https://dlthub.com/products/managed-infrastructure",
++    description: "Scheduling, observability and alerting for every pipeline you run.",
++  },
++  airflow: {
++    label: "Running dlt with Airflow",
++    href: "https://dlthub.com/blog/dlt-with-airflow",
++    description: "Four ways to run dlt in Airflow and which setup scales best.",
++  },
++  dagster: {
++    label: "Orchestrating dlt with Dagster",
++    href: "https://dlthub.com/blog/dlt-dagster",
++    description: "A step-by-step Dagster project that runs a dlt pipeline.",
++  },
++  prefect: {
++    label: "Resilient pipelines with dlt and Prefect",
++    href: "https://dlthub.com/blog/dlt-prefect",
++    description: "Loading Slack data into BigQuery and handling failures with Prefect.",
++  },
++  blog: {
++    label: "dltHub blog",
++    href: "https://dlthub.com/blog",
++    description: "Guides, benchmarks and case studies from the dlt team.",
++  },
++  pricing: {
++    label: "dltHub pricing",
++    href: "https://dlthub.com/pricing",
++    description: "Plans and what each one includes.",
++  },
++};
++
++const restApi = [LINKS.practiceApis, LINKS.context];
++const schema = [LINKS.schemaEvolutionGuide, LINKS.dataQuality];
++const credentials = [LINKS.managedInfrastructure];
++
++export const GO_FURTHER = {
++  "/docs/intro": [LINKS.dlthub, LINKS.context, LINKS.blog],
++  "/docs/general-usage/incremental-loading": [LINKS.scd2Guide, LINKS.scd2NestedJson],
++  "/docs/general-usage/merge-loading": [LINKS.scd2Guide, LINKS.scd2NestedJson],
++  "/docs/general-usage/schema-contracts": schema,
++  "/docs/general-usage/schema-evolution": schema,
++  "/docs/general-usage/credentials/setup": credentials,
++  "/docs/walkthroughs/add_credentials": credentials,
++  "/docs/dlt-ecosystem/verified-sources": [LINKS.context, LINKS.dlthub],
++  "/docs/dlt-ecosystem/verified-sources/rest_api": restApi,
++  "/docs/dlt-ecosystem/verified-sources/rest_api/basic": restApi,
++  "/docs/dlt-ecosystem/verified-sources/rest_api/advanced": restApi,
++  "/docs/dlt-ecosystem/destinations/motherduck": [LINKS.motherduckDemo],
++  "/docs/dlt-ecosystem/destinations/snowflake": [LINKS.snowflake],
++  "/docs/dlt-ecosystem/destinations/databricks": [LINKS.databricks],
++  "/docs/dlt-ecosystem/transformations/dbt": [LINKS.dbtSemanticLayer, LINKS.transformations],
++  "/docs/reference/performance": [LINKS.benchmark, LINKS.sqlBenchmark],
++  "docs/dlt-ecosystem/verified-sources/sql_database": LINKS.sqlBenchmark,
++  "/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer": [LINKS.airflow],
++  "/docs/walkthroughs/deploy-a-pipeline/deploy-with-dagster": [LINKS.dagster],
++  "/docs/walkthroughs/deploy-a-pipeline/deploy-with-prefect": [LINKS.prefect],
++  "/docs/hub/": [LINKS.dlthub, LINKS.pricing],
++};
++
++/** Returns the links for a version-less docs path, or undefined. */
++export function getGoFurtherLinks(path) {
++  const normalized = path.length > 1 ? path.replace(/\/+$/, "") : path;
++  if (GO_FURTHER[normalized]) {
++    return GO_FURTHER[normalized];
++  }
++  const prefix = Object.keys(GO_FURTHER)
++    .filter((key) => key.endsWith("/") && normalized.startsWith(key))
++    .sort((a, b) => b.length - a.length)[0];
++  return prefix ? GO_FURTHER[prefix] : undefined;
++}
+diff --git a/docs/website/src/theme/DocItem/Footer/index.js b/docs/website/src/theme/DocItem/Footer/index.js
+new file mode 100644
+index 000000000..2d6a8f7dc
+--- /dev/null
++++ b/docs/website/src/theme/DocItem/Footer/index.js
+@@ -0,0 +1,49 @@
++/**
++ * Wrapped DocItem/Footer: renders the original footer, then a short "Go further" list of
++ * dlthub.com pages for docs that have an entry in src/data/go-further.js.
++ */
++import React from "react";
++import Footer from "@theme-original/DocItem/Footer";
++import { useDoc, useDocsVersion, useVersions } from "@docusaurus/plugin-content-docs/client";
++import { getGoFurtherLinks } from "@site/src/data/go-further";
++import styles from "./styles.module.css";
++
++// "/docs/devel/intro" and "/docs/intro" both become "/docs/intro".
++function useVersionlessPath() {
++  const { metadata } = useDoc();
++  const { pluginId, version } = useDocsVersion();
++  const versionPath = (useVersions(pluginId).find((v) => v.name === version)?.path ?? "/docs").replace(/\/+$/, "");
++  const rest = metadata.permalink.slice(versionPath.length);
++  return `/docs${rest.startsWith("/") ? rest : `/${rest}`}`;
++}
++
++function GoFurther({ links }) {
++  return (
++    <nav className={styles.goFurther} aria-labelledby="go-further-heading">
++      <h2 id="go-further-heading" className={styles.heading}>
++        Go further
++      </h2>
++      <ul className={styles.list}>
++        {links.map((link) => (
++          <li key={link.href} className={styles.item}>
++            {/* Plain <a>: these pages live on the dlthub.com app, not in the docs router. */}
++            <a className={styles.link} href={link.href}>
++              {link.label}
++            </a>
++            {link.description && <span className={styles.description}>{link.description}</span>}
++          </li>
++        ))}
++      </ul>
++    </nav>
++  );
++}
++
++export default function FooterWrapper(props) {
++  const links = getGoFurtherLinks(useVersionlessPath());
++  return (
++    <>
++      <Footer {...props} />
++      {links?.length > 0 && <GoFurther links={links} />}
++    </>
++  );
++}
+diff --git a/docs/website/src/theme/DocItem/Footer/styles.module.css b/docs/website/src/theme/DocItem/Footer/styles.module.css
+new file mode 100644
+index 000000000..dc054a120
+--- /dev/null
++++ b/docs/website/src/theme/DocItem/Footer/styles.module.css
+@@ -0,0 +1,33 @@
++.goFurther {
++  margin-top: var(--ifm-spacing-vertical);
++  padding-top: var(--ifm-spacing-vertical);
++  border-top: 1px solid var(--ifm-toc-border-color);
++}
++
++.heading {
++  margin: 0 0 0.5rem;
++  font-size: var(--ifm-h5-font-size);
++  font-weight: var(--ifm-font-weight-semibold);
++  color: var(--ifm-color-emphasis-700);
++}
++
++.list {
++  margin: 0;
++  padding: 0;
++  list-style: none;
++}
++
++.item {
++  padding: 0.25rem 0;
++  font-size: 0.9375rem;
++  line-height: 1.5;
++}
++
++.link {
++  font-weight: var(--ifm-font-weight-semibold);
++}
++
++.description {
++  display: block;
++  color: var(--ifm-color-emphasis-700);
++}
+
+
+===== COMMIT 417e720c =====
+
+
+commit 417e720cb
+Author: rudolfix
+Date: 2026-10-07
+
+    (chore) bumps dlt to 1.31.0 (#4518)
+
+diff --git a/docs/uv.lock b/docs/uv.lock
+index 0ce0a8f6d..896e13261 100644
+--- a/docs/uv.lock
++++ b/docs/uv.lock
+@@ -800,7 +800,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.31.0a0"
++version = "1.31.0"
+ source = { editable = "../" }
+ dependencies = [
+     { name = "click" },
+diff --git a/pyproject.toml b/pyproject.toml
+index d9f7b7bd4..0320ba364 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "dlt"
+-version = "1.31.0a0"
++version = "1.31.0"
+ description = "dlt is an open-source python-first scalable data loading library that does not require any backend to run."
+ authors = [{ name = "dltHub Inc.", email = "services@dlthub.com" }]
+ requires-python = ">=3.10, <3.15"
+diff --git a/uv.lock b/uv.lock
+index 0f6678210..c9a7406b6 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2384,7 +2384,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.31.0a0"
++version = "1.31.0"
+ source = { editable = "." }
+ dependencies = [
+     { name = "click" },
+
+
+===== COMMIT bd32b42a =====
+
+
+commit bd32b42a9
+Author: Shreyas
+Date: 2026-10-05
+
+    docs(hub): explain how a job waits for several upstream jobs (#4513)
+
+diff --git a/docs/website/docs/hub/pipeline-operations/triggers.md b/docs/website/docs/hub/pipeline-operations/triggers.md
+index bb2b0a452..6e2b75729 100644
+--- a/docs/website/docs/hub/pipeline-operations/triggers.md
++++ b/docs/website/docs/hub/pipeline-operations/triggers.md
+@@ -58,6 +58,36 @@ def transform(run_context: TJobRunContext):
+ 
+ `TJobRunContext` is a dict injected by the launcher with: `run_id`, `trigger`, `refresh`, and the scheduler-supplied `interval_start` / `interval_end` (see [Scheduler-driven intervals](#scheduler-driven-intervals) below).
+ 
++A list of triggers means "any of these": the job runs whenever one of them fires, and each one starts its own run. With `trigger=[job_a.success, job_b.success, job_c.success]`, the job runs once after each upstream job succeeds, so up to three times.
++
++### Wait for several upstream jobs
++
++To run a job once, after all of its upstream jobs have finished, combine a [follow-up trigger](#follow-up-triggers) and a [freshness check](#freshness-checks) for each upstream job:
++
++```py notype
++@run.job(
++    trigger=[job_a.success, job_b.success, job_c.success],
++    freshness=[job_a.is_fresh, job_b.is_fresh, job_c.is_fresh],
++)
++def job_d(run_context: TJobRunContext):
++    ...
++```
++
++Each upstream success tries to start `job_d`, but the freshness check skips the run while any upstream job's latest run is still running or failed. `job_d` runs once, right after the last upstream job finishes.
++
++To run the job at a fixed time instead, keep the freshness check and give it a schedule:
++
++```py notype
++@run.job(
++    trigger=trigger.schedule("0 8 * * *"),
++    freshness=[job_a.is_fresh, job_b.is_fresh, job_c.is_fresh],
++)
++def job_d(run_context: TJobRunContext):
++    ...
++```
++
++At each scheduled time, `job_d` runs only if the latest run of every upstream job completed. Otherwise that run is skipped, and `job_d` tries again at its next scheduled time.
++
+ ## Follow-up triggers
+ 
+ Every decorated job exposes `.success`, `.fail`, and `.completed` trigger properties. Use them to chain jobs into a dependency graph.
+
+
+===== COMMIT fa493478 =====
+
+
+commit fa4934783
+Author: rudolfix
+Date: 2026-10-02
+
+    docs: format the merge strategy support table (#4508)
+
+diff --git a/docs/website/docs/general-usage/merge-loading.md b/docs/website/docs/general-usage/merge-loading.md
+index 4045968e0..0c2124828 100644
+--- a/docs/website/docs/general-usage/merge-loading.md
++++ b/docs/website/docs/general-usage/merge-loading.md
+@@ -996,13 +996,13 @@ def customers():
+ - **`destination_scope`** selects the destination records that the merge can delete or retire. `delete-insert`, `scd2`, and `cdc` support it.
+ - **`source_filter`** selects the loaded records to merge. dlt **discards** the other loaded records. The remaining records are the merge source. Keys and `merge_key` partitions come only from the merge source.
+ 
+-| strategy        | `destination_scope`         | `source_filter` |
+-| --------------- | --------------------- | -------------- |
+-| `delete-insert` | yes, the delete condition | yes            |
+-| `scd2`          | yes                   | yes            |
+-| `cdc`           | yes                   | yes            |
+-| `upsert`        | no                    | yes            |
+-| `insert-only`   | no                    | no             |
++| strategy        | `destination_scope`       | `source_filter` |
++| --------------- | ------------------------- | --------------- |
++| `delete-insert` | yes, the delete condition | yes             |
++| `scd2`          | yes                       | yes             |
++| `cdc`           | yes                       | yes             |
++| `upsert`        | no                        | yes             |
++| `insert-only`   | no                        | no              |
+ 
+ With an unsupported option, dlt raises an error when you define the resource. If the destination picks the strategy, dlt ignores the option and logs a warning.
+ 
+
+
+===== COMMIT 2a7a80c4 =====
+
+
+commit 2a7a80c43
+Author: dlt-oss-docs-agent[bot]
+Date: 2026-10-02
+
+    SQLAlchemy destination: document Oracle env var query params and merge staging schema privilege req… (#4485)
+
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md b/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md
+index 22aa1cbde..fe538fd4f 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md
+@@ -83,6 +83,10 @@ or
+ export DESTINATION__SQLALCHEMY__CREDENTIALS="mysql://loader:<password>@localhost:3306/dlt_data"
+ ```
+ 
++Some dialects need connection URL query parameters on top of the fields above, for example Oracle's `service_name`. Read
++[Oracle connection URL query parameters](#oracle-connection-url-query-parameters) to see how to pass them from `secrets.toml`
++and from environment variables.
++
+ An SQLAlchemy `Engine` can also be passed directly by creating an instance of the destination:
+ 
+ ```py
+@@ -336,6 +340,106 @@ workers=1
+ * VARCHAR precision is accepted in DDL but not stored by DuckDB.
+ * Parquet files are loaded with batch INSERT statements: ADBC ingestion is not implemented for this dialect.
+ 
++## Notes on Oracle
++
++Install the [python-oracledb](https://oracle.github.io/python-oracledb/) driver and use the `oracle+oracledb` dialect in your
++connection URL:
++
++```sh
++pip install oracledb
++```
++
++### Oracle connection URL query parameters
++
++Oracle instances are usually addressed by a service name, and SQLAlchemy takes it as a query parameter of the connection URL,
++not as a connection field. In `secrets.toml`, query parameters live in their own table:
++
++```toml
++[destination.sqlalchemy.credentials]
++drivername = "oracle+oracledb"
++username = "loader"
++password = "<password>"
++host = "orahost"
++port = 1521
++
++[destination.sqlalchemy.credentials.query]
++service_name = "svc.example.com"
++```
++
++There is no environment variable for a single query parameter. `query` is one credentials field holding a dictionary, and the
++environment provider reads one variable per field instead of walking into the dictionary. A variable such as
++`DESTINATION__SQLALCHEMY__CREDENTIALS__QUERY__SERVICE_NAME` is therefore never read, the credentials resolve with `query` unset,
++and `dlt` connects without the service name.
++
++Two forms do work. Pass the whole connection URL in one variable, with the query parameters appended to it:
++
++```sh
++export DESTINATION__SQLALCHEMY__CREDENTIALS="oracle+oracledb://loader:<password>@orahost:1521/?service_name=svc.example.com"
++```
++
++Or keep the fields separate and pass the entire `query` dictionary as the value of one variable:
++
++```sh
++export DESTINATION__SQLALCHEMY__CREDENTIALS__DRIVERNAME="oracle+oracledb"
++export DESTINATION__SQLALCHEMY__CREDENTIALS__USERNAME="loader"
++export DESTINATION__SQLALCHEMY__CREDENTIALS__PASSWORD="<password>"
++export DESTINATION__SQLALCHEMY__CREDENTIALS__HOST="orahost"
++export DESTINATION__SQLALCHEMY__CREDENTIALS__PORT="1521"
++export DESTINATION__SQLALCHEMY__CREDENTIALS__QUERY='{"service_name": "svc.example.com"}'
++```
++
++Both forms give the same connection, with `service_name` passed as a URL query parameter. Pass any other query parameter your
++driver accepts the same way.
++
++:::caution
++The `query` variable must hold valid JSON with double quotes. A Python-style value such as `{'service_name': 'svc.example.com'}`
++is rejected with `ConfigValueCannotBeCoercedException`. In the single-URL form, URL-encode characters like `@`, `/`, `?` and `#`
++in the password.
++:::
++
++### Oracle merge and staging datasets
++
++`merge`, and `replace` with the `insert-from-staging` or `staging-optimized` strategy, load data into a
++[staging dataset](../staging.md#staging-dataset) first. The staging dataset is a separate schema, named `<dataset_name>_staging`
++by default, and `dlt` writes to it over the same connection as the final dataset. You can't give it a second connection:
++`staging=` is for [file staging](../staging.md#staging-storage) and this destination refuses it.
++
++In Oracle, a schema is a user, and `CREATE SCHEMA` doesn't create one. If the staging schema doesn't exist, the load fails. You
++have two options:
++
++1. **Use a pre-created staging schema.** Ask a DBA to create it as a user, with quota on its tablespace, and point `dlt` at it:
++
++   ```py
++   import dlt
++
++   dest_ = dlt.destinations.sqlalchemy(staging_dataset_name_layout="analytics_staging")
++
++   pipeline = dlt.pipeline(
++       pipeline_name="oracle_merge",
++       destination=dest_,
++       dataset_name="analytics",
++   )
++   ```
++
++   Or in `config.toml`:
++
++   ```toml
++   [destination.sqlalchemy]
++   staging_dataset_name_layout = "analytics_staging"
++   ```
++
++   A layout without `%s` is used as the full name, so every dataset shares this schema. Because the connecting user doesn't own
++   it, the user also needs `CREATE ANY TABLE`, `ALTER ANY TABLE`, `INSERT ANY TABLE`, `SELECT ANY TABLE`, `DELETE ANY TABLE` and
++   `DROP ANY TABLE`. Check the exact set with your DBA.
++
++2. **Skip the staging dataset.** `append`, and `replace` with `truncate-and-insert` (the default for this destination), write
++   straight into the final tables.
++
++:::note
++Write the staging name in lowercase, like `analytics_staging`. Oracle stores it as `ANALYTICS_STAGING`, and `dlt` lowercases
++dataset names by default, so they match. Set `enable_dataset_name_normalization = false` only if you need to keep a different case.
++:::
++
+ ## Notes on other dialects
+ 
+ We tested this destination on **mysql**, **sqlite**, **duckdb**, **oracledb** and **mssql** dialects. Below are a few notes that may help enabling other dialects:
+@@ -354,10 +458,6 @@ Please report issues with particular dialects. We'll try to make them work.
+ * We convert JSON and BINARY types are cast to STRING (dialect seems to have a conversion bug)
+ * Trino does not support PRIMARY/UNIQUE constraints
+ 
+-### Oracle limitations
+-
+-* In Oracle, regular (non-DBA, non-SYS/SYSOPS) users are assigned one schema on user creation, and usually cannot create other schemas. For features requiring staging datasets you should either ensure schema creation rights for the DB user or exactly specify existing schema to be used for staging dataset. See [staging dataset documentation](../staging.md#staging-dataset) for more details
+-
+ ### Adapting destination for a dialect
+ 
+ #### Quick approach: pass `type_mapper` directly
+
+
+===== COMMIT 98d2eb68 =====
+
+
+commit 98d2eb684
+Author: Victor Schröder
+Date: 2026-09-30
+
+    docs(hub): update instructions for email and Slack alerts (#4499)
+
+diff --git a/docs/website/docs/hub/notifications/email.md b/docs/website/docs/hub/notifications/email.md
+index 57578fef8..1fb480906 100644
+--- a/docs/website/docs/hub/notifications/email.md
++++ b/docs/website/docs/hub/notifications/email.md
+@@ -1,27 +1,70 @@
+ ---
+ title: Send email notifications
+-description: Subscribe to dltHub workspace failure alerts, or send your own emails from a job with SMTP.
+-keywords: [email, smtp, gmail, notifications, alerting, alerts, hub, dltHub]
++description: Subscribe to dltHub workspace failure and success alerts, or send custom emails from your pipeline code with SMTP.
++keywords: [email, alerts, notifications, failure alerts, run alerts, hub, dltHub, smtp]
+ ---
+ # Send email notifications
+ 
+-## dltHub Platform alerts
++dltHub provides native email alerting managed directly from the Web UI, with no pipeline code changes required. You can also send custom emails directly from your pipeline code using SMTP.
+ 
+-Failure alerts by email: subscribe to workspace alerts and get an email when a run fails. Manage
+-subscriptions from the **Alerts** tab in workspace settings.
++---
++
++## dltHub platform alerts
++
++:::tip Recommended
++Configuring alerts in the dltHub Web UI is the preferred way to monitor your workloads. It requires no code or secrets in your repository and captures platform-level failures (such as container crashes, timeouts, memory limits, and dependency issues) that occur outside your pipeline code.
++:::
++
++With platform alerts, dltHub sends transactional email notifications when pipeline runs fail or complete successfully.
++
++![dltHub workspace email alert configuration](https://storage.googleapis.com/dlt-blog-images/dlthub-screenshot-email-alert-config.png)
++
++### How to configure
++
++1. Open the dltHub Web UI and navigate to your workspace.
++
++2. In the left navigation, go to **Settings > Alerts** (`/w/<workspace_id>/settings/alerts`).
++
++3. Under **Alerts Configuration**, locate the trigger you want to configure:
++
++  - **Job run failures**: Fires whenever a job or pipeline run transitions to failed status.
++  - **Job run successes**: Fires whenever a job or pipeline run transitions to completed status.
++
++4. Toggle the alert switch **On**.
++
++5. Under **Email Recipients**, select who should receive the email:
++
++  - **Workspace owners only**: Default for failure alerts. Delivers to users with the Workspace Owner or Org Owner role.
++  - **All workspace members**: Sends notifications to all human members belonging to the workspace.
++  - **( ) No email recipients**: Disables email delivery for this trigger (useful when routing notifications exclusively to Slack).
++
++6. Under **Scope**, choose which jobs to monitor:
++
++  - **All jobs**: Delivers alerts for any job run in the workspace.
++  - **Specific pipelines**: Filters alerts to a selected list of pipelines.
++
++7. Click **Save** in the bottom changes bar to apply your configuration.
++
++### What the email includes
++
++Platform alert emails are pre-formatted and sent via high-deliverability infrastructure. Each email includes:
++
++- The name of the pipeline and workspace.
++- The failure reason and error excerpt (for failure alerts).
++- The exact UTC timestamp of the run.
++- A direct link to open the run details and logs in the dltHub Web UI.
++
++---
+ 
+-![Alerts settings showing the job run failure alerts toggle and role selection](https://storage.googleapis.com/dlt-blog-images/workspace-images/alerts.png)
++## Custom email notification on pipeline failure (in-code alternative)
+ 
+-## Custom email notification on pipeline failure
++:::note When to use custom in-code emails
++Platform alerts above notify you when a **job run** fails, whatever the cause. The custom notification below covers **pipeline failures** only: it runs inside your job, so it cannot report a job that fails before your code runs or is killed mid-run by the container runtime.
+ 
+-:::note
+-Platform alerts above notify you when a **job run** fails, whatever the cause. The custom
+-notification below covers **pipeline failures** only: it runs inside your job, so it cannot report a
+-job that fails before your code runs or is killed mid-run.
++Use this custom approach only if you need custom email templates, attachments, or need to send alerts to external recipients outside your dltHub workspace.
+ :::
+ 
+-If you need a different channel, recipient list, or message body than the platform alerts provide,
+-send the email from the job itself. The pattern below uses Python's standard `smtplib` with Gmail SMTP, but the same shape works for any SMTP server (Outlook, Workspace SMTP relay, or transactional providers like Resend, SendGrid, Mailgun).
++If you need a different channel, recipient list, or message body than the platform alerts provide, send the email from the job itself. The pattern below uses Python's standard `smtplib` with Gmail SMTP, but the same shape works for any SMTP server (Outlook, Workspace SMTP relay, or transactional providers like Resend, SendGrid, Mailgun).
+ 
+ ### Prerequisites
+ 
+diff --git a/docs/website/docs/hub/notifications/slack.md b/docs/website/docs/hub/notifications/slack.md
+index 93ec8414f..7f2747397 100644
+--- a/docs/website/docs/hub/notifications/slack.md
++++ b/docs/website/docs/hub/notifications/slack.md
+@@ -1,23 +1,89 @@
+ ---
+ title: Send Slack notifications
+-description: Notify Slack when a dltHub job succeeds or fails.
+-keywords: [slack, notifications, alerting, hub, dltHub]
++description: Connect Slack incoming webhooks to receive dltHub workspace run failure and success alerts, or send custom messages from your pipeline code.
++keywords: [slack, incoming webhooks, alerts, notifications, failure alerts, run alerts, hub, dltHub]
+ ---
+ # Send Slack notifications
+ 
+-dlt ships a small helper, `send_slack_message`, that posts to a Slack [incoming webhook](https://api.slack.com/messaging/webhooks). Combined with `pipeline.runtime_config.slack_incoming_hook`, it gives you a one-line way to alert a channel when a job finishes or fails.
++dltHub supports native Slack notifications for pipeline status changes, configured directly in the Web UI using Slack incoming webhooks. You can also send custom Slack messages programmatically from within your pipeline code.
+ 
+-## Prerequisites
++---
++
++## dltHub platform alerts
++
++:::tip Recommended
++Configuring Slack alerts in the dltHub Web UI is the preferred way to monitor pipeline runs. It requires no code changes or secrets in your repository, catches container and runtime failures that happen before user code executes, formats messages with interactive Slack Block Kit buttons, and allows routing alerts to different channels across your team.
++:::
++
++With platform alerts, dltHub dispatches rich notifications to your Slack channels whenever a pipeline run fails or succeeds.
++
++![dltHub workspace Slack alert configuration](https://storage.googleapis.com/dlt-blog-images/dlthub-screenshot-slack-alert-config.png)
++
++### Step 1: Create an incoming webhook in Slack
++
++1. Open the [Slack Incoming Webhooks guide](https://api.slack.com/messaging/webhooks).
++2. Create a Slack app (or select an existing one in your workspace).
++3. Enable **Incoming Webhooks** and click **Add New Webhook to Workspace**.
++4. Select the destination Slack channel (e.g. `#data-alerts` or `#pipeline-monitoring`) and authorize the webhook.
++5. Copy the generated Webhook URL (`https://hooks.slack.com/services/T.../B.../...`).
++
++### Step 2: Connect the Slack channel in dltHub
++
++1. Open the dltHub Web UI and navigate to your workspace.
++2. In the left navigation, go to **Settings > Alerts** (`/w/<workspace_id>/settings/alerts`).
++3. In the **Slack Channel Setup** card, click **+ Add channel**.
++4. Enter a friendly **Channel** name (e.g. `#data-alerts`).
++5. Paste the **Webhook URL** copied from Slack.
++6. Click **Save** in the bottom changes bar to store the channel.
++
++### Step 3: Route alerts to your Slack channels and test
++
++1. In the **Alerts Configuration** section on the same page, locate the trigger:
++
++  - **Job run failures**: Fires whenever a pipeline or job run fails.
++  - **Job run successes**: Fires whenever a pipeline or job run finishes successfully.
++
++2. Toggle the alert switch **On**.
+ 
+-Create an incoming webhook for the channel that should receive alerts:
++3. Click the **Slack Channels** dropdown to open the **Post to** popover:
+ 
+-1. Open [https://api.slack.com/messaging/webhooks](https://api.slack.com/messaging/webhooks).
+-2. Create a new Slack app (or pick an existing one), enable **Incoming Webhooks**, and add a webhook to your workspace.
+-3. Pick the destination channel. You'll get a URL of the form `https://hooks.slack.com/services/T…/B…/…`.
++  - Check the channel(s) that should receive this alert. You can select multiple channels.
++  - Click the **Test** button next to any channel to dispatch a test notification immediately and verify delivery for that alert type.
++
++4. Under **Scope**, choose which jobs to monitor:
++
++  - **All jobs**: Delivers alerts for any job run in the workspace.
++  - **Specific pipelines**: Filters alerts to a selected list of pipelines.
++
++5. (Optional) Under **Email Recipients**, select **( ) No email recipients** if you want alerts routed exclusively to Slack.
++
++6. Click **Save** in the bottom changes bar.
++
++### What the Slack notification includes
++
++dltHub formats alerts using Slack Block Kit:
++
++- **Status header**: Indicates the pipeline name, environment, and outcome (e.g. `dltHub • Job Run Failed: my_pipeline (prod)`).
++- **Color-coded attachment**: Red for failures, green for completions.
++- **Run metadata**: Workspace name, exact reported timestamp, and trigger source.
++- **Failure reason**: Truncated error message and stack excerpt (for failure alerts).
++- **Interactive action buttons**:
++  - **View Run Details**: Deep links directly to the run page and execution logs in dltHub.
++  - **View Pipeline**: Links to the pipeline overview page.
++
++---
++
++## Custom Slack notifications from code (in-code alternative)
++
++:::note When to use custom in-code notifications
++dltHub platform alerts above manage channel webhooks and pipeline run notifications across your workspace with zero code changes.
++
++Use the in-code pattern below only if you need custom notification logic from within Python (for instance, notifying Slack on dlt schema changes or custom load metrics).
++:::
+ 
+-The webhook URL itself is the credential, so treat it as a secret.
++dlt ships a helper, `send_slack_message`, that posts to a Slack [incoming webhook](https://api.slack.com/messaging/webhooks). Combined with `pipeline.runtime_config.slack_incoming_hook`, it gives you a way to alert a channel directly from your Python script.
+ 
+-## Store the webhook in your prod profile
++### Store the webhook in your prod profile
+ 
+ Add to `.dlt/prod.secrets.toml`:
+ 
+@@ -28,7 +94,7 @@ slack_incoming_hook = "https://hooks.slack.com/services/T…/B…/…"
+ 
+ dlt picks this up automatically and exposes it at runtime as `pipeline.runtime_config.slack_incoming_hook`. To also get notifications from local runs, mirror the same `[runtime]` block into `.dlt/dev.secrets.toml`.
+ 
+-## Wire it into your pipeline
++### Wire it into your pipeline
+ 
+ ```python
+ import time
+@@ -76,7 +142,7 @@ The `if hook:` check skips the Slack call when no webhook is configured. The sam
+ You can also notify Slack whenever a load surfaces new tables or columns. The dlt chess pipeline shows this pattern by inspecting `schema_update` on each load package and posting a message when new tables or columns appear.
+ :::
+ 
+-## Deploy and trigger
++### Deploy and trigger
+ 
+ ```sh
+ uv run dlthub deploy                            # syncs code + prod secret
+
+
+===== COMMIT feff8796 =====
+
+
+commit feff87960
+Author: Martin Bach
+Date: 2026-09-29
+
+    Docs: serve the 404 page with a real 404 status (#4488)
+
+diff --git a/docs/website/redirects.js b/docs/website/redirects.js
+index 59ba7e2ef..7e5022c13 100644
+--- a/docs/website/redirects.js
++++ b/docs/website/redirects.js
+@@ -326,6 +326,101 @@ const REDIRECTS = [
+     from: "/docs/dlt-ecosystem/llm-tooling/explore-and-transform",
+     to: "/docs/hub/transformations/explore-and-transform",
+   },
++  // Removed pages that external sites still link to (public backlink crawl,
++  // Sept 2026: rest-client alone is linked from ~100 GitHub repos, many via
++  // the DataTalksClub zoomcamp). Without these they answer 404.
++  {
++    from: "/docs/general-usage/http/rest-client",
++    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced",
++  },
++  {
++    from: "/docs/general-usage/http/requests",
++    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced",
++  },
++  {
++    from: "/docs/general-usage/http/overview",
++    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced",
++  },
++  {
++    from: "/docs/general-usage/dashboard",
++    to: "/docs/hub/ingestion/dashboard",
++  },
++  {
++    from: "/docs/reference",
++    to: "/docs/api_reference/dlt/__init__",
++  },
++  {
++    from: "/docs/api_reference",
++    to: "/docs/api_reference/dlt/__init__",
++  },
++  {
++    from: "/docs/api_reference/dlt",
++    to: "/docs/api_reference/dlt/__init__",
++  },
++  {
++    from: "/docs/api_reference/sources/sql_database/__init__",
++    to: "/docs/api_reference/dlt/sources/sql_database/__init__",
++  },
++  {
++    from: "/docs/api_reference/helpers/dbt/runner",
++    to: "/docs/api_reference/dlt/helpers/dbt/runner",
++  },
++  {
++    from: "/docs/walkthroughs/add-a-verified-source",
++    to: "/docs/dlt-ecosystem/verified-sources",
++  },
++  {
++    from: "/docs/dlt-ecosystem/verified-sources/filesystem/basic",
++    to: "/docs/dlt-ecosystem/verified-sources/filesystem",
++  },
++  {
++    from: "/docs/performance",
++    to: "/docs/reference/performance",
++  },
++  {
++    from: "/docs/general-usage/performance",
++    to: "/docs/reference/performance",
++  },
++  {
++    from: "/docs/reference/explainers/airflow-gcp-cloud-composer",
++    to: "/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer",
++  },
++  {
++    from: "/docs/walkthroughs/deploy-a-pipeline/deploy-gcp-cloud-function-as-webhook",
++    to: "/docs/walkthroughs/deploy-a-pipeline/deploy-with-google-cloud-functions",
++  },
++  {
++    from: "/docs/general-usage/dataset-access/transformations",
++    to: "/docs/dlt-ecosystem/transformations",
++  },
++  {
++    from: "/docs/dlt-ecosystem/transformations/dbt/dbt_cloud",
++    to: "/docs/dlt-ecosystem/transformations/dbt",
++  },
++  {
++    from: "/docs/general-usage/dataset-access/",
++    to: "/docs/general-usage/dataset-access/dataset",
++  },
++  {
++    from: "/docs/hub/features/ai",
++    to: "/docs/hub/ai-harness/introduction",
++  },
++  {
++    from: "/docs/hub/features/mcp-server",
++    to: "/docs/hub/ai-harness/introduction",
++  },
++  {
++    from: "/docs/plus/features/ai",
++    to: "/docs/hub/ai-harness/introduction",
++  },
++  {
++    from: "/docs/guides/schema-management",
++    to: "/docs/general-usage/schema-evolution",
++  },
++  {
++    from: "/docs/dlt-ecosystem/visualizations/understanding-the-tables",
++    to: "/docs/general-usage/destination-tables",
++  },
+ ];
+ 
+ module.exports = REDIRECTS;
+diff --git a/docs/website/worker.ts b/docs/website/worker.ts
+index e550fd071..2264fdb26 100644
+--- a/docs/website/worker.ts
++++ b/docs/website/worker.ts
+@@ -5,6 +5,16 @@ import REDIRECTS from "./redirects.compiled.js";
+ 
+ const ROUTE_404 = "/docs/404";
+ 
++async function notFound(request, env): Promise<Response> {
++  const page = await env.ASSETS.fetch(new Request(new URL(ROUTE_404, request.url), request));
++  if (!page.ok) {
++    return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } });
++  }
++  const headers = new Headers(page.headers);
++  headers.set("cache-control", "public, max-age=300");
++  return new Response(page.body, { status: 404, headers });
++}
++
+ const handler = {
+   async fetch(request, env, _ctx) {
+     const url = new URL(request.url);
+@@ -15,9 +25,11 @@ const handler = {
+       return Response.redirect(url.toString(), 301);
+     }
+ 
+-    // handle redirects
++    // handle redirects (a trailing-slash variant of a redirected path resolves
++    // in one hop instead of two)
++    const bare = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
+     for (const redirect of REDIRECTS) {
+-      if (url.pathname === redirect.from) {
++      if (url.pathname === redirect.from || bare === redirect.from) {
+         // split off the fragment - URL.pathname would percent-encode a "#"
+         const [pathname, hash] = redirect.to.split("#");
+         url.pathname = pathname;
+@@ -26,10 +38,25 @@ const handler = {
+       }
+     }
+ 
++    // Trailing-slash URLs get a permanent redirect to the canonical path.
++    // The assets layer (html_handling: drop-trailing-slash) answers them with
++    // a 307, and a temporary redirect does not reliably consolidate links:
++    // /docs/dlt-ecosystem/destinations/ alone has ~30 followed backlinks.
++    if (bare !== url.pathname) {
++      url.pathname = bare;
++      return Response.redirect(url.toString(), 301);
++    }
++
++    // The 404 page is served in place, with a 404 status. It used to be a
++    // 301 to /docs/404, which answers 200, so every dead docs URL looked
++    // like a live page to crawlers (a soft 404) and inherited nothing.
++    if (url.pathname === ROUTE_404 || url.pathname === `${ROUTE_404}/`) {
++      return notFound(request, env);
++    }
++
+     const res = await env.ASSETS.fetch(request);
+     if (res.status === 404) {
+-      url.pathname = ROUTE_404;
+-      return Response.redirect(url.toString(), 301);
++      return notFound(request, env);
+     }
+     return res; // unchanged response (transparent externally)
+   },
+
+
+===== COMMIT fe73fbb2 =====
+
+
+commit fe73fbb24
+Author: Martin Bach
+Date: 2026-09-29
+
+    docs(api): drop private modules, `noindex` for internal modules (#4490)
+
+diff --git a/docs/tools/generate_api_reference.py b/docs/tools/generate_api_reference.py
+index 3f8a0d2cf..0655c1f9b 100644
+--- a/docs/tools/generate_api_reference.py
++++ b/docs/tools/generate_api_reference.py
+@@ -24,6 +24,7 @@ import re
+ from functools import partial
+ from typing import Any
+ 
++import docspec
+ from pydoc_markdown import PydocMarkdown
+ from pydoc_markdown.contrib.processors.smart import SmartProcessor
+ 
+@@ -41,9 +42,104 @@ EXCLUDED_MODULES = (
+     "dlt.reflection",
+ )
+ 
++#: modules under any of these path segments are implementation details: their pages stay
++#: in the reference and the sidebar but are kept out of search engine indexes
++NOINDEX_MODULE_SEGMENTS = frozenset(
++    {
++        "__main__",
++        "data_writers",
++        "exceptions",
++        "impl",
++        "libs",
++        "normalizers",
++        "runners",
++        "runtime",
++        "storages",
++        "typing",
++        "utils",
++        "warnings",
++    }
++)
++
++NOINDEX_HEAD = '<head>\n  <meta name="robots" content="noindex, follow" />\n</head>\n'
++
++#: search engines show about this many characters of a description
++MAX_DESCRIPTION_LENGTH = 155
++#: how many class and function names a generated description lists
++MAX_DESCRIPTION_MEMBERS = 4
++
+ sub = partial(re.sub, flags=re.M)
+ 
+ 
++def is_private_module(module_name: str) -> bool:
++    """Tells if any part of a dotted module name is private, e.g. `dlt._workspace.helpers`."""
++    return any(
++        part.startswith("_") and not part.startswith("__") for part in module_name.split(".")
++    )
++
++
++def is_noindex_module(module_name: str) -> bool:
++    """Tells if a module is an implementation detail that search engines should not index."""
++    return any(part in NOINDEX_MODULE_SEGMENTS for part in module_name.split("."))
++
++
++def plain_text(markdown: str) -> str:
++    """Reduces a docstring fragment to a single line of plain text."""
++    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", markdown)  # links keep their label
++    text = re.sub(r"[`*_]{1,2}([^`*_]+)[`*_]{1,2}", r"\1", text)  # inline code and emphasis
++    return re.sub(r"\s+", " ", text).strip()
++
++
++def shorten(text: str, limit: int = MAX_DESCRIPTION_LENGTH) -> str:
++    """Cuts `text` at a word boundary so it fits in `limit` characters."""
++    if len(text) <= limit:
++        return text
++    return text[: limit - 3].rsplit(" ", 1)[0].rstrip(",;:") + "..."
++
++
++def docstring_summary(module: docspec.Module) -> str | None:
++    """Returns the first sentence of the module docstring, if it describes the module."""
++    if not module.docstring or not module.docstring.content.strip():
++        return None
++    paragraph = plain_text(module.docstring.content.strip().split("\n\n")[0])
++    # license headers are not a description
++    if len(paragraph) < 20 or paragraph.lower().startswith(("copyright", "license")):
++        return None
++    sentence = re.split(r"(?<=[.!?])\s", paragraph, maxsplit=1)[0]
++    return shorten(sentence if len(sentence) >= 20 else paragraph)
++
++
++def members_summary(module: docspec.Module) -> str:
++    """Describes a module by the public classes and functions it defines."""
++    # overloads repeat a name, dict keeps the first occurrence in source order
++    names = list(
++        dict.fromkeys(
++            member.name
++            for member in module.members
++            # imported names are `Indirection`s and are skipped
++            if isinstance(member, (docspec.Class, docspec.Function))
++            and not member.name.startswith("_")
++        )
++    )
++    description = f"Python API reference for {module.name}"
++    if not names:
++        return f"{description}."
++    listed = names[:MAX_DESCRIPTION_MEMBERS]
++    rest = len(names) - len(listed)
++    if rest:
++        members = f"{', '.join(listed)} and {rest} more"
++    elif len(listed) > 1:
++        members = f"{', '.join(listed[:-1])} and {listed[-1]}"
++    else:
++        members = listed[0]
++    return shorten(f"{description}: {members}.")
++
++
++def describe_module(module: docspec.Module) -> str:
++    """Builds the page description for a module."""
++    return docstring_summary(module) or members_summary(module)
++
++
+ class DltProcessor(SmartProcessor):
+     """Makes `dlt` docstrings render correctly as MDX."""
+ 
+@@ -111,8 +207,11 @@ def build_config(output_dir: pathlib.Path) -> dict[str, Any]:
+     }
+ 
+ 
+-def render_api_reference(output_dir: pathlib.Path) -> None:
+-    """Loads the `dlt` modules and renders them into `output_dir`."""
++def render_api_reference(output_dir: pathlib.Path) -> dict[str, str]:
++    """Loads the `dlt` modules and renders them into `output_dir`.
++
++    Returns the page description of every rendered module, keyed by module name.
++    """
+     output_dir.mkdir(parents=True, exist_ok=True)
+ 
+     session = PydocMarkdown()
+@@ -121,9 +220,40 @@ def render_api_reference(output_dir: pathlib.Path) -> None:
+     # registered pydoc-markdown plugin; it replaces the default `SmartProcessor`
+     session.processors.append(DltProcessor())
+ 
+-    modules = session.load_modules()
++    # private modules are not part of the public API, so they get no pages at all
++    modules = [module for module in session.load_modules() if not is_private_module(module.name)]
++    # described before processing, which escapes docstrings for MDX
++    descriptions = {module.name: describe_module(module) for module in modules}
+     session.process(modules)
+     session.render(modules)
++    return descriptions
++
++
++def module_name_from_path(api_reference_dir: pathlib.Path, page: pathlib.Path) -> str:
++    """Maps a rendered page back to its module, e.g. `dlt/pipeline/__init__.md` -> `dlt.pipeline`."""
++    parts = list(page.relative_to(api_reference_dir).with_suffix("").parts)
++    if parts[-1] == "__init__":
++        parts.pop()
++    return ".".join(parts)
++
++
++def add_page_metadata(api_reference_dir: pathlib.Path, descriptions: dict[str, str]) -> None:
++    """Sets the page description and marks implementation-detail pages `noindex`.
++
++    Without a description Docusaurus uses the first heading, e.g. "BigQueryClient Objects".
++    Docusaurus also leaves `noindex` pages out of the sitemap.
++    """
++    for page in sorted(api_reference_dir.rglob("*.md")):
++        module_name = module_name_from_path(api_reference_dir, page)
++        content = page.read_text(encoding="utf-8")
++        _, front_matter, body = content.split("---\n", 2)
++        description = descriptions.get(module_name)
++        if description:
++            # a JSON string is a valid YAML scalar and escapes quotes and colons
++            front_matter += f"description: {json.dumps(description, ensure_ascii=False)}\n"
++        # the head block goes right after the front matter
++        head = f"\n{NOINDEX_HEAD}" if is_noindex_module(module_name) else ""
++        page.write_text(f"---\n{front_matter}---\n{head}{body}", encoding="utf-8")
+ 
+ 
+ def simplify_sidebar_labels(items: list[Any]) -> None:
+@@ -168,8 +298,9 @@ def main() -> None:
+     args = parser.parse_args()
+ 
+     output_dir = args.output_dir.resolve()
+-    render_api_reference(output_dir)
++    descriptions = render_api_reference(output_dir)
+     clean_sidebar(output_dir / RELATIVE_OUTPUT_PATH)
++    add_page_metadata(output_dir / RELATIVE_OUTPUT_PATH, descriptions)
+ 
+ 
+ if __name__ == "__main__":
+
+
+===== COMMIT 9f3b9d61 =====
+
+
+commit 9f3b9d610
+Author: Roope Ruusuvuori
+Date: 2026-09-24
+
+    fix(bigquery): escape table descriptions in generated sql (#4473)
+
+diff --git a/dlt/destinations/impl/bigquery/bigquery.py b/dlt/destinations/impl/bigquery/bigquery.py
+index 986d04f74..c4cdac577 100644
+--- a/dlt/destinations/impl/bigquery/bigquery.py
++++ b/dlt/destinations/impl/bigquery/bigquery.py
+@@ -472,7 +472,7 @@ class BigQueryClient(SqlJobClientWithStagingDataset, SupportsStagingDestination)
+         # Table options.
+         table_options: DictStrAny = {
+             "description": (
+-                f"'{table.get(TABLE_DESCRIPTION_HINT)}'"
++                escape_bigquery_literal(table.get(TABLE_DESCRIPTION_HINT))
+                 if table.get(TABLE_DESCRIPTION_HINT)
+                 else None
+             ),
+
+
+===== COMMIT 34f4b2d6 =====
+
+
+commit 34f4b2d6e
+Author: Alena Astrakhantseva
+Date: 2026-09-23
+
+    Docs: Education. fix lessons (#4475)
+

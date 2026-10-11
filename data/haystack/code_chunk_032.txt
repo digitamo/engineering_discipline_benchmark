@@ -1,0 +1,2924 @@
+diff --git a/dlt/common/configuration/specs/config_providers_context.py b/dlt/common/configuration/specs/config_providers_context.py
+index 3533adf11..cd01614ff 100644
+--- a/dlt/common/configuration/specs/config_providers_context.py
++++ b/dlt/common/configuration/specs/config_providers_context.py
+@@ -28,6 +28,7 @@ class VaultProviderConfiguration(BaseConfiguration):
+ 
+ @configspec
+ class ConfigProvidersConfiguration(BaseConfiguration):
++    # TODO: set to False in 2.0
+     enable_airflow_secrets: bool = True
+     enable_google_secrets: bool = False
+ 
+diff --git a/docs/website/docs/general-usage/credentials/setup.md b/docs/website/docs/general-usage/credentials/setup.md
+index b494158ea..11191899d 100644
+--- a/docs/website/docs/general-usage/credentials/setup.md
++++ b/docs/website/docs/general-usage/credentials/setup.md
+@@ -16,7 +16,7 @@ files or secure vaults. It understands both simple and verbose layouts of [confi
+ 
+ 2. [secrets.toml and config.toml files](#secretstoml-and-configtoml): These files store configuration values and secrets. `secrets.toml` contains sensitive information, while `config.toml` holds non-sensitive configuration.
+ 
+-3. [Vaults](#vaults): Credentials stored in secure vaults like Google Secrets Manager, Azure Key Vault, or AWS Secrets Manager.
++3. [Vaults](#vaults): Credentials stored in secure vaults like Google Secrets Manager, Azure Key Vault, or AWS Secrets Manager. Airflow Variables are also included here.
+ 
+ 4. [Custom Providers](#custom-providers) added with `register_provider`: These are custom implementations you can create to use your own configuration formats or perform specialized preprocessing.
+ 
+@@ -257,9 +257,11 @@ Only values marked as secrets (with `dlt.secrets.value` or using types like `TSe
+ 
+ `dlt` may read configuration from secure vaults - specialized services for storing credentials.
+ 
+-* For Google Cloud Secrets Manager, see our [example walkthrough](../../walkthroughs/add_credentials.md#retrieving-credentials-from-google-cloud-secret-manager).
++* For Google Cloud Secrets Manager, see our [example walkthrough](../../walkthroughs/add_credentials.md#retrieving-credentials-from-google-cloud-secret-manager) and [reference](vaults.md#configure-google-secret-provider)
+ 
+-* For other vault integrations like AWS Secrets Manager or Azure Key Vault, [contact our sales team](https://dlthub.com/contact-sales) to learn about our [secure building blocks for data platform teams](https://dlthub.com/product/data-platform-teams#secure).
++* For Airflow Variable see the [reference and examples](vaults.md#configure-airflow-variables-as-provider)
++
++* For other vault integrations like AWS Secrets Manager or Azure Key Vault we are happy to take contributions. There's an abstract class (look for `VaultDocProvider`) that does all the heavy lifting.
+ 
+ ## secrets.toml and config.toml
+ 
+diff --git a/docs/website/docs/general-usage/credentials/vaults.md b/docs/website/docs/general-usage/credentials/vaults.md
+new file mode 100644
+index 000000000..5f289a6a8
+--- /dev/null
++++ b/docs/website/docs/general-usage/credentials/vaults.md
+@@ -0,0 +1,293 @@
++---
++title: Vault providers
++description: Learn how to configure Google Secrets and Airflow providers
++---
++
++## How vault providers work
++`dlt` can read configuration and secrets from “vault” providers by reconstructing a secrets.toml-like document from one or more secrets stored in a vault. Internally this is handled by a vault-backed provider that:
++
++* looks up entire TOML fragments (recommended) and single values (optional), then merges them into a working in-memory TOML document
++* caches all retrieved values for the lifetime of the process to minimize repeated calls
++* optionally pre-lists all available keys to avoid unnecessary lookups for non-existent secrets
++
++Supported providers include:
++
++* [Google Cloud Secret Manager](#configure-google-secret-provider)
++* [Airflow Variables](#configure-airflow-variables-as-provider)
++
++For other vault integrations like AWS Secrets Manager or Azure Key Vault we are happy to take contributions. There's an abstract class (look for `VaultDocProvider`) that does all the heavy lifting.
++
++## Lookup and merge strategy
++On first access to any configuration value, the vault provider tries to populate its in-memory TOML document by fetching and merging known fragments, in the following order:
++
++1. Global `dlt_secrets_toml`. It first tries a special key `dlt_secrets_toml` that may contain an entire `secrets.toml` as a single secret.
++2. Pipeline-scoped `dlt_secrets_toml`. If you request a value for a specific pipeline, it also attempts to fetch a pipeline-scoped `<pipeline_name>.dlt_secrets_toml`.
++3. Known sections and names:
++  * The provider knows about these top-level sections: **sources** and **destination**.
++  * It will probe short-to-long paths so that more specific fragments override less specific ones:
++    * **`sources`** and **`sources.<source_name>`**
++    * **`destination`** and **`destination.<destination_name>`**
++    * The above both globally and pipeline-scoped when a pipeline name is provided.
++
++4. Single-value lookups (optional). If enabled, the provider may also fetch single values when a TOML fragment was not found. This can incur many calls because a single configuration may probe several possible locations.
++
++### Merging behavior
++
++Fragments are TOML documents and are merged into the in-memory configuration in the order they are found. More specific fragments (for example `destination.bigquery` over `destination`) override settings from more general fragments.
++
++### Caching
++
++Every successful or failed lookup (including “not found”) is cached for the lifetime of the process. Changes in the vault will not be picked up until the process restarts.
++
++## Configure the vault provider
++You can tune the provider to reduce the number of vault calls:
++
++### only_secrets (default varies by provider)
++
++When true, the provider only fetches values that are marked as secrets by `dlt` (for example, destination credentials and values annotated as secret). Non-secret settings are skipped.
++
++### only_toml_fragments (default varies by provider)
++
++When true, the provider fetches only the known TOML fragments (for example `destination`, `destination.bigquery`, `sources`, `sources.facebook`, and `dlt_secrets_toml`). Single-value lookups are skipped.
++
++### list_secrets (default false)
++
++When true, the provider lists all available secret names once and then avoids lookups for keys that do not exist. This can save many calls, but requires additional permissions (see Google Cloud Secret Manager example below).
++If you enable `list_secrets` while also enabling `only_secrets` and/or `only_toml_fragments`, note that some lookups may still be skipped by design.
++
++:::tip
++* Prefer TOML fragments (**destination**, **destination.**, **sources**, **sources.**, **dlt_secrets_toml**) to minimize the number of round trips.
++* Enable `list_secrets` whenever you can. It will radically reduce the number of calls to the vault's backend.
++* Keep `only_secrets=true` when you want to restrict vault calls to secret-typed configuration (for example credentials), and provide non-secret config via environment or files.
++:::
++
++## Configure Google Secret Provider
++
++Required permissions:
++
++* `roles/secretmanager.secretAccessor` to read particular secrets (required)
++* `roles/secretmanager.secretViewer` to list available secrets (required when `list_secrets=true`)
++
++### Activate Google Secret Provider
++To activate the Google Secrets Provider, you need to configure it. The simplest way is to add the configuration to your `secrets.toml` file or add it to environment variables. You can omit the credentials section if your environment already has default Google credentials with the necessary permissions.
++
++<Tabs
++  groupId="config-provider-type"
++  defaultValue="toml"
++  values={[
++    {"label": "TOML config provider", "value": "toml"},
++    {"label": "Environment variables", "value": "env"},
++]}>
++  <TabItem value="toml">
++
++```toml
++[providers]
++enable_google_secrets = true  # google secrets provider is disabled by default
++
++[providers.google_secrets]
++only_secrets = false
++only_toml_fragments = false
++list_secrets = true  # we recommend pre-listing secrets to minimize calls to google backend
++
++[providers.google_secrets.credentials]
++project_id = "<project_id>"
++private_key = "-----BEGIN PRIVATE KEY-----\n....\n-----END PRIVATE KEY-----\n"
++client_email = "....gserviceaccount.com"
++```
++  </TabItem>
++  <TabItem value="env">
++
++```sh
++PROVIDERS__ENABLE_GOOGLE_SECRETS="true"
++
++PROVIDERS__GOOGLE_SECRETS__ONLY_SECRETS="false"
++PROVIDERS__GOOGLE_SECRETS__ONLY_TOML_FRAGMENTS="false"
++PROVIDERS__GOOGLE_SECRETS__LIST_SECRETS="true"
++
++PROVIDERS__GOOGLE_SECRETS__CREDENTIALS__PROJECT_ID="<project_id>"
++PROVIDERS__GOOGLE_SECRETS__CREDENTIALS__PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n....\n-----END PRIVATE KEY-----\n"
++PROVIDERS__GOOGLE_SECRETS__CREDENTIALS__CLIENT_EMAIL="....gserviceaccount.com"
++```
++  </TabItem>
++</Tabs>
++
++
++Alternative vault configuration when listing secrets is not available:
++
++<Tabs
++  groupId="config-provider-type"
++  defaultValue="toml"
++  values={[
++    {"label": "TOML config provider", "value": "toml"},
++    {"label": "Environment variables", "value": "env"},
++]}>
++  <TabItem value="toml">
++
++```toml
++[providers]
++enable_google_secrets = true  # google secrets provider is disabled by default
++
++[providers.google_secrets]
++only_secrets = false
++only_toml_fragments = false
++list_secrets = true  # we recommend pre-listing secrets to minimize calls to google backend
++```
++  </TabItem>
++  <TabItem value="env">
++
++```sh
++PROVIDERS__ENABLE_GOOGLE_SECRETS="true"
++
++PROVIDERS__GOOGLE_SECRETS__ONLY_SECRETS="false"
++PROVIDERS__GOOGLE_SECRETS__ONLY_TOML_FRAGMENTS="false"
++PROVIDERS__GOOGLE_SECRETS__LIST_SECRETS="true"
++```
++  </TabItem>
++</Tabs>
++
++
++
++### Naming convention for Google Secrets
++You can now add secrets to Google Secrets directly. To optimize performance, use TOML fragments to reduce backend calls. Please, read carefully the description of naming convention for Google Secrets used by dlt:
++
++Secret names are normalized to contain letters, digits, hyphens (-), and underscores (_).
++
++* Punctuation (except `-` and `_`) and whitespace are removed.
++* Sections are joined with hyphens, for example:
++   * `destination.bigquery.credentials.project_id` → `destination-bigquery-credentials-project_id`
++   * `sources.pipedrive.pipedrive_api_key` → `sources-pipedrive-pipedrive_api_key`
++   * `destination.bigquery` → `destination-bigquery`
++   * `my_pipeline.dlt_secrets_toml` → `my_pipeline-dlt_secrets_toml`
++   
++ Below you will find a few examples.
++
++**secret name: `destination`**
++
++```toml 
++[destination]
++postgres.credentials = "postgresql://loader:***@host:5432/postgres"
++```
++
++**secret name: `destination-bigquery-credentials`**
++
++```toml
++[destination.bigquery.credentials]
++project_id = "<project_id>"
++private_key = "-----BEGIN PRIVATE KEY-----\n....\n-----END PRIVATE KEY-----\n"
++client_email = "....gserviceaccount.com"
++```
++
++
++**secret name: `destination-filesystem`**
++
++(whole `filesystem` destination configuration)
++```toml
++[destination.filesystem]
++bucket_url = "s3://bucket/path"
++
++[destination.filesystem.credentials]
++region_name = "eu-central-1"
++aws_access_key_id = "..."
++aws_secret_access_key = "..."
++```
++
++**secret name: `sources-mongodb`**
++
++```toml
++[sources.mongodb]
++connection_url = "mongodb+srv://user:***@host/db?authSource=admin&tls=true"
++```
++
++You can also store single values (more calls required):
++
++For example, the following keys would be fetched similarly to environment variables:
++
++* `sources-pipedrive-pipedrive_api_key`
++* `destination-bigquery-credentials-project_id`
++* `destination-bigquery-credentials-private_key`
++* `destination-bigquery-credentials-client_email`
++* `destination-bigquery-location`
++
++Moved this from caution to the main content
++**Naming convention for Google Secrets**
++
++Secret names are normalized to contain letters, digits, hyphens (-), and underscores (_).
++
++* Punctuation (except `-` and `_`) and whitespace are removed.
++* Sections are joined with hyphens, for example:
++   * `destination.bigquery.credentials.project_id` → `destination-bigquery-credentials-project_id`
++   * `sources.pipedrive.pipedrive_api_key` → `sources-pipedrive-pipedrive_api_key`
++   * `destination.bigquery` → `destination-bigquery`
++   * `my_pipeline.dlt_secrets_toml` → `my_pipeline-dlt_secrets_toml`
++:::
++
++### Notes on `list_secrets`
++
++When `list_secrets=true`, the provider will pre-list all secret names to skip lookups for non-existent keys.
++If the service account lacks `roles/secretmanager.secretViewer`, listing will fail and the provider will raise a configuration error.
++
++
++## Configure Airflow Variables as provider
++You can use Airflow Variables to store secrets and TOML fragments.
++
++### Activate and configure Airflow Provider
++The Airflow provider is automatically activated when Airflow is installed and usually requires no additional setup. However, you can optionally enable variable listing to reduce the number of backend calls. `list_secrets=true` is a useful optimization, especially for Airflow 3.0.
++
++```toml
++[providers.airflow_secrets]
++list_secrets = true
++```
++
++:::tip
++You can also disable the Airflow provider, for example, by setting the following environment variable:
++`PROVIDERS__ENABLE_AIRFLOW_SECRETS=False`
++:::
++
++### Add Airflow Variables with secrets
++
++Now you can create Airflow Variables whose values are either:
++
++* entire TOML fragments (recommended), such as **destination**, **sources.**, or a pipeline-scoped `dlt_secrets_toml`
++* single values (optional)
++
++Provider behavior is the same as with other vaults:
++
++* it probes `dlt_secrets_toml` first, then known sections (sources and destination), both globally and pipeline-scoped
++* if `only_toml_fragments=true`, it will not attempt single-value lookups
++* it caches lookups for the lifetime of the process
++
++Examples of values stored in Airflow Variables with following names:
++
++**variable name: `my_pipeline.dlt_secrets_toml`**
++
++(entire secrets TOML scoped for a pipeline):
++```toml
++[destination.bigquery]
++location = "US"
++
++[destination.bigquery.credentials]
++project_id = "<project_id>"
++private_key = "-----BEGIN PRIVATE KEY-----\n....\n-----END PRIVATE KEY-----\n"
++client_email = "....gserviceaccount.com"
++
++[sources.pipedrive]
++pipedrive_api_key = "..."
++```
++
++**variable name: `destination`**
++```toml
++[destination]
++postgres.credentials = "postgresql://loader:***@host:5432/postgres"
++```
++
++**variable name: `sources.mongodb`**
++```toml
++[sources.mongodb]
++connection_url = "mongodb+srv://user:***@host/db?authSource=admin&tls=true"
++```
++
++Provider behavior is the same as with other vaults:
++
++* it probes `dlt_secrets_toml` first, then known sections (sources and destination), both globally and pipeline-scoped
++* if `only_toml_fragments=true`, it will not attempt single-value lookups
++* it caches lookups for the lifetime of the process
+diff --git a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
+index 9ecfec8d0..0a5d18c28 100644
+--- a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
++++ b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
+@@ -398,6 +398,7 @@ There are two ways to pass the credentials:
+    - Add a new variable with the name `dlt_secrets_toml`.
+    - Paste the TOML fragment displayed by the `deploy` command.
+    - 💡 The content of this variable will be used by the `dlt` Airflow helper instead of the local `secrets.toml` which you are familiar with. If your local secrets file contains anything else you want to access on Airflow, you are good to just copy the local `secrets.toml` content to the `dlt_secrets_toml` variable.
++   - [read more on how to use Airflow Variables to store `dlt` configuration](../../general-usage/credentials/vaults.md#configure-airflow-variables-as-provider)
+ 
+ 1. As environment variables.
+ 
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index ec8d95db7..7a1fd641c 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -274,6 +274,7 @@ const sidebars = {
+           items: [
+             'general-usage/credentials/setup',
+             'general-usage/credentials/advanced',
++            'general-usage/credentials/vaults',
+             'general-usage/credentials/complex_types',
+             // Unsure item
+             'walkthroughs/add_credentials'
+diff --git a/tests/helpers/airflow_tests/test_airflow_provider.py b/tests/helpers/airflow_tests/test_airflow_provider.py
+index 2089b3126..92df37833 100644
+--- a/tests/helpers/airflow_tests/test_airflow_provider.py
++++ b/tests/helpers/airflow_tests/test_airflow_provider.py
+@@ -224,7 +224,6 @@ def test_airflow_secrets_toml_provider_invalid_content():
+     dag = DAG(dag_id="test_dag", start_date=DEFAULT_DATE)
+ 
+     def test_task():
+-        import tomlkit
+         from dlt.common.configuration.providers.airflow import AirflowSecretsTomlProvider
+ 
+         Variable.set(SECRETS_TOML_KEY, "invalid_content")
+@@ -259,3 +258,42 @@ def test_airflow_secrets_toml_provider_invalid_content():
+ 
+     assert ti.state == State.SUCCESS
+     assert result["exception_raised"]
++
++
++def test_airflow_pipeline_scoped_secrets_toml():
++    dag = DAG(dag_id="test_dag", start_date=DEFAULT_DATE)
++
++    def test_task():
++        import dlt
++
++        fragment = """
++[pipelines.my_pipeline]
++dataset_name="test_dataset_scoped"
++"""
++
++        Variable.set("my_pipeline." + SECRETS_TOML_KEY, fragment)
++
++        # this should access pipeline-scoped secrets.toml
++        pipeline = dlt.pipeline("my_pipeline")
++        # dataset name was configured
++        return {
++            "dataset_name": pipeline.dataset_name,
++        }
++
++    task = PythonOperator(task_id="test_task", python_callable=test_task, dag=dag)
++
++    dag.create_dagrun(
++        state=DagRunState.RUNNING,
++        execution_date=DEFAULT_DATE,
++        start_date=DEFAULT_DATE,
++        run_type=DagRunType.MANUAL,
++    )
++
++    ti = TaskInstance(task=task, execution_date=DEFAULT_DATE)
++
++    ti.run()
++
++    result = ti.xcom_pull(task_ids="test_task")
++
++    assert ti.state == State.SUCCESS
++    assert result["dataset_name"] == "test_dataset_scoped"
+diff --git a/tests/helpers/airflow_tests/utils.py b/tests/helpers/airflow_tests/utils.py
+index eaa9d9a0c..75bb3829a 100644
+--- a/tests/helpers/airflow_tests/utils.py
++++ b/tests/helpers/airflow_tests/utils.py
+@@ -26,11 +26,13 @@ def initialize_airflow_db():
+     Variable.set(SECRETS_TOML_KEY, SECRETS_TOML_CONTENT)
+     # re-create providers
+     Container()[PluggableRunContext].reload_providers()
+-    yield
+-    # restore providers
+-    Container()[PluggableRunContext].providers = providers
+-    # Make sure the variable is not set
+-    Variable.delete(SECRETS_TOML_KEY)
++    try:
++        yield
++    finally:
++        # restore providers
++        Container()[PluggableRunContext].providers = providers
++        # Make sure the variable is not set
++        Variable.delete(SECRETS_TOML_KEY)
+ 
+ 
+ def setup_airflow() -> None:
+
+
+===== COMMIT caf10281 =====
+
+
+commit caf102811
+Author: ivasio
+Date: 2025-10-10
+
+    Fix: make store_decimal_as_integer patching conditional on pyiceberg version (#3185)
+
+diff --git a/dlt/common/libs/pyiceberg.py b/dlt/common/libs/pyiceberg.py
+index a4d9f5fa0..d216d4c83 100644
+--- a/dlt/common/libs/pyiceberg.py
++++ b/dlt/common/libs/pyiceberg.py
+@@ -2,6 +2,7 @@ import os
+ from typing import Dict, Any, List, Optional
+ 
+ from fsspec import AbstractFileSystem
++from packaging.version import Version
+ 
+ from dlt import version
+ from dlt.common import logger
+@@ -22,11 +23,11 @@ from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
+ 
+ 
+ try:
++    import pyiceberg
+     from pyiceberg.table import Table as IcebergTable
+     from pyiceberg.catalog import Catalog as IcebergCatalog
+     from pyiceberg.exceptions import NoSuchTableError
+     import pyarrow as pa
+-    import pyiceberg.io.pyarrow as _pio
+ except ModuleNotFoundError:
+     raise MissingDependencyException(
+         "dlt pyiceberg helpers",
+@@ -34,19 +35,20 @@ except ModuleNotFoundError:
+         "Install `pyiceberg` so dlt can create Iceberg tables in the `filesystem` destination.",
+     )
+ 
++pyiceberg_semver = Version(pyiceberg.__version__)
+ 
+-# TODO: remove with pyiceberg's release after 0.9.1
+-_orig_get_kwargs = _pio._get_parquet_writer_kwargs
+-
++if pyiceberg_semver < Version("0.10.0"):
++    import pyiceberg.io.pyarrow as _pio
+ 
+-def _patched_get_parquet_writer_kwargs(table_properties):  # type: ignore[no-untyped-def]
+-    """Return the original kwargs **plus** store_decimal_as_integer=True."""
+-    kwargs = _orig_get_kwargs(table_properties)
+-    kwargs.setdefault("store_decimal_as_integer", True)
+-    return kwargs
++    _orig_get_kwargs = _pio._get_parquet_writer_kwargs
+ 
++    def _patched_get_parquet_writer_kwargs(table_properties):  # type: ignore[no-untyped-def]
++        """Return the original kwargs **plus** store_decimal_as_integer=True."""
++        kwargs = _orig_get_kwargs(table_properties)
++        kwargs.setdefault("store_decimal_as_integer", True)
++        return kwargs
+ 
+-_pio._get_parquet_writer_kwargs = _patched_get_parquet_writer_kwargs
++    _pio._get_parquet_writer_kwargs = _patched_get_parquet_writer_kwargs
+ 
+ 
+ def ensure_iceberg_compatible_arrow_schema(schema: pa.Schema) -> pa.Schema:
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/iceberg.md b/docs/website/docs/dlt-ecosystem/destinations/iceberg.md
+index 6ba94e2d8..f8a678317 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/iceberg.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/iceberg.md
+@@ -126,6 +126,10 @@ The [`upsert`](../../general-usage/merge-loading.md#upsert-strategy) merge strat
+ Until _pyiceberg_ > 0.9.1 is released, upsert is executed in chunks of **1000** rows. 
+ :::
+ 
++:::warning
++Schema evolution (changing the set of columns) is not supported when using the `upsert` merge strategy with _pyiceberg_ == 0.10.0
++:::
++
+ ```py
+ @dlt.resource(
+     write_disposition={"disposition": "merge", "strategy": "upsert"},
+
+
+===== COMMIT d3b87a5b =====
+
+
+commit d3b87a5b9
+Author: andreka
+Date: 2025-10-08
+
+    feat:3162 add resource name to incremental extract duplicate checks logging. (#3164)
+
+diff --git a/dlt/extract/incremental/__init__.py b/dlt/extract/incremental/__init__.py
+index 158444476..bc882f9d7 100644
+--- a/dlt/extract/incremental/__init__.py
++++ b/dlt/extract/incremental/__init__.py
+@@ -646,12 +646,11 @@ class Incremental(
+     ) -> None:
+         if initial_hash_count <= Incremental.duplicate_cursor_warning_threshold < final_hash_count:
+             logger.warning(
+-                f"Large number of records ({final_hash_count}) sharing the same value of "
+-                f"cursor field '{self.cursor_path}'. This can happen if the cursor "
+-                "field has a low resolution (e.g., only stores dates without times), "
+-                "causing many records to share the same cursor value. "
+-                "Consider using a cursor column with higher resolution to reduce "
+-                "the deduplication state size."
++                f"Large number of records ({final_hash_count}) sharing the same value of cursor"
++                f" field '{self.cursor_path}' on resource '{self.resource_name}'. This can happen"
++                " if the cursor field has a low resolution (e.g., only stores dates without"
++                " times), causing many records to share the same cursor value. Consider using a"
++                " cursor column with higher resolution to reduce the deduplication state size."
+             )
+ 
+ 
+
+
+===== COMMIT d63abaa4 =====
+
+
+commit d63abaa4d
+Author: Anton Burnashev
+Date: 2025-10-07
+
+    add custom header generation to ArrowToCsvWriter with quoting style handling (#3178)
+
+diff --git a/dlt/common/data_writers/writers.py b/dlt/common/data_writers/writers.py
+index 1d4569749..96c9267c4 100644
+--- a/dlt/common/data_writers/writers.py
++++ b/dlt/common/data_writers/writers.py
+@@ -14,6 +14,7 @@ from typing import (
+     Type,
+     NamedTuple,
+     TypeVar,
++    cast,
+ )
+ 
+ from dlt.common.json import json
+@@ -569,24 +570,21 @@ class ArrowToCsvWriter(DataWriter):
+         for item in items:
+             if isinstance(item, (pyarrow.Table, pyarrow.RecordBatch)):
+                 if not self.writer:
+-                    if self.quoting == "quote_needed":
+-                        quoting = "needed"
+-                    elif self.quoting == "quote_all":
+-                        quoting = "all_valid"
+-                    elif self.quoting == "quote_none":
+-                        quoting = "none"
+-                    else:
+-                        raise ValueError(self.quoting)
+                     try:
+                         self.writer = pyarrow.csv.CSVWriter(
+                             self._f,
+                             item.schema,
+                             write_options=pyarrow.csv.WriteOptions(
+-                                include_header=self.include_header,
++                                # set include_header to False to handle header separately until
++                                # https://github.com/apache/arrow/issues/47575 is released
++                                # see _make_csv_header() for details
++                                include_header=False,
+                                 delimiter=self._delimiter_b,
+-                                quoting_style=quoting,
++                                quoting_style=self._get_arrow_quoting_style(),
+                             ),
+                         )
++                        if self.include_header:
++                            self._f.write(self._make_csv_header())
+                         self._first_schema = item.schema
+                     except pyarrow.ArrowInvalid as inv_ex:
+                         if "Unsupported Type" in str(inv_ex):
+@@ -636,16 +634,10 @@ class ArrowToCsvWriter(DataWriter):
+             self.items_count += item.num_rows
+ 
+     def write_footer(self) -> None:
++        default_arrow_line_terminator = b"\n"
+         if self.writer is None and self.include_header:
+-            # write empty file
+-            self._f.write(
+-                self._delimiter_b.join(
+-                    [
+-                        b'"' + col["name"].encode("utf-8") + b'"'
+-                        for col in self._columns_schema.values()
+-                    ]
+-                )
+-            )
++            # empty file: emit only the header line (no data rows)
++            self._f.write(self._make_csv_header().rstrip(default_arrow_line_terminator))
+ 
+     def close(self) -> None:
+         if self.writer:
+@@ -665,6 +657,44 @@ class ArrowToCsvWriter(DataWriter):
+             supports_compression=True,
+         )
+ 
++    def _get_arrow_quoting_style(self) -> str:
++        if self.quoting == "quote_needed":
++            return "needed"
++        elif self.quoting == "quote_all":
++            return "all_valid"
++        elif self.quoting == "quote_none":
++            return "none"
++        else:
++            raise ValueError(self.quoting)
++
++    def _make_csv_header(self) -> bytes:
++        # In pyarrow 21.0.0, the CSVWriter does not support specifying the header quote style.
++        # This is a workaround to create a header which respects the quote style.
++        # See https://github.com/apache/arrow/issues/47575 for details.
++        # This needs to be removed once https://github.com/apache/arrow/issues/47575 is released.
++        from dlt.common.libs.pyarrow import pyarrow
++        import pyarrow.csv
++
++        names = [col["name"] for col in self._columns_schema.values()]
++        arrays = [pyarrow.array([n]) for n in names]
++        schema = pyarrow.schema([pyarrow.field(n, pyarrow.string()) for n in names])
++        table = pyarrow.Table.from_arrays(arrays, schema=schema)
++
++        # Write into an in-memory Arrow sink so schema doesn't affect the real writer
++        sink = pyarrow.BufferOutputStream()
++        header_writer = pyarrow.csv.CSVWriter(
++            sink,
++            schema,
++            write_options=pyarrow.csv.WriteOptions(
++                include_header=False,
++                delimiter=self._delimiter_b,
++                quoting_style=self._get_arrow_quoting_style(),
++            ),
++        )
++        header_writer.write(table)
++        header_writer.close()
++        return cast(bytes, sink.getvalue().to_pybytes())
++
+ 
+ class ArrowToObjectAdapter:
+     """A mixin that will convert object writer into arrow writer."""
+diff --git a/tests/libs/test_csv_writer.py b/tests/libs/test_csv_writer.py
+index 4dd3e7cc5..42d83b05f 100644
+--- a/tests/libs/test_csv_writer.py
++++ b/tests/libs/test_csv_writer.py
+@@ -255,12 +255,12 @@ def test_arrow_csv_writer_quoting_parameters(quoting: CsvQuoting) -> None:
+         writer.write_header(mock_schema)
+         writer.write_data([test_data])
+ 
+-        mock_csv_writer.assert_called_once()
++        mock_csv_writer.assert_called()
+         call_args = mock_csv_writer.call_args
+         write_options = call_args.kwargs["write_options"]
+         assert write_options.quoting_style == expected_quoting_mapping[quoting]
+ 
+-        mock_writer_instance.write.assert_called_once_with(test_data)
++        mock_writer_instance.write.assert_called_with(test_data)
+ 
+ 
+ def test_arrow_csv_writer_quote_none_with_special_characters() -> None:
+@@ -339,3 +339,154 @@ def test_csv_lineterminator(test_case: Dict[str, str]) -> None:
+         with open(writer.closed_files[0].file_path, "rb") as f:
+             content = f.read()
+             assert content == expected
++
++
++@pytest.mark.parametrize(
++    "quoting,delimiter,schema,test_data_dict,expected_header,expected_data_rows",
++    [
++        pytest.param(
++            "quote_none",
++            ",",
++            {
++                "col1": {"name": "col1", "data_type": "text"},
++                "col2": {"name": "col2", "data_type": "bigint"},
++            },
++            {
++                "col1": ["test_value", "another_value"],
++                "col2": [123, 456],
++            },
++            "col1,col2",
++            ["test_value,123", "another_value,456"],
++            id="quote_none_with_data",
++        ),
++        pytest.param(
++            "quote_all",
++            ",",
++            {
++                "col1": {"name": "col1", "data_type": "text"},
++                "col2": {"name": "col2", "data_type": "bigint"},
++            },
++            {"col1": ["value1"], "col2": [123]},
++            '"col1","col2"',
++            ['"value1","123"'],
++            id="quote_all_with_data",
++        ),
++        pytest.param(
++            "quote_needed",
++            ",",
++            {
++                "col1": {"name": "col1", "data_type": "text"},
++                "2": {"name": "2", "data_type": "bigint"},
++            },
++            {"col1": ["value1"], "col2": [123]},
++            '"col1","2"',
++            ['"value1",123'],
++            id="quote_needed_with_data",
++        ),
++        pytest.param(
++            "quote_none",
++            ",",
++            {
++                "col1": {"name": "col1", "data_type": "text"},
++                "col2": {"name": "col2", "data_type": "bigint"},
++            },
++            None,
++            "col1,col2",
++            [],
++            id="quote_none_empty_file",
++        ),
++        pytest.param(
++            "quote_none",
++            "|",
++            {
++                "col1": {"name": "col1", "data_type": "text"},
++                "col2": {"name": "col2", "data_type": "bigint"},
++            },
++            {"col1": ["value1"], "col2": [123]},
++            "col1|col2",
++            ["value1|123"],
++            id="quote_none_custom_delimiter",
++        ),
++    ],
++)
++def test_arrow_csv_writer(
++    quoting: CsvQuoting,
++    delimiter: str,
++    schema: TTableSchemaColumns,
++    test_data_dict,
++    expected_header: str,
++    expected_data_rows,
++) -> None:
++    # Test ArrowToCsvWriter header generation with various quoting styles for both header and data rows
++    import tempfile
++    import pyarrow as pa
++
++    with tempfile.NamedTemporaryFile(mode="w+b", suffix=".csv") as f:
++        writer = ArrowToCsvWriter(f, quoting=quoting, include_header=True, delimiter=delimiter)
++        writer.write_header(schema)
++
++        if test_data_dict is not None:
++            test_data = pa.table(test_data_dict)
++            writer.write_data([test_data])
++        else:
++            writer.write_footer()
++
++        f.flush()
++        f.seek(0)
++        lines = f.read().decode("utf-8").splitlines()
++
++        assert lines[0].strip() == expected_header
++
++        if expected_data_rows is not None and len(expected_data_rows) > 0:
++            for i, expected_row in enumerate(expected_data_rows):
++                assert lines[i + 1].strip() == expected_row
++
++
++def test_arrow_csv_writer_special_chars_in_column_names_quote_none() -> None:
++    import tempfile
++    import pyarrow as pa
++    from pyarrow.lib import ArrowInvalid
++
++    # Column names with commas should fail with quote_none
++    mock_schema: TTableSchemaColumns = {
++        "col,with,comma": {"name": "col,with,comma", "data_type": "text"},
++    }
++
++    test_data = pa.table({"col,with,comma": ["value1"]})
++
++    with tempfile.NamedTemporaryFile(mode="wb", suffix=".csv") as f:
++        writer = ArrowToCsvWriter(f, quoting="quote_none", include_header=True)
++        writer.write_header(mock_schema)
++        with pytest.raises(ArrowInvalid, match="CSV values may not contain structural characters"):
++            writer.write_data([test_data])
++
++
++def test_arrow_csv_writer_empty_schema() -> None:
++    import tempfile
++
++    mock_schema: TTableSchemaColumns = {}
++
++    with tempfile.NamedTemporaryFile(mode="w+b", suffix=".csv") as f:
++        writer = ArrowToCsvWriter(f, quoting="quote_none", include_header=True)
++        writer.write_header(mock_schema)
++        # this triggers _make_csv_header() with an empty schema
++        writer.write_footer()
++        f.flush()
++        f.seek(0)
++        assert f.read() == b""
++
++
++def test_arrow_csv_writer_invalid_quoting_parameter() -> None:
++    import tempfile
++
++    mock_schema: TTableSchemaColumns = {
++        "col1": {"name": "col1", "data_type": "text"},
++    }
++
++    with tempfile.NamedTemporaryFile(mode="wb", suffix=".csv") as f:
++        writer = ArrowToCsvWriter(f, quoting="quote_none", include_header=True)
++        writer.write_header(mock_schema)
++        # Manually set invalid quoting to trigger the error in _make_csv_header
++        writer.quoting = "invalid_quoting_style"  # type: ignore[assignment]
++        with pytest.raises(ValueError, match="invalid_quoting_style"):
++            writer.write_footer()
+
+
+===== COMMIT a3ec5bf4 =====
+
+
+commit a3ec5bf4e
+Author: Thierry Jean
+Date: 2025-10-02
+
+    fix(dashboard): remove `pandas` deps, use `pyarrow` (#3157)
+
+diff --git a/dlt/helpers/dashboard/dlt_dashboard.py b/dlt/helpers/dashboard/dlt_dashboard.py
+index 2d496ab07..79ce16602 100644
+--- a/dlt/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/helpers/dashboard/dlt_dashboard.py
+@@ -13,14 +13,10 @@ with app.setup:
+ 
+     import marimo as mo
+ 
+-    import pandas as pd
+-
+     import dlt
+-    from dlt.common.json import json
++    import pyarrow
+     from dlt.helpers.dashboard import strings, utils, ui_elements as ui
+     from dlt.helpers.dashboard.config import DashboardConfiguration
+-    from dlt.destinations.dataset.dataset import ReadableDBAPIDataset
+-    from dlt.destinations.dataset.relation import ReadableDBAPIRelation
+ 
+ 
+ @app.cell(hide_code=True)
+@@ -848,7 +844,7 @@ def utils_caches_and_state(
+     """
+ 
+     # some state variables
+-    dlt_get_last_query_result, dlt_set_last_query_result = mo.state(pd.DataFrame())
++    dlt_get_last_query_result, dlt_set_last_query_result = mo.state(pyarrow.table({}))
+     # a cache of query results in the form of {query: row_count}
+     dlt_get_query_cache, dlt_set_query_cache = mo.state(cast(Dict[str, int], {}))
+ 
+diff --git a/dlt/helpers/dashboard/runner.py b/dlt/helpers/dashboard/runner.py
+index b85315da1..4704ad384 100644
+--- a/dlt/helpers/dashboard/runner.py
++++ b/dlt/helpers/dashboard/runner.py
+@@ -20,7 +20,7 @@ def _detect_dashboard_command() -> str:
+ # keep this, will raise if user tries to run dashboard without dependencies
+ try:
+     import marimo
+-    import pandas
++    import pyarrow
+     import ibis
+ except ModuleNotFoundError:
+     raise MissingDependencyException(
+diff --git a/dlt/helpers/dashboard/utils.py b/dlt/helpers/dashboard/utils.py
+index fff78876b..05aa9338f 100644
+--- a/dlt/helpers/dashboard/utils.py
++++ b/dlt/helpers/dashboard/utils.py
+@@ -10,8 +10,7 @@ import sqlglot
+ 
+ import dlt
+ import marimo as mo
+-import pandas as pd
+-import yaml
++import pyarrow
+ import traceback
+ 
+ 
+@@ -381,7 +380,7 @@ def get_example_query_for_dataset(pipeline: dlt.Pipeline, schema_name: str) -> T
+     return "", "Schema does not contain any tables.", None
+ 
+ 
+-def get_query_result(pipeline: dlt.Pipeline, query: str) -> Tuple[pd.DataFrame, str, str]:
++def get_query_result(pipeline: dlt.Pipeline, query: str) -> Tuple[pyarrow.Table, str, str]:
+     """
+     Get the result of a query. Parses the query to ensure it is a valid SQL query before sending it to the destination.
+     """
+@@ -392,12 +391,12 @@ def get_query_result(pipeline: dlt.Pipeline, query: str) -> Tuple[pd.DataFrame,
+         )
+         return get_query_result_cached(pipeline, query), None, None
+     except Exception as exc:
+-        return pd.DataFrame(), _exception_to_string(exc), traceback.format_exc()
++        return pyarrow.table({}), _exception_to_string(exc), traceback.format_exc()
+ 
+ 
+ @functools.cache
+-def get_query_result_cached(pipeline: dlt.Pipeline, query: str) -> pd.DataFrame:
+-    return pipeline.dataset()(query, _execute_raw_query=True).df()
++def get_query_result_cached(pipeline: dlt.Pipeline, query: str) -> pyarrow.Table:
++    return pipeline.dataset()(query, _execute_raw_query=True).arrow()
+ 
+ 
+ def get_row_counts(
+@@ -415,8 +414,8 @@ def get_row_counts(
+             i["table_name"]: i["row_count"]
+             for i in pipeline.dataset(schema=selected_schema_name)
+             .row_counts(dlt_tables=True, load_id=load_id)
+-            .df()
+-            .to_dict(orient="records")
++            .arrow()
++            .to_pylist()
+         }
+     except (
+         DatabaseUndefinedRelation,
+@@ -451,7 +450,7 @@ def get_loads(
+         if limit:
+             loads = loads.limit(limit)
+         loads = loads.order_by("inserted_at", "desc")
+-        loads_list = loads.df().to_dict(orient="records")
++        loads_list = loads.arrow().to_pylist()
+         loads_list = [_humanize_datetime_values(c, load) for load in loads_list]
+         return loads_list, None, None
+     except Exception as exc:
+diff --git a/pyproject.toml b/pyproject.toml
+index 1fbd98b21..5de9473c9 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -179,9 +179,9 @@ postgis = [
+ ]
+ workspace = [
+     "duckdb>=0.9",
+-    "ibis-framework[duckdb]>=10.5.0 ; python_version >= '3.10'",
++    "ibis-framework>=10.5.0 ; python_version >= '3.10'",
++    "duckdb",
+     "pyarrow>=16.0.0",
+-    "pandas>=2.1.4",
+     "marimo>=0.14.5",
+ ]
+ dbml = [
+diff --git a/tests/helpers/dashboard/test_utils.py b/tests/helpers/dashboard/test_utils.py
+index 3cc3b1dd3..b1fcecfd3 100644
+--- a/tests/helpers/dashboard/test_utils.py
++++ b/tests/helpers/dashboard/test_utils.py
+@@ -2,20 +2,13 @@ import os
+ import tempfile
+ from datetime import datetime
+ from pathlib import Path
+-from this import d
+ 
+-from ibis import pi
+ import marimo as mo
++import pyarrow
+ import pytest
+-import pandas as pd
+-
+-from dlt.sources._single_file_templates.fruitshop_pipeline import (
+-    fruitshop as fruitshop_source,
+-)
+-import pendulum
+-
+ 
+ import dlt
++from dlt.common import pendulum
+ from dlt.helpers.dashboard.config import DashboardConfiguration
+ from dlt.helpers.dashboard.utils import (
+     PICKLE_TRACE_FILE,
+@@ -346,10 +339,10 @@ def test_get_query_result(pipeline: dlt.Pipeline):
+     )
+ 
+     if pipeline.pipeline_name in PIPELINES_WITH_LOAD:
+-        assert isinstance(result, pd.DataFrame)
++        assert isinstance(result, pyarrow.Table)
+         assert len(result) == 1
+         assert (
+-            result.iloc[0]["count"] == 100
++            result[0][0].as_py() == 100
+             if pipeline.pipeline_name == SUCCESS_PIPELINE_DUCKDB
+             else 103
+         )  #  merge does not work on filesystem
+@@ -697,7 +690,7 @@ def test_integration_pipeline_workflow(pipeline, temp_pipelines_dir):
+     )
+     if pipeline.pipeline_name in PIPELINES_WITH_LOAD:
+         assert len(query_result) == 13
+-        assert query_result.iloc[0]["name"] == "simon"
++        assert query_result[0][0].as_py() == "simon"
+         assert not error_message
+         assert not traceback_string
+     else:
+diff --git a/uv.lock b/uv.lock
+index 1cdc0b2b7..2cad1b940 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2204,9 +2204,8 @@ weaviate = [
+ workspace = [
+     { name = "duckdb", version = "1.2.0", source = { registry = "https://pypi.org/simple" }, marker = "os_name == 'nt'" },
+     { name = "duckdb", version = "1.3.2", source = { registry = "https://pypi.org/simple" }, marker = "os_name != 'nt'" },
+-    { name = "ibis-framework", extra = ["duckdb"], marker = "python_full_version >= '3.10'" },
++    { name = "ibis-framework", marker = "python_full_version >= '3.10'" },
+     { name = "marimo" },
+-    { name = "pandas" },
+     { name = "pyarrow" },
+ ]
+ 
+@@ -2353,6 +2352,7 @@ requires-dist = [
+     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=0.9" },
+     { name = "duckdb", marker = "extra == 'ducklake'", specifier = ">=1.2.0" },
+     { name = "duckdb", marker = "extra == 'motherduck'", specifier = ">=0.9" },
++    { name = "duckdb", marker = "extra == 'workspace'" },
+     { name = "duckdb", marker = "extra == 'workspace'", specifier = ">=0.9" },
+     { name = "fsspec", specifier = ">=2022.4.0" },
+     { name = "gcsfs", marker = "extra == 'bigquery'", specifier = ">=2022.4.0" },
+@@ -2367,7 +2367,7 @@ requires-dist = [
+     { name = "grpcio", marker = "extra == 'gcp'", specifier = ">=1.50.0" },
+     { name = "hexbytes", specifier = ">=0.2.2" },
+     { name = "humanize", specifier = ">=4.4.0" },
+-    { name = "ibis-framework", extras = ["duckdb"], marker = "python_full_version >= '3.10' and extra == 'workspace'", specifier = ">=10.5.0" },
++    { name = "ibis-framework", marker = "python_full_version >= '3.10' and extra == 'workspace'", specifier = ">=10.5.0" },
+     { name = "jsonpath-ng", specifier = ">=1.5.3" },
+     { name = "lancedb", marker = "python_full_version < '3.13' and extra == 'lancedb'", specifier = ">=0.22.0" },
+     { name = "marimo", marker = "extra == 'workspace'", specifier = ">=0.14.5" },
+@@ -2375,7 +2375,6 @@ requires-dist = [
+     { name = "orjson", marker = "sys_platform != 'emscripten'", specifier = ">=3.10.1" },
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.6.7,!=3.9.11,!=3.9.12,!=3.9.13,!=3.9.14,!=3.10.1,<4" },
+     { name = "packaging", specifier = ">=21.1" },
+-    { name = "pandas", marker = "extra == 'workspace'", specifier = ">=2.1.4" },
+     { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.3.0" },
+     { name = "pathvalidate", specifier = ">=2.5.2" },
+     { name = "pendulum", specifier = ">=2.1.2" },
+
+
+===== COMMIT 499afaf5 =====
+
+
+commit 499afaf5d
+Author: rudolfix
+Date: 2025-10-02
+
+    bump to version 1.17.1 (#3158)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index d10e9b363..1fbd98b21 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "dlt"
+-version = "1.17.0"
++version = "1.17.1"
+ description = "dlt is an open-source python-first scalable data loading library that does not require any backend to run."
+ authors = [{ name = "dltHub Inc.", email = "services@dlthub.com" }]
+ requires-python = ">=3.9.2, <3.15"
+diff --git a/uv.lock b/uv.lock
+index 90a3d7569..1cdc0b2b7 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2041,7 +2041,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.17.0"
++version = "1.17.1"
+ source = { editable = "." }
+ dependencies = [
+     { name = "click" },
+
+
+===== COMMIT 3b5a024e =====
+
+
+commit 3b5a024e3
+Author: anuunchin
+Date: 2025-10-02
+
+    Feat: Custom metrics in the incremental transform (#3117)
+
+diff --git a/dlt/extract/incremental/__init__.py b/dlt/extract/incremental/__init__.py
+index 401972acf..158444476 100644
+--- a/dlt/extract/incremental/__init__.py
++++ b/dlt/extract/incremental/__init__.py
+@@ -1,6 +1,16 @@
+ import os
+ from datetime import datetime  # noqa: I251
+-from typing import Generic, ClassVar, Any, Optional, Type, Dict, Union, Literal, Tuple
++from typing import (
++    Generic,
++    ClassVar,
++    Any,
++    Optional,
++    Type,
++    Dict,
++    Union,
++    Literal,
++    Tuple,
++)
+ 
+ import inspect
+ from functools import wraps
+@@ -20,6 +30,7 @@ from dlt.common.typing import (
+     is_optional_type,
+     is_subclass,
+     TColumnNames,
++    TypedDict,
+ )
+ from dlt.common.configuration import configspec, ConfigurationValueError
+ from dlt.common.configuration.specs import BaseConfiguration
+@@ -28,7 +39,7 @@ from dlt.common.data_types.type_helpers import (
+     coerce_value,
+     py_type_to_sc_type,
+ )
+-
++from dlt.common.data_writers.writers import count_rows_in_items
+ from dlt.extract.exceptions import IncrementalUnboundError
+ from dlt.extract.incremental.exceptions import (
+     IncrementalCursorPathMissing,
+@@ -63,8 +74,17 @@ except MissingDependencyException:
+     pandas = None
+ 
+ 
++class IncrementalCustomMetrics(TypedDict, total=False):
++    unfiltered_items_count: int
++    unfiltered_batches_count: int
++    initial_unique_hashes_count: int
++    final_unique_hashes_count: int
++
++
+ @configspec
+-class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorValue]):
++class Incremental(
++    ItemTransform[TDataItem, IncrementalCustomMetrics], BaseConfiguration, Generic[TCursorValue]
++):
+     """Adds incremental extraction for a resource by storing a cursor value in persistent state.
+ 
+     The cursor could for example be a timestamp for when the record was created and you can use this to load only
+@@ -191,6 +211,12 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
+         """Bound pipe"""
+         self.range_start = range_start
+         self.range_end = range_end
++        self._custom_metrics: IncrementalCustomMetrics = {
++            "unfiltered_items_count": 0,
++            "unfiltered_batches_count": 0,
++            "initial_unique_hashes_count": 0,
++            "final_unique_hashes_count": 0,
++        }
+ 
+     @property
+     def primary_key(self) -> Optional[TTableHintTemplate[TColumnNames]]:
+@@ -567,6 +593,10 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
+         if rows is None or (isinstance(rows, list) and len(rows) == 0):
+             return rows
+ 
++        # collect metrics
++        self.custom_metrics["unfiltered_items_count"] += count_rows_in_items(rows)
++        self.custom_metrics["unfiltered_batches_count"] += 1
++
+         transformer = self._get_transform(rows)
+         if isinstance(rows, list):
+             rows = [
+@@ -596,13 +626,19 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
+                 transformer.compute_unique_value(row, self.primary_key)
+                 for row in transformer.last_rows
+             )
+-            initial_hash_count = len(self._cached_state.get("unique_hashes", []))
++            initial_hash_list = self._cached_state.get("unique_hashes")
++            initial_hash_count = len(initial_hash_list) if initial_hash_list else 0
++            self.custom_metrics["initial_unique_hashes_count"] = initial_hash_count
++
+             # add directly computed hashes
+             unique_hashes.update(transformer.unique_hashes)
+             self._cached_state["unique_hashes"] = list(unique_hashes)
+             final_hash_count = len(self._cached_state["unique_hashes"])
++            self.custom_metrics["final_unique_hashes_count"] = final_hash_count
+ 
+             self._check_duplicate_cursor_threshold(initial_hash_count, final_hash_count)
++        else:
++            self._cached_state["unique_hashes"] = []
+         return rows
+ 
+     def _check_duplicate_cursor_threshold(
+@@ -625,7 +661,7 @@ Incremental.EMPTY.__is_resolved__ = True
+ TIncrementalConfig = Union[Incremental[Any], IncrementalArgs]
+ 
+ 
+-class IncrementalResourceWrapper(ItemTransform[TDataItem]):
++class IncrementalResourceWrapper(ItemTransform[TDataItem, IncrementalCustomMetrics]):
+     placement_affinity: ClassVar[float] = 1  # stick to end
+ 
+     _incremental: Optional[Incremental[Any]] = None
+@@ -644,7 +680,6 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem]):
+         Args:
+             primary_key (TTableHintTemplate[TColumnKey], optional): A primary key to be passed to Incremental Instance at execution. Defaults to None.
+         """
+-        BaseItemTransform.__init__(self)
+         self.primary_key = primary_key
+         self.incremental_state: IncrementalColumnState = None
+         self._allow_external_schedulers: bool = None
+@@ -787,6 +822,13 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem]):
+         if self._incremental:
+             self._incremental.allow_external_schedulers = value
+ 
++    @property
++    def custom_metrics(self) -> IncrementalCustomMetrics:
++        """Returns custom metrics of the Incremental object itself if exists"""
++        if self._incremental:
++            return self._incremental.custom_metrics
++        return {}
++
+     def bind(self, pipe: SupportsPipe) -> "IncrementalResourceWrapper":
+         # if pipe is None we are re-binding internal incremental
+         pipe = pipe or self._bound_pipe
+diff --git a/dlt/extract/items_transform.py b/dlt/extract/items_transform.py
+index 355020eea..e61dc867c 100644
+--- a/dlt/extract/items_transform.py
++++ b/dlt/extract/items_transform.py
+@@ -8,17 +8,16 @@ from typing import (
+     ClassVar,
+     Generic,
+     Iterator,
++    Mapping,
++    MutableMapping,
+     Optional,
+     Union,
+     Dict,
++    cast,
+ )
+ 
+ from dlt.common.data_writers.writers import count_rows_in_items
+-from dlt.common.typing import (
+-    TAny,
+-    TDataItem,
+-    TDataItems,
+-)
++from dlt.common.typing import TAny, TDataItem, TDataItems, TypeVar
+ 
+ from dlt.extract.utils import (
+     wrap_iterator,
+@@ -32,16 +31,21 @@ ItemTransformFunctionNoMeta = Callable[[TDataItem], TAny]
+ ItemTransformFunc = Union[ItemTransformFunctionWithMeta[TAny], ItemTransformFunctionNoMeta[TAny]]
+ 
+ 
+-class BaseItemTransform:
++TCustomMetrics = TypeVar(
++    "TCustomMetrics", covariant=True, bound=Mapping[str, Any], default=Dict[str, Any]
++)
++
++
++class BaseItemTransform(Generic[TCustomMetrics]):
+     def __init__(self) -> None:
+-        self._custom_metrics: Dict[str, Any] = {}
++        self._custom_metrics: TCustomMetrics = cast(TCustomMetrics, {})
+ 
+     @property
+-    def custom_metrics(self) -> Dict[str, Any]:
++    def custom_metrics(self) -> TCustomMetrics:
+         return self._custom_metrics
+ 
+ 
+-class ItemTransform(BaseItemTransform, ABC, Generic[TAny]):
++class ItemTransform(BaseItemTransform[TCustomMetrics], ABC, Generic[TAny, TCustomMetrics]):
+     _f_meta: ItemTransformFunctionWithMeta[TAny] = None
+     _f: ItemTransformFunctionNoMeta[TAny] = None
+ 
+@@ -58,7 +62,9 @@ class ItemTransform(BaseItemTransform, ABC, Generic[TAny]):
+         else:  # TODO: do better check
+             self._f_meta = transform_f  # type: ignore
+ 
+-    def bind(self: "ItemTransform[TAny]", pipe: SupportsPipe) -> "ItemTransform[TAny]":
++    def bind(
++        self: "ItemTransform[TAny, TCustomMetrics]", pipe: SupportsPipe
++    ) -> "ItemTransform[TAny, TCustomMetrics]":
+         return self
+ 
+     @abstractmethod
+@@ -149,7 +155,7 @@ class ValidateItem(ItemTransform[TDataItem]):
+ 
+     table_name: str
+ 
+-    def bind(self, pipe: SupportsPipe) -> ItemTransform[TDataItem]:
++    def bind(self, pipe: SupportsPipe) -> ItemTransform[TDataItem, Dict[str, Any]]:
+         self.table_name = pipe.name
+         return self
+ 
+diff --git a/dlt/extract/pipe.py b/dlt/extract/pipe.py
+index 0fc64639b..d009fd982 100644
+--- a/dlt/extract/pipe.py
++++ b/dlt/extract/pipe.py
+@@ -12,6 +12,7 @@ from typing import (
+     Iterator,
+     List,
+     Tuple,
++    Dict,
+ )
+ 
+ from dlt.common.reflection.inspect import isasyncgenfunction, isgeneratorfunction
+@@ -42,7 +43,7 @@ from dlt.extract.utils import (
+ )
+ 
+ 
+-class ForkPipe(ItemTransform[ResolvablePipeItem]):
++class ForkPipe(ItemTransform[ResolvablePipeItem, Dict[str, Any]]):
+     placement_affinity: ClassVar[float] = 2
+ 
+     def __init__(self, pipe: "Pipe", step: int = -1, copy_on_fork: bool = False) -> None:
+diff --git a/tests/extract/test_incremental.py b/tests/extract/test_incremental.py
+index b3cf1faf5..9be3d27d3 100644
+--- a/tests/extract/test_incremental.py
++++ b/tests/extract/test_incremental.py
+@@ -27,7 +27,7 @@ from dlt.common.json import json
+ from dlt.common.pendulum import pendulum, timedelta
+ from dlt.common.pipeline import NormalizeInfo, StateInjectableContext
+ from dlt.common.schema.schema import Schema
+-from dlt.common.typing import TSortOrder
++from dlt.common.typing import TSortOrder, TDataItems
+ from dlt.common.utils import chunks, digest128, uniq_id
+ 
+ from dlt.extract import DltSource
+@@ -4372,3 +4372,111 @@ def test_incremental_and_limit(offset_by_last_value: bool):
+     assert resource_called == 30 if offset_by_last_value else 60
+     # check that we have items 0-29
+     assert p.dataset().items.df().id.tolist() == list(range(30))
++
++
++def test_custom_metrics_in_incremental() -> None:
++    """Ensure that custom metrics from the incremental transform are correctly
++    collected along with the custom metrics from the resource itself"""
++
++    @dlt.resource(
++        table_name="items",
++    )
++    def resource_with_metrics(
++        items: TDataItems,
++        as_batch: bool,
++    ):
++        custom_metrics = dlt.current.resource_metrics()
++        custom_metrics["from_resource"] = "hey"
++        if as_batch:
++            yield items
++        else:
++            yield from items
++
++    p = dlt.pipeline(
++        pipeline_name="p" + uniq_id(),
++        destination="duckdb",
++    )
++
++    def _assert_custom_metrics(
++        load_id: str,
++        unfiltered_items_count: int,
++        unfiltered_batches_count: int,
++        initial_unique_hashes_count: int,
++        final_unique_hashes_count: int,
++        last_normalized_count: int,
++    ) -> None:
++        resource_metrics = p.last_trace.last_extract_info.metrics[load_id][0]["resource_metrics"][
++            "resource_with_metrics"
++        ]
++        assert resource_metrics.custom_metrics["from_resource"] == "hey"
++        assert resource_metrics.custom_metrics["unfiltered_items_count"] == unfiltered_items_count
++        assert (
++            resource_metrics.custom_metrics["unfiltered_batches_count"] == unfiltered_batches_count
++        )
++        # NOTE: initial_unique_hashes_count is always last value in pipeline state,
++        # so it persists across different incremental instances
++        assert (
++            resource_metrics.custom_metrics["initial_unique_hashes_count"]
++            == initial_unique_hashes_count
++        )
++        assert (
++            resource_metrics.custom_metrics["final_unique_hashes_count"]
++            == final_unique_hashes_count
++        )
++        assert p.last_trace.last_normalize_info.row_counts.get("items") == last_normalized_count
++
++    def _run_with_items(items: TDataItems, as_batch: bool) -> str:
++        load_info = p.run(resource_with_metrics(items=items, as_batch=as_batch))
++        return load_info.loads_ids[0]
++
++    # 1. run with a single new item as a single batch
++    resource_with_metrics.apply_hints(
++        incremental=dlt.sources.incremental(cursor_path="id", initial_value=-1)
++    )
++    load_id = _run_with_items({"id": 1, "value": "1"}, True)
++    _assert_custom_metrics(load_id, 1, 1, 0, 1, 1)
++
++    # 2. run with two new items as a single batch
++    load_id = _run_with_items([{"id": 2, "value": "2"}, {"id": 3, "value": "3"}], True)
++    _assert_custom_metrics(load_id, 3, 2, 1, 1, 2)
++
++    # 3. run with one old and one new item each as batch
++    load_id = _run_with_items([{"id": 3, "value": "3"}, {"id": 4, "value": "4"}], False)
++    _assert_custom_metrics(load_id, 5, 4, 1, 1, 1)
++
++    # 4. run with duplicate cursor field values, but different hashes, as a single batch
++    load_id = _run_with_items(
++        [{"id": 5, "value": "5.1"}, {"id": 5, "value": "5.2"}, {"id": 5, "value": "5.3"}], True
++    )
++    _assert_custom_metrics(load_id, 8, 5, 1, 3, 3)
++
++    # 5. reset incremental with no boundary deduplication (primary_key=()) and run with the same values
++    # from previous run, should be loaded as a single batch with 3 items
++    resource_with_metrics.apply_hints(
++        incremental=dlt.sources.incremental(cursor_path="id", initial_value=-1, primary_key=())
++    )
++    load_id = _run_with_items(
++        [{"id": 5, "value": "5.1"}, {"id": 5, "value": "5.2"}, {"id": 5, "value": "5.3"}], True
++    )
++    _assert_custom_metrics(load_id, 3, 1, 0, 0, 3)
++
++    # 6. run with one old and one new item as a single batch (still no boundary deduplication)
++    # should be loaded as a single batch with 2 items
++    load_id = _run_with_items([{"id": 5, "value": "5.1"}, {"id": 6, "value": "6.1"}], True)
++    _assert_custom_metrics(load_id, 5, 2, 0, 0, 2)
++
++    # 7. enable boundary deduplication and run with one old and one new item as a single batch
++    # should be loaded as a single batch with 2 items
++    resource_with_metrics.incremental.primary_key = "id"
++    load_id = _run_with_items([{"id": 6, "value": "6.1"}, {"id": 7, "value": "7"}], True)
++    _assert_custom_metrics(load_id, 7, 3, 0, 1, 2)
++
++    # 8. run with one old and one new item each as batch
++    # only the new item should be loaded
++    load_id = _run_with_items([{"id": 7, "value": "7"}, {"id": 8, "value": "8"}], False)
++    _assert_custom_metrics(load_id, 9, 5, 1, 1, 1)
++
++    # 9. run with None items and one new item as single batch
++    # None items should increment unfiltered_items_count
++    load_id = _run_with_items([None, None, {"id": 9, "value": "9"}], True)
++    _assert_custom_metrics(load_id, 12, 6, 1, 1, 1)
+diff --git a/tests/extract/utils.py b/tests/extract/utils.py
+index a5a91863c..cd93b5338 100644
+--- a/tests/extract/utils.py
++++ b/tests/extract/utils.py
+@@ -1,5 +1,4 @@
+ from typing import Any, Optional, List
+-import pytest
+ from itertools import zip_longest
+ 
+ from dlt.common.storages import PackageStorage, ParsedLoadJobFileName
+
+
+===== COMMIT 8eadba1b =====
+
+
+commit 8eadba1be
+Author: Thierry Jean
+Date: 2025-10-01
+
+    fix(ducklake): 3140 disambiguate config key and default values (#3153)
+
+diff --git a/dlt/common/configuration/exceptions.py b/dlt/common/configuration/exceptions.py
+index 8b1b1cbf9..863cb3a1c 100644
+--- a/dlt/common/configuration/exceptions.py
++++ b/dlt/common/configuration/exceptions.py
+@@ -69,12 +69,15 @@ class ConfigFieldMissingException(KeyError, ConfigurationException):
+         super().__init__(self.spec_name)
+ 
+     @staticmethod
+-    def _print_traces(
++    def _build_config_error_message(
+         # spec_name: str, union_pos: int, union_count: int,
+         spec_name: str,
+         resolved_keys: List[str],
+         traces: FieldLookupTraces,
+     ) -> str:
++        """Takes in the configuration spec, the resolved key and the configuration resolution traces
++        to create a detailed exception / log message about failed configuration resolution.
++        """
+         msg = ""
+         for f, field_traces in traces.items():
+             for idx, trace in enumerate(field_traces):
+@@ -88,7 +91,7 @@ class ConfigFieldMissingException(KeyError, ConfigurationException):
+                         msg += f" (Union {trace.union_pos} of {trace.union_count})"
+                     msg += "\n"
+                     msg += textwrap.indent(
+-                        ConfigFieldMissingException._print_traces(
++                        ConfigFieldMissingException._build_config_error_message(
+                             trace.spec_name, trace.resolved_fields_set, trace.traces
+                         ),
+                         "  ",
+@@ -113,7 +116,9 @@ class ConfigFieldMissingException(KeyError, ConfigurationException):
+             f"Missing {len(self.fields)} field(s) in configuration`{self.spec_name}`:"
+             f" {', '.join(f'`{f}`' for f in self.fields)}\n"
+         )
+-        msg += self._print_traces(self.spec_name, self.resolved_fields_set, self.traces)
++        msg += self._build_config_error_message(
++            self.spec_name, self.resolved_fields_set, self.traces
++        )
+ 
+         from dlt.common.configuration.container import Container
+         from dlt.common.configuration.specs import PluggableRunContext
+diff --git a/dlt/destinations/impl/ducklake/configuration.py b/dlt/destinations/impl/ducklake/configuration.py
+index 80fbb209d..839760883 100644
+--- a/dlt/destinations/impl/ducklake/configuration.py
++++ b/dlt/destinations/impl/ducklake/configuration.py
+@@ -1,7 +1,7 @@
+ # from __future__ import annotations
+ 
+ import dataclasses
+-from typing import Any, ClassVar, Dict, Final, List, Optional, TYPE_CHECKING, Union
++from typing import ClassVar, Union
+ 
+ from dlt.common.configuration import configspec
+ from dlt.common.configuration.exceptions import ConfigFieldMissingException
+@@ -18,6 +18,7 @@ from dlt.destinations.impl.duckdb.configuration import DuckDbConnectionPool, Duc
+ from dlt.destinations.impl.duckdb.factory import _set_duckdb_raw_capabilities
+ 
+ 
++DEFAULT_DUCKLAKE_NAME = "ducklake"
+ DUCKLAKE_STORAGE_PATTERN = "%s.files"
+ 
+ 
+@@ -33,16 +34,16 @@ def _get_ducklake_capabilities() -> DestinationCapabilitiesContext:
+ 
+ @configspec(init=False)
+ class DuckLakeCredentials(DuckDbBaseCredentials):
+-    catalog_name: str = "ducklake_catalog"
++    ducklake_name: str = DEFAULT_DUCKLAKE_NAME
+     catalog: ConnectionStringCredentials = None
+     # NOTE: consider moving to DuckLakeClientConfiguration so bucket_url is not a secret
+     storage: FilesystemConfiguration = None
+ 
+-    __config_gen_annotations__: ClassVar[List[str]] = ["catalog_name", "catalog", "storage"]
++    __config_gen_annotations__: ClassVar[list[str]] = ["ducklake_name", "catalog", "storage"]
+ 
+     def __init__(
+         self,
+-        catalog_name: str = "ducklake_catalog",
++        ducklake_name: str = DEFAULT_DUCKLAKE_NAME,
+         catalog: Union[str, ConnectionStringCredentials] = None,
+         storage: Union[str, FilesystemConfiguration] = None,
+     ) -> None:
+@@ -50,7 +51,7 @@ class DuckLakeCredentials(DuckDbBaseCredentials):
+         configuration.
+ 
+         Args:
+-            catalog_name: str
++            ducklake_name: str
+                 This value is mainly used as ATTACH name for the ducklake database and
+                 as names for catalog and storage files if not configured explicitly.
+                 If omitted, ducklake name is derived from destination name or pipeline name.
+@@ -66,7 +67,7 @@ class DuckLakeCredentials(DuckDbBaseCredentials):
+                 derived from the name_or_conn_str argument.
+ 
+         """
+-        self.catalog_name = catalog_name
++        self.ducklake_name = ducklake_name
+         if isinstance(catalog, str):
+             catalog = ConnectionStringCredentials(catalog)
+         self.catalog = catalog
+@@ -86,13 +87,13 @@ class DuckLakeCredentials(DuckDbBaseCredentials):
+         if self.catalog is None and not config_exception.was_partially_resolved("catalog"):
+             # use sqllite as default catalog
+             self.catalog = ConnectionStringCredentials(
+-                {"drivername": "sqlite", "database": self.catalog_name + ".sqlite"}
++                {"drivername": "sqlite", "database": self.ducklake_name + ".sqlite"}
+             ).resolve()
+             config_exception.drop_traces_for_field("catalog")
+ 
+         if self.storage is None and "bucket_url" in config_exception.traces["storage"][0].traces:  # type: ignore
+             self.storage = FilesystemConfigurationWithLocalFiles(
+-                bucket_url=DUCKLAKE_STORAGE_PATTERN % self.catalog_name, local_dir="."
++                bucket_url=DUCKLAKE_STORAGE_PATTERN % self.ducklake_name, local_dir="."
+             ).resolve()
+ 
+         if not self.is_partial():
+@@ -137,7 +138,7 @@ class DuckLakeClientConfiguration(WithLocalFiles, DestinationClientDwhWithStagin
+             # name is <pipeline|dest name>.<duckdb|sqlite>
+             local_db = self.make_location(
+                 self.credentials.catalog.database
+-                or self.credentials.catalog_name + "." + self.credentials.catalog.drivername,
++                or self.credentials.ducklake_name + "." + self.credentials.catalog.drivername,
+                 "%s",
+             )
+             self.credentials.catalog.database = local_db
+@@ -154,6 +155,4 @@ class DuckLakeClientConfiguration(WithLocalFiles, DestinationClientDwhWithStagin
+         """Return ducklake displayable location that contains catalog and storage locations"""
+         if not self.credentials or not self.credentials.catalog or not self.credentials.storage:
+             return ""
+-        return (
+-            f"{self.credentials.catalog_name}@{self.credentials.catalog}@{self.credentials.storage}"
+-        )
++        return f"{self.credentials.ducklake_name}@{self.credentials.catalog}@{self.credentials.storage}"
+diff --git a/dlt/destinations/impl/ducklake/ducklake.py b/dlt/destinations/impl/ducklake/ducklake.py
+index 6eb3eabe7..aabda081f 100644
+--- a/dlt/destinations/impl/ducklake/ducklake.py
++++ b/dlt/destinations/impl/ducklake/ducklake.py
+@@ -92,9 +92,9 @@ class DuckLakeClient(DuckDbClient):
+ 
+     A DuckLake has 3 components:
+         - ducklake client: this is a `duckdb` instance with the `ducklake` extension
+-        - catalog_database: this is an SQL database storing metadata. It can be a duckdb instance
++        - catalog: this is an SQL database storing metadata. It can be a duckdb instance
+             (typically the ducklake client) or a remote database (sqlite, postgres, mysql)
+-        - data_storage: this is a filesystem where data is stored in files
++        - storage: this is a filesystem where data is stored in files
+ 
+     The dlt DuckLake destination gives access to the "ducklake client".
+     You never have to manage the catalog and storage directly;
+diff --git a/dlt/destinations/impl/ducklake/sql_client.py b/dlt/destinations/impl/ducklake/sql_client.py
+index 9d9f88028..ad944382c 100644
+--- a/dlt/destinations/impl/ducklake/sql_client.py
++++ b/dlt/destinations/impl/ducklake/sql_client.py
+@@ -13,12 +13,12 @@ from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
+ from dlt.destinations.sql_client import raise_open_connection_error
+ 
+ 
+-class DucklakeDBApiCursorImpl(DuckDBDBApiCursorImpl):
++class DuckLakeDBApiCursorImpl(DuckDBDBApiCursorImpl):
+     vector_size: ClassVar[int] = 700  # vector size for ducklake
+ 
+ 
+ class DuckLakeSqlClient(DuckDbSqlClient):
+-    cursor_impl: ClassVar[Type[DuckDBDBApiCursorImpl]] = DucklakeDBApiCursorImpl
++    cursor_impl: ClassVar[Type[DuckDBDBApiCursorImpl]] = DuckLakeDBApiCursorImpl
+ 
+     def __init__(
+         self,
+@@ -57,7 +57,9 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+             # NOTE: database must be detached otherwise it is left in inconsistent state
+             # TODO: perhaps move attach/detach to connection pool
+             self._conn.execute(self.attach_statement)
+-            self._conn.execute(f"USE {self.credentials.catalog_name};")
++            self._conn.execute(
++                f"USE {self.capabilities.escape_identifier(self.credentials.ducklake_name)};"
++            )
+             # search path can only by set after database is attached
+             try:
+                 self._conn.execute(f"SET search_path = '{self.fully_qualified_dataset_name()}'")
+@@ -79,9 +81,9 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+                 pass
+             # make sure catalog is attached
+             current_db = self._conn.sql("SELECT current_database();").fetchone()[0]
+-            if current_db == self.credentials.catalog_name:
++            if current_db == self.credentials.ducklake_name:
+                 # `memory` is a name of initial memory database opened
+-                self._conn.execute(f"USE memory;DETACH {self.credentials.catalog_name}")
++                self._conn.execute(f"USE memory;DETACH {self.credentials.ducklake_name}")
+         return super().close_connection()
+ 
+     def create_secret(
+@@ -112,12 +114,12 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+                 )
+                 self._register_filesystem(fsspec_from_config(self.credentials.storage)[0], "gcs")
+             else:
+-                raise ValueError(f"Cannot create secret or register filesystem for `{protocol=:}`")
++                raise ValueError(f"Cannot create secret or register filesystem for `{protocol=}`")
+ 
+     @staticmethod
+     def build_attach_statement(
+         *,
+-        catalog_name: str,
++        ducklake_name: str,
+         catalog: ConnectionStringCredentials,
+         storage_url: str,
+     ) -> str:
+@@ -131,20 +133,20 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+ 
+             db_url = catalog.to_url().render_as_string(hide_password=False)
+             attach_statement = f"ATTACH IF NOT EXISTS 'ducklake:{catalog.drivername}:{db_url}'"
+-            attach_params = f", METADATA_SCHEMA '{catalog_name}'"
++            attach_params = f", METADATA_SCHEMA '{ducklake_name}'"
+         elif catalog.drivername == "md":
+             logger.warning(
+                 "Motherduck requires token present in the environment and will most probably crash."
+             )
+             attach_statement = f"ATTACH IF NOT EXISTS 'ducklake:md:{catalog.database}'"
+-            attach_params = f", METADATA_SCHEMA '{catalog_name}'"
++            attach_params = f", METADATA_SCHEMA '{ducklake_name}'"
+         elif catalog.drivername in ("sqlite", "duckdb"):
+             # attach sqllite with multi-process access
+             attach_statement = f"ATTACH IF NOT EXISTS 'ducklake:{catalog.database}'"
+             attach_params = ", META_TYPE 'sqlite', META_JOURNAL_MODE 'WAL', META_BUSY_TIMEOUT 1000"
+         else:
+             raise NotImplementedError(str(catalog))
+-        attach_statement += f" AS {catalog_name}"
++        attach_statement += f" AS {ducklake_name}"
+         attach_statement += f" (DATA_PATH '{storage_url}'{attach_params})"
+         return attach_statement
+ 
+@@ -155,7 +157,7 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+             return self._attach_statement
+         else:
+             return self.build_attach_statement(
+-                catalog_name=self.credentials.catalog_name,
++                ducklake_name=self.credentials.ducklake_name,
+                 catalog=self.credentials.catalog,
+                 storage_url=self.credentials.storage_url,
+             )
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/ducklake.md b/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
+index a7aa7e5f3..44fac2504 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
+@@ -28,7 +28,7 @@ dlt init foo ducklake
+ `dlt init` will create a sample `secrets.toml` for **postgres** catalog and **s3** bucket storage. For local automatic setup comment out catalog and storage entries:
+ ```toml
+ [destination.ducklake.credentials]
+-catalog_name="lake_catalog"  # we recommend explicit catalog name
++ducklake_name="ducklake"  # we recommend explicit catalog name
+ ```
+ 
+ - Run a test pipeline that writes to a local DuckLake:
+@@ -54,7 +54,7 @@ The console output will point you to where `sqlite` catalog database and data st
+ - `lake_catalog.files` folder with `lake_schema` subfolder for the dataset.
+ 
+ ## Configure Ducklake
+-Pick your `catalog_name` as described above. This name is the used:
++Pick your `ducklake_name` as described above. This name is the used:
+ - as attach name for the ducklake - each ducklake connection starts with **:memory:** connection to which we `ATTACH` the ducklake
+ - to set default folder name of the local filesystem storage and database file name for `sqlite` and `duckdb` (if no explicit configuration is provided)
+ - as **postgres** schema name where catalog tables will be created (if postgres configured)
+@@ -82,7 +82,7 @@ Refer to [duckdb](duckdb.md) configuration for more options.
+ [destination.ducklake.credentials]
+ catalog="postgres://loader:pass@localhost:5432/dlt_data"
+ ```
+-`ducklake` will use postgres schema with the name of `catalog_name` config option and create required tables automatically.
++`ducklake` will use postgres schema with the name of `ducklake_name` config option and create required tables automatically.
+ 
+ - 🧪 **mysql**: uses the same code path as for **postgres** but we never tested it
+ 
+@@ -104,7 +104,7 @@ Make sure that you have Motherduck token in your environment. Hopefully situatio
+ Example s3 configuration:
+ ```toml
+ [destination.ducklake.credentials]
+-catalog_name="lake_catalog"
++ducklake_name="lakehouse"
+ catalog="postgres://loader:pass@localhost:5432/dlt_data"
+ 
+ [destination.ducklake.credentials.storage]
+@@ -145,7 +145,7 @@ credentials = DuckLakeCredentials(
+     catalog="postgresql://loader:pass@localhost:5432/dlt_data",
+     storage="s3://dlt-ci-test-bucket/lake",
+ )
+-ducklake = dlt.destinations.ducklake(credentials=credentials)
++destination = dlt.destinations.ducklake(credentials=credentials)
+ ```
+ 
+ ```py
+diff --git a/tests/load/ducklake/test_ducklake_client.py b/tests/load/ducklake/test_ducklake_client.py
+index f803eca91..4e626a9a0 100644
+--- a/tests/load/ducklake/test_ducklake_client.py
++++ b/tests/load/ducklake/test_ducklake_client.py
+@@ -12,6 +12,7 @@ from dlt.destinations.impl.ducklake.sql_client import DuckLakeSqlClient
+ from dlt.destinations.impl.ducklake.configuration import (
+     DuckLakeCredentials,
+     DuckLakeClientConfiguration,
++    DEFAULT_DUCKLAKE_NAME,
+ )
+ 
+ from dlt.destinations.impl.ducklake.sql_client import DuckLakeSqlClient
+@@ -57,7 +58,7 @@ def test_default_credentials() -> None:
+     assert credentials.is_partial() is True
+     assert credentials.is_resolved() is False
+ 
+-    assert credentials.catalog_name == "ducklake_catalog"
++    assert credentials.ducklake_name == DEFAULT_DUCKLAKE_NAME
+     assert credentials.catalog is None
+     assert credentials.storage is None
+ 
+@@ -66,6 +67,7 @@ def test_default_credentials() -> None:
+     assert credentials.is_partial() is False
+     assert credentials.is_resolved() is True
+ 
++    assert credentials.ducklake_name == DEFAULT_DUCKLAKE_NAME
+     assert credentials.catalog is not None
+     assert credentials.catalog.drivername == "sqlite"
+     assert credentials.storage is not None
+@@ -73,34 +75,36 @@ def test_default_credentials() -> None:
+ 
+ 
+ def test_ducklake_urls() -> None:
+-    os.environ["DESTINATION__DUCKLAKE__CREDENTIALS__CATALOG_NAME"] = "env_ducklake_1"
++    os.environ["DESTINATION__DUCKLAKE__CREDENTIALS__DUCKLAKE_NAME"] = "env_ducklake_1"
+     credentials = resolve_configuration(DuckLakeCredentials(), sections=("destination", "ducklake"))
+-    assert credentials.catalog_name == "env_ducklake_1"
++    assert credentials.ducklake_name == "env_ducklake_1"
+ 
+ 
+-def test_default_ducklake_configuration() -> None:
++def test_ducklake_configuration_default() -> None:
++    local_dir = pathlib.Path.cwd() / TEST_STORAGE_ROOT
+     # without pipeline context and destination name
+     configuration = resolve_configuration(
+         DuckLakeClientConfiguration()._bind_dataset_name(dataset_name="foo")
+     )
+-
+-    local_dir = pathlib.Path.cwd() / TEST_STORAGE_ROOT
+     credentials = configuration.credentials
++
+     assert credentials.is_partial() is False
+     assert credentials.is_resolved() is True
+-
+-    assert credentials.catalog_name == "ducklake_catalog"
++    assert credentials.ducklake_name == DEFAULT_DUCKLAKE_NAME
+     # default catalog location should point to _storage (local_dir)
+-    assert credentials.catalog.database == str(local_dir / "ducklake_catalog.sqlite")
++    assert credentials.catalog.database == str(local_dir / "ducklake.sqlite")
+     # sqlite is default catalog
+     conn_str = credentials.catalog.to_native_representation()
+     assert conn_str.startswith("sqlite:")
+-    assert conn_str.endswith(str(local_dir / "ducklake_catalog.sqlite"))
++    assert conn_str.endswith(str(local_dir / "ducklake.sqlite"))
+     # storage in local dir, default name
+-    assert credentials.storage_url == str(local_dir / "ducklake_catalog.files")
++    assert credentials.storage_url == str(local_dir / "ducklake.files")
+     # file url
+     assert credentials.storage.bucket_url.startswith("file://")
+ 
++
++def test_ducklake_configuration_duckdb_catalog() -> None:
++    local_dir = pathlib.Path.cwd() / TEST_STORAGE_ROOT
+     # plug default duckdb catalog
+     configuration = resolve_configuration(
+         DuckLakeClientConfiguration(
+@@ -110,22 +114,30 @@ def test_default_ducklake_configuration() -> None:
+         )._bind_dataset_name(dataset_name="foo")
+     )
+     credentials = configuration.credentials
+-    assert credentials.catalog_name == "ducklake_catalog"
++
++    assert credentials.ducklake_name == DEFAULT_DUCKLAKE_NAME
+     conn_str = credentials.catalog.to_native_representation()
+-    assert conn_str.endswith(str(local_dir / "ducklake_catalog.duckdb"))
++    assert conn_str.endswith(str(local_dir / "ducklake.duckdb"))
++
+ 
++def test_ducklake_configuration_ducklake_name() -> None:
++    local_dir = pathlib.Path.cwd() / TEST_STORAGE_ROOT
+     # catalog name sets default locations
+     configuration = resolve_configuration(
+         DuckLakeClientConfiguration(
+-            credentials=DuckLakeCredentials(catalog_name="custom_catalog")
++            credentials=DuckLakeCredentials(ducklake_name="my_ducklake")
+         )._bind_dataset_name(dataset_name="foo")
+     )
+     credentials = configuration.credentials
+-    assert credentials.catalog_name == "custom_catalog"
++
++    assert credentials.ducklake_name == "my_ducklake"
+     conn_str = credentials.catalog.to_native_representation()
+-    assert conn_str.endswith(str(local_dir / "custom_catalog.sqlite"))
+-    assert credentials.storage_url == str(local_dir / "custom_catalog.files")
++    assert conn_str.endswith(str(local_dir / "my_ducklake.sqlite"))
++    assert credentials.storage_url == str(local_dir / "my_ducklake.files")
++
+ 
++def test_ducklake_configuration_destination_name() -> None:
++    local_dir = pathlib.Path.cwd() / TEST_STORAGE_ROOT
+     # destination name is set
+     configuration = resolve_configuration(
+         DuckLakeClientConfiguration(
+@@ -134,10 +146,14 @@ def test_default_ducklake_configuration() -> None:
+     )
+     credentials = configuration.credentials
+     # no impact on locations
+-    assert credentials.catalog_name == "ducklake_catalog"
++    assert credentials.ducklake_name == DEFAULT_DUCKLAKE_NAME
+     conn_str = credentials.catalog.to_native_representation()
+-    assert conn_str.endswith(str(local_dir / "ducklake_catalog.sqlite"))
+-    assert credentials.storage_url == str(local_dir / "ducklake_catalog.files")
++    assert conn_str.endswith(str(local_dir / "ducklake.sqlite"))
++    assert credentials.storage_url == str(local_dir / "ducklake.files")
++
++
++def test_ducklake_configuration_pipeline_name() -> None:
++    local_dir = pathlib.Path.cwd() / TEST_STORAGE_ROOT
+ 
+     # pipeline name is set
+     configuration = resolve_configuration(
+@@ -146,27 +162,32 @@ def test_default_ducklake_configuration() -> None:
+         )
+     )
+     credentials = configuration.credentials
+-    assert credentials.catalog_name == "ducklake_catalog"
++
++    assert credentials.ducklake_name == DEFAULT_DUCKLAKE_NAME
+     # no impact on locations
+     conn_str = credentials.catalog.to_native_representation()
+-    assert conn_str.endswith(str(local_dir / "ducklake_catalog.sqlite"))
+-    assert credentials.storage_url == str(local_dir / "ducklake_catalog.files")
++    assert conn_str.endswith(str(local_dir / "ducklake.sqlite"))
++    assert credentials.storage_url == str(local_dir / "ducklake.files")
++
+ 
++def test_ducklake_configuration_storage_credentials() -> None:
+     # explicit values
+     os.environ["CREDENTIALS__AWS_SECRET_ACCESS_KEY"] = "key"
+     os.environ["CREDENTIALS__AWS_ACCESS_KEY_ID"] = "id"
++
+     configuration = resolve_configuration(
+         DuckLakeClientConfiguration(
+             destination_name="named_lake",
+             credentials=DuckLakeCredentials(
+-                "explicit_ducklake",
++                "my_ducklake",
+                 catalog="postgresql://loader:loader@localhost:5432/dlt_data",
+                 storage="s3://dlt-ci-test-bucket/lake",
+             ),
+         )._bind_dataset_name(dataset_name="foo")
+     )
+     credentials = configuration.credentials
+-    assert credentials.catalog_name == "explicit_ducklake"
++
++    assert credentials.ducklake_name == "my_ducklake"
+     assert (
+         credentials.catalog.to_native_representation()
+         == "postgresql://loader:loader@localhost:5432/dlt_data"
+@@ -174,6 +195,10 @@ def test_default_ducklake_configuration() -> None:
+     # NOTE: dataset folders will be created in /lake/
+     assert credentials.storage_url == "s3://dlt-ci-test-bucket/lake"
+ 
++
++def test_ducklake_configuration_catalog_credentials() -> None:
++    local_dir = pathlib.Path.cwd() / TEST_STORAGE_ROOT
++
+     # explicit catalog
+     configuration = resolve_configuration(
+         DuckLakeClientConfiguration(
+@@ -184,12 +209,13 @@ def test_default_ducklake_configuration() -> None:
+         )._bind_dataset_name(dataset_name="foo")
+     )
+     credentials = configuration.credentials
+-    assert credentials.catalog_name == "ducklake_catalog"
++
++    assert credentials.ducklake_name == DEFAULT_DUCKLAKE_NAME
+     assert (
+         credentials.catalog.to_native_representation()
+         == "postgresql://loader:loader@localhost:5432/dlt_data"
+     )
+-    assert credentials.storage_url == str(local_dir / "ducklake_catalog.files")
++    assert credentials.storage_url == str(local_dir / "ducklake.files")
+ 
+ 
+ def test_ducklake_attach_statement() -> None:
+@@ -204,7 +230,7 @@ def test_ducklake_attach_statement() -> None:
+ 
+     attach_statement = DuckLakeSqlClient.build_attach_statement(
+         catalog=ConnectionStringCredentials("postgres://loader:loader@localhost:5432/dlt_data"),
+-        catalog_name="foo",
++        ducklake_name="foo",
+         storage_url="/path/to/storage",
+     )
+ 
+@@ -222,7 +248,7 @@ def test_attach_statement_doesnt_use_postgresql() -> None:
+     )
+     attach_statement = DuckLakeSqlClient.build_attach_statement(
+         catalog=ConnectionStringCredentials("postgresql://loader:loader@localhost:5432/dlt_data"),
+-        catalog_name="foo",
++        ducklake_name="foo",
+         storage_url="./path/to/storage",
+     )
+ 
+diff --git a/tests/load/ducklake/test_ducklake_pipeline.py b/tests/load/ducklake/test_ducklake_pipeline.py
+index da276000d..b30757f43 100644
+--- a/tests/load/ducklake/test_ducklake_pipeline.py
++++ b/tests/load/ducklake/test_ducklake_pipeline.py
+@@ -38,13 +38,13 @@ def test_all_catalogs(catalog: str) -> None:
+     """
+     if catalog is None:
+         # use destination alias
+-        catalog_name = "ducklake_catalog"
++        ducklake_name = "ducklake"
+         destination: TDestinationReferenceArg = "ducklake"
+     else:
+         # pick random catalog name so we isolate via postgres schema
+-        catalog_name = "catalog_" + uniq_id(4)
++        ducklake_name = "ducklake_" + uniq_id(4)
+         destination = ducklake(
+-            credentials=DuckLakeCredentials(catalog_name=catalog_name, catalog=catalog)
++            credentials=DuckLakeCredentials(ducklake_name=ducklake_name, catalog=catalog)
+         )
+     pipeline = dlt.pipeline(
+         "destination_defaults", destination=destination, dataset_name="lake_schema", dev_mode=True
+@@ -68,7 +68,7 @@ def test_all_catalogs(catalog: str) -> None:
+     assert ds.table_foo["foo"].fetchall() == [(1,), (2,)]
+ 
+     # test lake location
+-    expected_location = pathlib.Path(TEST_STORAGE_ROOT, DUCKLAKE_STORAGE_PATTERN % catalog_name)
++    expected_location = pathlib.Path(TEST_STORAGE_ROOT, DUCKLAKE_STORAGE_PATTERN % ducklake_name)
+     assert expected_location.exists()
+     # test dataset in lake
+     assert (expected_location / pipeline.dataset_name).exists()
+
+
+===== COMMIT d76ee508 =====
+
+
+commit d76ee508f
+Author: Anton Burnashev
+Date: 2025-10-01
+
+    restclient, rest_api: add support for `data` parameter (#3134)
+
+diff --git a/dlt/sources/helpers/rest_client/__init__.py b/dlt/sources/helpers/rest_client/__init__.py
+index c9fe0a4dc..97744d6f0 100644
+--- a/dlt/sources/helpers/rest_client/__init__.py
++++ b/dlt/sources/helpers/rest_client/__init__.py
+@@ -19,6 +19,8 @@ def paginate(
+     paginator: Optional[BasePaginator] = None,
+     data_selector: Optional[jsonpath.TJsonPath] = None,
+     hooks: Optional[Hooks] = None,
++    *,
++    data: Optional[Any] = None,
+ ) -> Iterator[PageData[Any]]:
+     """
+     Paginate over a REST API endpoint.
+@@ -43,4 +45,5 @@ def paginate(
+         paginator=paginator,
+         data_selector=data_selector,
+         hooks=hooks,
++        data=data,
+     )
+diff --git a/dlt/sources/helpers/rest_client/client.py b/dlt/sources/helpers/rest_client/client.py
+index 37cced9a1..e51e507a1 100644
+--- a/dlt/sources/helpers/rest_client/client.py
++++ b/dlt/sources/helpers/rest_client/client.py
+@@ -110,9 +110,15 @@ class RESTClient:
+         headers: Optional[Dict[str, Any]] = None,
+         params: Optional[Dict[str, Any]] = None,
+         json: Optional[Dict[str, Any]] = None,
++        data: Optional[Any] = None,
+         auth: Optional[AuthBase] = None,
+         hooks: Optional[Hooks] = None,
+     ) -> Request:
++        if json and data:
++            raise ValueError(
++                "Cannot use both 'json' and 'data' parameters simultaneously. "
++                "Use 'json' for JSON payloads or 'data' for form-encoded/raw data."
++            )
+         parsed_url = urlparse(path_or_url)
+         if parsed_url.scheme in ("http", "https"):
+             url = path_or_url
+@@ -127,6 +133,7 @@ class RESTClient:
+             headers=request_headers,
+             params=params,
+             json=json,
++            data=data,
+             auth=auth or self.auth,
+             hooks=hooks,
+         )
+@@ -152,7 +159,7 @@ class RESTClient:
+             logger.debug(
+                 f"Making {request.method.upper()} request to {request.url}"
+                 f" with params={request.params}, json={request.json},"
+-                f" headers={request.headers}"
++                f" data={request.data}, headers={request.headers}"
+             )
+         else:
+             sanitized_url = sanitize_url(prepared_url)
+@@ -165,6 +172,7 @@ class RESTClient:
+             headers=kwargs.pop("headers", None),
+             params=kwargs.pop("params", None),
+             json=kwargs.pop("json", None),
++            data=kwargs.pop("data", None),
+             auth=kwargs.pop("auth", None),
+             hooks=kwargs.pop("hooks", None),
+         )
+@@ -173,8 +181,15 @@ class RESTClient:
+     def get(self, path: str, params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Response:
+         return self.request(path, method="GET", params=params, **kwargs)
+ 
+-    def post(self, path: str, json: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Response:
+-        return self.request(path, method="POST", json=json, **kwargs)
++    def post(
++        self,
++        path: str,
++        json: Optional[Dict[str, Any]] = None,
++        *,
++        data: Optional[Any] = None,
++        **kwargs: Any,
++    ) -> Response:
++        return self.request(path, method="POST", json=json, data=data, **kwargs)
+ 
+     def paginate(
+         self,
+@@ -187,6 +202,8 @@ class RESTClient:
+         data_selector: Optional[jsonpath.TJsonPath] = None,
+         hooks: Optional[Hooks] = None,
+         headers: Optional[Dict[str, Any]] = None,
++        *,
++        data: Optional[Any] = None,
+         **kwargs: Any,
+     ) -> Iterator[PageData[Any]]:
+         """Iterates over paginated API responses, yielding pages of data.
+@@ -200,6 +217,8 @@ class RESTClient:
+                 Overwrites default headers.
+             params (Optional[Dict[str, Any]]): URL parameters for the request.
+             json (Optional[Dict[str, Any]]): JSON payload for the request.
++            data (Optional[Any]): Data to send in the body of the request. Can be a dictionary
++                (form-encoded), bytes, string, or file-like object. Mutually exclusive with json.
+             auth (Optional[AuthBase): Authentication configuration for the request.
+             paginator (Optional[BasePaginator]): Paginator instance for handling
+                 pagination logic.
+@@ -241,6 +260,7 @@ class RESTClient:
+             method=method,
+             params=params,
+             json=json,
++            data=data,
+             auth=auth,
+             hooks=hooks,
+         )
+@@ -273,6 +293,7 @@ class RESTClient:
+     def extract_response(self, response: Response, data_selector: jsonpath.TJsonPath) -> List[Any]:
+         # we should compile data_selector
+         data: Any = jsonpath.find_values(data_selector, response.json())
++
+         # extract if single item selected
+         data = data[0] if isinstance(data, list) and len(data) == 1 else data
+         if isinstance(data, list):
+diff --git a/dlt/sources/rest_api/__init__.py b/dlt/sources/rest_api/__init__.py
+index 22a212d92..6bbaaf5ec 100644
+--- a/dlt/sources/rest_api/__init__.py
++++ b/dlt/sources/rest_api/__init__.py
+@@ -243,6 +243,7 @@ def create_resources(
+         endpoint_config = cast(Endpoint, endpoint_resource["endpoint"])
+         request_params = endpoint_config.get("params", {})
+         request_json = endpoint_config.get("json")
++        request_data = endpoint_config.get("data")
+         request_headers = endpoint_config.get("headers")
+         paginator = create_paginator(endpoint_config.get("paginator"))
+         processing_steps = endpoint_resource.pop("processing_steps", [])
+@@ -295,6 +296,7 @@ def create_resources(
+                 headers=request_headers,
+                 params=request_params,
+                 json=request_json,
++                data=request_data,
+                 paginator=paginator,
+                 data_selector=endpoint_config.get("data_selector"),
+                 hooks=hooks,
+@@ -322,6 +324,7 @@ def create_resources(
+                 headers=request_headers,
+                 params=base_params,
+                 json=request_json,
++                data=request_data,
+                 paginator=paginator,
+                 data_selector=endpoint_config.get("data_selector"),
+                 hooks=hooks,
+diff --git a/dlt/sources/rest_api/config_setup.py b/dlt/sources/rest_api/config_setup.py
+index 69e545952..82849ef26 100644
+--- a/dlt/sources/rest_api/config_setup.py
++++ b/dlt/sources/rest_api/config_setup.py
+@@ -102,6 +102,7 @@ class ProcessedParentData(NamedTuple):
+     headers: Optional[Dict[str, Any]]
+     params: Dict[str, Any]
+     json: Optional[Dict[str, Any]]
++    data: Optional[Any]
+     parent_record: Dict[str, Any]
+ 
+ 
+@@ -328,19 +329,27 @@ def build_resource_dependency_graph(
+             endpoint_resource["endpoint"]["path"], available_contexts
+         )
+ 
+-        # Find all expressions in params, json, or header, but error if any of them is not in available_contexts
++        # Find all expressions in params, json, data, or headers, but error if any of them
++        # are not in available_contexts
+         params_expressions = _find_expressions(endpoint_resource["endpoint"].get("params", {}))
+         _raise_if_any_not_in(params_expressions, available_contexts, message="params")
+ 
+         json_expressions = _find_expressions(endpoint_resource["endpoint"].get("json", {}))
+         _raise_if_any_not_in(json_expressions, available_contexts, message="json")
+ 
++        data_expressions = _find_expressions(endpoint_resource["endpoint"].get("data", {}))
++        _raise_if_any_not_in(data_expressions, available_contexts, message="data")
++
+         headers_expressions = _find_expressions(endpoint_resource["endpoint"].get("headers", {}))
+         _raise_if_any_not_in(headers_expressions, available_contexts, message="headers")
+ 
+         resolved_params += _expressions_to_resolved_params(
+             _filter_resource_expressions(
+-                path_expressions | params_expressions | json_expressions | headers_expressions
++                path_expressions
++                | params_expressions
++                | json_expressions
++                | data_expressions
++                | headers_expressions
+             )
+         )
+ 
+@@ -696,7 +705,7 @@ def _find_expressions(
+             for key, val in value.items():
+                 recursive_search(key)
+                 recursive_search(val)
+-        elif isinstance(value, list):
++        elif isinstance(value, (list, tuple)):
+             for item in value:
+                 recursive_search(item)
+         elif isinstance(value, str):
+@@ -743,6 +752,7 @@ def process_parent_data_item(
+     headers: Optional[Dict[str, Any]] = None,
+     params: Optional[Dict[str, Any]] = None,
+     request_json: Optional[Dict[str, Any]] = None,
++    request_data: Optional[Any] = None,
+     include_from_parent: Optional[List[str]] = None,
+     incremental: Optional[Incremental[Any]] = None,
+     incremental_value_convert: Optional[Callable[..., Any]] = None,
+@@ -754,6 +764,7 @@ def process_parent_data_item(
+     expanded_headers = expand_placeholders(headers, params_values)
+     expanded_params = expand_placeholders(params or {}, params_values)
+     expanded_json = expand_placeholders(request_json, params_values, preserve_value_type=True)
++    expanded_data = expand_placeholders(request_data, params_values)
+ 
+     parent_resource_name = resolved_params[0].resolve_config["resource"]
+     parent_record = build_parent_record(item, parent_resource_name, include_from_parent)
+@@ -763,6 +774,7 @@ def process_parent_data_item(
+         headers=expanded_headers,
+         params=expanded_params,
+         json=expanded_json,
++        data=expanded_data,
+         parent_record=parent_record,
+     )
+ 
+@@ -877,7 +889,7 @@ def expand_placeholders(
+             for k, v in obj.items()
+         }
+ 
+-    if isinstance(obj, list):
++    if isinstance(obj, (list, tuple)):
+         return [expand_placeholders(item, placeholders, preserve_value_type) for item in obj]
+ 
+     return obj  # For other data types, do nothing
+@@ -1016,6 +1028,7 @@ def paginate_dependent_resource(
+     headers: Optional[Dict[str, Any]],
+     params: Dict[str, Any],
+     json: Optional[Dict[str, Any]],
++    data: Optional[Any],
+     paginator: Optional[BasePaginator],
+     data_selector: Optional[jsonpath.TJsonPath],
+     hooks: Optional[Dict[str, Any]],
+@@ -1041,6 +1054,7 @@ def paginate_dependent_resource(
+             headers=headers,
+             params=params,
+             request_json=json,
++            request_data=data,
+             resolved_params=resolved_params,
+             include_from_parent=include_from_parent,
+             incremental=incremental_object,
+@@ -1053,6 +1067,7 @@ def paginate_dependent_resource(
+             headers=processed_data.headers,
+             params=processed_data.params,
+             json=processed_data.json,
++            data=processed_data.data,
+             paginator=paginator,
+             data_selector=data_selector,
+             hooks=hooks,
+@@ -1069,6 +1084,7 @@ def paginate_resource(
+     headers: Optional[Dict[str, Any]],
+     params: Dict[str, Any],
+     json: Optional[Dict[str, Any]],
++    data: Optional[Any],
+     paginator: Optional[BasePaginator],
+     data_selector: Optional[jsonpath.TJsonPath],
+     hooks: Optional[Dict[str, Any]],
+@@ -1096,6 +1112,7 @@ def paginate_resource(
+     headers = expand_placeholders(headers, format_kwargs)
+     params = expand_placeholders(params, format_kwargs)
+     json = expand_placeholders(json, format_kwargs, preserve_value_type=True)
++    data = expand_placeholders(data, format_kwargs)
+ 
+     yield from client.paginate(
+         method=method,
+@@ -1103,6 +1120,7 @@ def paginate_resource(
+         headers=headers,
+         params=params,
+         json=json,
++        data=data,
+         paginator=paginator,
+         data_selector=data_selector,
+         hooks=hooks,
+diff --git a/dlt/sources/rest_api/typing.py b/dlt/sources/rest_api/typing.py
+index c6a2e3878..6a6d34b4d 100644
+--- a/dlt/sources/rest_api/typing.py
++++ b/dlt/sources/rest_api/typing.py
+@@ -250,6 +250,7 @@ class Endpoint(TypedDict, total=False):
+     method: Optional[HTTPMethodBasic]
+     params: Optional[Dict[str, Union[ResolveParamConfig, IncrementalParamConfig, Any]]]
+     json: Optional[Dict[str, Any]]
++    data: Optional[Any]
+     paginator: Optional[PaginatorConfig]
+     data_selector: Optional[jsonpath.TJsonPath]
+     response_actions: Optional[List[ResponseAction]]
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
+index b3c0d3fee..dc497a3c9 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
+@@ -364,6 +364,7 @@ used as-is and `base_url` will be ignored.
+ - `headers`: Additional headers specific to this endpoint. See the [headers configuration](./advanced#headers-configuration) section for more details.
+ - `params`: Query parameters to be sent with each request. For example, `sort` to order the results or `since` to specify [incremental loading](#incremental-loading). This is also may be used to define [resource relationships](#define-resource-relationships).
+ - `json`: The JSON payload to be sent with the request (for POST and PUT requests).
++- `data`: The data payload to be sent with the request body. Can be a dictionary (form-encoded) or string. Mutually exclusive with `json` parameter. Use this for APIs that expect form-encoded data or raw payloads instead of JSON.
+ - `paginator`: Pagination configuration for the endpoint. See the [pagination](#pagination) section for more details.
+ - `data_selector`: A JSONPath to select the data from the response. See the [data selection](#data-selection) section for more details.
+ - `response_actions`: A list of actions that define how to process the response data. See the [response actions](./advanced#response-actions) section for more details.
+@@ -485,7 +486,7 @@ To change this behavior for a specific endpoint, explicitly set the `paginator`
+ {
+     "name": "user_details",
+     "endpoint": {
+-        "path": "user/{id}/comments",
++        "path": "user/{resources.users.id}/comments",
+         "paginator": {"type": "json_link", "next_url_path": "next"}
+     }
+ }
+diff --git a/docs/website/docs/general-usage/http/rest-client.md b/docs/website/docs/general-usage/http/rest-client.md
+index 93796d1e8..ccbb26e97 100644
+--- a/docs/website/docs/general-usage/http/rest-client.md
++++ b/docs/website/docs/general-usage/http/rest-client.md
+@@ -46,6 +46,25 @@ client = RESTClient(base_url="https://api.example.com")
+ response = client.get("/posts/1")
+ ```
+ 
++### POST requests with data
++
++The `post()` method supports both JSON payloads and form-encoded/raw data through separate parameters:
++
++```py
++# JSON payload (sets Content-Type: application/json)
++response = client.post("/posts", json={"title": "New post", "content": "Post content"})
++
++# Form-encoded data (sets Content-Type: application/x-www-form-urlencoded)
++response = client.post("/posts", data={"field1": "value1", "field2": "value2"})
++
++# Raw string or bytes data
++response = client.post("/posts", data="raw text data")
++```
++
++:::note
++The `json` and `data` parameters are mutually exclusive. You cannot use both in the same request. Use `json` for JSON payloads or `data` for form-encoded/raw data.
++:::
++
+ ## Paginating API responses
+ 
+ The `RESTClient.paginate()` method is specifically designed to handle paginated responses, yielding `PageData` instances for each page:
+@@ -55,6 +74,18 @@ for page in client.paginate("/posts"):
+     print(page)
+ ```
+ 
++The `paginate()` method supports the same request parameters as regular requests:
++
++```py
++# Paginating with JSON payload
++for page in client.paginate("/search", method="POST", json={"query": "python"}):
++    print(page)
++
++# Paginating with form-encoded data
++for page in client.paginate("/search", method="POST", data={"q": "python", "limit": 10}):
++    print(page)
++```
++
+ :::tip
+ If a `paginator` is not specified, the `paginate()` method will attempt to automatically detect the pagination mechanism used by the API. If the API uses a standard pagination mechanism like having a `next` link in the response's headers or JSON body, the `paginate()` method will handle this automatically. Otherwise, you can specify a paginator object explicitly or implement a custom paginator.
+ :::
+diff --git a/tests/sources/helpers/rest_client/test_client.py b/tests/sources/helpers/rest_client/test_client.py
+index 6a10bbb71..8f36ee9e6 100644
+--- a/tests/sources/helpers/rest_client/test_client.py
++++ b/tests/sources/helpers/rest_client/test_client.py
+@@ -560,6 +560,44 @@ class TestRESTClient:
+         response = rest_client.get("https://my.url", headers={"Accept": "my/mimetype"})
+         assert response.json() == expected
+ 
++    def test_post_with_data_dict(self, rest_client) -> None:
++        result = rest_client.post(
++            path="/post_form_data",
++            data={"key1": "value1", "key2": "value2"},
++        )
++        assert result.json()["data"] == {"key1": ["value1"], "key2": ["value2"]}
++
++    def test_post_with_list_of_tuples(self, rest_client) -> None:
++        result = rest_client.post(
++            path="/post_form_data",
++            data=[("key1", "value1"), ("key1", "value2")],
++        )
++        assert result.json()["data"] == {"key1": ["value1", "value2"]}
++
++    def test_post_with_data_string(self, rest_client) -> None:
++        raw_data = "raw string data"
++        result = rest_client.post(
++            path="/post_raw_data",
++            data=raw_data,
++        )
++        assert result.json()["data"] == raw_data
++
++    def test_json_and_data_mutual_exclusivity(self, rest_client) -> None:
++        with pytest.raises(ValueError) as exc_info:
++            rest_client.post(path="/posts", json={"key": "value"}, data={"other": "data"})
++
++        assert "Cannot use both 'json' and 'data' parameters simultaneously" in str(exc_info.value)
++
++    def test_paginate_json_and_data_mutual_exclusivity(self, rest_client) -> None:
++        with pytest.raises(ValueError) as exc_info:
++            list(
++                rest_client.paginate(
++                    path="/posts", method="POST", json={"key": "value"}, data={"other": "data"}
++                )
++            )
++
++        assert "Cannot use both 'json' and 'data' parameters simultaneously" in str(exc_info.value)
++
+ 
+ class TestSecretRedaction:
+     def test_sanitize_url_basic(self):
+diff --git a/tests/sources/rest_api/conftest.py b/tests/sources/rest_api/conftest.py
+index c12d5ec2a..39ae5a3a5 100644
+--- a/tests/sources/rest_api/conftest.py
++++ b/tests/sources/rest_api/conftest.py
+@@ -168,6 +168,21 @@ def mock_api_server():
+             post_id = int(body.get("post_id", 0))
+             return paginate_by_page_number(request, generate_comments(post_id))
+ 
++        @router.post(r"/post_comments_via_form_data(\?.*)?$")
++        def post_comments_via_form_data(request, context):
++            content_type = request.headers.get("Content-Type")
++            if content_type and content_type.lower() == "application/x-www-form-urlencoded":
++                body = parse_qs(request.text) if request.text else {}
++                post_id = int(body.get("post_id", [0])[0])
++            elif not content_type:
++                raw_body = request.text
++                # this is just to test the raw "data" param case
++                post_id = int(raw_body)
++            else:
++                raise ValueError(f"Unsupported content type: {content_type}")
++
++            return paginate_by_page_number(request, generate_comments(post_id))
++
+         @router.get(r"/posts/\d+$")
+         def post_detail(request, context):
+             post_id = request.url.split("/")[-1]
+@@ -357,6 +372,23 @@ def mock_api_server():
+                 # Final page - return null data and null cursor
+                 return {"users": None, "next_token": None}
+ 
++        @router.post(r"/post_form_data$")
++        def posts_form_data(request, context):
++            content_type = request.headers.get("Content-Type")
++            if content_type == "application/x-www-form-urlencoded":
++                data = parse_qs(request.text)
++                return {"data": data}
++            else:
++                return {"error": f"Unsupported content type: {content_type}", "data": request.text}
++
++        @router.post(r"/post_raw_data$")
++        def posts_raw_data(request, context):
++            return {"data": request.text}
++
++        @router.post(r"/posts_form_data_incremental$")
++        def posts(request, context):
++            return paginate_by_page_number(request, generate_posts())
++
+         router.register_routes(m)
+ 
+         yield m
+diff --git a/tests/sources/rest_api/integration/test_offline.py b/tests/sources/rest_api/integration/test_offline.py
+index 3ba26130b..174239ec7 100644
+--- a/tests/sources/rest_api/integration/test_offline.py
++++ b/tests/sources/rest_api/integration/test_offline.py
+@@ -1,3 +1,4 @@
++import re
+ from typing import Any, List, Optional
+ from unittest import mock
+ from urllib.parse import parse_qs, urlsplit
+@@ -20,6 +21,16 @@ from tests.sources.rest_api.conftest import DEFAULT_PAGE_SIZE, DEFAULT_TOTAL_PAG
+ from tests.pipeline.utils import assert_load_info, load_table_counts, assert_query_column
+ 
+ 
++def _parse_single_valued_qs(body) -> dict[str, str]:
++    """Parse query string expecting single values per key."""
++    return {k: v[0] for k, v in parse_qs(body).items()}
++
++
++def _filter_by_path_pattern(request_history: list[Any], path_pattern: str) -> list[Any]:
++    pattern = re.compile(path_pattern)
++    return [request for request in request_history if pattern.match(request.path)]
++
++
+ @pytest.mark.parametrize(
+     "config",
+     [
+@@ -504,8 +515,9 @@ def test_dependent_resource_query_string_params(
+ 
+     list(mock_source.with_resources("posts", "post_comments").add_limit(1))
+ 
+-    history = mock_api_server.request_history
+-    post_comments_calls = [h for h in history if "/comments" in h.url]
++    post_comments_calls = _filter_by_path_pattern(
++        mock_api_server.request_history, r"/posts/\d+/comments"
++    )
+     assert len(post_comments_calls) == 50
+ 
+     for call in post_comments_calls:
+@@ -587,8 +599,7 @@ def test_interpolate_params_in_query_string(
+     )
+     list(mock_source.with_resources("posts", "post_details").add_limit(1))
+ 
+-    history = mock_api_server.request_history
+-    post_details_calls = [h for h in history if "/post_detail" in h.url]
++    post_details_calls = _filter_by_path_pattern(mock_api_server.request_history, "/post_detail")
+     assert len(post_details_calls) == 5
+ 
+     for index, call in enumerate(post_details_calls):
+@@ -637,7 +648,9 @@ def test_request_json_body(mock_api_server, endpoint_config, expected_body) -> N
+     )
+     list(source.with_resources("posts", "posts_comments").add_limit(1))
+ 
+-    post_comments_calls = [h for h in mock_api_server.request_history if "/comments" in h.url]
++    post_comments_calls = _filter_by_path_pattern(
++        mock_api_server.request_history, r"/posts/\d+/comments"
++    )
+     assert len(post_comments_calls) == 50
+ 
+     request = post_comments_calls[0]
+@@ -1433,9 +1446,7 @@ def test_headers_in_dependent_resource(mock_api_server):
+     )
+ 
+     list(source.with_resources("posts", "post_details").add_limit(1))
+-
+-    history = mock_api_server.request_history
+-    post_details_calls = [h for h in history if "/post_detail" in h.url]
++    post_details_calls = _filter_by_path_pattern(mock_api_server.request_history, "/post_detail")
+     assert len(post_details_calls) == 5
+ 
+     for index, call in enumerate(post_details_calls):
+@@ -1606,3 +1617,260 @@ def test_secret_redaction_in_http_errors(mock_api_server):
+ 
+     assert "404" in error_str
+     assert "Resource not found" not in error_str
++
++
++@pytest.mark.parametrize(
++    "endpoint_config,expected_content_type,expected_body_contains",
++    [
++        pytest.param(
++            {
++                "path": "post_form_data",
++                "method": "POST",
++                "data": {},
++            },
++            None,
++            None,
++            id="empty_data_dict",
++        ),
++        pytest.param(
++            {
++                "path": "post_form_data",
++                "method": "POST",
++                "data": {"key1": "value1", "key2": "value2"},
++            },
++            "application/x-www-form-urlencoded",
++            "key1=value1&key2=value2",
++            id="data_as_dict",
++        ),
++        pytest.param(
++            {
++                "path": "post_form_data",
++                "method": "POST",
++                "data": [("key1", "value1"), ("key2", "value2"), ("key1", "another_value")],
++            },
++            "application/x-www-form-urlencoded",
++            "key1=value1&key2=value2&key1=another_value",
++            id="data_as_list_of_tuples",
++        ),
++        pytest.param(
++            {
++                "path": "post_raw_data",
++                "method": "POST",
++                "data": "raw string data",
++            },
++            None,
++            "raw string data",
++            id="data_as_string",
++        ),
++        pytest.param(
++            {
++                "path": "post_form_data",
++                "method": "POST",
++            },
++            None,
++            None,
++            id="no_data_post",
++        ),
++    ],
++)
++def test_request_data_body(
++    mock_api_server, endpoint_config, expected_content_type, expected_body_contains
++) -> None:
++    source = rest_api_source(
++        {
++            "client": {"base_url": "https://api.example.com"},
++            "resources": [
++                {
++                    "name": "test_data",
++                    "endpoint": endpoint_config,
++                },
++            ],
++        }
++    )
++    list(source.with_resources("test_data").add_limit(1))
++
++    history = mock_api_server.request_history
++    assert len(history) >= 1
++    request = history[0]
++
++    assert expected_content_type == request.headers.get("Content-Type")
++    assert request.body == expected_body_contains
++
++
++def test_data_and_json_mutual_exclusivity(mock_api_server):
++    source = rest_api_source(
++        {
++            "client": {"base_url": "https://api.example.com"},
++            "resources": [
++                {
++                    "name": "posts",
++                    "endpoint": {
++                        "path": "posts/search",
++                        "method": "POST",
++                        "json": {"search_term": "test"},
++                        "data": {"should_be_ignored": "yes"},
++                    },
++                },
++            ],
++        }
++    )
++
++    with pytest.raises(Exception) as exc_info:
++        list(source.with_resources("posts").add_limit(1))
++
++    assert "Cannot use both 'json' and 'data' parameters simultaneously" in str(exc_info.value)
++
++
++def test_dependent_resource_post_data_param(mock_api_server):
++    source = rest_api_source(
++        {
++            "client": {"base_url": "https://api.example.com"},
++            "resources": [
++                "posts",
++                {
++                    "name": "post_comments",
++                    "endpoint": {
++                        "path": "post_comments_via_form_data",
++                        "method": "POST",
++                        "data": {
++                            "post_id": "{resources.posts.id}",
++                            "static_value": "constant",
++                            "escaped_braces": "{{not_interpolated}}",
++                        },
++                        "paginator": "single_page",
++                    },
++                },
++            ],
++        }
++    )
++
++    list(source.with_resources("posts", "post_comments").add_limit(1))
++
++    post_comments_calls = _filter_by_path_pattern(
++        mock_api_server.request_history, "/post_comments_via_form_data"
++    )
++    assert len(post_comments_calls) == 5
++
++    for index, call in enumerate(post_comments_calls):
++        assert _parse_single_valued_qs(call.body) == {
++            "post_id": str(index),
++            "static_value": "constant",
++            "escaped_braces": "{not_interpolated}",
++        }
++
++
++def test_post_data_param_with_incremental_values(mock_api_server):
++    source = rest_api_source(
++        {
++            "client": {"base_url": "https://api.example.com"},
++            "resources": [
++                {
++                    "name": "posts_form_data_incremental",
++                    "endpoint": {
++                        "path": "/posts_form_data_incremental",
++                        "method": "POST",
++                        "data": {
++                            "initial_value": "{incremental.initial_value}",
++                            "start_value": "{incremental.start_value}",
++                            "end_value": "{incremental.end_value}",
++                            "escaped": "{{not_this}}",
++                        },
++                        "incremental": {
++                            "cursor_path": "id",
++                            "initial_value": 100,
++                            "end_value": 200,
++                        },
++                        "paginator": "single_page",
++                    },
++                },
++            ],
++        }
++    )
++
++    list(source.with_resources("posts_form_data_incremental").add_limit(1))
++
++    history = mock_api_server.request_history
++    assert len(history) == 1
++    request_call = history[0]
++    actual_data = _parse_single_valued_qs(request_call.body)
++
++    assert actual_data == {
++        "initial_value": "100",
++        "start_value": "100",
++        "end_value": "200",
++        "escaped": "{not_this}",
++    }
++
++
++def test_post_data_param_with_raw_data(mock_api_server):
++    source = rest_api_source(
++        {
++            "client": {"base_url": "https://api.example.com"},
++            "resources": [
++                "posts",
++                {
++                    "name": "post_comments",
++                    "endpoint": {
++                        "path": "post_comments_via_form_data",
++                        "method": "POST",
++                        "data": "{resources.posts.id}",
++                        "paginator": "single_page",
++                    },
++                },
++            ],
++        }
++    )
++
++    list(source.with_resources("posts", "post_comments").add_limit(1))
++    post_comments_calls = _filter_by_path_pattern(
++        mock_api_server.request_history, "/post_comments_via_form_data"
++    )
++
++    assert len(post_comments_calls) == 5
++    for index, call in enumerate(post_comments_calls):
++        assert call.body == str(index)
++        assert call.headers.get("Content-Type") is None, "Content-Type should be None for raw data"
++
++
++def test_post_data_param_with_list_of_tuples(mock_api_server):
++    """Test interpolation works with list of tuples data format"""
++    source = rest_api_source(
++        {
++            "client": {"base_url": "https://api.example.com"},
++            "resources": [
++                "posts",
++                {
++                    "name": "post_comments",
++                    "endpoint": {
++                        "path": "post_comments_via_form_data",
++                        "method": "POST",
++                        "data": [
++                            ("post_id", "{resources.posts.id}"),
++                            ("action", "comment"),
++                            ("post_id", "{resources.posts.id}_duplicate"),  # Test duplicate keys
++                            ("title", "{resources.posts.title}"),
++                            ("escaped", "{{literal_braces}}"),
++                        ],
++                        "paginator": "single_page",
++                    },
++                },
++            ],
++        }
++    )
++
++    list(source.with_resources("posts", "post_comments").add_limit(1))
++
++    post_comments_calls = _filter_by_path_pattern(
++        mock_api_server.request_history, "/post_comments_via_form_data"
++    )
++    assert len(post_comments_calls) == 5
++
++    for index, call in enumerate(post_comments_calls):
++        actual_data = parse_qs(call.body)
++
++        assert actual_data == {
++            "post_id": [str(index), f"{index}_duplicate"],
++            "action": ["comment"],
++            "title": [f"Post {index}"],
++            "escaped": ["{literal_braces}"],
++        }
+diff --git a/tests/sources/rest_api/test_rest_api_source.py b/tests/sources/rest_api/test_rest_api_source.py
+index a4f7bea4f..796738506 100644
+--- a/tests/sources/rest_api/test_rest_api_source.py
++++ b/tests/sources/rest_api/test_rest_api_source.py
+@@ -9,7 +9,7 @@ from dlt.sources.rest_api import rest_api_source, rest_api
+ 
+ from tests.common.configuration.utils import environment, toml_providers
+ from tests.utils import ALL_DESTINATIONS
+-from tests.pipeline.utils import assert_load_info, load_table_counts
++from tests.pipeline.utils import assert_load_info, load_table_counts, load_tables_to_dicts
+ 
+ 
+ def _make_pipeline(destination_name: str):
+@@ -150,3 +150,83 @@ def test_dependent_resource(destination_name: str, invocation_type: str) -> None
+     }
+ 
+     assert table_counts["pokemon"] == 2
++
++
++@pytest.mark.parametrize("destination_name", ALL_DESTINATIONS)
++def test_rest_api_source_with_data_parameter(destination_name: str) -> None:
++    """Test REST API source with data parameter for form-encoded requests"""
++    config: RESTAPIConfig = {
++        "client": {
++            "base_url": "https://httpbingo.org",
++        },
++        "resources": [
++            {
++                "name": "post_form_test",
++                "endpoint": {
++                    "path": "post",
++                    "method": "POST",
++                    "data": {"field1": "value1", "field2": "value2", "field3": "test data"},
++                    "paginator": SinglePagePaginator(),
++                    "data_selector": "$",
++                },
++            },
++            {
++                "name": "post_raw_test",
++                "endpoint": {
++                    "path": "post",
++                    "method": "POST",
++                    "data": "raw string data",
++                    "paginator": SinglePagePaginator(),
++                    "data_selector": "$",
++                },
++            },
++        ],
++    }
++
++    pipeline = _make_pipeline(destination_name)
++    load_info = pipeline.run(rest_api_source(config))
++    assert_load_info(load_info)
++    table_counts = load_table_counts(pipeline, "post_form_test", "post_raw_test")
++    assert table_counts["post_form_test"] == 1
++    assert table_counts["post_raw_test"] == 1
++
++    tables = load_tables_to_dicts(pipeline, exclude_system_cols=True)
++    assert tables["post_form_test"][0]["data"] == "field1=value1&field2=value2&field3=test+data"
++    assert tables["post_form_test__form__field1"] == [{"value": "value1"}]
++    assert tables["post_form_test__form__field2"] == [{"value": "value2"}]
++    assert tables["post_form_test__form__field3"] == [{"value": "test data"}]
++    # Requests does not decode raw data from httpbingo.org so the raw data is returned
++    assert (
++        tables["post_raw_test"][0]["data"]
++        == "data:application/octet-stream;base64,cmF3IHN0cmluZyBkYXRh"
++    )
++
++
++def test_rest_api_data_json_mutual_exclusivity() -> None:
++    """Test that data and json parameters are mutually exclusive in REST API config"""
++    config: RESTAPIConfig = {
++        "client": {
++            "base_url": "https://httpbin.org",
++        },
++        "resources": [
++            {
++                "name": "invalid_test",
++                "endpoint": {
++                    "path": "post",
++                    "method": "POST",
++                    "json": {"key": "value"},
++                    "data": {"other": "data"},
++                    "paginator": SinglePagePaginator(),
++                },
++            },
++        ],
++    }
++
++    pipeline = _make_pipeline("duckdb")
++    from dlt.pipeline.exceptions import PipelineStepFailed
++
++    with pytest.raises(PipelineStepFailed) as exc_info:
++        pipeline.run(rest_api_source(config))
++
++    # The actual error is wrapped in the pipeline exception
++    assert "Cannot use both 'json' and 'data' parameters simultaneously" in str(exc_info.value)
+
+
+===== COMMIT 6fd20d1c =====
+
+
+commit 6fd20d1c1
+Author: Thierry Jean
+Date: 2025-09-30
+
+    fix: 3145 add `read_parquet(use_arrow: bool)` (#3149)
+

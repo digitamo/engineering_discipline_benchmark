@@ -1,0 +1,3207 @@
+Inherits arguments from [`dlthub ai mcp`](#dlthub-ai-mcp).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--stdio` - Use stdio transport mode
+* `--sse` - Use legacy sse transport instead of streamable-http
+* `--port PORT` - Port for the mcp server (default: 8000)
+* `--features [FEATURES ...]` - Mcp features to enable/disable. default: context, pipeline, secrets, toolkit, workspace. use +name to add, -name to remove (e.g. --features=-secrets,+context)
+* `--no-default-features` - Serve only the features named by --features, without the defaults above
+* `--access ACCESS` - Access the caller was granted, as `axis:verb,verb` pairs (e.g. data:read,local:read). tools requiring more are not served. `axis:` alone grants nothing on that axis. everything is served when omitted.
+
+</details>
+
+### `dlthub ai mcp install`
+
+Install MCP server config into the current project.
+
+**Usage**
+
+```sh
+dlthub ai mcp install [-h] [--agent {claude,cursor,codex}] [--features [FEATURES
+    ...]] [--name NAME] [--overwrite]
+```
+
+**Description**
+
+Install MCP server config into the current project.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai mcp`](#dlthub-ai-mcp).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--agent {claude,cursor,codex}` - Ai coding agent to install for. auto-detected if omitted.
+* `--features [FEATURES ...]` - Mcp feature sets to include in the server config
+* `--name NAME` - Server name in the mcp config (default: dlt-workspace)
+* `--overwrite` - Overwrite existing server config instead of skipping.
+
+</details>
+
+
+===== FILE: docs/website/docs/hub/cookbook/build-streamlit-dashboard.md =====
+
+---
+title: Build and deploy a Streamlit app
+description: Build, serve, and deploy a Streamlit app on dltHub.
+keywords: [streamlit, dashboard, hub, app, deploy, dltHub]
+---
+# Build and deploy a Streamlit app
+
+[Streamlit](https://docs.streamlit.io/) is a Python framework for turning a script into an interactive web app. On dltHub, a Streamlit app is a plain `.py` file that imports `streamlit`, and the runtime serves it as an interactive dashboard.
+
+This page walks through building a small dashboard against a loaded dlt dataset and deploying it to [app.dlthub.com](https://app.dlthub.com).
+
+## Prerequisites
+
+Add Streamlit to your workspace dependencies:
+
+```sh
+uv add streamlit
+```
+
+The example below reads from the `sample_shop_pipeline` that `uvx dlthub-start@latest` scaffolds (see [Deploy your first pipeline](../getting-started/onboarding.md)). The dashboard needs that data already loaded against the same destination it'll read from:
+
+```sh
+# Load locally (dev profile, DuckDB) so the dashboard works under `dlthub local serve`
+uv run dlthub local run load_sample_shop
+
+# OR, before deploying remotely, load against the prod destination on dltHub
+uv run dlthub run load_sample_shop
+```
+
+A dashboard can only display data that's already been loaded. If you skip this step the deployed app boots but every read returns "table not found".
+
+## Write the dashboard
+
+Create `sample_shop_dashboard.py` in the workspace root:
+
+```py
+"""Sample shop dashboard."""
+
+import dlt
+import streamlit as st
+
+
+st.set_page_config(page_title="Sample shop", layout="wide")
+st.title("Sample shop orders")
+
+
+@st.cache_data
+def load_data():
+    dataset = dlt.dataset(destination="warehouse", dataset_name="sample_shop")
+    return dataset["orders"].df(), dataset["customers"].df()
+
+
+orders, customers = load_data()
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Orders", f"{len(orders):,}")
+col2.metric("Customers", f"{len(customers):,}")
+col3.metric("Total revenue", f"${orders['order_total'].sum():,.2f}")
+col4.metric("Avg order value", f"${orders['order_total'].mean():.2f}")
+
+st.subheader("Top customers by spend")
+by_customer = (
+    orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("_o", "_c"))
+    .groupby("name", as_index=False)["order_total"].sum()
+    .sort_values("order_total", ascending=False)
+    .head(10)
+)
+st.dataframe(
+    by_customer.rename(columns={"name": "Customer", "order_total": "Total spend ($)"}),
+    width="stretch", hide_index=True,
+)
+
+st.subheader("Orders by store")
+by_store = orders.groupby("store_id").size().rename("orders").sort_values(ascending=False)
+st.bar_chart(by_store)
+```
+
+[`dlt.dataset(destination, dataset_name)`](../../general-usage/dataset-access/dataset.md) connects directly to a loaded dataset. Wrap the call in `@st.cache_data` so each widget interaction doesn't requery the destination.
+
+## Run it locally
+
+```sh
+uv run dlthub local serve sample_shop_dashboard.py
+```
+
+This boots the dashboard under the workspace's active local profile (default `dev`, which reads from `.dlt/config.toml`) and opens it in your browser.
+
+## Configure the `access` profile
+
+`dlthub serve` runs interactive jobs under the `access` profile by default. The minimal scaffold doesn't ship an `access` profile, so create one before deploying. Add the destination type in `.dlt/access.config.toml`:
+
+```toml
+[destination.warehouse]
+destination_type = "motherduck"
+```
+
+And the credentials in `.dlt/access.secrets.toml`. **Both `database` and `password` need to be in the secrets file** for MotherDuck:
+
+```toml
+[destination.warehouse.credentials]
+database = "dlt_test"
+password = "<read-only motherduck JWT>"
+```
+
+See the [Profiles in dltHub](../pipeline-operations/profiles.md) page for the full profile model.
+
+## Deploy to dltHub
+
+Add the dashboard to your `__deployment__.py` manifest so the workspace knows about it:
+
+```py
+"""Minimal dltHub workspace."""
+
+from pipeline import load_sample_shop
+import sample_shop_dashboard            # module-import → one job
+
+__all__ = ["load_sample_shop", "sample_shop_dashboard"]
+```
+
+Then deploy and serve:
+
+```sh
+uv run dlthub deploy                                       # publishes manifest + uploads code
+uv run dlthub serve sample_shop_dashboard.py               # boots the app remotely, opens URL
+```
+
+`dlthub serve` runs the app behind the workspace's auth — only your account can open the link. To create a publicly shareable URL:
+
+```sh
+uv run dlthub job publish sample_shop_dashboard.py         # public URL
+uv run dlthub job unpublish sample_shop_dashboard.py       # revoke
+```
+
+
+===== FILE: docs/website/docs/hub/data-apps/build-marimo-notebook.md =====
+
+---
+title: Build and deploy a marimo notebook
+description: Build a marimo notebook on a loaded dlt dataset, serve it locally, and deploy it to dltHub as an interactive job.
+keywords: [marimo, notebook, dashboard, hub, data app, deploy, dltHub]
+---
+# Build and deploy a marimo notebook
+
+[marimo](https://docs.marimo.io/) is a reactive Python notebook: when you change a cell or interact with a UI element, every dependent cell re-runs. On dltHub, a marimo notebook is a plain `.py` file that creates a `marimo.App`, and the runtime serves it as an interactive job. The built-in [workspace dashboard](../ingestion/dashboard.md) is itself a marimo notebook served that way.
+
+This page walks through building a notebook against a loaded dlt dataset and deploying it to [app.dlthub.com](https://app.dlthub.com). To explore data in marimo on your own machine, without a workspace, see [Explore data with marimo](../../general-usage/dataset-access/marimo.md). For the Streamlit version of this walkthrough, see [Build and deploy a Streamlit app](../cookbook/build-streamlit-dashboard.md).
+
+## Prerequisites
+
+Add marimo to your workspace dependencies:
+
+```sh
+uv add marimo
+```
+
+The example below reads from the `sample_shop_pipeline` that `uvx dlthub-start@latest` scaffolds (see [Deploy your first pipeline](../getting-started/onboarding.md)). The notebook needs that data already loaded against the same destination it'll read from:
+
+```sh
+# Load locally (dev profile, DuckDB) so the notebook works under `dlthub local serve`
+uv run dlthub local run load_sample_shop
+
+# OR, before deploying remotely, load against the prod destination on dltHub
+uv run dlthub run load_sample_shop
+```
+
+A notebook can only display data that's already been loaded. If you skip this step the deployed notebook boots but every read fails with "table not found".
+
+## Write the notebook
+
+Create `sample_shop_notebook.py` in the workspace root:
+
+```py
+"""Sample shop notebook: orders and customers loaded by load_sample_shop."""
+
+import marimo
+
+app = marimo.App(width="medium", app_title="Sample shop")
+
+
+@app.cell
+def imports():
+    import dlt
+    import marimo as mo
+
+    return dlt, mo
+
+
+@app.cell
+def read_dataset(dlt):
+    dataset = dlt.dataset(destination="warehouse", dataset_name="sample_shop")
+    orders = dataset["orders"].df()
+    customers = dataset["customers"].df()
+    return orders, customers
+
+
+@app.cell
+def headline(mo, orders, customers):
+    mo.hstack(
+        [
+            mo.stat(len(orders), label="Orders"),
+            mo.stat(len(customers), label="Customers"),
+            mo.stat(f"${orders['order_total'].sum():,.2f}", label="Revenue"),
+        ]
+    )
+    return
+
+
+@app.cell
+def store_filter(mo, orders):
+    store = mo.ui.dropdown(options=sorted(orders["store_id"].unique()), label="Store")
+    store
+    return (store,)
+
+
+@app.cell
+def orders_table(mo, orders, store):
+    selected = orders if store.value is None else orders[orders["store_id"] == store.value]
+    mo.ui.table(selected, selection=None)
+    return
+
+
+if __name__ == "__main__":
+    app.run()
+```
+
+Three things make this file a deployable notebook rather than an ordinary script:
+
+- **A module-level `marimo.App`.** dlt looks for one in the module, preferring a variable called `app` and otherwise taking the first module-level `marimo.App` it finds. Without it, the file is treated as a batch script.
+- **`app_title` and the module docstring.** Both are picked up and combined into the job description shown in the dltHub UI.
+- **Cells that declare their inputs.** Each cell takes the variables it reads as arguments and returns the ones later cells need. marimo derives the execution order from that, and re-runs only the cells affected by a change, so the dataset read does not need a cache decorator around it.
+
+[`dlt.dataset(destination, dataset_name)`](../../general-usage/dataset-access/dataset.md) connects directly to a loaded dataset. `warehouse` is a [named destination](../../general-usage/destination.md#use-named-destinations), so the same notebook reads from DuckDB locally and from your production destination once deployed.
+
+## Run it locally
+
+Edit the notebook in marimo's own editor while you build it:
+
+```sh
+uv run marimo edit sample_shop_notebook.py
+```
+
+Then run it the way the platform will, as a workspace job:
+
+```sh
+uv run dlthub local serve sample_shop_notebook.py
+```
+
+This resolves the job from the deployment manifest exactly as the runtime does, boots it under the workspace's active local profile (default `dev`), and prints `Listening on http://localhost:5000`.
+
+The two commands do different things: `marimo edit` opens the editor, while serving the job runs `marimo run`, the read-only app with the source hidden. That second form is what your viewers get.
+
+## Configure the `access` profile
+
+Interactive jobs run under the `access` profile on dltHub: a production profile meant for notebooks, usually holding read-only credentials. The minimal scaffold doesn't ship one, and without it interactive jobs fall back to the `prod` profile, which the CLI warns about before it launches.
+
+Add the destination type in `.dlt/access.config.toml`:
+
+```toml
+[destination.warehouse]
+destination_type = "motherduck"
+```
+
+And the credentials in `.dlt/access.secrets.toml`:
+
+```toml
+[destination.warehouse.credentials]
+database = "dlt_test"
+password = "<read-only motherduck JWT>"
+```
+
+See [Profiles in dltHub](../pipeline-operations/profiles.md) for the full profile model.
+
+## Deploy to dltHub
+
+Add the notebook to your `__deployment__.py` manifest so the workspace knows about it:
+
+```py
+"""Minimal dltHub workspace."""
+
+from pipeline import load_sample_shop
+import sample_shop_notebook            # module import, one job
+
+__all__ = ["load_sample_shop", "sample_shop_notebook"]
+```
+
+Importing the module, rather than a decorated function, is what turns it into a single job. dlt finds the `marimo.App` and registers an interactive notebook job with an HTTP trigger and a concurrency of one. See [the deployment module](../pipeline-operations/deployments.md#the-deployment-module) for the other forms.
+
+Then deploy and serve:
+
+```sh
+uv run dlthub deploy                                    # publishes manifest + uploads code
+uv run dlthub serve sample_shop_notebook.py             # boots the notebook remotely, opens URL
+```
+
+`dlthub serve` runs the notebook behind the workspace's auth, so only members of your workspace can open the link, including [viewers](../platform-capabilities/users-and-roles.md), who may launch interactive jobs. To create a publicly shareable URL:
+
+```sh
+uv run dlthub job publish sample_shop_notebook          # public URL
+uv run dlthub job unpublish sample_shop_notebook        # revoke
+```
+
+:::note
+`job publish` and `job unpublish` take the job name, not the file path. Passing `sample_shop_notebook.py` is read as a `section.name` job reference and fails to resolve.
+:::
+
+
+===== FILE: docs/website/docs/hub/data-discovery/datasets.md =====
+
+---
+title: Datasets
+description: Datasets in dltHub — the serving layer for loaded data.
+keywords: [dataset, datasets, hub, governance, profile, catalog, dlthub]
+---
+# Datasets
+
+A **dataset** is a physical collection of data and dlt metadata at a destination — including the schema, load history, traces, and quality results. In dltHub, datasets are the **serving layer**: schemas, annotations, and run metadata propagate from sources through transformations and end up inside the dataset, so notebooks, dashboards, and downstream agents read from a single source of truth.
+
+For the Python access surface — `pipeline.dataset()`, `ReadableRelation`, `.df()`/`.arrow()`, ibis, SQL — see the [OSS Dataset reference](../../general-usage/dataset-access/dataset.md). This page focuses on what's specific to running datasets on dltHub.
+
+## One destination, many datasets
+
+A destination is a physical system (DuckDB, MotherDuck, Snowflake, BigQuery, etc.). One destination can host any number of datasets, addressed by their `dataset_name`. Two pipelines writing into the same destination but different datasets stay isolated:
+
+```py
+import dlt
+
+# `warehouse` resolves via .dlt/<profile>.config.toml + .dlt/<profile>.secrets.toml
+
+orders_pipeline = dlt.pipeline(
+    pipeline_name="orders_pipeline",
+    destination="warehouse",
+    dataset_name="orders",
+)
+customers_pipeline = dlt.pipeline(
+    pipeline_name="customers_pipeline",
+    destination="warehouse",
+    dataset_name="customers",
+)
+```
+
+Both datasets live side-by-side in the same MotherDuck database as separate schemas.
+
+## Profile-aware materialization
+
+The same logical destination (and therefore the same dataset) resolves to **different physical systems per profile**. You write code once; switching profiles redirects materialization.
+
+In a workspace, the binding lives in `.dlt/<profile>.config.toml`:
+
+```toml
+# .dlt/dev.config.toml
+[destination.warehouse]
+destination_type = "duckdb"
+```
+
+```toml
+# .dlt/prod.config.toml
+[destination.warehouse]
+destination_type = "motherduck"
+```
+
+```py
+# pipeline.py — unchanged across profiles
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="orders_pipeline",
+    destination="warehouse",          # resolves via the active profile
+    dataset_name="orders",
+)
+```
+
+| Profile  | `destination_type`                  | Where data lives                              |
+| -------- | ----------------------------------- | --------------------------------------------- |
+| `dev`    | `duckdb`                            | `.dlt/data/dev/warehouse.duckdb` (local file) |
+| `prod`   | `motherduck`                        | MotherDuck (cloud)                            |
+| `access` | `motherduck`, read-only credentials | MotherDuck (cloud), read-only                 |
+
+See [Profiles in dltHub](../pipeline-operations/profiles.md) for the full profile model and [Workspace setup](../pipeline-operations/workspace-setup.md) for the configuration file layout.
+
+## Catalog and discovery in the dashboard
+
+Every load writes schema, traces, and (if enabled) data-quality results into the dataset itself. The dltHub dashboard at [app.dlthub.com](https://app.dlthub.com) reads those tables and surfaces them across two main views:
+
+- **Datasets** — every dataset in your workspace listed with its destination, owning pipeline, runs, success rate, rows and bytes loaded, schema migrations, average run time, and last-run status.
+- **Notebooks** — the `dashboard (workspace)` notebook renders per-pipeline panels (schema inspection, data browsing, data-quality results, pipeline state, run traces, and load history). You can also add your own marimo notebooks.
+
+No additional configuration is needed; landing data into a workspace-configured destination is what populates these views.
+
+## What lives inside a dataset
+
+Alongside your tables, dlt writes a small set of system tables. They're present in every dataset and are the substrate for the dashboard, data quality, and downstream tooling.
+
+| Table                 | Source | Purpose                                                             |
+| --------------------- | ------ | ------------------------------------------------------------------- |
+| `_dlt_loads`          | OSS    | One row per load package — load_id, schema name, status, timestamp. |
+| `_dlt_pipeline_state` | OSS    | Pipeline state across runs (incremental cursors, source state).     |
+| `_dlt_version`        | OSS    | Schema versions over time.                                          |
+| `_dlt_dq_metrics`     | Hub    | Per-call metric snapshots written by `dq.run_metrics()`.            |
+| `_dlt_checks`         | Hub    | Per-call check pass/fail summaries written by `dq.run_checks()`.    |
+
+The first three are documented in the [OSS internal tables](../../general-usage/dataset-access/dataset.md#internal-dlt-tables) reference; the last two are written by the [Data Quality](../data-quality/index.md) runners.
+
+## Reading a dataset from another job or notebook
+
+A transformation, downstream job, or marimo notebook can read a dataset another pipeline produced — without re-extracting from source. In a workspace where the destination is configured in `.dlt/<profile>.config.toml`, this is enough:
+
+```py
+import dlt
+
+pipeline = dlt.attach("orders_pipeline")
+orders = pipeline.dataset()["orders"].df()
+```
+
+`dlt.attach` reconstructs the pipeline from its persisted state, picking up the destination from the active profile.
+
+:::note Platform deploys
+When deploying a notebook to the Platform, pass `destination` and `dataset_name` explicitly:
+
+```py
+pipeline = dlt.attach(
+    pipeline_name="orders_pipeline",
+    destination="warehouse",
+    dataset_name="orders",
+)
+```
+
+Notebooks running on the Platform require these arguments explicitly; local scripts can rely on the workspace configuration alone.
+:::
+
+A quick sanity check that returns a frame of `(table_name, row_count)` across the whole dataset:
+
+```py
+pipeline.dataset().row_counts().df()
+```
+
+## Serving datasets with marimo
+
+Marimo notebooks deployed against the `access` profile turn a dataset into a shareable read-only app: schema-aware widgets, SQL/Python access, and a URL that stakeholders open without provisioning credentials of their own. See [Marimo notebooks](../../general-usage/dataset-access/marimo.md) for the full integration.
+
+
+===== FILE: docs/website/docs/hub/data-quality/advanced.md =====
+
+---
+title: "Data quality (advanced)"
+description: Validate your data and control its quality
+keywords: ["dlthub", "data quality", "contracts", "check", "metrics"]
+---
+# Data quality (advanced)
+
+:::warning
+This feature is in public preview
+:::
+
+This page covers more in-depth details about data quality features, such as metrics and checks. It shows the full flexibility available for advanced use cases. It can also serve as an FAQ and helper for debugging.
+
+Note that these APIs are more likely to change than the basics page.
+
+## Metrics and checks are `DltSource` objects
+
+Internally, metrics and checks are defined as `dlt.source` objects that are executed by the pipeline. You can interact with these objects directly, unlocking the ability to:
+
+- load data into destination A and write metrics and checks to destination B
+- run data quality checks and metrics disjointed from the primary `pipeline.run()` (for example, on a schedule, after another trigger, etc.)
+- dynamically modify metrics and checks to execute via Python code
+- have a central data quality pipeline that you run for multiple pipelines / datasets
+
+## Metrics and checks use a special `dlt.Schema`
+
+Currently, a `dlt.Dataset` is associated with a single `dlt.Schema`. This defines what tables are known and available to the dataset's API (for example, `dataset.table(...)`).
+
+But a `dlt.Pipeline` can be associated with multiple `dlt.Schema`, such as when loading several sources.
+
+The data quality metrics and checks sources have a dedicated `_dlt_data_quality` schema with internal tables for metrics and checks results. These tables are not directly visible via the `dlt.Dataset` API. (this may change in the future)
+
+The `dq.read_metric()` and `dq.read_check()` retrieve data from these internal tables.
+
+## Checks anatomy: result, decision, outcome, level
+
+In its simplest form, a check is a function that returns an **outcome** (boolean) that indicates success or failure. Under the hood, it involves a **result** (any type) that is computed and converted to an **outcome** via a **decision** function.
+
+For example, the check `is_in(column_name, accepted_values)` has a success outcome if all values are valid values.
+
+A more granular implementation could be:
+
+- count the number of records with valid values (**result**)
+- count the number of records
+- if the ratio of valid records is higher than `0.95` (**decision**)
+- the **outcome** is a success, else it is a failure
+
+Most built-in checks return the outcome directly, but they can be configured to store intermediary results. Those are most useful for custom checks or when wanting to assign different tolerance thresholds based on the environment / context.
+
+### Check level
+
+So far, we explained how a result is converted into an outcome. The check **level** describes the granularity of the **result**.
+
+For instance:
+
+- **Row-level** checks produce a result per record. It's possible to inspect which specific records pass / failed the check.
+
+- **Table-level** checks produce a result per table (for example, result is "the number of unique values" and decision is "is this greater than 5?").
+
+    These checks can often be rewritten as row-level checks (for example, "is this value unique?")
+
+- **Dataset-level** checks produce a result per dataset. This typically involves multiple tables, temporal comparisons, or pipeline information (for example, "the number of rows in `orders` is higher than the number of rows in 'customers')
+
+:::important
+Notice that the **check level** relates to the result and not the **input data** of the check. For instance, a row-level check can involve multiple tables as input.
+:::
+
+
+===== FILE: docs/website/docs/hub/data-quality/index.md =====
+
+---
+title: "Data quality"
+description: Validate your data and control its quality
+keywords: ["dlthub", "data quality", "contracts", "check", "metrics"]
+---
+# Data quality
+
+:::warning
+This feature is in public preview
+:::
+
+dltHub data quality features include metrics for monitoring dataset properties over time, and checks to validate them against expectations. Together, they offer visibility and help catch data issues early. Metrics and checks are defined via Python code. The extensive configuration allows you to specify what to monitor and validate, when, how, and where to store results.
+
+This page covers the basics of metrics and checks. You should notice a lot of symmetry (for example, `with_metrics()` and `with_checks()`). The later parts of this page cover notions applicable to both.
+
+## Metrics
+
+A **data quality metric** or **metric** a function applied to data that returns a scalar value describing a property of the data. A metric can take as input a column, a table, or the full dataset (i.e., all tables and historical metrics).
+
+### Define metrics
+
+#### Static metrics
+
+You can define metrics along your `@dlt.resource` (and `@dlt.transformer`, `@dlt.hub.transformation`) via the new decorator `@with_metrics`. It's available under the `dlt.hub.data_quality` module, commonly imported as `dq`. Inside the decorator, you can set the individual metrics available through `dq.metrics.column.`, `dq.metrics.table.`, or `dq.metrics.dataset.`.
+
+The next snippet defines 3 metrics on the `customers` resource: the mean of the `amount` column, the number of null values in the `email` column, and the total number of rows in the table.
+
+:::note
+Only column-level and table-level metrics can be defined on a `@dlt.resource`. To set dataset-level metrics, use `@with_metrics` on the `@dlt.source`.
+:::
+
+```python
+import dlt
+from dlt.hub import data_quality as dq
+
+@dq.with_metrics(
+    dq.metrics.column.mean("amount"),
+    dq.metrics.column.null_count("email"),
+    dq.metrics.table.row_count()
+)
+@dlt.resource
+def customers():
+    yield data
+```
+
+The next snippet shows how to add dataset-level metrics to a source. The `total_row_count` is added on the `crm` source.
+
+```python
+import dlt
+from dlt.hub import data_quality as dq
+
+@dq.with_metrics(
+    dq.metrics.column.mean("amount"),
+    dq.metrics.column.null_count("email"),
+    dq.metrics.table.row_count()
+)
+@dlt.resource
+def customers():
+    yield data
+
+
+@dq.with_metrics(
+    dq.metrics.dataset.total_row_count()
+)
+@dlt.source
+def crm():
+    return [customers]
+```
+
+#### Dynamic metrics
+
+Similar to the static approach, you can add metrics to an instantiated resource or source object using `with_metrics`. This is particularly useful when using built-in sources and resources like `filesystem`, `rest_api` or `sql_database`.
+
+```python
+import dlt
+from dlt.hub import data_quality as dq
+
+@dlt.resource
+def customers():
+    yield from [...]
+
+# later; this mutates the resource object and sets metrics
+dq.with_metrics(
+    customers,
+    dq.metrics.column.mean("amount"),
+    dq.metrics.column.null_count("email"),
+    dq.metrics.table.row_count()
+)
+```
+
+### Available metrics
+
+Here's the list of built-in metrics:
+
+```python
+from dlt.hub import data_quality as dq
+
+# column-level
+dq.metrics.column.maximum("col")
+dq.metrics.column.minimum("col")
+dq.metrics.column.mean("col")
+dq.metrics.column.median("col")
+dq.metrics.column.mode("col")
+dq.metrics.column.sum("col")
+dq.metrics.column.standard_deviation("col")
+dq.metrics.column.quantile("col", quantile=0.95)
+dq.metrics.column.null_count("col")
+dq.metrics.column.null_rate("col")
+dq.metrics.column.unique_count("col")
+dq.metrics.column.average_length("col")
+dq.metrics.column.minimum_length("col")
+dq.metrics.column.maximum_length("col")
+
+# table-level
+dq.metrics.table.row_count()  # Number of rows in table
+dq.metrics.table.unique_count()  # Number of distinct / unique rows in table
+dq.metrics.table.null_row_count()  # Number of rows where all columns are null
+
+# dataset-level
+dq.metrics.dataset.total_row_count()  # Total number of rows
+dq.metrics.dataset.load_row_count()  # Rows added in latest load
+dq.metrics.dataset.latest_loaded_at()  # Timestamp of most recent load
+```
+
+:::note
+If you have built-in metrics requests, let us know. Custom metrics are planned.
+:::
+
+### Compute metrics
+
+After loading data, call `dq.run_metrics()` on your pipeline to compute every metric registered via `@with_metrics` and persist the results to the destination:
+
+```python
+pipeline = dlt.pipeline("my_pipeline", destination="duckdb")
+pipeline.run(customers)
+
+# compute metrics and persist them to the destination
+dq.run_metrics(pipeline)
+```
+
+`run_metrics` is dispatched on the argument type — pass either the pipeline or a `dlt.Dataset`:
+
+```python
+# alternative: compute metrics against the loaded dataset
+# (for example, after re-attaching from another script or notebook)
+pipeline = dlt.attach("my_pipeline")
+dq.run_metrics(pipeline.dataset())
+```
+
+:::note
+Each call to `run_metrics` writes a fresh snapshot to the `_dlt_dq_metrics` table — one row per registered metric, with columns `_dlt_load_id`, `loaded_at`, `table_name` (null for dataset-level metrics), `column_name` (null for table- and dataset-level metrics), `metric_name`, and the computed `metric_value`. Successive calls append; nothing is overwritten.
+:::
+
+### Read metrics
+
+The convenience function `dq.read_metric()` allows you to retrieve stored metrics with some metadata. This makes it easy to build reporting, dashboard, or analytics over this data.
+
+The function produces a `dlt.Relation` which can be converted to a list, pandas dataframe, arrow table, etc.
+
+```python
+dataset = pipeline.dataset()
+# column-level `mean` as pandas.DataFrame
+dq.read_metric(
+    dataset, 
+    table="customers", 
+    column="amount", 
+    metric="mean"
+).df()
+
+# table-level `row_count` as list of tuples
+dq.read_metric(
+    dataset, 
+    table="customers", 
+    metric="row_count"
+).fetchall()
+
+# dataset-level `total_row_count` as pyarrow.Table
+dq.read_metric(
+    dataset, 
+    metric="total_row_count"
+).arrow()
+```
+
+`read_metric` returns rows **ordered newest-first by `_dlt_load_id`** — so the first row in the result is the most recent snapshot. To grab the current value of a metric, for example, the row count of a table:
+
+```py notype
+latest = dq.read_metric(dataset, table="customers", metric="row_count").df()
+latest_row_count = latest["metric_value"].iloc[0]
+```
+
+## Checks
+
+A **data quality check** or **check** is a function applied to data that returns a **check result** or **result** (can be boolean, integer, float, etc.). The result is converted to a success / fail **check outcome** or **outcome** (boolean) based on a **decision**.
+
+:::info
+A **test** verifies that **code** behaves as expected. A **check** verifies that the **data** meets some expectations. Code tests enable you to make changes with confidence and data checks help monitor your live systems.
+:::
+
+### Define checks
+
+#### Static checks
+
+You can define checks along your `@dlt.resource` (and `@dlt.transformer`, `@dlt.hub.transformation`) via the new decorator `@with_checks` available under the `dlt.hub.data_quality` module. Inside the decorator, you can set the individual checks available through `dq.checks.`.
+
+This snippet shows a single `is_in()` check being run against the `orders` table.
+
+```py
+import dlt
+from dlt.hub import data_quality as dq
+
+@dq.with_checks(  # type: ignore[attr-defined]
+    dq.checks.is_in("payment_methods", ["card", "cash", "voucher"]),
+)
+@dlt.resource
+def orders():
+    yield from [...]
+```
+
+#### Dynamic checks
+
+Similar to the static approach, you can add checks to an instantiated resource or source object using `with_checks`. This is particularly useful when using built-in sources and resources like `filesystem`, `rest_api` or `sql_database`.
+
+```python
+import dlt
+from dlt.hub import data_quality as dq
+
+@dlt.resource
+def orders():
+    yield data
+
+# later; this mutates the resource object and sets checks
+dq.with_checks(
+    orders,
+    dq.checks.is_in("payment_methods", ["card", "cash", "voucher"]),
+)
+```
+
+### Available checks
+
+Here's the list of built-in checks:
+
+```py
+from dlt.hub import data_quality as dq
+
+dq.checks.is_unique("col")
+dq.checks.is_not_null("col")
+dq.checks.is_primary_key("col")  # valid primary key
+dq.checks.is_in("foo", ["bar", "baz"])  # valid values
+dq.checks.case("col < 0")  # row-wise check
+```
+
+### Compute checks
+
+After loading data, call `dq.run_checks()` and pass the `checks=` mapping explicitly. Unlike `run_metrics`, `run_checks` doesn't auto-discover decorator-registered checks — you pass them at run time, keyed by table name:
+
+```python
+pipeline = dlt.pipeline("my_pipeline", destination="duckdb")
+pipeline.run(orders)
+
+# compute checks and persist results to the destination
+dq.run_checks(pipeline, checks={
+    "orders": [
+        dq.checks.is_in("payment_method", ["card", "cash", "voucher"]),
+        dq.checks.is_not_null("order_id"),
+    ],
+})
+```
+
+`@with_checks` is still useful as metadata — it documents the intent alongside the resource — but the same check objects must be passed to `run_checks` at execution time.
+
+:::note
+Each call to `run_checks` writes results to the `_dlt_checks` table — one row per check, with columns `_dlt_load_id`, `loaded_at`, `table_name`, `check_qualified_name`, `row_count`, `success_count`, and `success_rate`. Each `check_qualified_name` is formatted as `<column>__<check_name>` (for example `payment_method__is_in`). Successive calls append; nothing is overwritten.
+:::
+
+### Explore failing rows with `CheckSuite`
+
+`run_checks` is the persistence path — it writes a summary row per check to `_dlt_checks`, which is what dashboards and `read_check` read from. To inspect the actual rows that failed a check, use `dq.CheckSuite`. It runs the same check objects against a dataset without persisting anything, and exposes the failing and passing rows as `dlt.Relation` objects:
+
+```py
+import dlt
+from dlt.hub import data_quality as dq
+
+orders_dataset = dlt.attach("orders_pipeline").dataset()
+
+suite = dq.CheckSuite(
+    orders_dataset,
+    checks={
+        "orders": [
+            dq.checks.is_in("payment_method", ["card", "cash", "voucher"]),
+            dq.checks.is_not_null("order_id"),
+        ],
+    },
+)
+
+# Inspect the failing rows for one check
+suite.get_failures("orders", "payment_method__is_in").df()
+# ... or the passing rows
+suite.get_successes("orders", "payment_method__is_in").df()
+```
+
+`CheckSuite` does not write to `_dlt_checks`, so dashboards and `read_check` won't see its results. Pick the pattern that matches your goal:
+
+| Pattern                                                  | Persists to `_dlt_checks` | Best for                                            |
+| -------------------------------------------------------- | ------------------------- | --------------------------------------------------- |
+| `dq.run_checks(pipeline, checks={...})`                  | Yes                       | Scheduled jobs, monitoring history, dashboards      |
+| `dq.CheckSuite(dataset, checks={...}).get_failures(...)` | No                        | Interactive notebooks, debugging row-level failures |
+
+Both APIs accept the same check objects, so you can register checks once and use either path.
+
+### Read checks
+
+The convenience function `dq.read_check()` allows you to retrieve stored checks with some metadata. This makes it easy to build reporting, dashboard, or analytics over this data.
+
+The function produces a `dlt.Relation` which can be converted to a list, pandas dataframe, arrow table, etc.
+
+```python
+dataset = pipeline.dataset()
+all_checks = dq.read_check(dataset, table="orders").df()
+```
+
+`read_check` returns rows **ordered newest-first by `_dlt_load_id`** — so the first row is the most recent check result. To grab the latest `success_rate` for a specific check:
+
+```py notype
+all_checks = dq.read_check(dataset, table="orders").df()
+latest_success_rate = all_checks[
+    all_checks["check_qualified_name"] == "payment_method__is_in"
+]["success_rate"].iloc[0]
+```
+
+To look at all checks for a specific column, filter by the column prefix:
+
+```python
+# checks on the `payment_method` column only
+payment_checks = all_checks[
+    all_checks["check_qualified_name"].str.startswith("payment_method__")
+]
+```
+
+## Lifecycle
+
+Data quality (both metrics and checks) can be executed at different stages of the pipeline lifecycle. This impacts several aspects including:
+
+- available **input data**
+- compute resources used
+- **actions** available after a failed check (for example, prevent invalid data load)
+
+<!--How does this affect transactions? How do we handle errors in the data quality part-->
+
+### Post-load
+
+The post-load execution is the simplest option. The pipeline goes through `Extract -> Normalize -> Load` as usual. Then, the checks are executed on the destination.
+
+Properties:
+
+- Failed records can't be dropped or quarantined before load. All records must be written, checked, and then handled. This only works with `write_disposition="append"` or destinations supporting snapshots (for example `iceberg`, `ducklake`).
+- Checks have access to the full dataset. This includes current and past loads + internal dlt tables.
+- Computed directly on the destination. This scales well with the size of the data and the complexity of the checks.
+- Results and outcome are directly stored on the dataset. No data movement is required.
+
+```mermaid
+sequenceDiagram
+    participant Resource
+    participant Pipeline
+    participant Dataset
+
+    Resource->>Pipeline: Extract
+    Pipeline->>Pipeline: Normalize
+    Pipeline->>Dataset: Load
+    Dataset->>Dataset: Run Checks
+```
+
+### Pre-load (staging)
+
+:::warning
+Work in progress. Currently unavailable.
+:::
+
+The pre-load execution via staging dataset allows you to execute checks on the destination and trigger actions before data is loaded into the dataset. This is effectively using **post-load** checks before a second load phase.
+
+:::info
+`dlt` uses staging datasets for other features such as `merge` and `replace` write dispositions.
+:::
+
+Properties:
+
+- Failed records can be dropped or quarantined before load. This works with all `write_disposition`
+- Requires a destination that supports staging datasets.
+- Checks have access to the current load.
+  - If the staging dataset is on the same destination, checks can access the full dataset.
+  - If the staging dataset is on a different destination, communication between the staging dataset and the dataset.
+- Computed on the staging destination. This scales well with the size of the data and the complexity of the checks.
+- Data and checks results & outcome can be safely stored on the staging dataset until review. This helps human-in-the-loop workflows without reprocessing the full pipeline.
+
+```mermaid
+sequenceDiagram
+    participant Resource
+    participant Pipeline
+    participant Staging as Staging Dataset
+    participant Dataset
+
+    Resource->>Pipeline: Extract
+    Pipeline->>Pipeline: Normalize
+    Pipeline->>Staging: Load
+    Staging->>Staging: Run Checks
+    Staging->>Dataset: Load
+```
+
+### Pre-load (in-memory)
+
+:::warning
+Work in progress. Currently unavailable.
+:::
+
+The pre-load execution in-memory executes checks using `duckdb` against the load packages (i.e., temporary files) stored on the machine that runs `dlt`. This allows you to trigger actions before data is loaded into the destination.
+
+:::note
+This is equivalent to using a staging destination that's the local filesystem. This section highlights the trade-offs of this choice.
+:::
+
+Properties:
+
+- Failed records can be dropped or quarantined before load. This works with all `write_disposition
+- Checks only have access to the current load. Checking against the full dataset requires communication between the staging destination and the main destination.
+- Computed on the machine running the pipeline. The resource need to match the compute requirements.
+- Data and checks results & outcome may be lost if the runtime is ephemeral (for example, AWS Lambda timeout). In this case, the pipeline must process the data again.
+
+```mermaid
+sequenceDiagram
+    participant Resource
+    participant Pipeline
+    participant Dataset
+
+    Resource->>Pipeline: Extract
+    Pipeline->>Pipeline: Normalize
+    Pipeline->>Pipeline: Run checks
+    Pipeline->>Dataset: Load
+```
+
+## Roadmap
+
+- Define checks that depend on metrics (this should reduce verbosity)
+- Support user-defined group-by metrics
+- Support completely custom checks via `@dlt.hub.transformation` (for example, SQL, SQLGlot, Ibis, Narwhals, Polars)
+- Trigger actions based on check result or outcome (for example, send Slack notification)
+- Track metrics and checks changes via `dlt.Schema` versioning
+
+
+===== FILE: docs/website/docs/hub/getting-started/installation.md =====
+
+---
+title: Installation
+description: Install dlt[hub], create a workspace, and license paid features
+keywords: [installation, dlthub, dlthub-init, dlthub-start, workspace mode, license]
+---
+# Installation
+
+:::info Supported Python versions
+
+dltHub currently supports Python versions 3.10-3.14.
+
+:::
+
+## What is a dltHub workspace?
+
+A workspace is a Python project layout that bundles your `dlt` pipelines, transformations, configuration, and AI toolkit setup into a single deployable unit. The same folder runs on your local machine, in CI, and — when you deploy — on the managed dltHub platform, so what you build locally is what runs in production.
+
+Every workspace contains:
+
+- **`.dlt/.workspace`** — a marker file that activates the `dlthub` CLI, [profile support](../pipeline-operations/profiles.md), and the managed-platform commands. Without this file you're using plain OSS `dlt`.
+- **`.dlt/config.toml`** and **`.dlt/secrets.toml`** — settings and credentials, with optional per-profile overrides (`dev`, `prod`, `tests`, `access`).
+- **`pyproject.toml`** (or `requirements.txt`) — workspace-level dependencies like `dlt[hub]`, `duckdb`, `marimo`.
+- **Pipeline files** and an optional **`__deployment__.py`** manifest — the code you run, and the description of how it's deployed.
+- **AI toolkit configuration** — skills, rules, and MCP wiring for Claude Code, Cursor, or Codex (added when you opt in during scaffolding).
+
+For the wider feature surface that a workspace unlocks — [profiles](../pipeline-operations/profiles.md), [data quality](../data-quality/index.md), [transformations](../transformations/index.md), the [managed platform](../pipeline-operations/overview.md), the [dashboard](../ingestion/dashboard.md) — see the [introduction](introduction.md).
+
+### Playground destination
+
+When you deploy and run pipelines on the dltHub platform, you can use `destination="playground"` without configuring credentials or storage. The platform provisions isolated storage for each workspace and loads your pipeline data as [Delta tables](../ingestion/delta.md). Use it for testing and for a faster introduction to the platform — set `destination="playground"` in your pipeline and run. Read more about [playground destination](../ingestion/playground.md).
+
+## Quickstart
+
+If you already have `uv` installed:
+
+```sh
+uvx dlthub-start@latest
+```
+
+If you don't have `uv` yet, either [install it first](#setting-up-your-environment) or run via `pipx` — the CLI will offer to install `uv` for you before syncing dependencies:
+
+```sh
+pipx run dlthub-start
+```
+
+Either way, it runs a guided first experience — it scaffolds the workspace, installs `dlt[hub]` and dependencies with `uv sync`, logs you in to the dltHub platform, connects your personal [Playground workspace](../pipeline-operations/playground-workspace.md), then prompts you to pick a coding agent (Claude / Cursor / Codex) and launches it. Your agent deploys and runs the sample pipeline, then is ready to build your own source.
+
+:::tip
+Run `dlthub-start` yourself with no arguments — it's interactive and guides you through each step. It scaffolds into your current folder, so the AI skills land right where your coding agent is open. For a walkthrough of the whole flow, see [Deploy your first pipeline](onboarding.md).
+:::
+
+## Setting up your environment
+
+### Configuration of the Python environment
+
+This documentation uses `uv` (a modern package manager) to install Python versions, manage virtual environments, and manage project dependencies.
+To install `uv`, you can use `pip` or follow [the OS-specific installation instructions](https://docs.astral.sh/uv/getting-started/installation/).
+
+Once you have `uv` installed you can pick any Python version supported by it:
+
+```sh
+uv python install 3.13
+```
+
+or use any Python version you have installed on your system.
+
+### Virtual environment
+
+Working within a [virtual environment](https://docs.python.org/3/library/venv.html) is recommended when creating Python projects.
+This way, all the dependencies for your current project are isolated from packages in other projects. With `uv`, run:
+
+```sh
+uv venv
+```
+
+This creates a virtual environment in the `.venv` folder using the default system Python version.
+
+```sh
+uv venv --python 3.13
+```
+
+This uses `Python 3.13` for your virtual environment.
+
+Activate the virtual environment using the instructions displayed by `uv`, i.e.:
+
+```sh
+source .venv/bin/activate
+```
+
+## Add dltHub to an existing project
+
+To add dltHub to an existing project, run:
+
+```sh
+uvx dlthub-init@latest
+```
+
+This scaffolds a workspace, installs `dlt[hub]`, and sets up the AI skills your coding agent uses. The `dlt[hub]` extra pulls in two plugin packages:
+
+* `dlthub`—enables the `dlthub` command and features like AI toolkits and transformations
+* `dlthub-client`—enables access to the [managed dltHub platform](../pipeline-operations/overview.md) (login, deploy, run, serve, etc.)
+
+Workspace-level dependencies (destinations like `duckdb`, plus tools like `marimo` or `fastmcp` used by notebooks and MCP jobs) are managed in the generated `pyproject.toml`, not via `dlt` extras—extend it with `uv add <package>`.
+
+## Upgrade existing installation
+
+To upgrade just the `hub` extra without upgrading `dlt` itself run:
+
+```sh
+uv pip install -U "dlt[hub]==1.27.0"
+```
+
+This keeps the current `1.27.0` `dlt` and upgrades `dlthub` and `dlthub-client` to their newest matching versions.
+
+:::tip
+A particular `dlt` version expects `dlthub` and `dlthub-client` versions in a matching range. For example: `1.27.x` expects
+`0.27.x` of each plugin. This is enforced via dependencies in the `hub` extra and at import time. Installing a plugin directly won't change the
+installed `dlt` version (to prevent unwanted upgrades). For example, if you run:
+
+```sh
+uv pip install dlthub
+```
+
+and it downloads `0.28.0` of the plugin, `dlt` `1.27.0` is still installed but reports a wrong plugin version on import (with instructions
+how to install a compatible plugin version).
+:::
+
+## Enable workspace mode
+
+The full dltHub feature surface—profiles, the `dlthub` CLI host, and [managed-platform commands](../pipeline-operations/overview.md)—is gated behind **Workspace mode**, signaled by a `.dlt/.workspace` marker file. The simplest way to turn it on is:
+
+```sh
+uvx dlthub-init@latest
+```
+
+This scaffolds a fresh, ready-to-run dltHub workspace—the `.dlt/.workspace` marker, local config and secrets, dependencies, and the dltHub AI skills your coding agent uses—and installs everything with `uv sync`. See [Initialize a pipeline](../ingestion/init.md) for the next steps.
+
+If you'd rather flip the toggle by hand in an existing project, create the empty marker file yourself:
+
+<Tabs values={[{"label": "Ubuntu", "value": "ubuntu"}, {"label": "macOS", "value": "macos"}, {"label": "Windows", "value": "windows"}]} groupId="operating-systems" defaultValue="ubuntu">
+<TabItem value="ubuntu">
+
+```sh
+mkdir -p .dlt && touch .dlt/.workspace
+```
+
+  </TabItem>
+  <TabItem value="macos">
+
+```sh
+mkdir -p .dlt && touch .dlt/.workspace
+```
+
+  </TabItem>
+  <TabItem value="windows">
+
+```sh
+mkdir .dlt
+type nul > .dlt\.workspace
+```
+
+  </TabItem>
+</Tabs>
+
+
+===== FILE: docs/website/docs/hub/ingestion/dashboard.md =====
+
+---
+title: Pipeline and dataset troubleshooting
+description: Troubleshoot pipelines and inspect loaded datasets using the local dltHub dashboard, a marimo-based web app
+keywords: [pipeline, schema, data, inspect, troubleshoot, dashboard]
+---
+# Pipeline and dataset troubleshooting
+
+Once you have run a [pipeline](../../general-usage/pipeline.md) locally, you can launch a web app that displays detailed information about your pipeline. This app is built with the [marimo](https://marimo.io/) Python notebook framework. For this to work, you will need a few additional dependencies.
+
+:::info Also available on the dltHub platform
+The same dashboard is available on the managed dltHub platform under the **Notebooks** section, alongside built-in run logs and metrics. See [Monitoring and debugging](../pipeline-operations/monitoring.md) for the platform-side troubleshooting flow.
+:::
+
+:::tip
+The dashboard works with all [destinations](../../general-usage/destination.md) that are supported by the [dataset interface](../../general-usage/dataset-access/dataset.md). Vector databases are not supported at this moment. However, you can still inspect metadata such as run traces, schemas, and pipeline state.
+:::
+
+## Overview
+
+The dashboard is a locally hosted application built on [marimo](https://marimo.io/). It comes preconfigured with the key pipeline metadata and operational context you need to review pipeline health and validate data quality.
+
+With the dashboard, you can:
+
+1. [Inspect pipeline metadata](#pipeline-info)
+2. [Query data in the destination](#querying-your-dataset)
+3. [Review traces and exceptions](#last-run-trace)
+4. [Check the history of pipeline runs](#pipeline-loads)
+5. [Verify incremental loading behavior](#pipeline-state)
+
+You can also customize the dashboard and create a personalized version tailored to your workflow.
+
+![Dashboard overview](https://storage.googleapis.com/dlt-blog-images/dashboard-overview.png)
+
+## Quick start
+
+Install additional dependencies:
+
+```sh
+pip install "dlt[hub]" pyarrow marimo ibis-framework
+```
+
+## Launching the dashboard
+
+You can start the dashboard with:
+
+```sh
+dlthub local show
+```
+
+The dashboard opens on your most recently used pipeline and shows its dataset browser. Use the pipeline dropdown in the top-right to switch between the pipelines found on your machine.
+
+You can use the `show` [CLI command](../command-line-interface.md#dlthub-local-pipeline-show)
+with your pipeline name to directly jump to the dashboard page of this pipeline:
+
+```sh
+dlthub local pipeline show {pipeline_name}
+```
+
+Use the pipeline name you defined in your Python code with the `pipeline_name` argument. If you are unsure, you can use the `dlthub local pipeline list` command to list all pipelines.
+
+## Credentials
+
+`dlt` will resolve your destination [credentials](../../general-usage/credentials/setup.md) from:
+
+* `secrets.toml` and `config.toml` in the `.dlt` folder of the current working directory (CWD), which is the directory you started the dashboard from
+* `secrets.toml` and `config.toml` in the global `dlt` folder at `~/.dlt`.
+* Environment variables
+
+It is best to run the dashboard from the same folder where you ran your pipeline, or to keep your credentials in the global folder.
+
+`dlt` will NOT be able to pick up any credentials that you have configured in your code, since the dashboard app runs independently of any pipeline scripts you have.
+
+## Using the dashboard
+
+This section is a development checklist for validating a new REST API pipeline using the dashboard.
+
+:::tip Quick checklist
+
+1. **Row counts look right?** → Dataset Browser
+2. **Incremental cursor advancing?** → Pipeline State
+3. **Schema structure correct?** → Schema Explorer
+4. **Business entities present?** → Dataset Browser
+5. **Data types correct?** → Schema Explorer
+:::
+
+### 1) Am I grabbing data correctly?
+
+#### 1.1) What to look for
+
+Pagination sanity:
+
+- If your first successful run shows a suspiciously round count (for example, **10 / 20 / 100**) for a resource whose page size matches that number, you probably captured only page 1.
+- Cross-check the source's expected volume (API docs, admin UI, or a known "ground truth") vs. what landed.
+
+To do so, navigate to the Dataset Browser and load row counts:
+
+![Dataset Browser row counts](https://storage.googleapis.com/dlt-blog-images/docs-dashboard-dq1.png)
+
+#### 1.2) Typical failure modes
+
+- The wrong paginator pattern was chosen vs. the API docs (cursor vs. offset vs. page/size).
+- The API supports multiple pagination styles per endpoint and you implemented the wrong one.
+
+#### 1.3) What to do
+
+Reread the endpoint's official documentation (or ask your agent to do so) and confirm the exact pagination contract (parameter names, response fields, end-of-data signal).
+
+### 2) Am I loading data correctly?
+
+#### Full loads (non-incremental)
+
+Using `replace` write disposition is slower but simpler. If you are using it to do full loads, you do not need to troubleshoot incremental loading.
+
+#### Incremental loads
+
+- Run **multiple increments** and check that each run only brings the delta.
+- Validate in two places:
+  - **Pipeline State**: the resource's cursor (for example, `last_extracted_at` / `last_value`) should advance to the end of the previous run. This is how it looks in the raw pipeline state:
+
+    ![Pipeline state cursor](https://storage.googleapis.com/dlt-blog-images/docs-dashboard-dq2.png)
+
+  - **Pipeline Loads row counts**: Check how many rows each run loaded by running a query in the Dataset Browser:
+
+    ```sql
+    SELECT _dlt_load_id, COUNT(*) FROM items GROUP BY 1
+    ```
+
+- Optionally, check for continuity in the data. If you have a time axis or incremental IDs with normal distribution, plot them on a line chart to spot any anomalies. For easy plotting, we suggest using our integrated [marimo notebook](../../general-usage/dataset-access/marimo.md).
+
+### 3) Is my normalized schema the one I actually want?
+
+We generally recommend you let `dlt` fully manage your schema for two reasons: you do less work, and the entire schema is discovered and explicit. But sometimes your data might also contain metadata that is not useful and should be removed.
+
+To inspect the schema, check the Schema Explorer:
+
+![Schema Explorer](https://storage.googleapis.com/dlt-blog-images/docs-dashboard-dq3.png)
+
+**Options to change your schema**
+
+- [**Filter at extraction** to drop unneeded fields](../../dlt-ecosystem/transformations/add-map.md)
+- [**Reduce unnesting**](../../reference/frequently-asked-questions.md#can-i-configure-different-nesting-levels-for-each-resource) or keep some payloads as **complex (nested) types** if your destination supports it.
+
+**Example:** Using `json` type with REST API:
+
+```py
+import dlt
+from dlt.sources.rest_api import rest_api_source, RESTAPIConfig
+
+def example_complex_unnesting():
+    # Default behavior: dlt creates 'orders__items' child table.
+    # Desired behavior: 'items' column in 'orders' table with JSON/Struct type.
+
+    config: RESTAPIConfig = {
+        "client": {
+            "base_url": "https://jaffle-shop.dlthub.com/api/v1/",
+            "paginator": {
+                "type": "page_number",
+                "page_param": "page",
+                "base_page": 1,
+                "maximum_page": 1,  # Just 1 page for testing
+                "total_path": None
+            }
+        },
+        "resources": [
+            {
+                "name": "orders_complex_test",
+                "endpoint": {
+                    "path": "orders",
+                    "params": {"page_size": 5}
+                },
+                "write_disposition": "replace",  # clean start
+                "columns": {
+                    "items": {"data_type": "json"}  # keep this table nested
+                }
+            }
+        ]
+    }
+
+    pipeline = dlt.pipeline(
+        pipeline_name="test_complex_pipeline",
+        destination="duckdb",
+        dataset_name="test_data"
+    )
+
+    source = rest_api_source(config)
+    load_info = pipeline.run(source)
+```
+
+### 4) Do I have the right business data?
+
+#### 4.1) What to look for
+
+Open the Dataset Browser and run a query to see what you actually have:
+
+```sql
+SELECT * FROM {your_table} LIMIT 10
+```
+
+- Do the tables contain the entities and attributes your use case needs?
+- Are key columns present (IDs, timestamps, status fields)?
+- Is the data complete or are important fields showing up as `NULL`?
+
+#### 4.2) Typical failure modes
+
+- The API returns a **summary view** by default; you need extra parameters (for example, `expand`, `include=changes`, `since=`) to get full details.
+- **Related data lives in separate endpoints** that you haven't added yet (for example, orders exist but order line items are a different endpoint).
+- **PII columns** (emails, phones, names) are present and need to be hashed or removed before analytics.
+
+#### 4.3) What to do
+
+1. Check the API docs for expansion parameters that return nested/related data.
+2. Add additional endpoints to your source if you need related entities.
+3. Use [`add_map`](../../dlt-ecosystem/transformations/add-map.md) to hash PII or reshape records before loading.
+
+Use the Dataset Browser to explore the data, or the [marimo notebook](../../general-usage/dataset-access/marimo.md) for more complex analysis.
+
+### 5) Are my data types correct?
+
+#### 5.1) What to look for
+
+Open the Schema Explorer and check the `data_type` column for each field:
+
+- Numbers should be `bigint` or `double`, not `text`
+- Dates should be `timestamp` or `date`, not `text`
+- Boolean fields should be `bool`, not `text`
+
+#### 5.2) Typical failure modes
+
+- Numbers arrive as strings (`"amount": "100.00"`) because the API returns them quoted.
+- Timestamps in non-standard formats (for example, `"12/25/2024"` or Unix epochs) aren't auto-detected.
+- Boolean values come as `"true"`/`"false"` strings or `0`/`1` integers.
+
+#### 5.3) What to do
+
+1. **Enable additional autodetectors** to catch more types automatically. Add to your config:
+
+```toml
+[schema]
+detections = ["iso_timestamp", "timestamp", "large_integer"]
+```
+
+2. **Transform at extraction** using [`add_map`](../../dlt-ecosystem/transformations/add-map.md) to cast values before they hit the schema.
+
+#### Docs
+
+- [Schema → Data type autodetectors](../../general-usage/schema.md#data-type-autodetectors)
+- [`add_map` for custom record transformations](../../dlt-ecosystem/transformations/add-map.md)
+
+## Understanding the dashboard
+
+The dashboard app should mostly be self-explanatory. The Dataset Browser is shown by default; open any other section by clicking its toggle. The dashboard app also refreshes all data when a new local pipeline run is detected for your selected pipeline. You can switch between pipelines on your machine using the pipeline dropdown in the top-right.
+
+The following sections are available:
+
+### Pipeline info
+
+The overview section serves as a health check for your pipeline. If a run fails, this is where dlt surfaces the exception details and stack traces. Review last executed to ensure the pipeline is running on the expected schedule or has recently completed a load.
+
+![Pipeline info](https://storage.googleapis.com/dlt-blog-images/dashboard-pipeline-overview.png)
+
+* **Last executed:** The timestamp of the last successful run. This is the primary indicator that your pipeline is running on schedule.
+
+* **Credentials:** Displays the connection string or file path currently being used to reach the destination.
+
+* **Schemas:** Lists all schemas associated with the pipeline name.
+
+#### Remote state
+
+This section queries and displays the state information that has been successfully committed to the **destination**, confirming what is stored outside the local working directory.
+
+* The `state_version` shown here should generally match the `state_version` in the Pipeline Overview if the last run was successful.
+* Click `Load and show remote state` to query the destination and retrieve this information.
+
+### Schema explorer
+
+The schema browser allows you to dive deep into your pipeline's [schemas](../../general-usage/schema.md) and see all tables, columns, and type hints. This view is based on the dlt schema, the internal blueprint used to create and update tables in your destination.
+
+When loading data for the first time, use this section to:
+
+1. Click `Show child tables` to ensure that nested data is unnested successfully and at the required level.
+2. Inspect the **type hints** specifically, making sure that timestamps and large numbers are captured in the right way.
+3. Raw Schema as YAML can be exported and stored in your git repository as a reference for the dataset schema.
+
+![Schema explorer](https://storage.googleapis.com/dlt-blog-images/dashboard-schema-explorer.png)
+
+### Dataset browser
+
+The dataset browser allows you to query data directly from your destination. You can inspect the state of each of your resources. Click the `Load row counts` button to refresh the record counts for all tables based on the current destination data.
+
+![Dataset Browser](https://storage.googleapis.com/dlt-blog-images/dashboard-dataset-browser.png)
+
+### Querying your dataset
+
+You can use SQL to query your dataset here. Querying the dataset works with all remote and local destinations including Iceberg tables, Delta tables and Filesystem destination. This is what a query on the fruitshop dataset looks like:
+
+![Querying Data](https://storage.googleapis.com/dlt-blog-images/dashboard-query.png)
+
+All query results are cached. The **Query History** shows previous runs that benefit from this cache. Click `Clear cache` to force a fresh execution against the destination. Queries are executed directly on your destination (for example, DuckDB).
+
+### Pipeline state
+
+This section displays a raw, JSON view of the currently stored pipeline state. This state is critical for tracking progress, especially for [incremental loading](../../general-usage/incremental-loading.md) logic.
+
+![Pipeline state](https://storage.googleapis.com/dlt-blog-images/dashboard-state.png)
+
+### Last run trace
+
+This section provides a detailed overview of the most recent run for the selected pipeline. You can use this for performance tuning and debugging execution issues. It contains the following:
+
+1. **Trace Overview**
+    This is a summary of the entire run. It shows the full duration, start time, and end time.
+
+2. **Execution Context**
+    This section details the environment in which the pipeline was executed, including Python and dlt versions and details like operating system (os), CPU count (cpu), and whether it was a CI run (ci_run).
+
+3. **Steps Overview**
+
+    This table breaks down the total duration into the three phases of a dlt pipeline run: extract, normalize, and load.
+
+  - **Bottleneck Check:** Use the duration column to identify performance bottlenecks.
+  - A long extract time suggests a slow source.
+  - Long normalize or load times often point to destination performance or data complexity issues.
+
+    **Deep Dive:** you can click on each step to see more specific details like table names, item counts, file sizes, and timestamps for that specific phase.
+
+4. **Resolved Config Values**
+    This section lists the configuration values that were resolved and used during this pipeline run. Use this to ensure your intended config values were correctly picked up, or to find errors where configuration you set up was not used. The values of the resolved configs are not displayed for security reasons.
+
+5. **Raw Trace**
+    Clicking Show displays the complete trace information (including all sections above) as a raw JSON payload, which can be viewed and downloaded for advanced analysis or error reporting.
+
+    ![Last run trace](https://storage.googleapis.com/dlt-blog-images/dashboard-trace.png)
+
+### Pipeline loads
+
+This section displays a history of all load packages found in the _dlt_loads table. It tracks every load package committed to the destination.
+
+By selecting a specific load, you can:
+
+* See exactly how many rows were added to each specific table in that run.
+* View the full schema that resulted from this load.
+* Download the raw schema as a YAML file for historical debugging.
+
+![Pipeline loads](https://storage.googleapis.com/dlt-blog-images/dashboard-loads.png)
+
+## Creating your own workspace dashboard
+
+You can eject the code for the workspace dashboard into your current working directory and start editing it to create a custom version that fits your needs. To do this, run the `show` command with the `--edit` flag:
+
+```sh
+dlthub local pipeline show {pipeline_name} --edit
+# or for the overview
+dlthub local show --edit
+```
+
+This will copy the dashboard code to the local folder and start marimo in edit mode. If a local copy already exists, it will not overwrite it but will start it in edit mode.
+
+Below is an example of a custom cell created to verify unique number of rows vs total rows to ensure there are no duplicates in each table after a new run. You can also use the Generate with AI feature to easily add custom cells for your own use cases.
+
+![Adding custom cell in dashboard](https://storage.googleapis.com/dlt-blog-images/dashboards-custom-cell.png)
+
+Here is the [marimo](https://docs.marimo.io/api/) code used to generate the cell above. `mo` (marimo), `dlt`, and `utils` (from `dlt._workspace.helpers.dashboard`) are already available in the ejected dashboard:
+
+```py notype
+@app.cell
+def _(dlt_pipeline: dlt.Pipeline, dlt_selected_schema_name):
+    # Create a list to hold the data for the table
+    data = []
+
+    if dlt_pipeline:
+        _table_names = dlt_pipeline.schemas[dlt_selected_schema_name].tables.keys()
+        for table_name in _table_names:
+            _schema_table = dlt_pipeline.schemas[dlt_selected_schema_name].tables[table_name]
+        
+            # Fetch column names assuming _schema_table is a dictionary
+            column_names = list(_schema_table.get('columns', []))
+        
+            if not column_names:
+                data.append({"Table Name": table_name, "Total Rows": 0, "Unique Rows": "N/A"})
+                continue
+        
+            # Construct the SQL query to count total rows and unique rows across all columns
+            columns_quoted = ', '.join(f'"{col}"' for col in column_names)  # Quote column names
+            count_query = f'SELECT COUNT(*) as total_rows, COUNT(DISTINCT ({columns_quoted})) as unique_rows FROM "{table_name}"'
+
+            # Execute the query and handle any errors
+            _query_result, _error_message, _traceback_string = utils.queries.get_query_result(dlt_pipeline, count_query)
+
+            if _error_message:
+                data.append({"Table Name": table_name, "Total Rows": "Error", "Unique Rows": "Error"})
+            else:
+                row_count_info = _query_result.iloc[0]
+                data.append({
+                    "Table Name": table_name,
+                    "Total Rows": row_count_info['total_rows'],
+                    "Unique Rows": row_count_info['unique_rows']  # Count of distinct rows
+                })
+
+    # Prepare the result in a tabular format to display
+    if data:
+        basic_data_checks_table = utils.ui.dlt_table(data)
+
+    # Display the table with a title
+    mo.vstack([
+        mo.md("### Basic Data Checks"),
+        basic_data_checks_table
+    ]) if data else None
+    return
+```
+
+Once you have the local version, you can also use the regular marimo commands to run or edit this notebook. This way, you can maintain multiple versions of your dashboard or other marimo apps in your project:
+
+```sh
+# this will run a local dashboard
+marimo run dlt_dashboard.py
+
+# this will run the marimo in edit mode
+marimo edit dlt_dashboard.py
+```
+
+## Further reading
+
+If you are running `dlt` in Python interactively or in a notebook, read the [Accessing loaded data in Python](../../general-usage/dataset-access/dataset.md) guide.
+
+
+===== FILE: docs/website/docs/hub/ingestion/delta.md =====
+
+---
+title: "Destination: Delta"
+description: Delta destination
+keywords: [delta, delta lake]
+---
+# Delta
+
+:::note
+Use of the dltHub platform and toolkits is subject to a commercial dltHub License.
+:::
+
+The Delta destination is based on the [filesystem destination](../../dlt-ecosystem/destinations/filesystem.md) in dlt. All configuration options from the filesystem destination can be configured as well.
+
+## Setup
+
+Make sure you have installed the necessary dependencies:
+
+```sh
+pip install deltalake
+```
+
+If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-init@latest` (see the [installation guide](../getting-started/installation.md)). Then, from inside the workspace, add a Delta pipeline:
+
+```sh
+dlthub pipeline init sql_database delta
+```
+
+Configure the Delta destination in your `config.toml`:
+
+```toml
+[destination.delta]
+bucket_url = "s3://your_bucket" # replace with bucket url
+```
+
+The credentials can be defined in the `secrets.toml`:
+
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="aws"
+  values={[
+    {"label": "AWS S3", "value": "aws"},
+    {"label": "GCS/GDrive", "value": "gcp"},
+    {"label": "Azure", "value": "azure"},
+    {"label": "SFTP", "value": "sftp"},
+]}>
+
+<TabItem value="aws">
+
+```toml
+# secrets.toml
+[destination.delta.credentials]
+aws_access_key_id="Please set me up!"
+aws_secret_access_key="Please set me up!"
+```
+
+</TabItem>
+
+<TabItem value="azure">
+
+```toml
+# secrets.toml
+[destination.delta.credentials]
+azure_storage_account_name="Please set me up!"
+azure_storage_account_key="Please set me up!"
+```
+
+</TabItem>
+
+<TabItem value="gcp">
+
+:::warning
+Only [Service Account](../../dlt-ecosystem/destinations/bigquery#setup-guide) and [Application Default Credentials](../../dlt-ecosystem/destinations/bigquery#using-default-credentials) authentication methods are supported for Google Cloud Storage.
+:::
+
+```toml
+# secrets.toml
+[destination.delta.credentials]
+client_email="Please set me up!"
+private_key="Please set me up!"
+project_id="Please set me up!"
+```
+
+</TabItem>
+
+<TabItem value="sftp">
+
+Learn how to set up SFTP credentials for each authentication method in the [SFTP section](../../dlt-ecosystem/destinations/filesystem#sftp).
+For example, in the case of key-based authentication, you can configure the source the following way:
+
+```toml
+# secrets.toml
+[destination.delta.credentials]
+sftp_username = "foo"
+sftp_key_filename = "/path/to/id_rsa"     # Replace with the path to your private key file
+sftp_key_passphrase = "your_passphrase"   # Optional: passphrase for your private key
+```
+
+</TabItem>
+
+</Tabs>
+
+The Delta destination can also be defined in Python as follows:
+
+```py
+pipeline = dlt.pipeline("loads_delta", destination="delta")
+```
+
+## Write dispositions
+
+The Delta destination handles the write dispositions as follows:
+
+- `append` - files belonging to such tables are added to the dataset folder.
+- `replace` - all files that belong to such tables are deleted from the dataset folder, and then the current set of files is added.
+- `merge` - can be used with the `upsert` [merge strategy](../../general-usage/merge-loading.md#upsert-strategy) and the `insert-only` [merge strategy](../../general-usage/merge-loading.md#insert-only-strategy).
+
+The `merge` write disposition can be configured as follows on the source/resource level:
+
+```py
+import dlt
+
+@dlt.resource(
+    primary_key="id",  # merge_key also works; primary_key and merge_key may be used together
+    write_disposition={"disposition": "merge", "strategy": "upsert"},
+)
+def my_resource():
+    yield [
+        {"id": 1, "foo": "foo"},
+        {"id": 2, "foo": "bar"}
+    ]
+...
+
+pipeline = dlt.pipeline("loads_delta", destination="delta")
+```
+
+Or on the `pipeline.run` level: <!-- can this also be defined in the yaml??-->
+
+```py
+pipeline.run(write_disposition={"disposition": "merge", "strategy": "upsert"})
+```
+
+## Partitioning
+
+Delta tables can be partitioned (using [Hive-style partitioning](https://delta.io/blog/pros-cons-hive-style-partionining/)) by specifying one or more partition column hints on the source/resource level:
+
+```py
+import dlt
+
+@dlt.resource(
+  columns={"_dlt_load_id": {"partition": True}}
+)
+def my_resource():
+    ...
+
+pipeline = dlt.pipeline("loads_delta", destination="delta")
+```
+
+:::warning
+Partition evolution (changing partition columns after a table has been created) is currently not supported.
+:::
+
+## Table access helper functions
+
+You can use the `get_delta_tables` helper functions to access the native [DeltaTable](https://delta-io.github.io/delta-rs/api/delta_table/) objects.
+
+```py
+from dlt.common.libs.deltalake import get_delta_tables
+
+...
+
+# get dictionary of DeltaTable objects
+delta_tables = get_delta_tables(pipeline)
+
+# execute operations on DeltaTable objects
+delta_tables["my_delta_table"].optimize.compact()
+delta_tables["another_delta_table"].optimize.z_order(["col_a", "col_b"])
+# delta_tables["my_delta_table"].vacuum()
+# etc.
+```
+
+## Table format
+
+The Delta destination automatically assigns the `delta` table format to all resources that it will load. You can still fall back to storing files by setting `table_format` to native on the resource level:
+
+  ```py
+  @dlt.resource(
+    table_format="native"
+  )
+  def my_resource():
+      ...
+
+  pipeline = dlt.pipeline("loads_delta", destination="delta")
+  ```
+
+## Storage options and configuration
+
+You can pass storage options and configuration by configuring both `destination.filesystem.deltalake_storage_options` and
+`destination.filesystem.deltalake_configuration`:
+
+```toml
+[destination.filesystem]
+deltalake_configuration = '{"delta.enableChangeDataFeed": "true", "delta.minWriterVersion": "7"}'
+deltalake_storage_options = '{"AWS_S3_LOCKING_PROVIDER": "dynamodb", "DELTA_DYNAMO_TABLE_NAME": "custom_table_name"}'
+```
+
+dlt passes these as arguments to the `write_deltalake` method in the `deltalake` library (`deltalake_configuration` maps to `configuration` and `deltalake_storage_options` maps to `storage_options`). Look at their [documentation](https://delta-io.github.io/delta-rs/api/delta_writer/#deltalake.write_deltalake) to see which options can be used.
+
+You don't need to specify credentials here. dlt merges the required credentials with the options you provided before passing it as `storage_options`.
+
+:::warning
+When using `s3`, you need to specify storage options to [configure](https://delta-io.github.io/delta-rs/usage/writing/writing-to-s3-with-locking-provider/) locking behavior.
+:::
+
+
+===== FILE: docs/website/docs/hub/ingestion/iceberg.md =====
+
+---
+title: "Destination: Iceberg"
+description: Iceberg destination
+keywords: [Iceberg, pyiceberg]
+---
+# Iceberg
+
+:::note
+Use of the dltHub platform and toolkits is subject to a commercial dltHub License.
+:::
+
+Apache Iceberg is an open table format designed for high-performance analytics on large datasets. It supports ACID transactions, schema evolution, and time travel.
+
+The Iceberg destination in dlt allows you to load data into Iceberg tables using the [pyiceberg](https://py.iceberg.apache.org/) library. It supports multiple catalog types and both local and cloud storage backends.
+
+## Features
+
+* Compatible with SQL and REST catalogs (Lakekeeper, Polaris)
+* Automatic schema evolution and table creation
+* All write dispositions supported
+* Works with local filesystems and cloud storage (S3, Azure, GCS)
+* Exposes data via DuckDB views using `pipeline.dataset()`
+* Supports partitioning
+
+## Prerequisites
+
+If you don't have a dltHub workspace yet, scaffold one with:
+
+```sh
+uvx dlthub-init@latest
+```
+
+This installs `dlt[hub]` and sets up the workspace. Alternatively, install the required extras into an existing project:
+
+```sh
+pip install dlt[filesystem,pyiceberg]>=1.9.1
+pip install dlthub>=0.9.1
+```
+
+## Configuration
+
+### Overview
+
+To configure Iceberg destination you need to choose and configure the catalog. The role of iceberg catalog is to:
+
+* store metadata and coordinate transactions (required)
+* generate and hand credentials to pyiceberg client (credentials vending)
+* generate and hand locations for newly generated tables (rest catalogs)
+
+Currently, the Iceberg destination supports two catalog types:
+
+* SQL-based catalog. Ideal for local development; stores metadata in SQLite or PostgreSQL
+* REST catalog. Used in production with systems like Lakekeeper or Polaris
+
+### SQL catalog
+
+The SQL catalog is ideal for development and testing. It does not provide credential or location vending, so these must be configured manually. It supports local storage paths, such as a file-based SQLite database, and is generally used for working with local filesystems.
+
+To configure a SQL catalog, provide the following parameters:
+
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML files", "value": "toml"},
+    {"label": "Environment variables", "value": "env"}
+]}>
+
+<TabItem value="toml">
+
+```toml
+[destination.iceberg]
+catalog_type="sql"
+credentials="sqlite:///catalog.db" # connection string for accessing the database
+
+[destination.iceberg.filesystem]
+bucket_url="path_to_data" # table location
+
+# credentials section below is only needed if you're using the cloud storage (not local disk)
+[destination.iceberg.filesystem.credentials]
+aws_access_key_id = "please set me up!"
+aws_secret_access_key = "please set me up!"
+
+[destination.iceberg.capabilities]
+# will register tables if found in storage but not found in the catalog (backward compatibility)
+register_new_tables=true
+table_location_layout="{dataset_name}/{table_name}"
+```
+
+</TabItem>
+
+<TabItem value="env">
+
+```sh
+export DESTINATION__ICEBERG__CATALOG_TYPE=sql
+export DESTINATION__ICEBERG__CREDENTIALS=sqlite:///catalog.db
+export DESTINATION__ICEBERG__FILESYSTEM__BUCKET_URL=path_to_data
+# credentials section below is only needed if you're using the cloud storage (not local disk)
+export DESTINATION__ICEBERG__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID="please set me up!"
+export DESTINATION__ICEBERG__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY="please set me up!"
+
+export DESTINATION__ICEBERG__CAPABILITIES__REGISTER_NEW_TABLE=True
+export DESTINATION__ICEBERG__CAPABILITIES__TABLE_LOCATION_LAYOUT={dataset_name}/{table_name}
+```
+
+</TabItem>
+</Tabs>
+
+* `catalog_type=sql` - this indicates, that you will use SQL-based catalog.
+* `credentials=dialect+database_type://username:password@server:port/database_name` -  the connection string for your catalog database.
+This can be any SQLAlchemy-compatible database such as SQLite or PostgreSQL. For local development, a simple SQLite file like `sqlite:///catalog.db` works well. dlt will create it automatically if it doesn't exist.
+* `filesystem.bucket_url` - the physical location where Iceberg table data is stored.
+This can be a local directory or any cloud storage supported by the [filesystem destination](../../dlt-ecosystem/destinations/filesystem.md). If you’re using cloud storage, be sure to include the appropriate credentials as explained in the
+[credentials setup guide](../../dlt-ecosystem/destinations/filesystem.md#set-up-the-destination-and-credentials). For local filesystems, no additional credentials are needed.
+* `capabilities.register_new_tables=true` - enables automatic registration of tables found in storage but missing in the catalog.
+* `capabilities.table_location_layout` - controls the directory structure for Iceberg table files.
+It supports two modes:
+  * absolute - you provide a full URI that matches the catalog’s warehouse path, optionally including deeper subpaths.
+  * relative - a path that’s appended to the catalog’s warehouse root. This is especially useful with catalogs like Lakekeeper.
+
+The SQL catalog stores one table of the following schema:
+
+| catalog_name | table_namespace     | table_name | metadata_location | previous_metadata_location |
+| ------------ | ------------------- | ---------- | ----------------- | -------------------------- |
+| default      | jaffle_shop_dataset | orders     | path/to/files     | path/to/files              |
+| default      | jaffle_shop_dataset | _dlt_loads | path/to/files     | path/to/files              |
+
+### Lakekeeper catalog
+
+[Lakekeeper](https://docs.lakekeeper.io/) is an open-source, production-grade Iceberg catalog. It’s easy to set up, plays well with any cloud storage, and lets you build real
+data platforms without needing to set up heavy-duty infrastructure. Lakeleeper also supports vended credentials, credential vending, removing the need to pass long-lived secrets directly to dlt.
+
+To configure Lakekeeper, you need to specify both catalog and storage parameters. The catalog handles metadata and credential vending, while the `bucket_url` must align with the warehouse configured in Lakekeeper.
+
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML files", "value": "toml"},
+    {"label": "Environment variables", "value": "env"}
+]}>
+
+<TabItem value="toml">
+
+```toml
+[destination.iceberg]
+catalog_type="rest"
+
+[destination.iceberg.credentials]
+credential="my_lakekeeper_key"
+uri="https://lakekeeper.path.to.host/catalog"
+warehouse="warehouse"
+
+[destination.iceberg.credentials.properties]
+scope="lakekeeper"
+oauth2-server-uri="https://keycloak.path.to.host/realms/master/protocol/openid-connect/token"
+
+[destination.iceberg.filesystem]
+bucket_url="s3://warehouse/"
+
+[destination.iceberg.capabilities]
+table_location_layout="lakekeeper-warehouse/dlthub_demo/lakekeeper_demo/{dataset_name}/{table_name}"
+```
+
+</TabItem>
+
+<TabItem value="env">
+
+```sh
+export DESTINATION__ICEBERG__CATALOG_TYPE=rest
+export DESTINATION__ICEBERG__CREDENTIALS__CREDENTIAL=my_lakekeeper_key
+export DESTINATION__ICEBERG__CREDENTIALS__URI=https://lakekeeper.path.to.host/catalog
+export DESTINATION__ICEBERG__CREDENTIALS__WAREHOUSE=warehouse
+export DESTINATION__ICEBERG__CREDENTIALS__PROPERTIES__SCOPE=lakekeeper
+export DESTINATION__ICEBERG__CREDENTIALS__PROPERTIES__OAUTH2-SERVER-URI=https://keycloak.path.to.host/realms/master/protocol/openid-connect/token
+export DESTINATION__ICEBERG__FILESYSTEM__BUCKET_URL=s3://warehouse/
+export DESTINATION__ICEBERG__CAPABILITIES__TABLE_LOCATION_LAYOUT=lakekeeper-warehouse/dlthub_demo/lakekeeper_demo/{dataset_name}/{table_name}
+```
+
+</TabItem>
+
+</Tabs>
+
+* `catalog_type=rest` - specifies that you're using a REST-based catalog implementation.
+* `credentials.credential` - your Lakekeeper key or token used to authenticate with the catalog.
+* `credentials.uri` - the URL of your Lakekeeper catalog endpoint.
+* `credentials.warehouse` - the name of the warehouse configured in Lakekeeper, which defines the root location for all data tables.
+* `credentials.properties.scope=lakekeeper` - the scope required for authentication.
+* `credentials.properties.oauth2-server-uri` - he URL of your OAuth2 token endpoint used for Lakekeeper authentication.
+* `filesystem.bucket_url` - the physical storage location for Iceberg table files. This can be any supported cloud storage backend listed in the [filesystem destination](../../dlt-ecosystem/destinations/filesystem.md).
+
+:::warning
+Currently, the following buckets and credentials combinations are well-tested:
+
+* s3: STS and signer, s3 express
+* azure: both access key and tenant-id (principal) based auth
+* google storage
+:::
+
+* `capabilities.table_location_layout` - controls the directory structure for Iceberg table files.
+It supports two modes:
+  * absolute - you provide a full URI that matches the catalog’s warehouse path, optionally including deeper subpaths.
+  * relative - a path that’s appended to the catalog’s warehouse root. This is especially useful with catalogs like Lakekeeper.
+
+### Polaris catalog
+
+[Polaris](https://polaris.apache.org/) - is an open-source, fully featured catalog for Iceberg. Its configuration is similar to Lakekeeper, with some differences in credential scopes and URI.
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML files", "value": "toml"},
+    {"label": "Environment variables", "value": "env"}
+]}>
+
+<TabItem value="toml">
+
+```toml
+[destination.iceberg]
+catalog_type="rest"
+
+[destination.iceberg.credentials]
+credential="my_polaris_key"
+uri="https://account.snowflakecomputing.com/polaris/api/catalog"
+warehouse="warehouse"
+
+[destination.iceberg.credentials.properties]
+scope="PRINCIPAL_ROLE:ALL"
+
+[destination.iceberg.filesystem]
+bucket_url="s3://warehouse"
+
+[destination.iceberg.capabilities]
+table_location_layout="{dataset_name}/{table_name}"
+```
+
+</TabItem>
+
+<TabItem value="env">
+
+```sh
+export DESTINATION__ICEBERG__CATALOG_TYPE=rest
+export DESTINATION__ICEBERG__CREDENTIALS__CREDENTIAL=my_polaris_key
+export DESTINATION__ICEBERG__CREDENTIALS__URI=https://account.snowflakecomputing.com/polaris/api/catalog
+export DESTINATION__ICEBERG__CREDENTIALS__WAREHOUSE=warehouse
+export DESTINATION__ICEBERG__CREDENTIALS__PROPERTIES__SCOPE=PRINCIPAL_ROLE:ALL
+export DESTINATION__ICEBERG__FILESYSTEM__BUCKET_URL=s3://warehouse/
+export DESTINATION__ICEBERG__CAPABILITIES__TABLE_LOCATION_LAYOUT={dataset_name}/{table_name}
+```
+
+</TabItem>
+
+</Tabs>
+
+For more information, refer to the [Lakekeeper section above](#lakekeeper-catalog).
+
+### AWS Iceberg Catalogs
+
+dlt supports three AWS-backed Iceberg catalogs.
+Their names correspond to the `catalog_type` value you pass in your destination block:
+
+| `catalog_type`      | What it talks to under the hood                                                   |
+| ------------------- | --------------------------------------------------------------------------------- |
+| **`s3tables-rest`** | Uses the AWS S3 Tables Iceberg REST API endpoint, and S3 table buckets            |
+| **`glue-rest`**     | Uses the AWS Glue Iceberg REST API endpoint, Lake Formation, and S3 table buckets |
+| **`glue`**          | Uses the AWS Glue Catalog, and normal S3 buckets                                  |
+
+#### Catalog `[s3tables-rest]`
+
+Configure this catalog when you want to publish Iceberg tables directly into an S3 Table bucket via the Amazon S3 Tables Iceberg REST API endpoint.
+
+To configure a `s3tables-rest` catalog, provide the following parameters and replace `<region>`, `<account-id>`, `<s3-table-bucket-name>`, and AWS keys with your actual values:
+
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML files", "value": "toml"},
+    {"label": "Environment variables", "value": "env"}
+]}>
+
+<TabItem value="toml">
+
+```toml
+[destination.iceberg]
+catalog_type = "s3tables-rest"
+catalog_name = "iceberg_lake"
+
+[destination.iceberg.credentials]
+warehouse = "arn:aws:s3tables:<region>:<account-id>:bucket/<s3-table-bucket-name>"
+uri       = "https://s3tables.<region>.amazonaws.com/iceberg"
+aws_access_key_id     = "<aws_access_key_id>"
+aws_secret_access_key = "<aws_secret_access_key>"
+region_name           = "<region>"
+
+[destination.iceberg.credentials.properties]
+"rest.sigv4-enabled"  = "true"
+"rest.signing-name"   = "s3tables"
+"rest.signing-region" = "<region>"
+```
+
+</TabItem>
+
+<TabItem value="env">
+
+```sh
+export DESTINATION__ICEBERG__CREDENTIALS__WAREHOUSE="arn:aws:s3tables:<region>:<account-id>:bucket/<s3-table-bucket-name>"
+export DESTINATION__ICEBERG__CREDENTIALS__URI="https://s3tables.<region>.amazonaws.com/iceberg"
+export DESTINATION__ICEBERG__CREDENTIALS__AWS_ACCESS_KEY_ID="<aws_access_key_id>"
+export DESTINATION__ICEBERG__CREDENTIALS__AWS_SECRET_ACCESS_KEY="<aws_secret_access_key>"
+export DESTINATION__ICEBERG__CREDENTIALS__REGION_NAME="<region>"
+
+export DESTINATION__ICEBERG__CREDENTIALS__PROPERTIES='{
+  "rest.sigv4-enabled": "true",
+  "rest.signing-name" : "s3tables",
+  "rest.signing-region": "<region>"
+}'
+```
+
+</TabItem>
+
+</Tabs>
+
+##### S3 Tables Catalog Prerequisites
+
+Create the S3 Table bucket first and grant the calling IAM principal s3tables:* actions read/write permissions on that bucket.
+
+* `warehouse` – full bucket ARN for your S3 Tables catalog.
+* `uri` – region-specific S3 Tables REST endpoint.
+* `rest.*` properties – mandatory SigV4 settings for every call.
+
+#### Catalog `[glue-rest]`
+
+Configure this catalog when you want to publish Iceberg tables directly into an S3 Tables bucket via the AWS Glue Iceberg REST API endpoint.
+
+:::note
+`glue-rest` catalog involves the most complex IAM/Lake Formation setup.
+:::
+To configure a `glue-rest` catalog, provide the following parameters and replace `<region>`, `<account-id>`, `<s3-table-bucket-name>`, and AWS keys with real values:
+
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML files", "value": "toml"},
+    {"label": "Environment variables", "value": "env"}
+]}>
+
+<TabItem value="toml">
+
+```toml
+[destination.iceberg]
+catalog_type = "glue-rest"
+catalog_name = "iceberg_lake"
+
+[destination.iceberg.credentials]
+warehouse = "<account-id>:s3tablescatalog/<s3-table-bucket-name>"
+uri       = "https://glue.<region>.amazonaws.com/iceberg"
+aws_access_key_id     = "<aws_access_key_id>"
+aws_secret_access_key = "<aws_secret_access_key>"
+region_name           = "<region>"
+
+[destination.iceberg.credentials.properties]
+"rest.sigv4-enabled"  = "true"
+"rest.signing-name"   = "glue"
+"rest.signing-region" = "<region>"
+```
+
+</TabItem>
+<TabItem value="env">
+
+```sh
+export DESTINATION__ICEBERG__CREDENTIALS__WAREHOUSE="<account-id>:s3tablescatalog/<s3-table-bucket-name>"
+export DESTINATION__ICEBERG__CREDENTIALS__URI="https://glue.<region>.amazonaws.com/iceberg"
+export DESTINATION__ICEBERG__CREDENTIALS__AWS_ACCESS_KEY_ID="<aws_access_key_id>"
+export DESTINATION__ICEBERG__CREDENTIALS__AWS_SECRET_ACCESS_KEY="<aws_secret_access_key>"
+export DESTINATION__ICEBERG__CREDENTIALS__REGION_NAME="<region>"
+export DESTINATION__ICEBERG__CREDENTIALS__PROPERTIES='{
+  "rest.sigv4-enabled": "true",
+  "rest.signing-name" : "glue",
+  "rest.signing-region": "<region>"
+}'
+```
+
+</TabItem>
+</Tabs>
+
+##### Glue REST Catalog Prerequisites
+
+Сreate the S3 Table bucket first and follow this AWS documentation to properly configure IAM, Glue, and Lake Formation: [Create an Iceberg catalog for S3 Tables via Glue REST](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-glue-endpoint.html)
+
+* `warehouse` – glue catalog arn for your S3 Tables catalog.
+* `uri` – region-specific Glue REST endpoint.
+* `rest.*` properties – mandatory SigV4 settings for every call.
+
+#### Catalog `[glue]`
+
+Choose this when you simply want to use the Glue Catalog with a normal S3 bucket for table storage.
+
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML files", "value": "toml"},
+    {"label": "Environment variables", "value": "env"}
+]}>
+
+<TabItem value="toml">
+
+```toml
+[destination.iceberg]
+catalog_type = "glue"
+catalog_name = "iceberg_lake"
+
+[destination.iceberg.filesystem]
+bucket_url = "<s3-bucket-url>"
+
+[destination.iceberg.credentials]
+aws_access_key_id     = "<aws_access_key_id>"
+aws_secret_access_key = "<aws_secret_access_key>"
+region_name           = "<region>"
+```
+
+</TabItem> <TabItem value="env">
+
+```sh
+export DESTINATION__ICEBERG__FILESYSTEM__BUCKET_URL="<s3-bucket-url>"
+export DESTINATION__ICEBERG__CREDENTIALS__AWS_ACCESS_KEY_ID="<aws_access_key_id>"
+export DESTINATION__ICEBERG__CREDENTIALS__AWS_SECRET_ACCESS_KEY="<aws_secret_access_key>"
+export DESTINATION__ICEBERG__CREDENTIALS__REGION_NAME="<region>"
+```
+
+</TabItem>
+</Tabs>
+
+##### Glue Catalog Prerequisites
+
+An S3 bucket and an IAM principal allowed to read/write that bucket and access the Glue Data Catalog.
+
+* `bucket_url` – S3 prefix where Iceberg data and metadata files will live.
+
+### Unity Catalog
+
+[Unity Catalog](https://www.databricks.com/product/unity-catalog) provides a REST API for Iceberg that allows external clients to access Databricks tables.
+
+#### Unity Catalog Prerequisites
+
+Before using Unity Catalog with the Iceberg destination, ensure you have:
+
+1. Unity Catalog enabled in your workspace
+2. External data access enabled for your metastore
+3. EXTERNAL USE SCHEMA privilege granted to your principal:
+
+   ```sql
+   GRANT EXTERNAL USE SCHEMA ON CATALOG <catalog_name> TO `user@company.com`;
+   ```
+
+   Where `<catalog_name>` is the name of the catalog you want to grant access to.
+
+For detailed setup instructions, see Databricks guide on [accessing tables from Apache Iceberg clients](https://learn.microsoft.com/en-us/azure/databricks/external-access/iceberg).
+
+#### Unity Catalog Configuration
+
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML files", "value": "toml"},
+    {"label": "Environment variables", "value": "env"}
+]}>
+
+<TabItem value="toml">
+
+```toml
+[destination.iceberg]
+catalog_type = "rest"
+
+[destination.iceberg.credentials]
+uri = "https://<workspace-url>/api/2.1/unity-catalog/iceberg-rest"
+warehouse = "dlt_ci"
+
+[destination.iceberg.credentials.properties]
+token = "please set me up!"
+```
+
+</TabItem>
+
+<TabItem value="env">
+
+```sh
+export DESTINATION__ICEBERG__CATALOG_TYPE=rest
+export DESTINATION__ICEBERG__CREDENTIALS__URI=https://<workspace-url>/api/2.1/unity-catalog/iceberg-rest
+export DESTINATION__ICEBERG__CREDENTIALS__WAREHOUSE=dlt_ci
+export DESTINATION__ICEBERG__CREDENTIALS__PROPERTIES__TOKEN=please set me up!
+```
+
+</TabItem>
+
+</Tabs>
+
+#### Configuration Parameters
+
+* `catalog_type=rest` - specifies the REST catalog implementation
+* `credentials.uri` - the Unity Catalog Iceberg REST API endpoint (format: `https://<workspace-url>/api/2.1/unity-catalog/iceberg-rest`)
+* `credentials.warehouse` - the catalog name in Unity Catalog containing your tables
+* `credentials.properties.token` - your Databricks personal access token for authentication
+
+## Write dispositions
+
+All [write dispositions](../../general-usage/incremental-loading.md) are supported.
+
+## Merge strategies
+
+The Iceberg destination supports three merge strategies when using `write_disposition="merge"`: `delete-insert`, `upsert`, and `insert-only`.
+All strategies use a single Iceberg transaction for delete and insert operations and support [hard delete](../../general-usage/merge-loading.md#delete-records) functionality.
+
+### Delete-insert strategy
+
+The `delete-insert` strategy first deletes existing rows matching the key columns, then inserts new data.
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "delete-insert"},
+    primary_key="id",
+    table_format="iceberg"
+)
+def my_resource():
+    yield [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+```
+
+#### Key characteristics
+
+- Requires primary key or merge key columns
+- Supports only regular tables (nested tables not supported)
+- Automatically deduplicates data based on primary keys
+- Uses single Iceberg transaction for delete and insert operations
+
+### Upsert strategy
+
+The `upsert` strategy is similar to delete-insert strategy but with key differences in behavior and requirements:
+
+- Supports nested data: unlike `delete-insert`, `upsert` handles nested data
+  - Note: nested data requires a column with the `unique` property (dlt will use `_dlt_id` by default)
+- Does not deduplicate records with duplicate primary keys in the incoming data
+- Upsert _does not_ support merge keys
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "upsert"},
+    primary_key="id",
+    table_format="iceberg"
+)
+def my_upsert_resource():
+    yield [{"id": 1, "name": "Alice Updated"}, {"id": 3, "name": "Charlie"}]
+```
+
+### Insert-only strategy
+
+The `insert-only` strategy inserts new records based on primary key without updating existing records. See the [insert-only strategy](../../general-usage/merge-loading.md#insert-only-strategy) docs for details.
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "insert-only"},
+    primary_key="id",
+    table_format="iceberg"
+)
+def my_insert_only_resource():
+    yield [{"id": 1, "name": "Alice"}, {"id": 3, "name": "Charlie"}]
+```
+
+:::info Performance Testing
+The `delete-insert`, `upsert`, and `insert-only` merge strategies have been stress tested with datasets containing tens of millions of rows without encountering any issues. Memory usage and processing time scale linearly with the size of the updated dataset.
+:::
+
+#### Known limitations
+
+- Orphaned nested table records: updates to nested structures that remove elements do not delete them from the destination table.
+
+## Data access
+
+The Iceberg destination integrates with `pipeline.dataset()` to give users queryable access to their data.
+When invoked, this creates an in-memory DuckDB database with views pointing to Iceberg tables.
+
+The created views reflect the latest available snapshot. To ensure fresh data during development, use the `always_refresh_views` option. Views are materialized only on demand, based on query usage.
+
+## Credentials for data access
+
+By default, credentials for accessing data are vended by the catalog, and per-table secrets are created automatically. This works best with cloud storage providers like AWS S3 using STS credentials.
+However, due to potential performance limitations with temporary credentials, we recommend defining the filesystem explicitly when working with `dataset()` or dltHub transformations.
+This approach allows for native DuckDB filesystem access, persistent secrets, and faster data access. For example, when using AWS S3 as the storage location
+for your Iceberg tables, you can provide explicit credentials in the destination configuration in `filesystem` section:
+
+```toml
+[destination.iceberg.filesystem.credentials]
+aws_access_key_id = "please set me up!"
+aws_secret_access_key = "please set me up!"
+```
+
+## Partitioning
+
+Apache Iceberg supports [table partitioning](https://iceberg.apache.org/docs/latest/partitioning/) to optimize query performance.
+
+There are two ways to configure partitioning in dltHub Iceberg destination:
+
+* Using the [`iceberg_adapter`](#using-the-iceberg_adapter-function) function
+* Using column-level [`partition`](#using-column-level-partition-property) property
+
+### Using the `iceberg_adapter` function
+
+The `iceberg_adapter` function allows you to configure partitioning for your Iceberg tables. This adapter supports various partition transformations that can be applied to your data columns.
+
+```py
+import dlt
+from dlthub.destinations.adapters import iceberg_adapter, iceberg_partition
+
+@dlt.resource
+def my_data():
+    yield [{"id": 1, "created_at": "2024-01-01", "category": "A"}]
+
+# Apply partitioning to the resource
+iceberg_adapter(
+    my_data,
+    partition=["category"]  # Simple identity partition
+)
+```
+
+### Partition transformations
+
+Iceberg supports several transformation functions for partitioning. Use the `iceberg_partition` helper class to create partition specifications:
+
+#### Identity partitioning
+
+Partition by the exact value of a column (default for string columns when specified by name):
+
+```py
+from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+
+# These are equivalent:
+iceberg_adapter(resource, partition=["region"])
+iceberg_adapter(resource, partition=[iceberg_partition.identity("region")])
+```
+
+#### Temporal transformations
+
+Extract time components from date/datetime columns:
+
+* `iceberg_partition.year(column_name)`: Partition by year
+* `iceberg_partition.month(column_name)`: Partition by month
+* `iceberg_partition.day(column_name)`: Partition by day
+* `iceberg_partition.hour(column_name)`: Partition by hour
+
+```py
+import dlt
+from dlthub.destinations.adapters import iceberg_adapter, iceberg_partition
+
+@dlt.resource
+def events():
+    yield [{"id": 1, "event_time": datetime.datetime(2024, 3, 15, 10, 30), "data": "..."}]
+
+iceberg_adapter(
+    events,
+    partition=[iceberg_partition.month("event_time")]
+)
+```
+
+#### Bucket partitioning
+
+Distribute data across a fixed number of buckets using a hash function:
+
+```py
+from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+
+iceberg_adapter(
+    resource,
+    partition=[iceberg_partition.bucket(16, "user_id")]
+)
+```
+
+#### Truncate partitioning
+
+Partition string values by a fixed prefix length:
+
+```py
+from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+
+iceberg_adapter(
+    resource,
+    partition=[iceberg_partition.truncate(3, "category")]  # Groups "ELECTRONICS" → "ELE"
+)
+```
+
+### Advanced partitioning examples
+
+#### Multi-column partitioning
+
+Combine multiple partition strategies:
+
+```py
+import dlt
+from dlthub.destinations.adapters import iceberg_adapter, iceberg_partition
+
+@dlt.resource
+def sales_data():
+    yield [
+        {
+            "id": 1,
+            "timestamp": datetime.datetime(2024, 1, 15, 10, 30),
+            "region": "US",
+            "category": "Electronics",
+            "amount": 1250.00
+        },
+        {
+            "id": 2,
+            "timestamp": datetime.datetime(2024, 1, 16, 14, 20),
+            "region": "EU",
+            "category": "Clothing",
+            "amount": 890.50
+        }
+    ]
+
+# Partition by month and region
+iceberg_adapter(
+    sales_data,
+    partition=[
+        iceberg_partition.month("timestamp"),
+        "region"  # Identity partition on region
+    ]
+)
+
+pipeline = dlt.pipeline("sales_pipeline", destination="iceberg")
+pipeline.run(sales_data)
+```
+
+#### Custom partition field names
+
+Specify custom names for partition fields to make them more descriptive:
+
+```py
+import dlt
+from dlthub.destinations.adapters import iceberg_adapter, iceberg_partition
+
+@dlt.resource
+def user_activity():
+    yield [{"user_id": 123, "activity_time": datetime.datetime.now(), "action": "click"}]
+
+iceberg_adapter(
+    user_activity,
+    partition=[
+        iceberg_partition.year("activity_time", "activity_year"),
+        iceberg_partition.bucket(8, "user_id", "user_bucket")
+    ]
+)
+```
+
+### Using column-level partition property
+
+You can configure identity partitioning directly at the column level using the `"partition": True` property in the column specification. This approach uses identity transformation (partitioning by exact column values).
+
+#### Basic column-level partitioning
+
+```py
+import dlt
+
+@dlt.resource(columns={"region": {"partition": True}})
+def sales_data():
+    yield [
+        {"id": 1, "region": "US", "amount": 1250.00},
+        {"id": 2, "region": "EU", "amount": 890.50},
+        {"id": 3, "region": "APAC", "amount": 1100.00}
+    ]
+
+pipeline = dlt.pipeline("sales_pipeline", destination="iceberg")
+pipeline.run(sales_data)
+```
+
+#### Multiple column partitioning
+
+You can partition on multiple columns by setting `"partition": True` for each column:
+
+```py
+@dlt.resource(columns={
+    "region": {"partition": True},
+    "category": {"partition": True},
+})
+def multi_partition_data():
+    yield [
+        {"id": 1, "region": "US", "category": "Electronics", "amount": 1250.00},
+        {"id": 2, "region": "EU", "category": "Clothing", "amount": 890.50}
+    ]
+```
+
+### Partitioning by dlt load id
+
+dlt [load id](../../general-usage/destination-tables.md#load-packages-and-load-ids) is a unique identifier for each load package (a batch of data processed by dlt). Each execution of a pipeline generates a unique load id that identifies all data loaded in that specific run. The `_dlt_load_id` is a system column automatically added by `dlt` to each row of data loaded in a table.
+
+To partition by dlt load id, set the `partition` property to `_dlt_load_id` in the column specification:
+
+```py
+@dlt.resource(columns={"_dlt_load_id": {"partition": True}})
+def load_partitioned_data():
+    yield [
+        {"id": 1, "data": "example1"},
+        {"id": 2, "data": "example2"}
+    ]
+```
+
+
+===== FILE: docs/website/docs/hub/ingestion/init.md =====
+
+---
+title: Initialize a pipeline
+description: How to initialize and develop a dlt pipeline using CLI, workspace, or verified sources
+keywords: [create a pipeline, verified source, workspace, rest client, how to, dlt init]
+---
+# Initialize a pipeline
+
+This guide walks you through creating and initializing a `dlt` pipeline in dltHub Workspace—whether manually, with agentic help, or from one of the **verified sources** maintained by dltHub team.
+
+## Overview
+
+A `dlt` pipeline moves data from a source (like an API or database) into a destination (like DuckDB, Snowflake, or Iceberg). Initializing a pipeline is the first step in the data workflow.
+You can create one in two CLI-based ways:
+
+| Method          | Command                                                | Best for                                                       |
+| --------------- | ------------------------------------------------------ | -------------------------------------------------------------- |
+| Manual          | `dlthub pipeline init <source> <destination>`          | Developers who prefer manual setup                             |
+| Verified source | `dlthub pipeline init <verified_source> <destination>` | Prebuilt, tested connectors from the community and dltHub team |
+
+Outside of a workspace (plain OSS `dlt`), the same scaffold is reachable as `dlt init <source> <destination>`. Inside a dltHub workspace, `dlthub pipeline init` is the canonical entry point—it adds the pipeline to the current workspace.
+
+## Step 0: Install dlt with workspace support
+
+Before you start, make sure you followed the [installation instructions](../getting-started/installation.md) and have a dltHub workspace initialized. The fastest way is:
+
+```sh
+uvx dlthub-init@latest
+```
+
+This scaffolds a workspace with `.dlt/.workspace` already set, the AI toolkits vendored, and `dlt[hub]` synced. See the [installation guide](../getting-started/installation.md) for the alternative paths (adding to an existing project, or enabling workspace mode by hand).
+
+**dltHub Workspace** is a unified environment for developing, running, and maintaining data pipelines—from local development to production.
+
+[More about dlt Workspace](../getting-started/installation.md#what-is-a-dlthub-workspace)
+
+## Step 1: Initialize a custom pipeline
+
+### Manual setup (standard workflow)
+
+A lightweight, code-first approach ideal for developers comfortable with Python.
+
+```sh
+dlthub pipeline init {source_name} duckdb
+````
+
+for example:
+
+```sh
+dlthub pipeline init my_github_pipeline duckdb
+```
+
+It scaffolds the pipeline template—a minimal starter project with a single Python script that shows three quick ways to load data into DuckDB using dlt:
+
+- fetch JSON from a public REST API (chess.com as an example) with requests,
+- read a public CSV with pandas, and
+- pull rows from a SQL database via SQLAlchemy.
+
+The file also includes an optional GitHub REST client example (a `@dlt.resource` + `@dlt.source`) that can use a token from `.dlt/secrets.toml`, but will work unauthenticated at low rate limits.
+It’s meant as a hands-on playground you can immediately run and then adapt into a real pipeline.
+
+Learn how to build you own dlt pipeline with [dlt Fundamentals course.](https://dlthub.learnworlds.com/course/dlt-fundamentals)
+
+### Agentic setup
+
+A collaborative AI-human workflow that integrates `dlt` with AI editors and agents like:
+
+- **Claude**
+- **Cursor**
+- **Codex**
+- [the full list](./rest-api-source.md#setup)
+
+Start with the [`/find-source` skill](./rest-api-source.md#find-source--discover-your-data-source) to describe your data source in natural language—the assistant identifies a verified source or researches the API, then chains into pipeline scaffolding.
+
+[Read more about running a pipeline](../../walkthroughs/run-a-pipeline)
+
+## Next steps: Deploy and scale
+
+Once your pipeline runs locally:
+
+* [Monitor via the workspace dashboard](../../general-usage/dataset-access/data-quality-dashboard)
+* Set up [Profiles](../pipeline-operations/profiles.md) to manage separate dev, prod, and test environments
+* [Deploy to runtime](../pipeline-operations/deployments.md)
+
+
+===== FILE: docs/website/docs/hub/ingestion/ms-sql.md =====
+
+---
+title: "Source: MS SQL replication"
+description: MS SQL replication
+keywords: [MSSQL, CDC, Change Tracking, MSSQL replication]
+---
+# MS SQL replication
+
+:::note
+Use of the dltHub platform and toolkits is subject to a commercial dltHub License.
+:::
+
+dltHub provides a comprehensive solution for syncing an MS SQL Server table using [Change Tracking](https://learn.microsoft.com/en-us/sql/relational-databases/track-changes/about-change-tracking-sql-server), a solution similar to CDC. By leveraging SQL Server's native Change Tracking feature, you can efficiently load incremental data changes — including inserts, updates, and deletes — into your destination.
+
+## Prerequisites
+
+Before you begin, ensure that Change Tracking is enabled on both your database and the tables you wish to track, as it is a feature that must be explicitly activated.
+
+### Enable Change Tracking on the database
+
+Run the following SQL command to enable Change Tracking on your database:
+
+```sql
+ALTER DATABASE [YourDatabaseName]
+SET CHANGE_TRACKING = ON
+(CHANGE_RETENTION = 7 DAYS, AUTO_CLEANUP = ON);
+```
+
+- `[YourDatabaseName]`: Replace with the name of your database.
+- `CHANGE_RETENTION`: Specifies how long Change Tracking information is retained. In this example, it’s set to 7 days.
+- `AUTO_CLEANUP`: When set to ON, Change Tracking information older than the retention period is automatically removed.
+
+### Enable Change Tracking on the table
+
+For each table you want to track, execute:
+
+```sql
+ALTER TABLE [YourSchemaName].[YourTableName]
+ENABLE CHANGE_TRACKING
+WITH (TRACK_COLUMNS_UPDATED = ON);
+```
+
+- `[YourSchemaName].[YourTableName]`: Replace with your schema and table names.
+- `TRACK_COLUMNS_UPDATED`: When set to ON, allows you to see which columns were updated in a row. Set to OFF if you don’t need this level of detail.
+
+### Set up dlthub and drivers
+
+* If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-init@latest` (see the [installation guide](../getting-started/installation.md) for prerequisites and alternative install paths).
+
+* Install the Microsoft ODBC Driver for SQL Server according to the official [instructions](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server?view=sql-server-ver16). If you prefer, there is also a [Python library alternative](https://www.pymssql.org/).
+
+* Specify the credentials for your SQL Server connection according to the [sql_database source instructions](../../dlt-ecosystem/verified-sources/sql_database/setup)
+
+## Setting up the pipeline
+
+The process involves two main steps:
+
+1. **Initial full load**: Use the `sql_table` function to perform a full backfill of your table data.
+2. **Incremental loading**: Use the `create_change_tracking_table` function to load incremental changes using SQL Server's Change Tracking.
+
+This approach ensures that you have a complete dataset from the initial load and efficiently keep it updated with subsequent changes.
+
+### Initial full load
+
+Get the Change Tracking version **before you execute the initial load** to make sure you do not miss any updates that may happen during it. This may result in "replaying" a few changes that happen during the load, but this will not have any impact on the destination data due to the `merge` write disposition.
+
+```py
+from dlthub.sources.mssql import get_current_change_tracking_version
+from sqlalchemy import create_engine
+
+connection_url = "mssql+pyodbc://username:password@your_server:port/YourDatabaseName?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
+
+engine = create_engine(connection_url)
+
+tracking_version = get_current_change_tracking_version(engine)
+```
+
+To fully avoid any duplication, you may completely lock the table during the initial load.
+
+Now you can use the `sql_table` resource to perform the initial backfill:
+
+```py
+import dlt
+from dlt.sources.sql_database import sql_table
+from sqlalchemy import create_engine, Engine
+
+engine: Engine = create_engine("...")
+# Initial full load
+initial_resource = sql_table(
+    credentials=engine,
+    schema=schema_name,
+    table=table_name,
+    reflection_level="full",
+    write_disposition="merge",
+)
+
+pipeline = dlt.pipeline(
+    pipeline_name='sql_server_sync_pipeline',
+    destination='your_destination',
+    dataset_name='destination_dataset',
+)
+
+# Run the pipeline for initial load
+pipeline.run(initial_resource)
+```
+
+By default, the `_DLT_DELETED` or the `_DLT_SYS_CHANGE_VERSION` columns are only created by the incremental change tracking resource when there are changes. If you want these to be created during the initial load, you can configure this with `apply_hints` before running the pipeline as follows:
+
+```py notype
+initial_resource.apply_hints(
+        columns=[
+            {"name": "_dlt_sys_change_version", "data_type": "bigint"},
+            {"name": "_dlt_deleted", "data_type": "text", "precision": 10},
+        ]
+    )
+```
+
+Next, configure the incremental resource for the first run with the `create_change_tracking_table` function and run it **once**:
+
+```py notype
+from dlthub.sources.mssql import create_change_tracking_table
+
+# Optional: Configure engine isolation level
+# use it if you create an Engine implicitly
+def configure_engine_isolation_level(engine):
+    return engine.execution_options(isolation_level="SERIALIZABLE")
+
+incremental_resource = create_change_tracking_table(
+    credentials=engine,
+    table=table_name,
+    schema=schema_name,
+    initial_tracking_version=tracking_version,
+    engine_adapter_callback=configure_engine_isolation_level,
+)
+
+pipeline.run(incremental_resource)
+```
+
+When running for the first time, it is necessary to pass the `tracking_version` in the `initial_tracking_version` argument. This will initialize incremental loading and keep the updated tracking version in the dlt state. In subsequent runs, you do not need to provide the initial value anymore.
+
+### Incremental loading
+
+After the initial load, you can run the `create_change_tracking_table` resource on a schedule to load only the changes since the last tracking version using SQL Server’s `CHANGETABLE` function.
+You do not need to pass `initial_tracking_version` anymore, since this is automatically stored in the dlt state.
+
+```py
+from sqlalchemy import create_engine, Engine
+from dlthub.sources.mssql import create_change_tracking_table
+
+engine: Engine = create_engine("...")
+incremental_resource = create_change_tracking_table(
+    credentials=engine,
+    table=table_name,
+    schema=schema_name,
+)
+pipeline.run(incremental_resource)
+```
+
+:::note
+ The `write_disposition` is by default set to `merge`, which handles upserts based on primary keys. This determines the behavior when new data is loaded, especially regarding duplicates, updates, and deletes.
+:::
+
+## Full code example
+
+<details>
+
+<summary>Show full code example</summary>
+
+```py
+import dlt
+
+from sqlalchemy import create_engine
+
+from dlt.sources.sql_database import sql_table
+from dlthub.sources.mssql import (
+    create_change_tracking_table,
+    get_current_change_tracking_version,
+)
+
+
+def single_table_initial_load(connection_url: str, schema_name: str, table_name: str) -> None:
+    """Performs an initial full load and sets up tracking version and incremental loads"""
+    # Create a new pipeline
+    pipeline = dlt.pipeline(
+        pipeline_name=f"{schema_name}_{table_name}_sync",
+        destination="duckdb",
+        dataset_name=schema_name,
+    )
+
+    # Explicit database connection
+    engine = create_engine(connection_url, isolation_level="SNAPSHOT")
+
+    # Initial full load
+    initial_resource = sql_table(
+        credentials=engine,
+        schema=schema_name,
+        table=table_name,
+        reflection_level="full",
+        write_disposition="merge",
+    )
+
+    # Get the current tracking version before you run the pipeline to make sure
+    # you do not miss any records
+    tracking_version = get_current_change_tracking_version(engine)
+    print(f"will track from: {tracking_version}")  # noqa
+
+    # Apply hints to create _DLT_DELETED and _DLT_SYS_CHANGE_VERSION columns on the initial load
+    # This is an optional step
+    initial_resource.apply_hints(
+        columns=[
+            {"name": "_dlt_sys_change_version", "data_type": "bigint"},
+            {"name": "_dlt_deleted", "data_type": "text", "precision": 10},
+        ]
+    )
+
+    # Run the pipeline for the initial load
+    # NOTE: we always drop data and state from the destination on initial load
+    print(pipeline.run(initial_resource, refresh="drop_resources"))  # noqa
+
+    # Incremental loading resource
+    incremental_resource = create_change_tracking_table(
+        credentials=engine,
+        table=table_name,
+        schema=schema_name,
+        initial_tracking_version=tracking_version,
+    )
+
+    # Run the pipeline for incremental load
+    print(pipeline.run(incremental_resource))  # noqa
+
+
+def single_table_incremental_load(connection_url: str, schema_name: str, table_name: str) -> None:
+    """Continues loading incrementally"""
+    # Make sure you use the same pipeline and dataset names in order to continue incremental
+    # loading.
+    pipeline = dlt.pipeline(
+        pipeline_name=f"{schema_name}_{table_name}_sync",
+        destination="duckdb",
+        dataset_name=schema_name,
+    )
+
+    engine = create_engine(connection_url, isolation_level="SNAPSHOT")
+    # We do not need to pass the tracking version anymore
+    incremental_resource = create_change_tracking_table(
+        credentials=engine,
+        table=table_name,
+        schema=schema_name,
+    )
+    print(pipeline.run(incremental_resource))  # noqa
+
+
+if __name__ == "__main__":
+    # Change Tracking already enabled here
+    test_db = "my_database83ed099d2d98a3ccfa4beae006eea44c"
+    # A test run with a local mssql instance
+    connection_url = (
+        f"mssql+pyodbc://sa:Strong%21Passw0rd@localhost:1433/{test_db}"
+        "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
+    )
+    single_table_initial_load(
+        connection_url,
+        "my_dlt_source",
+        "app_user",
+    )
+    single_table_incremental_load(
+        connection_url,
+        "my_dlt_source",
+        "app_user",
+    )
+```
+
+</details>
+
+## Understanding the change tracking query
+
+The incremental loading process uses a SQL query that joins the CHANGETABLE function with the source table to fetch the latest changes. Here’s a simplified version of the query:
+
+```sql
+SELECT
+    [Columns],
+    ct.SYS_CHANGE_VERSION AS _dlt_sys_change_version,
+    CASE WHEN ct.SYS_CHANGE_OPERATION = 'D' THEN 'DELETE' ELSE NULL END AS _dlt_deleted
+FROM
+    CHANGETABLE(CHANGES [YourSchemaName].[YourTableName], @last_version) AS ct
+    LEFT JOIN [YourSchemaName].[YourTableName] AS t
+        ON ct.[PrimaryKey] = t.[PrimaryKey]
+WHERE
+    ct.SYS_CHANGE_VERSION > @last_version
+ORDER BY
+    ct.SYS_CHANGE_VERSION ASC
+```
+
+- *CHANGETABLE*: Retrieves changes for the specified table since the last tracking version.
+- **Join with source table**: The join retrieves the current data for the changed rows.
+- *SYS_CHANGE_VERSION*: Used to track and order changes.
+- *_dlt_deleted*: Indicates if a row was deleted.
+
+:::note
+ Since the query joins with the production table, there may be implications for locking and performance. Ensure your database can handle the additional load, and consider isolation levels if necessary.
+:::
+
+## Full refresh
+
+:::warning
+Doing a full refresh will drop the destination table, i.e., delete data from the destination, and reset the state holding the tracking version.
+:::
+You can trigger a full refresh by performing a full load again and passing `drop_resources` to the run method (as described in the [pipeline configuration](../../general-usage/pipeline#selectively-drop-tables-and-resource-state-with-drop_resources)):
+
+```py notype
+pipeline.run(initial_resource, refresh="drop_resources")
+```
+
+## Handling deletes
+
+There is an optional parameter that can be passed to `create_change_tracking_table` for configuring how to handle deletes:
+
+```py
+from sqlalchemy import create_engine, Engine
+from dlthub.sources.mssql import create_change_tracking_table
+
+engine: Engine = create_engine("...")
+incremental_resource = create_change_tracking_table(
+    credentials=engine,
+    table=table_name,
+    schema=schema_name,
+    hard_delete=True,
+)
+pipeline.run(incremental_resource)
+```
+
+### Hard deletes
+
+By default, `hard_delete` is set to `True`, meaning hard deletes are performed, i.e., rows deleted in the source will be permanently removed from the destination.
+
+Replicated data allows for NULLs for not nullable columns when a record is deleted. To avoid additional tables that hold deleted rows and additional merge steps, dlt emits placeholder values that are stored in the staging dataset only.
+
+### Soft deletes
+
+If `hard_delete` is set to `False`, soft deletes are performed: rows deleted in the source are kept in the destination and marked with `_dlt_deleted = 'D'` instead of being physically removed.
+
+:::warning
+Soft delete keeps the **row**, not its values. Change Tracking (unlike CDC) stores no before-image of a deleted row, so a delete event carries only the primary key. The soft-deleted row therefore lands as **primary key + `_dlt_deleted = 'D'` with every other column set to NULL**, and because the write disposition is `merge`, this overwrites the values previously loaded for that row.
+
+If you need to retain a deleted row's last-known values, do not rely on soft delete — keep history in a separate table (e.g. via a snapshot/append pattern) before the delete is processed.
+:::
+
+Because deleted rows carry NULLs, the destination schema must accept NULLs for the replicated columns. Pass the `remove_nullability_adapter` adapter to the `sql_table` resource:
+
+```py
+from dlthub.sources.mssql import remove_nullability_adapter
+from dlt.sources.sql_database import sql_table
+
+table = sql_table(
+    table_adapter_callback=remove_nullability_adapter,
+)
+```
+
+
+===== FILE: docs/website/docs/hub/ingestion/playground.md =====
+
+---
+title: "Destination: Playground"
+description: Zero-config Playground destination for non-production example pipelines on the dltHub platform
+keywords: [playground, destination, delta, testing, experiments]
+---
+# Playground
+
+:::note
+Use of the dltHub platform and toolkits is subject to a commercial dltHub License.
+:::
+
+The **Playground** is a zero-config destination managed by the dltHub platform. When you run pipelines on the platform, you can load data with `destination="playground"` without configuring any credentials or storage of your own. The platform provisions isolated storage for each [workspace](../getting-started/installation.md#what-is-a-dlthub-workspace) and writes your data as [Delta tables](delta.md) to a managed S3 bucket.
+
+It is meant for quick testing, demos, and a fast first run on the platform.
+
+:::warning
+The Playground is intended for demos and a quick start, not for production. For production workloads, use a destination you own and control, such as [Delta](delta.md), [Iceberg](iceberg.md), [Snowflake Plus](snowflake-plus.md), or any of the [dlt destinations](../../dlt-ecosystem/destinations/index.md).
+:::
+
+## Why use it
+
+When you run a pipeline on the platform with a local-style destination such as `duckdb`, the data is written to the dltHub's ephemeral storage, which is erased after the run, so it can't be explored afterwards. The Playground instead **persists** your data in managed storage, so you can query it from the platform UI once the run finishes.
+
+Use it for:
+
+* A quick first run on the dltHub platform without setting up a bucket or credentials.
+* Running examples and demos.
+
+:::warning
+Do not load sensitive or confidential data into the Playground.
+:::
+
+## Prerequisites
+
+* A dltHub [workspace](../getting-started/installation.md). If you don't have one yet, scaffold it with `uvx dlthub-start@latest` (see [Deploy your first pipeline](../getting-started/onboarding.md)).
+* You must be logged in and connected to a workspace:
+
+  ```sh
+  uv run dlthub login
+  uv run dlthub workspace connect <workspace-name>
+  ```
+
+* The `deltalake` package must be installed in your project. The Playground writes Delta tables, and the runtime image installs your project dependencies, so add it to your `pyproject.toml`:
+
+  ```sh
+  uv add deltalake
+  ```
+
+## Usage
+
+Set the destination to `playground` in your pipeline and declare it as a job so the platform can deploy and run it. No `bucket_url`, credentials, or other configuration is required.
+
+Decorate your pipeline function with `@run.pipeline` in `data_pipeline.py`:
+
+```py
+import dlt
+from dlt.hub import run
+
+@run.pipeline("pipeline")
+def load_data():
+    pipeline = dlt.pipeline(
+        pipeline_name="pipeline",
+        destination="playground",
+        dataset_name="data",
+    )
+    pipeline.run([{"id": 1}], table_name="items")
+```
+
+Declare the job in `__deployment__.py` so the platform can discover it:
+
+```py
+from data_pipeline import load_data
+
+__all__ = ["load_data"]
+```
+
+Deploy the workspace, then run the job on the platform:
+
+```sh
+uv run dlthub deploy
+uv run dlthub pipeline run pipeline -f
+```
+
+See [deployments](../pipeline-operations/deployments.md) for more on the `__deployment__.py` manifest, `@run.pipeline`, and deploying jobs on the platform.
+
+## Working with the data
+
+Once a run completes, open the platform dashboard to explore the persisted data. It includes a SQL query editor against your dataset:
+
+```sh
+uv run dlthub dashboard
+```
+
+:::note
+The platform dashboard is itself a deployed job, provisioned when you run `dlthub deploy` with a `__deployment__.py` manifest. The local dashboard (`uv run dlthub local show`) does not require a manifest.
+:::
+
+## How it works
+
+The Playground behaves like the [Delta destination](delta.md): it is a `filesystem` destination that writes Delta tables to a dltHub-managed S3 bucket. Each workspace gets its own isolated prefix (`s3://.../<org_id>/<workspace_id>/...`), so data from different workspaces never mixes. Storage and write dispositions follow the behavior of the [Delta destination](delta.md).
+
+dlt is destination-agnostic, so anything you prototype against the Playground can later be moved to any destination you own with minimal changes. You swap the destination and provide your own storage and credentials.
+
+
+===== FILE: docs/website/docs/hub/ingestion/snowflake-plus.md =====
+
+---
+title: "Destination: Snowflake+ Iceberg / Open Catalog"
+description: Snowflake destination with Iceberg and Open Catalog
+keywords: [Snowflake, Iceberg, destination]
+---
+# Snowflake+ Iceberg / Open Catalog
+
+:::note
+Use of the dltHub platform and toolkits is subject to a commercial dltHub License.
+:::
+
+Snowflake+ is a drop-in replacement for [OSS Snowflake destination](../../dlt-ecosystem/destinations/snowflake.md) that adds [Apache Iceberg tables](https://docs.snowflake.com/en/user-guide/tables-iceberg) creation and related features.
+
+It uses Snowflake to manage Iceberg data - tables are created and data is copied via Snowflake SQL and automatically visible in Snowflake (HORIZON)
+catalog as other (native) tables. On top of that, Snowflake provides table maintenance (like compacting, deleting snapshot etc.).
+
+**Snowflake Open Catalog** (Polaris) is [fully supported](#syncing-snowflake-managed-iceberg-tables-to-snowflake-open-catalog) via `CATALOG SYNC` option. Both new data and all schema migrations performed by `dlt` are visible in it without any additional code or setup.
+
+All [data access](../../general-usage/dataset-access/dataset.md) methods (pandas, arrow, Ibis, SQL etc.) that `dlt` supports via `pipeline.dataset()` are available.
+
+:::tip
+You can [link](https://docs.snowflake.com/LIMITEDACCESS/iceberg/tables-iceberg-externally-managed-writes#label-tables-iceberg-external-writes-create-cld) any catalog (Lakekeeper, Glue, S3Tables or Open Catalog/Polaris) used by `dlt` [Iceberg](iceberg.md) destination to a Snowflake database.
+:::
+
+This destination is available starting from dltHub version 0.9.0. It fully supports all the functionality of the standard Snowflake destination, plus:
+
+1. The ability to create Iceberg tables in Snowflake by configuring `iceberg_mode` in your `config.toml` file.
+2. Additional configuration for Iceberg tables in Snowflake via:
+

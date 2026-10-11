@@ -1,0 +1,4282 @@
+When passing these hints to a resource, keep in mind that:
+
+#### 1. Direct `primary_key` and `merge_key` hints override column-level hints when both are set
+
+In the example below, the `primary_key="col_1"` argument takes precedence over any `primary_key` hints defined in `columns`. As a result, only `col_1` will be treated as the primary key.
+
+```py execute
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline",
+    destination="duckdb",
+    dataset_name="my_data",
+)
+
+@dlt.resource(
+    name="my_table",
+    primary_key="col_1",
+    columns={"col_2": {"primary_key": True}},
+)
+def my_resource():
+    yield {"col_1": 1, "col_2": 2}
+
+pipeline.run(my_resource)
+```
+
+Note that direct `primary_key` and `merge_key` hints are always authoritative within a single resource definition, even if they are set to an empty value (e.g. `""` or `[]`). In that case, the empty direct hint forces any column-level key hints to be ignored. In the following example, `col_2` will not receive a primary key hint.
+
+```py execute
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline",
+    destination="duckdb",
+    dataset_name="my_data_2",
+)
+
+@dlt.resource(
+    name="my_table",
+    primary_key="",
+    columns={"col_2": {"primary_key": True}},
+)
+def my_resource():
+    yield {"col_1": 1, "col_2": 2}
+
+pipeline.run(my_resource)
+
+assert not pipeline.default_schema.tables["my_table"]["columns"]["col_1"].get(
+    "primary_key"
+)
+assert not pipeline.default_schema.tables["my_table"]["columns"]["col_2"].get(
+    "primary_key"
+)
+```
+
+The same precedence rule applies to `merge_key`. It also applies when direct key and column-level hints are both provided via `apply_hints`. In the example below, only `col_1` will be treated as the merge key.
+
+```py execute
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline",
+    destination="duckdb",
+    dataset_name="my_data_3",
+)
+
+@dlt.resource(
+    name="my_table",
+)
+def my_resource():
+    yield {"col_1": 1, "col_2": 2}
+
+my_resource.apply_hints(merge_key="col_1", columns={"col_2": {"merge_key": True}})
+
+pipeline.run(my_resource)
+
+assert (
+    pipeline.default_schema.tables["my_table"]["columns"]["col_1"].get("merge_key")
+    is True
+)
+assert not pipeline.default_schema.tables["my_table"]["columns"]["col_2"].get(
+    "merge_key"
+)
+```
+
+#### 2. Redefining hints on an already extracted resource replaces previous configuration
+
+If you redefine a compound hint for a resource that has already been extracted, the new hint configuration overwrites the previous one. This means that old and new compound hints are not merged.
+
+In the example below, the resource is first defined with `partition` on `col_2`. After the first run, we update the resource hints and set `partition` on `col_1` instead. On the next run, only `col_1` will remain partitioned, and `col_2` will no longer have the `partition` property.
+
+```py execute
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline1",
+    destination="duckdb",
+    dataset_name="my_data",
+)
+
+@dlt.resource(
+    name="my_table",
+    columns={"col_2": {"partition": True}},
+)
+def my_resource():
+    yield {"col_1": 1, "col_2": 2}
+
+pipeline.run(my_resource)
+
+@dlt.resource(  # type: ignore[no-redef]
+    name="my_table",
+    columns={"col_1": {"partition": True}},
+)
+def my_resource():
+    yield {"col_1": 1, "col_2": 2}
+
+pipeline.run(my_resource)
+
+# only col_1 has the partition property, col_2 lost it on redefinition
+assert (
+    pipeline.default_schema.tables["my_table"]["columns"]["col_1"].get("partition")
+    is True
+)
+assert not pipeline.default_schema.tables["my_table"]["columns"]["col_2"].get(
+    "partition"
+)
+```
+
+:::warning
+Note that direct `primary_key` and `merge_key` hints automatically set `nullable=False` for the respective columns, unless you explicitly set `nullable=True`. If you later redefine the key hints, columns that were previously part of the key will keep their existing nullability and will not be reset to `nullable=True` automatically.
+:::
+
+Be aware that redefining `primary_key` or `merge_key` to an empty value on an extracted resource does not clear any key properties in the schema. In the example below, `col_1` will remain the primary key.
+
+```py execute
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline1",
+    destination="duckdb",
+    dataset_name="my_data_2",
+)
+
+@dlt.resource(
+    name="my_table",
+    primary_key="col_1",
+)
+def my_resource():
+    yield {"col_1": 1, "col_2": 2}
+
+pipeline.run(my_resource)
+
+@dlt.resource(  # type: ignore[no-redef]
+    name="my_table",
+    primary_key=[],
+)
+def my_resource():
+    yield {"col_1": 1, "col_2": 2}
+
+pipeline.run(my_resource)
+
+# col_1 remains the primary key, the empty redefinition is ignored
+assert (
+    pipeline.default_schema.tables["my_table"]["columns"]["col_1"].get(
+        "primary_key"
+    )
+    is True
+)
+```
+
+#### 3. Column-level compound hints via `apply_hints` are merged
+
+When you call `apply_hints` with column-level compound hints on a resource that has already been extracted, the new column hints are merged into the existing schema. In the example below, the first run defines `col_2` as a primary key. After the run, we add a `primary_key` hint for `col_1` via the `columns` argument of `apply_hints`. On the next run, both `col_1` and `col_2` are treated as primary keys.
+
+```py execute
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline1",
+    destination="duckdb",
+    dataset_name="my_data_3",
+)
+
+@dlt.resource(
+    name="my_table",
+    columns={"col_2": {"primary_key": True}},
+)
+def my_resource():
+    yield {"col_1": 1, "col_2": 2}
+
+pipeline.run(my_resource)
+
+my_resource.apply_hints(columns={"col_1": {"primary_key": True}})
+
+pipeline.run(my_resource)
+
+# both col_1 and col_2 are now primary keys, apply_hints merged them
+assert (
+    pipeline.default_schema.tables["my_table"]["columns"]["col_1"].get(
+        "primary_key"
+    )
+    is True
+)
+assert (
+    pipeline.default_schema.tables["my_table"]["columns"]["col_2"].get(
+        "primary_key"
+    )
+    is True
+)
+```
+
+:::note
+This merging behavior applies to all column-level hints passed via `apply_hints`, not only to
+compound hints.
+:::
+
+#### 4. Direct key hints via `apply_hints` replace existing key properties
+
+Unlike column-level hints, direct key hints provided through `apply_hints` are treated as authoritative. As a result, they replace any existing key configuration instead of being merged. In the example below, setting `primary_key="col_1"` via `apply_hints` replaces the previously defined primary key on `col_2`.
+
+```py execute
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline1",
+    destination="duckdb",
+    dataset_name="my_data_4",
+)
+
+@dlt.resource(
+    name="my_table",
+    columns={"col_2": {"primary_key": True}},
+)
+def my_resource():
+    yield {"col_1": 1, "col_2": 2}
+
+pipeline.run(my_resource)
+
+my_resource.apply_hints(primary_key="col_1")
+
+pipeline.run(my_resource)
+
+# the direct key hint replaces col_2's primary key instead of merging with it
+assert (
+    pipeline.default_schema.tables["my_table"]["columns"]["col_1"].get(
+        "primary_key"
+    )
+    is True
+)
+assert not pipeline.default_schema.tables["my_table"]["columns"]["col_2"].get(
+    "primary_key"
+)
+```
+
+## Data types
+
+| dlt Data Type | Source Value Example                                | Precision and Scale                                     |
+| ------------- | --------------------------------------------------- | ------------------------------------------------------- |
+| text          | `'hello world'`                                     | Supports precision, typically mapping to **VARCHAR(N)** |
+| double        | `45.678`                                            |                                                         |
+| bool          | `True`                                              |                                                         |
+| timestamp     | `'2023-07-26T14:45:00Z'`, `datetime.datetime.now()` | Supports precision expressed as parts of a second       |
+| date          | `datetime.date(2023, 7, 26)`                        |                                                         |
+| time          | `'14:01:02'`, `datetime.time(14, 1, 2)`             | Supports precision - see **timestamp**                  |
+| bigint        | `9876543210`                                        | Supports precision as number of bits                    |
+| binary        | `b'\x00\x01\x02\x03'`                               | Supports precision, like **text**                       |
+| json          | `[4, 5, 6]`, `{'a': 1}`                             |                                                         |
+| decimal       | `Decimal('4.56')`                                   | Supports precision and scale                            |
+| wei           | `2**56`                                             |                                                         |
+
+`wei` is a datatype that tries to best represent native Ethereum 256-bit integers and fixed-point decimals. It works correctly on Postgres and BigQuery. All other destinations have insufficient precision.
+
+`json` data type tells `dlt` to load that element as JSON or string and not attempt to flatten or create a nested table out of it. Note that structured types like arrays or maps are not supported by `dlt` at this point.
+
+`time` data type is saved in the destination **without timezone info**; if timezone is included, time is converted to UTC and then to naive.
+
+### Handling of timestamp and time zones
+
+By default, `dlt` normalizes timestamps (tz-aware and naive) into time zone aware types in UTC timezone. Since `1.16.0`, it fully honors the `timezone` boolean hint if set
+explicitly on a column or by a source/resource. Normalizers do not infer this hint from data. The same rules apply for tabular data (arrow/pandas/polars) and Python objects:
+
+| input timestamp | `timezone` hint | normalized timestamp  |
+| --------------- | --------------- | --------------------- |
+| naive           | `None`, `True`  | tz-aware in UTC       |
+| naive           | `False`         | naive (pass-through)  |
+| tz-aware        | `None`, `True`  | tz-aware in UTC       |
+| tz-aware        | `False`         | to UTC and then naive |
+|                 |                 |                       |
+
+The hint applies to every value of the column, including values that already arrive as `datetime` objects and need no type coercion.
+
+:::warning
+naive timestamps are **read as UTC**, system timezone settings are ignored by `dlt`
+:::
+
+`dlt` stores values in UTC by default. `dlt` can also store them in another timezone, called the [context timezone](#context-timezone). That timezone then takes UTC's place in the table above.
+
+Ultimately, the destination will interpret the timestamp values. Some destinations:
+
+- do not support naive timestamps (i.e. BigQuery) and will interpret them as naive UTC by attaching UTC timezone
+- do not support tz-aware timestamps (i.e. Dremio, Athena) and will strip timezones from timestamps being loaded
+- do not store timezone at all and all timestamps are converted to UTC
+- store timezone as column level property and internally convert timestamps to UTC (i.e. postgres)
+- store timezone and offset (i.e. MSSQL). However, we could not find any destination that can read back the original timezones
+
+`dlt` sets sessions to UTC timezone to minimize chances of erroneous conversion.
+
+### Handling dates
+
+* `date` carries no timezone. `dlt` passes dates to the destination as calendar days.
+* `dlt` takes the day of a **timestamp** in UTC, or in the [context timezone](#context-timezone) when you set one. `dlt` shifts a tz-aware timestamp to that timezone first, and reads a naive timestamp in it. Two timestamps that are the same instant always give the same day.
+* `dlt` converts a `date` into a **timestamp** as midnight without a timezone. The timestamp rules above then apply, so a `date` becomes midnight UTC.
+* The same rules apply to tabular data (arrow/pandas/polars), to Python objects, and to [incremental cursors](incremental/cursor.md) on `date` columns.
+* A SQL cast from a timestamp to `date` is not portable. `duckdb` and `postgres` use the session timezone, `snowflake` the offset in the value, `bigquery` always UTC. An explicit `AT TIME ZONE` in the query removes that difference. `dlt` sets its own sessions to UTC.
+
+| input timestamp             | coerced `date` |
+| --------------------------- | -------------- |
+| `2026-07-25T00:00:00+02:00` | `2026-07-24`   |
+| `2026-07-25T00:00:00`       | `2026-07-25`   |
+|                             |                |
+
+### Context timezone
+
+The two sections above describe UTC because UTC is the default. `dlt` can store values in another
+timezone. This timezone is the **context timezone**. Every rule above then holds with the context
+timezone in place of UTC.
+
+`dlt` uses one context timezone for each run. The name must be a canonical IANA name, for example
+`Europe/Berlin`. `dlt` rejects a fixed offset such as `+02:00`.
+
+Set the context timezone for a block of code with `TimezoneContext`:
+
+```py
+from dlt.common.configuration.container import Container
+from dlt.common.configuration.specs import TimezoneContext
+
+with Container().injectable_context(TimezoneContext("Europe/Berlin")):
+    pipeline.run(my_source)
+```
+
+`dlt.current.timezone()` returns the context timezone in force, and never `None`.
+
+Reading the same four cases as the table above, under a `Europe/Berlin` context timezone:
+
+| input timestamp | `timezone` hint | stored value                                                                     |
+| --------------- | --------------- | -------------------------------------------------------------------------------- |
+| naive           | `None`, `True`  | read as Berlin, so the instant moves                                             |
+| naive           | `False`         | untouched, nothing to convert                                                    |
+| tz-aware        | `None`, `True`  | `Europe/Berlin` in load package, but destination can change the storage timezone |
+| tz-aware        | `False`         | converted to Berlin, then naive                                                  |
+|                 |                 |                                                                                  |
+
+:::note
+This is not the destination's **session timezone**, which decides how a destination renders stored
+timestamps when you read them back. The two are set independently - see the `Session timezone`
+section on your destination's page.
+:::
+
+### Handling precision
+
+The precision and scale are interpreted by the particular destination and are validated when a column is created. Destinations that do not support precision for a given data type will ignore it.
+
+The precision for **bigint** is mapped to available integer types, i.e., TINYINT, INT, BIGINT. The default is 64 bits (8 bytes) precision (BIGINT).
+
+Selected destinations honor precision hint on **timestamp**. Precision is a numeric value in range of 0 (seconds) to 9 (nanoseconds) and sets the fractional
+number of seconds stored in a column. The default value is 6 (microseconds) which is Python `datetime` precision. `postgres`, `duckdb`, `snowflake`, `synapse` and `mssql` allow setting precision. Additionally, `duckdb` and `filesystem` (via parquet) allow for nanosecond precision if:
+
+* you configure [parquet version](../dlt-ecosystem/file-formats.md#writer-settings) to **2.6**
+* you yield tabular data (arrow tables/pandas/polars). `dlt` coerces all Python datetime objects into `pendulum` with microsecond precision.
+
+### Handling nulls
+
+In general, destinations are responsible for NULL enforcement. `dlt` does not verify nullability of data in arrow tables and Python objects. Note that:
+
+* there's an exception to that rule if a Python object (`dict`) contains explicit `None` for a non-nullable key. This check will be eliminated. Note that if a value
+for a key is not present at all, nullability check is not done
+* nullability is checked by Arrow when saving parquet files. This is a new behavior and `dlt` normalizes it for older arrow versions.
+
+### Structured types
+
+`dlt` has experimental support for structured types that currently piggyback on `json` data type and may be set only by yielding arrow tables. `dlt` does not
+evolve nested types and will not migrate destination schemas to match. Nested types are enabled for `filesystem`, `iceberg`, `delta` and `lancedb` destinations.
+
+:::info
+You can materialize a schema in the destination without loading data.
+See [Materialize schema without loading data](resource.md#materialize-schema-without-loading-data).
+:::
+
+## Table references
+
+`dlt` tables refer to other tables. It supports two types of such references:
+
+1. **Nested reference** created automatically when nested data (i.e., a `json` document containing a nested list) is converted into relational form. These references use specialized column and table hints and are used, for example, when [merging data](merge-loading.md).
+2. **Table references** are optional, user-defined annotations that are not verified and enforced but may be used by downstream tools, for example, to generate automatic tests or models for the loaded data.
+
+### Nested references: root and nested tables
+
+When `dlt` normalizes nested data into a relational schema, it automatically creates [**root** and **nested** tables](destination-tables.md) and links them using **nested references**.
+
+1. All tables receive a column with the `row_key` hint (named `_dlt_id` by default) to uniquely identify each row of data.
+2. Nested tables receive a `parent` table hint with the name of the parent table. The root table does not have a `parent` hint defined.
+3. Nested tables receive a column with the `parent_key` hint (named `_dlt_parent_id` by default) that refers to the `row_key` of the `parent` table.
+
+`parent` + `row_key` + `parent_key` form a **nested reference**: from the nested table to the `parent` table and are extensively used when loading data. Both `replace` and `merge` write dispositions.
+
+`row_key` is created as follows:
+
+1. A random string on **root** tables, except for [`upsert`](merge-loading.md#upsert-strategy), [`insert-only`](merge-loading.md#insert-only-strategy), [`cdc`](merge-loading.md#cdc-strategy), and
+[`scd2`](merge-loading.md#scd2-strategy) merge strategies, where it is a deterministic hash of the `primary_key` (or whole row, so-called `content_hash`, if PK is not defined).
+2. A deterministic hash of `parent_key`, `parent` table name, and position in the list (`_dlt_list_idx`)
+for **nested** tables.
+
+You are able to bring your own `row_key` by adding a `_dlt_id` column/field to your data (both root and nested). All data types with an equal operator are supported.
+
+`merge` write disposition requires an additional nested reference that goes from **nested** to **root** table, skipping all parent tables in between. This reference is created by [adding a column with a hint](merge-loading.md#forcing-root-key-propagation) `root_key` (named `_dlt_root_id` by default) to nested tables.
+
+### Generate custom linking for nested tables
+
+Using `nested_hints` in `@dlt.resource` you can model your own relations between root and nested tables. You do that by specifying `primary_key` or `merge_key` on
+a nested table.
+
+```py execute
+import dlt
+from dlt.common import Decimal
+
+@dlt.resource(
+    primary_key="id",
+    write_disposition="merge",
+    nested_hints={
+        "purchases": dlt.mark.make_nested_hints(
+            # column hint is optional - makes sure that customer_id is a first column in the table
+            columns=[{"name": "customer_id", "data_type": "bigint"}],
+            primary_key=["customer_id", "id"],
+            write_disposition="merge",
+            references=[
+                {
+                    "referenced_table": "customers",
+                    "columns": ["customer_id"],
+                    "referenced_columns": ["id"],
+                }
+            ],
+        )
+    },
+)
+def customers():
+    """Load customer data from a simple python list."""
+    yield [
+        {
+            "id": 1,
+            "name": "simon",
+            "city": "berlin",
+            "purchases": [{"id": 1, "name": "apple", "price": Decimal("1.50")}],
+        },
+        {
+            "id": 2,
+            "name": "violet",
+            "city": "london",
+            "purchases": [{"id": 1, "name": "banana", "price": Decimal("1.70")}],
+        },
+        {
+            "id": 3,
+            "name": "tammo",
+            "city": "new york",
+            "purchases": [{"id": 1, "name": "pear", "price": Decimal("2.50")}],
+        },
+    ]
+
+def _pushdown_customer_id(row):
+    id_ = row["id"]
+    for purchase in row["purchases"]:
+        purchase["customer_id"] = id_
+    return row
+
+p = dlt.pipeline(
+    pipeline_name="test_nested_hints_primary_key",
+    destination="duckdb",
+    dataset_name="local",
+)
+p.run(customers().add_map(_pushdown_customer_id))
+# load same data again to prove that merge works
+p.run(customers().add_map(_pushdown_customer_id))
+# check counts
+row_count = p.dataset().row_counts().fetchall()
+print(dict(row_count))
+#> {'customers': 3, 'customers__purchases': 3}
+```
+
+In the above example we effectively convert `customers__purchases` table into a top level table that is linked to `customers` table `id` column with `customer_id` foreign key.
+
+1. we declare compound primary key on `purchases` on (customer_id, id) columns
+2. we add a mapping function that will push the customer `id` to `purchases` as `customer_id`
+3. we declare table reference from `purchases` to `customers` (this is optional)
+4. we set `merge` write disposition on `purchases`.
+
+Here's resulting schema. Note that regular linking for nested tables was not generated. Instead `customer__purchases` table has compound
+primary key, write disposition, load id but still receives data from `purchases` nested list.
+
+```yaml
+tables:
+  customers:
+    columns:
+      id:
+        nullable: false
+        primary_key: true
+        data_type: bigint
+      name:
+        data_type: text
+        nullable: true
+      city:
+        data_type: text
+        nullable: true
+      _dlt_id:
+        data_type: text
+        nullable: false
+        unique: true
+        row_key: true
+      _dlt_load_id:
+        data_type: text
+        nullable: false
+    write_disposition: merge
+    resource: customers
+  customers__purchases:
+    columns:
+      customer_id:
+        data_type: bigint
+        primary_key: true
+        nullable: false
+      id:
+        nullable: false
+        primary_key: true
+        data_type: bigint
+      name:
+        data_type: text
+        nullable: true
+      price:
+        data_type: decimal
+        nullable: true
+      _dlt_root_id:
+        data_type: text
+        nullable: false
+        root_key: true
+      _dlt_id:
+        data_type: text
+        nullable: false
+        unique: true
+        row_key: true
+      _dlt_load_id:
+        data_type: text
+        nullable: false
+    references:
+    - referenced_table: customers
+      columns:
+      - customer_id
+      referenced_columns:
+      - id
+    write_disposition: merge
+    resource: customers
+```
+
+### Table reference hints
+
+You can annotate tables with table references. `@dlt.resource` implements `references` argument that declares table references. Those references
+are not enforced by `dlt`. See [example](#generate-custom-linking-for-nested-tables) above.
+
+## Schema settings
+
+The `settings` section of the schema file lets you define various global rules that impact how tables
+and columns are inferred from data. For example, you can assign a **primary_key** hint to all columns named `id` or force a **timestamp** data type on all columns containing `timestamp` with the use of a regex pattern.
+
+### Data type autodetectors
+
+You can define a set of functions that will be used to infer the data type of a column from a
+value. The functions are run from top to bottom on the lists. Look in `detections.py` to see what is
+available. The **iso_timestamp** detector that looks for ISO 8601 strings and converts them to **timestamp**
+is enabled by default.
+
+```yaml
+settings:
+  detections:
+    - timestamp
+    - iso_timestamp
+    - iso_date
+    - large_integer
+    - hexbytes_to_text
+    - wei_to_double
+```
+
+Alternatively, you can add and remove detections from code:
+
+```py
+  source = data_source()
+  # remove iso time detector
+  source.schema.remove_type_detection("iso_timestamp")
+  # convert UNIX timestamp (float, within a year from NOW) into timestamp
+  source.schema.add_type_detection("timestamp")
+```
+
+Above, we modify a schema that comes with a source to detect UNIX timestamps with the **timestamp** detector.
+
+### Column hint rules
+
+You can define global rules that will apply hints to newly inferred columns. These rules apply to normalized column names. You can use column names directly or with regular expressions. `dlt` matches the column names **after they have been normalized with naming conventions**.
+
+By default, the schema adopts hint rules from the json(relational) normalizer to support correct hinting of columns added by the normalizer:
+
+```yaml
+settings:
+  default_hints:
+    row_key:
+      - _dlt_id
+    parent_key:
+      - _dlt_parent_id
+    not_null:
+      - _dlt_id
+      - _dlt_root_id
+      - _dlt_parent_id
+      - _dlt_list_idx
+      - _dlt_load_id
+    unique:
+      - _dlt_id
+    root_key:
+      - _dlt_root_id
+```
+
+Above, we require an exact column name match for a hint to apply. You can also use a regular expression (which we call `SimpleRegex`) as follows:
+
+```yaml
+settings:
+    partition:
+      - re:_timestamp$
+```
+
+Above, we add a `partition` hint to all columns ending with `_timestamp`. You can do the same thing in the code:
+
+```py
+  from dlt.common.schema.typing import TSimpleRegex
+  
+  source = data_source()
+  # this will update existing hints with the hints passed
+  source.schema.merge_hints({"partition": [TSimpleRegex("re:_timestamp$")]})
+```
+
+### Preferred data types
+
+You can define rules that will set the data type for newly created columns. Put the rules under the `preferred_types` key of `settings`. On the left side, there's a rule on a column name; on the right side is the data type. You can use column names directly or with regular expressions. `dlt` matches the column names **after they have been normalized with naming conventions**.
+
+Example:
+
+```yaml
+settings:
+  preferred_types:
+    re:timestamp: timestamp
+    inserted_at: timestamp
+    created_at: timestamp
+    updated_at: timestamp
+```
+
+Above, we prefer the `timestamp` data type for all columns containing the **timestamp** substring and define a few exact matches, i.e., **created_at**.
+Here's the same thing in code:
+
+```py
+from dlt.common.schema.typing import TSimpleRegex
+
+source = data_source()
+source.schema.update_preferred_types(
+{
+    TSimpleRegex("re:timestamp"): "timestamp",
+    TSimpleRegex("inserted_at"): "timestamp",
+    TSimpleRegex("created_at"): "timestamp",
+    TSimpleRegex("updated_at"): "timestamp",
+}
+)
+```
+
+### Applying data types directly with `@dlt.resource` and `apply_hints`
+
+`dlt` offers the flexibility to directly apply data types and hints in your code, bypassing the need for importing and adjusting schemas. This approach is ideal for rapid prototyping and handling data sources with dynamic schema requirements.
+
+### Direct specification in `@dlt.resource`
+
+Directly define data types and their properties, such as nullability, within the `@dlt.resource` decorator. This eliminates the dependency on external schema files. For example:
+
+```py
+
+@dlt.resource(name='my_table', columns={"my_column": {"data_type": "bool", "nullable": True}})
+def my_resource():
+    for i in range(10):
+        yield {'my_column': i % 2 == 0}
+```
+
+This code snippet sets up a nullable boolean column named `my_column` directly in the decorator.
+
+#### Using `apply_hints`
+
+When dealing with dynamically generated resources or needing to programmatically set hints, `apply_hints` is your tool. It's especially useful for applying hints across various collections or tables at once.
+
+For example, to apply a `json` data type across all collections from a MongoDB source:
+
+```py
+all_collections = ["collection1", "collection2", "collection3"]  # replace with your actual collection names
+source_data = mongodb().with_resources(*all_collections)  # ty: ignore
+
+for col in all_collections:
+    source_data.resources[col].apply_hints(columns={"column_name": {"data_type": "json"}})
+
+pipeline = dlt.pipeline(
+    pipeline_name="mongodb_pipeline",
+    destination="duckdb",
+    dataset_name="mongodb_data"
+)
+load_info = pipeline.run(source_data)
+```
+
+This example iterates through MongoDB collections, applying the **json** [data type](schema#data-types) to a specified column, and then processes the data with `pipeline.run`.
+
+## View and print the schema
+
+To view and print the default schema in a clear YAML format, use the command:
+
+```py
+pipeline.default_schema.to_pretty_yaml()
+```
+
+This can be used in a pipeline as:
+
+```py
+# Create a pipeline
+pipeline = dlt.pipeline(
+               pipeline_name="chess_pipeline",
+               destination='duckdb',
+               dataset_name="games_data")
+
+# Run the pipeline
+load_info = pipeline.run(source)
+
+# Print the default schema in a pretty YAML format
+print(pipeline.default_schema.to_pretty_yaml())
+```
+
+This will display a structured YAML representation of your schema, showing details like tables, columns, data types, and metadata, including version, version_hash, and engine_version.
+
+## Export and import schema files
+
+Please follow the guide on [how to adjust a schema](../walkthroughs/adjust-a-schema.md) to export and import YAML
+schema files in your pipeline.
+
+## Attaching schemas to sources
+
+We recommend not creating schemas explicitly. Instead, users should provide a few global schema
+settings and then let the table and column schemas be generated from the resource hints and the
+data itself.
+
+The `dlt.source` decorator accepts a schema instance that you can create yourself and modify in
+whatever way you wish. The decorator also supports a few typical use cases:
+
+### Schema created implicitly by decorator
+
+If no schema instance is passed, the decorator creates a schema with the name set to the source name and
+all the settings to default.
+
+### Automatically load schema file stored with source python module
+
+If no schema instance is passed, and a file with a name `{source name}.schema.yaml` exists in the
+same folder as the module with the decorated function, it will be automatically loaded and used as
+the schema.
+
+This should make it easier to bundle a fully specified (or pre-configured) schema with a source.
+
+### Schema is modified in the source function body
+
+What if you can configure your schema or add some tables only inside your schema function, when, for example,
+you have the source credentials and user settings available? You could, for example, add detailed
+schemas of all the database tables when someone requests table data to be loaded. This information
+is available only at the moment the source function is called.
+
+Similarly to the `source_state()` and `resource_state()`, the source and resource function has the current
+schema available via `dlt.current.source_schema()`.
+
+Example:
+
+```py
+@dlt.source
+def textual(nesting_level: int):
+    # get the source schema from the `current` context
+    schema = dlt.current.source_schema()
+    # remove date detector
+    schema.remove_type_detection("iso_timestamp")
+    # convert UNIX timestamp (float, within a year from NOW) into timestamp
+    schema.add_type_detection("timestamp")
+
+    return dlt.resource([])
+```
+
+
+===== FILE: docs/website/docs/general-usage/source.md =====
+
+---
+title: Source
+description: Explanation of what a dlt source is
+keywords: [source, api, dlt.source]
+---
+# Source
+
+A [source](glossary.md#source) is a logical grouping of resources, i.e., endpoints of a
+single API. The most common approach is to define it in a separate Python module.
+
+- A source is a function decorated with `@dlt.source` that returns one or more resources.
+- A source can optionally define a [schema](schema.md) with tables, columns, performance hints, and
+  more.
+- The source Python module typically contains optional customizations and data transformations.
+- The source Python module typically contains the authentication and pagination code for a particular
+  API.
+
+## Declare sources
+
+You declare a source by decorating an (optionally async) function that returns or yields one or more resources with `@dlt.source`. Our
+[Create a pipeline](../tutorial/load-data-from-an-api.md) how-to guide teaches you how to do that.
+
+### Create resources dynamically
+
+You can create resources by using `dlt.resource` as a function. In the example below, we reuse a
+single generator function to create a list of resources for several Hubspot endpoints.
+
+```py
+@dlt.source
+def hubspot(api_key=dlt.secrets.value):
+
+    endpoints = ["companies", "deals", "products"]
+
+    def get_resource(endpoint):
+        yield requests.get(url + "/" + endpoint).json()
+
+    for endpoint in endpoints:
+        # calling get_resource creates a generator,
+        # the actual code of the function will be executed in pipeline.run
+        yield dlt.resource(get_resource(endpoint), name=endpoint)
+```
+
+### Attach and configure schemas
+
+You can [create, attach, and configure schemas](schema.md#attaching-schemas-to-sources) that will be
+used when loading the source.
+
+### Avoid long-lasting operations in source function
+
+Do not extract data in the source function. Leave that task to your resources if possible. The source function is executed immediately when called (contrary to resources which delay execution - like Python generators). There are several benefits (error handling, execution metrics, parallelization) you get when you extract data in `pipeline.run` or `pipeline.extract`.
+
+If this is impractical (for example, you want to reflect a database to create resources for tables), make sure you do not call the source function too often. [See this note if you plan to deploy on Airflow](../walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md#2-modify-dag-file)
+
+## Customize sources
+
+### Access and select resources to load
+
+You can access resources present in a source and select which of them you want to load. In the case of
+the `hubspot` resource above, we could select and load the "companies", "deals", and "products" resources:
+
+```py
+from hubspot import hubspot
+
+source = hubspot()
+# "resources" is a dictionary with all resources available, the key is the resource name
+print(source.resources.keys())  # print names of all resources
+# print resources that are selected to load
+print(source.resources.selected.keys())
+# load only "companies" and "deals" using the "with_resources" convenience method
+pipeline.run(source.with_resources("companies", "deals"))
+```
+
+Resources can be individually accessed and selected:
+
+```py
+# resources are accessible as attributes of a source
+for c in source.companies:  # enumerate all data in the companies resource
+    print(c)
+
+# check if deals are selected to load
+print(source.deals.selected)
+# deselect the deals
+source.deals.selected = False
+```
+
+### Filter, transform, and pivot data
+
+You can modify and filter data in resources, for example, if we want to keep only deals after a certain
+date:
+
+```py
+yesterday = "2026-01-31"
+source.deals.add_filter(lambda deal: deal["created_at"] > yesterday)
+```
+
+Find more on transforms [here](resource.md#filter-transform-and-pivot-data).
+
+### Load data partially with `add_limit`
+
+You can limit the number of items produced by each resource by calling the `add_limit` method on a source. This is useful for testing, debugging, and generating sample datasets for experimentation. You can easily get your test dataset in a few minutes, when otherwise you'd need to wait hours for the full loading to complete. Below, we limit the `pipedrive` source to just get **10 pages** of data from each endpoint. Mind that the transformers will be evaluated fully:
+
+```py
+from pipedrive import pipedrive_source
+
+pipeline = dlt.pipeline(pipeline_name='pipedrive', destination='duckdb', dataset_name='pipedrive_data')
+load_info = pipeline.run(pipedrive_source().add_limit(10))
+print(load_info)
+```
+
+You can also apply a time limit to the source:
+
+```py
+pipeline.run(pipedrive_source().add_limit(max_time=10))
+```
+
+Or limit by both, the limit that is reached first will stop the extraction:
+
+```py
+pipeline.run(pipedrive_source().add_limit(max_items=10, max_time=10))
+```
+
+:::note
+Note that `add_limit` **does not limit the number of rows** but rather the "number of yields". dlt will close the iterator/generator that produces data after the limit is reached. Please read in more detail about the `add_limit` on the resource page.
+:::
+
+Find more on sampling data [here](resource.md#sample-from-large-data).
+
+### Rename the source
+
+dlt allows you to rename the source i.e. to place the source configuration into custom section or to have many instances
+of the source created side by side. For example:
+
+```py
+from dlt.sources.sql_database import sql_database
+
+my_db = sql_database.clone(name="my_db", section="my_db")(table_names=["table_1"])
+print(my_db.name)
+```
+
+Here we create a renamed version of the `sql_database` and then instantiate it. You can configure it using a compact layout with just the source name:
+
+```toml
+[sources.my_db.credentials]
+password="..."
+```
+
+The full path `sources.my_db.my_db.credentials` is also supported and takes precedence if both are present. See [how dlt looks for values](credentials/setup.md#how-dlt-looks-for-values) for details.
+
+### Add more resources to existing source
+
+You can add a custom resource to a source after it was created. Imagine that you want to score all the deals with a keras model that will tell you if the deal is a fraud or not. In order to do that, you declare a new [transformer that takes the data from](resource.md#process-resources-with-dlttransformer) `deals` resource and add it to the source.
+
+```py
+import dlt
+from hubspot import hubspot
+
+# source contains `deals` resource
+source = hubspot()
+
+@dlt.transformer
+def deal_scores(deal_item):
+    # obtain the score, deal_items contains data yielded by source.deals
+    score = model.predict(featurize(deal_item))  # ty: ignore
+    yield {"deal_id": deal_item, "score": score}
+
+# connect the data from `deals` resource into `deal_scores` and add to the source
+source.resources.add(source.deals | deal_scores)
+# load the data: you'll see the new table `deal_scores` in your destination!
+pipeline.run(source)
+
+
+# You can also set the resources in the source as follows:
+source.deal_scores = source.deals | deal_scores
+
+# or
+source.resources["deal_scores"] = source.deals | deal_scores
+```
+
+:::note
+When adding a resource to the source, dlt clones the resource so your existing instance is not affected.
+:::
+
+### Reduce the nesting level of generated tables
+
+You can limit how deep dlt goes when generating nested tables and flattening dicts into columns. By default, the library will descend and generate nested tables for all nested lists and columns from dicts, without limit.
+
+```py
+@dlt.source(max_table_nesting=1)
+def mongo_db():
+    ...
+```
+
+In the example above, we want only 1 level of nested tables to be generated (so there are no nested tables of a nested table). Typical settings:
+
+- `max_table_nesting=0` will not generate nested tables and will not flatten dicts into columns at all. All nested data will be represented as JSON.
+- `max_table_nesting=1` will generate nested tables of root tables and nothing more. All nested data in nested tables will be represented as JSON.
+
+You can achieve the same effect after the source instance is created:
+
+```py
+from mongo_db import mongo_db
+
+source = mongo_db()
+source.max_table_nesting = 0
+```
+
+Several data sources are prone to contain semi-structured documents with very deep nesting, e.g., MongoDB databases. Our practical experience is that setting the `max_table_nesting` to 2 or 3 produces the clearest and human-readable schemas.
+
+:::tip
+The `max_table_nesting` parameter at the source level doesn't automatically apply to individual resources when accessed directly (e.g., using `source.resources["resource_1"]`). To make sure it works, either use `source.with_resources("resource_1")` or set the parameter directly on the resource.
+:::
+
+You can directly configure the `max_table_nesting` parameter on the resource level as:
+
+```py
+@dlt.resource(max_table_nesting=0)
+def my_resource():
+    ...
+```
+
+or
+
+```py
+source.my_resource.max_table_nesting = 0
+```
+
+### Modify schema
+
+The schema is available via the `schema` property of the source.
+[You can manipulate this schema, i.e., add tables, change column definitions, etc., before the data is loaded.](schema.md#schema-is-modified-in-the-source-function-body)
+
+The source provides two other convenience properties:
+
+1. `max_table_nesting` to set the maximum nesting level for nested tables and flattened columns.
+1. `root_key` to propagate the `_dlt_id` from a root table to all nested tables.
+
+## Load sources
+
+You can pass individual sources or a list of sources to the `dlt.pipeline` object. By default, all the
+sources will be loaded into a single dataset.
+
+You are also free to decompose a single source into several ones. For example, you may want to break
+down a 50-table copy job into an Airflow DAG with high parallelism to load the data faster. To do
+so, you could get the list of resources as:
+
+```py
+# get a list of resources' names
+resource_list = sql_source().resources.keys()
+
+# now we are able to make a pipeline for each resource
+for res in resource_list:
+    pipeline.run(sql_source().with_resources(res))
+```
+
+### Do a full refresh
+
+You can temporarily change the "write disposition" to `replace` on all (or selected) resources within
+a source to force a full refresh:
+
+```py
+@dlt.source
+def merge_source():
+    ...
+
+p.run(merge_source(), write_disposition="replace")
+```
+
+With selected resources:
+
+```py
+@dlt.source
+def crm():
+    @dlt.resource
+    def users():
+        ...
+
+    return [users, ...]
+
+p.run(
+    crm().with_resources("users"),
+    write_disposition="replace"
+)
+```
+
+
+===== FILE: docs/website/docs/general-usage/state.md =====
+
+---
+title: State
+description: Explanation of what a dlt state is
+keywords: [state, metadata, dlt.current.resource_state, dlt.current.source_state]
+---
+# State
+
+The pipeline state is a Python dictionary that lives alongside your data; you can store values in
+it and, on the next pipeline run, request them back.
+
+## Read and write pipeline state in a resource
+
+You read and write the state in your resources. Below, we use the state to create a list of chess
+game archives, which we then use to
+[prevent requesting duplicates](incremental/advanced-state.md#advanced-state-usage-storing-a-list-of-processed-entities).
+
+```py
+@dlt.resource(write_disposition="append")
+def players_games(chess_url, player, start_month=None, end_month=None):
+    # create or request a list of archives from resource-scoped state
+    checked_archives = dlt.current.resource_state().setdefault("archives", [])
+    # get a list of archives for a particular player
+    archives = _get_players_archives(chess_url, player)  # ty: ignore[unresolved-reference]
+    for url in archives:
+        if url in checked_archives:
+            print(f"skipping archive {url}")
+            continue
+        else:
+            print(f"getting archive {url}")
+            checked_archives.append(url)
+        # get the filtered archive
+        r = requests.get(url)
+        r.raise_for_status()
+        yield r.json().get("games", [])
+```
+
+Above, we request the resource-scoped state. The `checked_archives` list stored under the `archives`
+dictionary key is private and visible only to the `players_games` resource.
+
+The pipeline state is stored locally in the
+[pipeline working directory](pipeline.md#pipeline-working-directory) and, as a consequence, it
+cannot be shared with pipelines with different names. You must also make sure that data written into
+the state is JSON serializable. Except for standard Python types, `dlt` handles `DateTime`, `Decimal`,
+`bytes`, and `UUID`.
+
+## Share state across resources and read state in a source
+
+You can also access the source-scoped state with `dlt.current.source_state()`, which can be shared
+across resources of a particular source and is also available read-only in the source-decorated
+functions. The most common use case for the source-scoped state is to store a mapping of custom fields
+to their displayable names. You can take a look at our
+[pipedrive source](https://github.com/dlt-hub/verified-sources/blob/master/sources/pipedrive/__init__.py#L118)
+for an example of state passed across resources.
+
+:::tip
+[Decompose your source](../reference/performance.md#source-decomposition-for-serial-and-parallel-resource-execution)
+to, for example, run it on Airflow in parallel. If you cannot avoid that, designate one of
+the resources as the state writer and all others as state readers. This is exactly what the `pipedrive`
+pipeline does. With such a structure, you will still be able to run some of your resources in
+parallel.
+:::
+
+## Syncing state with destination
+
+What if you run your pipeline on, for example, Airflow, where every task gets a clean filesystem and
+the [pipeline working directory](pipeline.md#pipeline-working-directory) is always deleted? `dlt` loads
+your state into the destination along with all other data, and when faced with a clean start, it
+will try to restore the state from the destination.
+
+The remote state is identified by the pipeline name, the destination location (as given by the
+credentials), and the destination dataset. To reuse the same state, use the same pipeline name and
+destination.
+
+The state is stored in the `_dlt_pipeline_state` table at the destination and contains information
+about the pipeline, the pipeline run (to which the state belongs), and the state blob.
+
+`dlt` has a `dlt pipeline sync` command where you can
+[request the state back from that table](../reference/command-line-interface.md#dlt-pipeline-sync).
+
+:::info
+If you can keep the pipeline working directory across the runs, you can disable the state sync
+by setting `restore_from_destination=false` in your `config.toml`.
+:::
+
+## When to use pipeline state
+
+- `dlt` uses the state internally to implement
+  [last value incremental loading](incremental/cursor.md). This
+  use case should cover around 90% of your needs to use the pipeline state.
+- [Store a list of already requested entities](incremental/advanced-state.md#advanced-state-usage-storing-a-list-of-processed-entities)
+  if the list is not much bigger than 100k elements.
+- [Store large dictionaries of last values](incremental/advanced-state.md#advanced-state-usage-tracking-the-last-value-for-all-search-terms-in-twitter-api)
+  if you are not able to implement it with the standard incremental construct.
+- Store custom fields dictionaries, dynamic configurations, and other source-scoped state.
+
+## Do not use pipeline state if it can grow to millions of records
+
+Do not use `dlt` state when it may grow to millions of elements. Do you plan to store modification
+timestamps of all your millions of user records? This is probably a bad idea! In that case, you
+could:
+
+- Store the state in DynamoDB, Redis, etc., taking into account that if the extract stage fails,
+  you'll end up with an invalid state.
+- Use your loaded data as the state. `dlt` exposes the current pipeline via `dlt.current.pipeline()`
+  from which you can obtain
+  [sqlclient](../dlt-ecosystem/transformations/sql.md)
+  and load the data of interest. In that case, try at least to process your user records in batches.
+
+### Access data in the destination instead of pipeline state
+
+In the example below, we load recent comments made by a given `user_id`. We access the `user_comments` table to select the maximum comment id for a given user.
+
+```py
+import dlt
+
+@dlt.resource(name="user_comments")
+def comments(user_id: str):
+    current_pipeline = dlt.current.pipeline()
+    # find the last comment id for the given user_id by looking in the destination
+    max_id: int = 0
+    # on the first pipeline run, the user_comments table does not yet exist so do not check at all
+    # alternatively, catch DatabaseUndefinedRelation which is raised when an unknown table is selected
+    if not current_pipeline.first_run:
+        # get user comments table from pipeline dataset
+        # get last user comment id with ibis expression, ibis-extras need to be installed
+        dataset = current_pipeline.dataset()
+        user_comments = dataset.table("user_comments").to_ibis()
+        max_id_expression = user_comments.filter(user_comments.user_id == user_id).select(user_comments["_id"].max())
+        max_id_df = dataset(max_id_expression).df()
+        # if there are no comments for the user, max_id will be None, so we replace it with 0
+        max_id = max_id_df[0][0] if len(max_id_df.index) else 0  # ty: ignore
+
+    # use max_id to filter our results (we simulate an API query)
+    yield from [
+        {"_id": i, "value": letter, "user_id": user_id}
+        for i, letter in zip([1, 2, 3], ["A", "B", "C"])
+        if i > max_id
+    ]
+```
+
+When the pipeline is first run, the destination dataset and `user_comments` table do not yet exist. We skip the destination query by using the `first_run` property of the pipeline. We also handle a situation where there are no comments for a user_id by replacing None with 0 as `max_id`.
+
+## Inspect the pipeline state
+
+You can inspect the pipeline state with the [`dlt pipeline` command](../reference/command-line-interface.md#dlt-pipeline):
+
+```sh
+dlt pipeline -v chess_pipeline info
+```
+
+This will display the source and resource state slots for all known sources.
+
+## Reset the pipeline state: full or partial
+
+### To fully reset the state
+
+- Drop the destination dataset to fully reset the pipeline.
+- [Set the `dev_mode` flag when creating the pipeline](pipeline.md#do-experiments-with-dev-mode).
+- Use the `dlt pipeline <pipeline_name> drop --drop-all` command to [drop the state and tables for a given schema name](../reference/command-line-interface.md#dlt-pipeline-drop).
+
+### To partially reset the state
+
+- Use the `dlt pipeline <pipeline_name> drop <resource_name>` command to [drop the state and tables for a given resource](../reference/command-line-interface.md#dlt-pipeline-drop).
+- Use the `dlt pipeline <pipeline_name> drop --state-paths` command to [reset the state at a given path without touching the tables and data](../reference/command-line-interface.md#dlt-pipeline-drop).
+
+
+===== FILE: docs/website/docs/hub/command-line-interface.md =====
+
+---
+title: Command Line Interface
+description: Command line interface (CLI) full reference of dlt
+keywords: [command line interface, cli, dlt init]
+---
+# Command Line Interface Reference
+
+<!-- this page is fully generated from the argparse object of dlt, run make update-cli-docs to update it -->
+
+This page contains all commands available in the dlt CLI and is generated
+automatically from the fully populated python argparse object of dlt.
+:::note
+Flags and positional commands are inherited from the parent command. Position within the command string
+is important. For example if you want to enable debug mode on the pipeline command, you need to add the
+debug flag to the base dlt command:
+
+```sh
+dlt --debug pipeline
+```
+
+Adding the flag after the pipeline keyword will not work.
+:::
+
+## `dlthub`
+
+Creates, adds, inspects and deploys dlt pipelines. Further help is available at [https://dlthub.com/docs/reference/command-line-interface](https://dlthub.com/docs/reference/command-line-interface).
+
+**Usage**
+
+```sh
+dlthub [-h] [-v] [--non-interactive] [-y] [--debug] [--version]
+    [--disable-telemetry] [--enable-telemetry] [--no-pwd]
+    {dbt,workspace,variable,show,serve,run,logout,login,job,deploy,dashboard,profile,pipeline,local,init,ai}
+    ...
+```
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `-v, --verbose` - Increase verbosity. repeat for more (-v, -vv, -vvv).
+* `--non-interactive` - Use prompt defaults; fail if a prompt has none. implied when stdin is not a tty.
+* `-y, --yes` - Auto-accept confirmations. free-form prompts still need defaults.
+* `--debug` - Show full stack traces on exceptions.
+* `--version` - Show program's version number and exit
+* `--disable-telemetry` - Disables telemetry before command is executed
+* `--enable-telemetry` - Enables telemetry before command is executed
+* `--no-pwd` - Do not add current working directory to sys.path. by default $pwd is added to reproduce python behavior when running scripts.
+
+**Available subcommands**
+
+* [`dbt`](#dlthub-dbt) - Dlthub dbt transformation generator
+* [`workspace`](#dlthub-workspace) - Workspace operations: connect, list, info, show, deploy, deployment, configuration
+* [`variable`](#dlthub-variable) - Workspace variable operations: list, set, delete
+* [`show`](#dlthub-show) - Open the current workspace in the dlthub web app (alias for `dlthub workspace show`)
+* [`serve`](#dlthub-serve) - Deploy and serve an interactive notebook/app (alias for `dlthub job serve`)
+* [`run`](#dlthub-run) - Deploy code/config and run a script (alias for `dlthub job run`)
+* [`logout`](#dlthub-logout) - Log out from dlthub
+* [`login`](#dlthub-login) - Log in to dlthub (identity only)
+* [`job`](#dlthub-job) - Job operations: list, info, run, serve, trigger, publish, unpublish, pause, resume, logs, cancel, runs
+* [`deploy`](#dlthub-deploy) - Sync code/config and deploy jobs
+* [`dashboard`](#dlthub-dashboard) - Open the workspace dashboard in the dlthub web app (deploys a default one if missing)
+* [`profile`](#dlthub-profile) - Manage workspace built-in profiles
+* [`pipeline`](#dlthub-pipeline) - Interact with pipelines running in dlthub
+* [`local`](#dlthub-local) - Operations on the local workspace (run, serve, info, show, clean, schema, telemetry, pipeline)
+* [`init`](#dlthub-init) - Initialize a new dlthub workspace
+* [`ai`](#dlthub-ai) - Use ai-powered development tools and utilities
+
+</details>
+
+## `dlthub dbt`
+
+dlthub dbt transformation generator.
+
+**Usage**
+
+```sh
+dlthub dbt [-h] {generate} ...
+```
+
+**Description**
+
+dlthub dbt transformation generator.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`generate`](#dlthub-dbt-generate) - Generate dbt project
+
+</details>
+
+### `dlthub dbt generate`
+
+Generate dbt project.
+
+**Usage**
+
+```sh
+dlthub dbt generate [-h] [--include_dlt_tables] [--fact [FACT]] [--force]
+    [--mart_table_prefix [MART_TABLE_PREFIX]] pipeline_name
+```
+
+**Description**
+
+Generate dbt project.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub dbt`](#dlthub-dbt).
+
+**Positional arguments**
+
+* `pipeline_name` - The pipeline to create a dbt project for
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--include_dlt_tables` - Do not render _dlt tables
+* `--fact [FACT]` - Create a fact table for a given table
+* `--force` - Force overwrite of existing files
+* `--mart_table_prefix [MART_TABLE_PREFIX]` - Prefix for mart tables
+
+</details>
+
+## `dlthub workspace`
+
+Workspace operations: connect, list, info, show, deploy, deployment, configuration.
+
+**Usage**
+
+```sh
+dlthub workspace [-h] [--timestamps]
+    {list,connect,info,show,dashboard,deploy,deployment,configuration} ...
+```
+
+**Description**
+
+Bind this project to a remote dltHub workspace and manage its deployments and configurations.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--timestamps` - Show exact iso timestamps and precise durations (e.g. 1.291 s) instead of humanized relative times.
+
+**Available subcommands**
+
+* [`list`](#dlthub-workspace-list) - List all workspaces you have access to
+* [`connect`](#dlthub-workspace-connect) - Connects local to a remote workspace by name or id
+* [`info`](#dlthub-workspace-info) - Show overview of current dlthub workspace (workspace, job count, latest run, latest deployment, latest configuration)
+* [`show`](#dlthub-workspace-show) - Open the current workspace in the dlthub web app (alias for `dlthub workspace show`)
+* [`dashboard`](#dlthub-workspace-dashboard) - Open the workspace dashboard in the dlthub web app (deploys a default one if missing)
+* [`deploy`](#dlthub-workspace-deploy) - Sync code/config and deploy jobs
+* [`deployment`](#dlthub-workspace-deployment) - Manipulate deployments in the workspace
+* [`configuration`](#dlthub-workspace-configuration) - Manipulate configurations in the workspace
+
+</details>
+
+### `dlthub workspace list`
+
+List all workspaces you have access to.
+
+**Usage**
+
+```sh
+dlthub workspace list [-h]
+```
+
+**Description**
+
+List all workspaces you have access to.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace`](#dlthub-workspace).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub workspace connect`
+
+Connects local to a remote workspace by name or ID.
+
+**Usage**
+
+```sh
+dlthub workspace connect [-h] [--create] [--org-id ORG_ID] [workspace]
+```
+
+**Description**
+
+Connects local and remote workspaces. Jobs, pipelines and code available locally can then be deployed, scheduled and run in remote workspace.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace`](#dlthub-workspace).
+
+**Positional arguments**
+
+* `workspace` - Workspace name or id to connect to. when omitted interactive picker will allow to select existing or create a new one. required when using an api key.
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--create` -
+* `--org-id ORG_ID` - Organization uuid to scope the connection to. required in non-interactive mode when you belong to multiple organizations and local workspace has no organization pinned.
+
+</details>
+
+### `dlthub workspace info`
+
+Show overview of current dltHub workspace (workspace, job count, latest run, latest deployment, latest configuration).
+
+**Usage**
+
+```sh
+dlthub workspace info [-h]
+```
+
+**Description**
+
+Show workspace ID and summary of deployments, configurations and jobs.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace`](#dlthub-workspace).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub workspace show`
+
+Open the current workspace in the dltHub web app (alias for `dlthub workspace show`).
+
+**Usage**
+
+```sh
+dlthub workspace show [-h]
+```
+
+**Description**
+
+Open the workspace overview for the current remote workspace in the browser.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace`](#dlthub-workspace).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub workspace dashboard`
+
+Open the workspace dashboard in the dltHub web app (deploys a default one if missing).
+
+**Usage**
+
+```sh
+dlthub workspace dashboard [-h]
+```
+
+**Description**
+
+Open the dltHub dashboard for the current remote workspace, deploying a default dashboard if none exists.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace`](#dlthub-workspace).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub workspace deploy`
+
+Sync code/config and deploy jobs.
+
+**Usage**
+
+```sh
+dlthub workspace deploy [-h] [--deployment DEPLOYMENT] [--dry-run]
+    [--show-manifest]
+```
+
+**Description**
+
+Sync workspace files, generate job manifest from \_\_deployment\_\_.py, and reconcile jobs with the runtime. Use --dry-run to preview changes.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace`](#dlthub-workspace).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--deployment DEPLOYMENT` - Python file to use as manifest source (instead of \_\_deployment\_\_)
+* `--dry-run` - Preview changes without applying them
+* `--show-manifest` - Dump the expanded deployment manifest as yaml and exit
+
+</details>
+
+### `dlthub workspace deployment`
+
+Manipulate deployments in the workspace.
+
+**Usage**
+
+```sh
+dlthub workspace deployment [-h] [deployment_version_no] {list,info,sync} ...
+```
+
+**Description**
+
+Manipulate deployments in the workspace.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace`](#dlthub-workspace).
+
+**Positional arguments**
+
+* `deployment_version_no` - Deployment version number. only used in the `info` subcommand
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`list`](#dlthub-workspace-deployment-list) - List all deployments in workspace
+* [`info`](#dlthub-workspace-deployment-info) - Get detailed information about a deployment
+* [`sync`](#dlthub-workspace-deployment-sync) - Create new deployment if local workspace content changed
+
+</details>
+
+### `dlthub workspace deployment list`
+
+List all deployments in workspace.
+
+**Usage**
+
+```sh
+dlthub workspace deployment                             [deployment_version_no]
+    list [-h]
+```
+
+**Description**
+
+List all deployments in workspace.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace deployment`](#dlthub-workspace-deployment).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub workspace deployment info`
+
+Get detailed information about a deployment.
+
+**Usage**
+
+```sh
+dlthub workspace deployment                             [deployment_version_no]
+    info [-h]
+```
+
+**Description**
+
+Get detailed information about a deployment.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace deployment`](#dlthub-workspace-deployment).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub workspace deployment sync`
+
+Create new deployment if local workspace content changed.
+
+**Usage**
+
+```sh
+dlthub workspace deployment                             [deployment_version_no]
+    sync [-h] [--dry-run] [-v]
+```
+
+**Description**
+
+Create new deployment if local workspace content changed.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace deployment`](#dlthub-workspace-deployment).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--dry-run` - Compare local files to latest deployment without uploading
+* `-v, --verbose` - Print per-file added/updated/deleted tree alongside the summary
+
+</details>
+
+### `dlthub workspace configuration`
+
+Manipulate configurations in the workspace.
+
+**Usage**
+
+```sh
+dlthub workspace configuration [-h] [configuration_version_no] {list,info,sync}
+    ...
+```
+
+**Description**
+
+Manipulate configurations in the workspace.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace`](#dlthub-workspace).
+
+**Positional arguments**
+
+* `configuration_version_no` - Configuration version number. only used in the `info` subcommand
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`list`](#dlthub-workspace-configuration-list) - List all configuration versions
+* [`info`](#dlthub-workspace-configuration-info) - Get detailed information about a configuration
+* [`sync`](#dlthub-workspace-configuration-sync) - Create new configuration if local config content changed
+
+</details>
+
+### `dlthub workspace configuration list`
+
+List all configuration versions.
+
+**Usage**
+
+```sh
+dlthub workspace configuration
+    [configuration_version_no] list [-h]
+```
+
+**Description**
+
+List all configuration versions.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace configuration`](#dlthub-workspace-configuration).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub workspace configuration info`
+
+Get detailed information about a configuration.
+
+**Usage**
+
+```sh
+dlthub workspace configuration
+    [configuration_version_no] info [-h]
+```
+
+**Description**
+
+Get detailed information about a configuration.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace configuration`](#dlthub-workspace-configuration).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub workspace configuration sync`
+
+Create new configuration if local config content changed.
+
+**Usage**
+
+```sh
+dlthub workspace configuration
+    [configuration_version_no] sync [-h] [--dry-run] [-v]
+```
+
+**Description**
+
+Create new configuration if local config content changed.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub workspace configuration`](#dlthub-workspace-configuration).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--dry-run` - Compare local config to latest configuration without uploading
+* `-v, --verbose` - Print per-file added/updated/deleted tree alongside the summary
+
+</details>
+
+## `dlthub variable`
+
+Workspace variable operations: list, set, delete.
+
+**Usage**
+
+```sh
+dlthub variable [-h] [--timestamps] {list,set,delete} ...
+```
+
+**Description**
+
+Manage workspace variables — plain or secret values injected into every run's environment. Scope them workspace-wide or to a single profile.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--timestamps` - Show exact iso timestamps and precise durations (e.g. 1.291 s) instead of humanized relative times.
+
+**Available subcommands**
+
+* [`list`](#dlthub-variable-list) - List variables in every scope, or in one scope
+* [`set`](#dlthub-variable-set) - Create or update one variable
+* [`delete`](#dlthub-variable-delete) - Remove one variable
+
+</details>
+
+### `dlthub variable list`
+
+List variables in every scope, or in one scope.
+
+**Usage**
+
+```sh
+dlthub variable list [-h] [--profile PROFILE | --workspace]
+```
+
+**Description**
+
+List workspace variables. Without a scope selector every scope is listed, with the profile shown per row. Secret values are masked.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub variable`](#dlthub-variable).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--profile PROFILE` - Target the scope of this profile
+* `--workspace` - Target the workspace-wide scope
+
+</details>
+
+### `dlthub variable set`
+
+Create or update one variable.
+
+**Usage**
+
+```sh
+dlthub variable set [-h] [--value VALUE] (--plain | --secret) (--profile PROFILE
+    | --workspace) name
+```
+
+**Description**
+
+Create or update a variable. The value is read from stdin unless --value is given, so secrets need not appear in argv or shell history.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub variable`](#dlthub-variable).
+
+**Positional arguments**
+
+* `name` - Variable name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--value VALUE` - Value to store. omit to read it from stdin
+* `--plain` - Store a readable value
+* `--secret` - Store a write-only value, never shown again
+* `--profile PROFILE` - Target the scope of this profile
+* `--workspace` - Target the workspace-wide scope
+
+</details>
+
+### `dlthub variable delete`
+
+Remove one variable.
+
+**Usage**
+
+```sh
+dlthub variable delete [-h] [--allow-missing] (--profile PROFILE | --workspace)
+    name
+```
+
+**Description**
+
+Remove a variable from the workspace or a profile scope.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub variable`](#dlthub-variable).
+
+**Positional arguments**
+
+* `name` - Variable name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--allow-missing` - Treat an absent variable as success instead of an error
+* `--profile PROFILE` - Target the scope of this profile
+* `--workspace` - Target the workspace-wide scope
+
+</details>
+
+## `dlthub show`
+
+Open the current workspace in the dltHub web app (alias for `dlthub workspace show`).
+
+**Usage**
+
+```sh
+dlthub show [-h]
+```
+
+**Description**
+
+Open the workspace overview for the current remote workspace in the browser.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+## `dlthub serve`
+
+Deploy and serve an interactive notebook/app (alias for `dlthub job serve`).
+
+**Usage**
+
+```sh
+dlthub serve [-h] [--deployment DEPLOYMENT] [--timestamps] [-f] [--job-ref REF]
+    [selector_or_job_ref]
+```
+
+**Description**
+
+Deploy current workspace and run a notebook as a read-only web app. A plain `.py` script (marimo notebook, Streamlit app, FastMCP server, etc.) may also be passed and will be deployed and served remotely as a regular script. Alias for `dlthub job serve`.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Positional arguments**
+
+* `selector_or_job_ref` - Selector or job ref to pick an interactive app from the manifest, or a .py file path to deploy and serve as a regular script
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--deployment DEPLOYMENT` - Python file to use as manifest source (instead of \_\_deployment\_\_)
+* `--timestamps` - Show exact iso timestamps and precise durations (e.g. 1.291 s) instead of humanized relative times.
+* `-f, --follow` - Stream logs until the app stops
+* `--job-ref REF` - Pick this job from the matched candidate set when the selector matches multiple jobs. errors if ref is not in the matched set.
+
+</details>
+
+## `dlthub run`
+
+Deploy code/config and run a script (alias for `dlthub job run`).
+
+**Usage**
+
+```sh
+dlthub run [-h] [--deployment DEPLOYMENT] [--timestamps] [-f] [--refresh]
+    [--job-ref REF] [selector_or_job_ref]
+```
+
+**Description**
+
+Deploy current workspace and run a batch script remotely. Use -f/--follow to tail logs until completion. A plain `.py` script may also be passed: if it exposes no jobs it is deployed and executed remotely as a regular Python script. Alias for `dlthub job run`.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Positional arguments**
+
+* `selector_or_job_ref` - Selector or job ref to pick a job from the manifest, or a .py file path to deploy and run as a regular script
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--deployment DEPLOYMENT` - Python file to use as manifest source (instead of \_\_deployment\_\_)
+* `--timestamps` - Show exact iso timestamps and precise durations (e.g. 1.291 s) instead of humanized relative times.
+* `-f, --follow` - Follow status changes and stream logs until the run completes
+* `--refresh` - Re-run from scratch (full reload). cascades to freshness-graph downstream jobs.
+* `--job-ref REF` - Pick this job from the matched candidate set when the selector matches multiple jobs. errors if ref is not in the matched set.
+
+</details>
+
+## `dlthub logout`
+
+Log out from dltHub.
+
+**Usage**
+
+```sh
+dlthub logout [-h]
+```
+
+**Description**
+
+Log out from dltHub.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+## `dlthub login`
+
+Log in to dltHub (identity only).
+
+**Usage**
+
+```sh
+dlthub login [-h] [--resume DEVICE_CODE] [--device]
+```
+
+**Description**
+
+Log in to dltHub. Authenticates the current user; does not connect a workspace. Run `dlthub workspace connect` to bind this project to a remote workspace. Opens your browser to authenticate by default; use `--device` to force the device-code flow (e.g. on a remote session).
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--resume DEVICE_CODE` - Resume a previously started device flow login. the device_code is printed by `dlthub login` when no tty is attached.
+* `--device` - Force the device authorization flow instead of the default browser loopback login.
+
+</details>
+
+## `dlthub job`
+
+Job operations: list, info, run, serve, trigger, publish, unpublish, pause, resume, logs, cancel, runs.
+
+**Usage**
+
+```sh
+dlthub job [-h] [--timestamps]
+    {list,info,show,trigger,publish,unpublish,pause,resume,logs,cancel,runs,serve,run}
+    ...
+```
+
+**Description**
+
+List and operate on jobs registered in the connected workspace, plus their runs.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--timestamps` - Show exact iso timestamps and precise durations (e.g. 1.291 s) instead of humanized relative times.
+
+**Available subcommands**
+
+* [`list`](#dlthub-job-list) - List jobs (filter with selectors: batch, schedule:*, tag:ops, ...)
+* [`info`](#dlthub-job-info) - Show job info
+* [`show`](#dlthub-job-show) - Open the job page in the web gui
+* [`trigger`](#dlthub-job-trigger) - Trigger jobs matching selectors (does not sync or deploy)
+* [`publish`](#dlthub-job-publish) - Generate or revoke a public link for an interactive notebook/app
+* [`unpublish`](#dlthub-job-unpublish) - Revoke the public link for an interactive notebook/app
+* [`pause`](#dlthub-job-pause) - Pause the schedule of one or more jobs
+* [`resume`](#dlthub-job-resume) - Resume the schedule of one or more jobs
+* [`logs`](#dlthub-job-logs) - Show logs for latest or selected job run
+* [`cancel`](#dlthub-job-cancel) - Cancel active runs for matching jobs
+* [`runs`](#dlthub-job-runs) - Manage job runs: list, info, logs, cancel
+* [`serve`](#dlthub-job-serve) - Deploy and serve an interactive notebook/app
+* [`run`](#dlthub-job-run) - Deploy code/config and run a batch job
+
+</details>
+
+### `dlthub job list`
+
+List jobs (filter with selectors: batch, schedule:*, tag:ops, ...).
+
+**Usage**
+
+```sh
+dlthub job list [-h] [--archived] [selector_or_job_name ...]
+```
+
+**Description**
+
+List jobs registered in the workspace. Pass selectors to filter: batch, interactive, schedule:*, tag:&lt;name&gt;, manual:*, etc.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Selector(s) or job name(s) used to filter the listing
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--archived` - Include archived jobs in the listing (hidden by default)
+
+</details>
+
+### `dlthub job info`
+
+Show job info.
+
+**Usage**
+
+```sh
+dlthub job info [-h] [selector_or_job_name]
+```
+
+**Description**
+
+Display detailed information about the job.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job name, script path, or selector identifying the job
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub job show`
+
+Open the job page in the web GUI.
+
+**Usage**
+
+```sh
+dlthub job show [-h] [selector_or_job_name]
+```
+
+**Description**
+
+Print the URL of the job page in the dltHub dashboard and open it in a browser when interactive.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job name, script path, or selector identifying the job
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub job trigger`
+
+Trigger jobs matching selectors (does not sync or deploy).
+
+**Usage**
+
+```sh
+dlthub job trigger [-h] [--dry-run] [--profile PROFILE] [--refresh] selectors
+    [selectors ...]
+```
+
+**Description**
+
+Trigger runs for jobs matching the given selectors. Can select only jobs already deployed. Does not sync code or deploy jobs. Examples: 'tag:backfill', 'manual:jobs.etl.*', 'schedule:*'.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selectors` - Trigger selectors (fnmatch patterns), e.g. 'tag:backfill', 'manual:jobs.etl.*'
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--dry-run` - Preview matched jobs without creating runs
+* `--profile PROFILE` - Profile override for all triggered runs
+* `--refresh` - Force a refresh on every triggered job (jobs skipped by freshness are not refreshed).
+
+</details>
+
+### `dlthub job publish`
+
+Generate or revoke a public link for an interactive notebook/app.
+
+**Usage**
+
+```sh
+dlthub job publish [-h] [--cancel] script_path
+```
+
+**Description**
+
+Generate a public link for a notebook/app, or revoke it with --cancel.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `script_path` - Local path to the notebook/app
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--cancel` - Revoke the public link for the notebook/app
+
+</details>
+
+### `dlthub job unpublish`
+
+Revoke the public link for an interactive notebook/app.
+
+**Usage**
+
+```sh
+dlthub job unpublish [-h] script_path
+```
+
+**Description**
+
+Revoke the public link for an interactive notebook/app.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `script_path` - Local path to the notebook/app
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub job pause`
+
+Pause the schedule of one or more jobs.
+
+**Usage**
+
+```sh
+dlthub job pause [-h] selector_or_job_name [selector_or_job_name ...]
+```
+
+**Description**
+
+Pause the schedule of every job matching the given names, refs or selectors (batch, schedule:*, tag:ops, ...). Only jobs with a schedule can be paused.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job names, script paths, job refs, or selectors.
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub job resume`
+
+Resume the schedule of one or more jobs.
+
+**Usage**
+
+```sh
+dlthub job resume [-h] selector_or_job_name [selector_or_job_name ...]
+```
+
+**Description**
+
+Resume the schedule of every job matching the given names, refs or selectors (batch, schedule:*, tag:ops, ...). The first run covers the whole period the job was paused for.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job names, script paths, job refs, or selectors.
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub job logs`
+
+Show logs for latest or selected job run.
+
+**Usage**
+
+```sh
+dlthub job logs [-h] [-f] selector_or_job_name [run_number]
+```
+
+**Description**
+
+Show logs for the latest run of a job or a specific run number. Use -f/--follow to stream logs in real-time.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job name, script path, or selector (e.g. batch, schedule:*).
+* `run_number` - Run number (optional)
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `-f, --follow` - Follow logs in real-time until the run completes
+
+</details>
+
+### `dlthub job cancel`
+
+Cancel active runs for matching jobs.
+
+**Usage**
+
+```sh
+dlthub job cancel [-h] [--dry-run] selector_or_job_name [selector_or_job_name
+    ...]
+```
+
+**Description**
+
+Cancel active (non-terminal) runs for jobs matching selectors or names. Multiple values cancel active runs for all matching jobs. Use --dry-run to preview.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job name, script path, or selector (e.g. batch, schedule:*).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--dry-run` - Show what would be cancelled without actually cancelling
+
+</details>
+
+### `dlthub job runs`
+
+Manage job runs: list, info, logs, cancel.
+
+**Usage**
+
+```sh
+dlthub job runs [-h] {list,info,logs,show,cancel} ...
+```
+
+**Description**
+
+Operate on runs of a job: list runs, show info, stream logs, cancel.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`list`](#dlthub-job-runs-list) - List job runs (filter with a selector: batch, schedule:*, ...)
+* [`info`](#dlthub-job-runs-info) - Show job run info
+* [`logs`](#dlthub-job-runs-logs) - Show logs for the latest or selected job run
+* [`show`](#dlthub-job-runs-show) - Open the job run page in the web gui
+* [`cancel`](#dlthub-job-runs-cancel) - Cancel the latest or selected job run
+
+</details>
+
+### `dlthub job runs list`
+
+List job runs (filter with a selector: batch, schedule:*, ...).
+
+**Usage**
+
+```sh
+dlthub job runs list [-h] [--running] [selector_or_job_name]
+```
+
+**Description**
+
+List job runs registered in the workspace. Pass a selector to filter by matching jobs.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job runs`](#dlthub-job-runs).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Selector or job name to filter runs by
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--running` - Show only runs that are not in a terminal state
+
+</details>
+
+### `dlthub job runs info`
+
+Show job run info.
+
+**Usage**
+
+```sh
+dlthub job runs info [-h] selector_or_job_name [run_number]
+```
+
+**Description**
+
+Display detailed information about the job run.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job runs`](#dlthub-job-runs).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job name, script path, or selector
+* `run_number` - Run number (defaults to latest run of the given job)
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub job runs logs`
+
+Show logs for the latest or selected job run.
+
+**Usage**
+
+```sh
+dlthub job runs logs [-h] [-f] selector_or_job_name [run_number]
+```
+
+**Description**
+
+Show logs for the latest or selected job run. Use -f/--follow to stream logs in real-time until completion.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job runs`](#dlthub-job-runs).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job name, script path, or selector
+* `run_number` - Run number (defaults to latest run)
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `-f, --follow` - Follow logs in real-time until the run completes
+
+</details>
+
+### `dlthub job runs show`
+
+Open the job run page in the web GUI.
+
+**Usage**
+
+```sh
+dlthub job runs show [-h] selector_or_job_name [run_number]
+```
+
+**Description**
+
+Print the URL of the job run page in the dltHub dashboard and open it in a browser when interactive.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job runs`](#dlthub-job-runs).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job name, script path, or selector
+* `run_number` - Run number (defaults to latest run of the given job)
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub job runs cancel`
+
+Cancel the latest or selected job run.
+
+**Usage**
+
+```sh
+dlthub job runs cancel [-h] selector_or_job_name [run_number]
+```
+
+**Description**
+
+Cancel the latest or selected job run.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job runs`](#dlthub-job-runs).
+
+**Positional arguments**
+
+* `selector_or_job_name` - Job name, script path, or selector
+* `run_number` - Run number (defaults to latest run)
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub job serve`
+
+Deploy and serve an interactive notebook/app.
+
+**Usage**
+
+```sh
+dlthub job serve [-h] [--deployment DEPLOYMENT] [--timestamps] [-f] [--job-ref
+    REF] [selector_or_job_ref]
+```
+
+**Description**
+
+Deploy current workspace and run a notebook as a read-only web app. A plain `.py` script (marimo notebook, Streamlit app, FastMCP server, etc.) may also be passed and will be deployed and served remotely as a regular script.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selector_or_job_ref` - Selector or job ref to pick an interactive app from the manifest, or a .py file path to deploy and serve as a regular script
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--deployment DEPLOYMENT` - Python file to use as manifest source (instead of \_\_deployment\_\_)
+* `--timestamps` - Show exact iso timestamps and precise durations (e.g. 1.291 s) instead of humanized relative times.
+* `-f, --follow` - Stream logs until the app stops
+* `--job-ref REF` - Pick this job from the matched candidate set when the selector matches multiple jobs. errors if ref is not in the matched set.
+
+</details>
+
+### `dlthub job run`
+
+Deploy code/config and run a batch job.
+
+**Usage**
+
+```sh
+dlthub job run [-h] [--deployment DEPLOYMENT] [--timestamps] [-f] [--refresh]
+    [--job-ref REF] [selector_or_job_ref]
+```
+
+**Description**
+
+Deploy current workspace and run a batch script remotely. Use -f/--follow to tail logs until completion. A plain `.py` script may also be passed: if it exposes no jobs it is deployed and executed remotely as a regular Python script.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub job`](#dlthub-job).
+
+**Positional arguments**
+
+* `selector_or_job_ref` - Selector or job ref to pick a job from the manifest, or a .py file path to deploy and run as a regular script
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--deployment DEPLOYMENT` - Python file to use as manifest source (instead of \_\_deployment\_\_)
+* `--timestamps` - Show exact iso timestamps and precise durations (e.g. 1.291 s) instead of humanized relative times.
+* `-f, --follow` - Follow status changes and stream logs until the run completes
+* `--refresh` - Re-run from scratch (full reload). cascades to freshness-graph downstream jobs.
+* `--job-ref REF` - Pick this job from the matched candidate set when the selector matches multiple jobs. errors if ref is not in the matched set.
+
+</details>
+
+## `dlthub deploy`
+
+Sync code/config and deploy jobs.
+
+**Usage**
+
+```sh
+dlthub deploy [-h] [--timestamps] [--deployment DEPLOYMENT] [--dry-run]
+    [--show-manifest]
+```
+
+**Description**
+
+Sync workspace files, generate job manifest from \_\_deployment\_\_.py, and reconcile jobs with the runtime. Use --dry-run to preview changes.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--timestamps` - Show exact iso timestamps and precise durations (e.g. 1.291 s) instead of humanized relative times.
+* `--deployment DEPLOYMENT` - Python file to use as manifest source (instead of \_\_deployment\_\_)
+* `--dry-run` - Preview changes without applying them
+* `--show-manifest` - Dump the expanded deployment manifest as yaml and exit
+
+</details>
+
+## `dlthub dashboard`
+
+Open the workspace dashboard in the dltHub web app (deploys a default one if missing).
+
+**Usage**
+
+```sh
+dlthub dashboard [-h]
+```
+
+**Description**
+
+Open the dltHub dashboard for the current remote workspace, deploying a default dashboard if none exists.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+## `dlthub profile`
+
+Manage Workspace built-in profiles.
+
+**Usage**
+
+```sh
+dlthub profile [-h] {info,list} ...
+```
+
+**Description**
+
+Show and list workspace profiles.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`info`](#dlthub-profile-info) - Display the active profile (paths, providers, pinned status)
+* [`list`](#dlthub-profile-list) - List all available profiles
+
+</details>
+
+### `dlthub profile info`
+
+Display the active profile (paths, providers, pinned status).
+
+**Usage**
+
+```sh
+dlthub profile info [-h]
+```
+
+**Description**
+
+Display the active profile (paths, providers, pinned status).
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub profile`](#dlthub-profile).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub profile list`
+
+List all available profiles.
+
+**Usage**
+
+```sh
+dlthub profile list [-h]
+```
+
+**Description**
+
+List all available profiles.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub profile`](#dlthub-profile).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+## `dlthub pipeline`
+
+Interact with pipelines running in dlthub.
+
+**Usage**
+
+```sh
+dlthub pipeline [-h] {init,show,run} ...
+```
+
+**Description**
+
+Create, run, inspect and monitor pipelines at dltHub.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`init`](#dlthub-pipeline-init) - Creates a pipeline in the current folder by adding existing verified source or creating a new one from template.
+* [`show`](#dlthub-pipeline-show) - Open the pipeline observability view in the dlthub dashboard
+* [`run`](#dlthub-pipeline-run) - Run a job by pipeline name
+
+</details>
+
+### `dlthub pipeline init`
+
+Creates a pipeline in the current folder by adding existing verified source or creating a new one from template.
+
+**Usage**
+
+```sh
+dlthub pipeline init [-h] [--list-sources] [--list-destinations] [--location
+    LOCATION] [--branch BRANCH] [--eject] [source] [destination]
+```
+
+**Description**
+
+This command creates a new dlt pipeline script that loads data from `source` to `destination`. When you run the command, several things happen:
+
+1. Creates a basic project structure if the current folder is empty by adding `.dlt/config.toml`, `.dlt/secrets.toml`, and `.gitignore` files.
+2. Checks if the `source` argument matches one of our verified sources and, if so, adds it to your project.
+3. If the `source` is unknown, uses a generic template to get you started.
+4. Rewrites the pipeline scripts to use your `destination`.
+5. Creates sample config and credentials in `secrets.toml` and `config.toml` for the specified source and destination.
+6. Creates `requirements.txt` with dependencies required by the source and destination. If one exists, prints instructions on what to add to it.
+
+This command can be used several times in the same folder to add more sources, destinations, and pipelines. It will also update the verified source code to the newest
+version if run again with an existing `source` name. You will be warned if files will be overwritten or if the `dlt` version needs an upgrade to run a particular pipeline.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub pipeline`](#dlthub-pipeline).
+
+**Positional arguments**
+
+* `source` - Name of data source for which to create a pipeline. adds existing verified source or creates a new pipeline template if verified source for your data source is not yet implemented.
+* `destination` - Name of a destination i.e. bigquery or redshift
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--list-sources, -l` - Shows all available verified sources and their short descriptions. for each source, it checks if your local `dlt` version requires an update and prints the relevant warning.
+* `--list-destinations` - Shows the name of all core dlt destinations.
+* `--location LOCATION` - Advanced. uses a specific url or local path to verified sources repository.
+* `--branch BRANCH` - Advanced. uses specific branch of the verified sources repository to fetch the template.
+* `--eject` - Ejects the source code of the core source like sql_database or rest_api so they will be editable by you.
+
+</details>
+
+### `dlthub pipeline show`
+
+Open the pipeline observability view in the dltHub dashboard.
+
+**Usage**
+
+```sh
+dlthub pipeline show [-h] pipeline_name
+```
+
+**Description**
+
+Show the URL of the pipeline observability view in the dltHub dashboard and open it in a browser when interactive. Replaces the core dlt local-marimo `pipeline show`.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub pipeline`](#dlthub-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Name of the pipeline to show
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub pipeline run`
+
+Run a job by pipeline name.
+
+**Usage**
+
+```sh
+dlthub pipeline run [-h] [--timestamps] [-f] [--refresh] [--job-ref REF]
+    pipeline_name
+```
+
+**Description**
+
+Run a job decorated with @run.pipeline, using pipeline_name: selector.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub pipeline`](#dlthub-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Name of the pipeline to run
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--timestamps` - Show exact iso timestamps and precise durations (e.g. 1.291 s) instead of humanized relative times.
+* `-f, --follow` - Follow status changes and stream logs until the run completes
+* `--refresh` - Re-run from scratch (full reload). cascades to freshness-graph downstream jobs.
+* `--job-ref REF` - Pick this job from the matched candidate set when the selector matches multiple jobs. errors if ref is not in the matched set.
+
+</details>
+
+## `dlthub local`
+
+Operations on the local Workspace (run, serve, info, show, clean, schema, telemetry, pipeline).
+
+**Usage**
+
+```sh
+dlthub local [-h] {info,show,run,serve,clean,profile,schema,telemetry,pipeline}
+    ...
+```
+
+**Description**
+
+Local-only operations on the current workspace.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`info`](#dlthub-local-info) - Display detailed local workspace info
+* [`show`](#dlthub-local-show) - Show workspace dashboard
+* [`run`](#dlthub-local-run) - Run a single batch workspace job locally
+* [`serve`](#dlthub-local-serve) - Serve an interactive workspace job locally (notebook, dashboard, app)
+* [`clean`](#dlthub-local-clean) - Clean local data for the current profile. locally loaded data and pipelines working dirs are deleted by default. remote destinations are not affected.
+* [`profile`](#dlthub-local-profile) - Profile operations that affect only the local workspace
+* [`schema`](#dlthub-local-schema) - Shows, converts and upgrades schemas
+* [`telemetry`](#dlthub-local-telemetry) - Shows telemetry status
+* [`pipeline`](#dlthub-local-pipeline) - Local pipeline operations (info, drop, sync, load-package, etc.)
+
+</details>
+
+### `dlthub local info`
+
+Display detailed local workspace info.
+
+**Usage**
+
+```sh
+dlthub local info [-h]
+```
+
+**Description**
+
+Display detailed local workspace info.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local`](#dlthub-local).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub local show`
+
+Show workspace dashboard.
+
+**Usage**
+
+```sh
+dlthub local show [-h] [--edit]
+```
+
+**Description**
+
+Show workspace dashboard.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local`](#dlthub-local).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--edit` - Eject dashboard and start editable version
+
+</details>
+
+### `dlthub local run`
+
+Run a single batch workspace job locally.
+
+**Usage**
+
+```sh
+dlthub local run [-h] [--deployment FILE] [--job-ref REF] [--profile NAME]
+    [--dry-run] [-c KEY=VALUE] [--start ISO] [--end ISO] [--refresh]
+    [selector_or_job_ref]
+```
+
+**Description**
+
+Run one batch job by selector or job ref. A plain `.py` path is run as a regular script.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local`](#dlthub-local).
+
+**Positional arguments**
+
+* `selector_or_job_ref` - Job ref, trigger selector (tag:..., schedule:*), or a .py file to run as a script.
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--deployment FILE` - Path to a .py deployment module. defaults to \_\_deployment\_\_.py.
+* `--job-ref REF` - Pick this job when the selector matches multiple jobs.
+* `--profile NAME` - Override require.profile and the workspace pinned profile.
+* `--dry-run` - Resolve the job and print the entry point without launching
+* `-c KEY=VALUE, --config KEY=VALUE` - Config key=value pairs passed to the job (repeatable)
+* `--start ISO` - Override interval start (iso 8601). naive values use the job's timezone.
+* `--end ISO` - Override interval end (iso 8601). defaults to now if --start is set.
+* `--refresh` - Request a refresh run. honored unless the job declares refresh=block.
+
+</details>
+
+### `dlthub local serve`
+
+Serve an interactive workspace job locally (notebook, dashboard, app).
+
+**Usage**
+
+```sh
+dlthub local serve [-h] [--deployment FILE] [--job-ref REF] [--profile NAME]
+    [--dry-run] [-c KEY=VALUE] [selector_or_job_ref]
+```
+
+**Description**
+
+Serve one interactive job (marimo, Streamlit, FastMCP, ...). Same selector / `--job-ref` semantics as `dlthub local run`.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local`](#dlthub-local).
+
+**Positional arguments**
+
+* `selector_or_job_ref` - Job ref, trigger selector (tag:..., schedule:*), or a .py file to run as a script.
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--deployment FILE` - Path to a .py deployment module. defaults to \_\_deployment\_\_.py.
+* `--job-ref REF` - Pick this job when the selector matches multiple jobs.
+* `--profile NAME` - Override require.profile and the workspace pinned profile.
+* `--dry-run` - Resolve the job and print the entry point without launching
+* `-c KEY=VALUE, --config KEY=VALUE` - Config key=value pairs passed to the job (repeatable)
+
+</details>
+
+### `dlthub local clean`
+
+Clean local data for the current profile. Locally loaded data and pipelines working dirs are deleted by default. Remote destinations are not affected.
+
+**Usage**
+
+```sh
+dlthub local clean [-h] [--skip-local-data-dir]
+```
+
+**Description**
+
+Clean local data for the current profile. Locally loaded data and pipelines working dirs are deleted by default. Remote destinations are not affected.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local`](#dlthub-local).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--skip-local-data-dir` - Does not delete locally loaded data but removes pipeline working dirs.
+
+</details>
+
+### `dlthub local profile`
+
+Profile operations that affect only the local workspace.
+
+**Usage**
+
+```sh
+dlthub local profile [-h] {use} ...
+```
+
+**Description**
+
+Profile operations scoped to the local workspace.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local`](#dlthub-local).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`use`](#dlthub-local-profile-use) - Pin a profile in the local workspace so subsequent local commands use it by default
+
+</details>
+
+### `dlthub local profile use`
+
+Pin a profile in the local workspace so subsequent local commands use it by default.
+
+**Usage**
+
+```sh
+dlthub local profile use [-h] profile_name
+```
+
+**Description**
+
+Pin a profile in the local workspace so subsequent local commands use it by default.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local profile`](#dlthub-local-profile).
+
+**Positional arguments**
+
+* `profile_name` - Profile name to pin
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub local schema`
+
+Shows, converts and upgrades schemas.
+
+**Usage**
+
+```sh
+dlthub local schema [-h] [--format {json,yaml,dbml,dot,mermaid}]
+    [--remove-defaults] file
+```
+
+**Description**
+
+Loads, validates and prints out a dlt schema from a yaml or json file.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local`](#dlthub-local).
+
+**Positional arguments**
+
+* `file` - Schema file name, in yaml or json format, will autodetect based on extension
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--format {json,yaml,dbml,dot,mermaid}` - Display schema in this format
+* `--remove-defaults` - Does not show default hint values
+
+</details>
+
+### `dlthub local telemetry`
+
+Shows telemetry status.
+
+**Usage**
+
+```sh
+dlthub local telemetry [-h]
+```
+
+**Description**
+
+Shows the current status of dlt telemetry. Learn more about telemetry and what we send in our telemetry docs.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local`](#dlthub-local).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub local pipeline`
+
+Local pipeline operations (info, drop, sync, load-package, etc.).
+
+**Usage**
+
+```sh
+dlthub local pipeline [-h] [--pipelines-dir PIPELINES_DIR]
+    {list,run,info,show,failed-jobs,drop-pending-packages,abort-packages,sync,trace,schema,drop,load-package}
+    ...
+```
+
+**Description**
+
+Local pipeline operations (info, drop, sync, load-package, etc.).
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local`](#dlthub-local).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--pipelines-dir PIPELINES_DIR` - Pipelines working directory
+
+**Available subcommands**
+
+* [`list`](#dlthub-local-pipeline-list) - List local pipelines
+* [`run`](#dlthub-local-pipeline-run) - Run a job by pipeline name
+* [`info`](#dlthub-local-pipeline-info) - Displays state of the pipeline, use -v or -vv for more info
+* [`show`](#dlthub-local-pipeline-show) - Generates and launches workspace dashboard with the loading status and dataset explorer
+* [`failed-jobs`](#dlthub-local-pipeline-failed-jobs) - Displays information on all the failed loads in all completed packages, failed jobs and associated error messages
+* [`drop-pending-packages`](#dlthub-local-pipeline-drop-pending-packages) - [deprecated: use abort-packages] deletes all extracted and normalized packages including those that are partially loaded.
+* [`abort-packages`](#dlthub-local-pipeline-abort-packages) - Safely cancels pending loads: marks packages as aborted, records failed jobs, then resyncs pipeline state from the destination.
+* [`sync`](#dlthub-local-pipeline-sync) - Drops the local state of the pipeline and resets all the schemas and restores it from destination. the destination state, data and schemas are left intact.
+* [`trace`](#dlthub-local-pipeline-trace) - Displays last run trace, use -v or -vv for more info
+* [`schema`](#dlthub-local-pipeline-schema) - Displays default schema
+* [`drop`](#dlthub-local-pipeline-drop) - Selectively drop tables and reset state
+* [`load-package`](#dlthub-local-pipeline-load-package) - Displays information on a load package or acts on it (abort, fail-job, ...).
+
+</details>
+
+### `dlthub local pipeline list`
+
+List local pipelines.
+
+**Usage**
+
+```sh
+dlthub local pipeline list [-h]
+```
+
+**Description**
+
+List pipelines in the working directory.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub local pipeline run`
+
+Run a job by pipeline name.
+
+**Usage**
+
+```sh
+dlthub local pipeline run [-h] [--job-ref REF] [--profile NAME] [--refresh]
+    [--dry-run] pipeline_name
+```
+
+**Description**
+
+Run the job whose `deliver.pipeline_name` matches. Use --job-ref when multiple jobs target the same pipeline.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name to match against `deliver.pipeline_name`
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--job-ref REF` - Narrow to this job when multiple jobs deliver to the same pipeline
+* `--profile NAME` - Override require.profile and the workspace pinned profile.
+* `--refresh` - Request a refresh run. honored unless the job declares refresh=block.
+* `--dry-run` - Resolve the job and print the entry point without launching
+
+</details>
+
+### `dlthub local pipeline info`
+
+Displays state of the pipeline, use -v or -vv for more info.
+
+**Usage**
+
+```sh
+dlthub local pipeline info [-h] [pipeline_name]
+```
+
+**Description**
+
+Displays the content of the working directory of the pipeline: dataset name, destination, list of
+schemas, resources in schemas, list of completed and normalized load packages, and optionally a
+pipeline state set by the resources during the extraction process.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub local pipeline show`
+
+Generates and launches workspace dashboard with the loading status and dataset explorer.
+
+**Usage**
+
+```sh
+dlthub local pipeline show [-h] [--edit] [pipeline_name]
+```
+
+**Description**
+
+Launches the workspace dashboard with a comprehensive interface to inspect the pipeline state, schemas, and data in the destination.
+
+This dashboard should be executed from the same folder from which you ran the pipeline script to be able access destination credentials.
+
+If the --edit flag is used, will launch the editable version of the dashboard if it exists in the current directory, or create this version and launch it in edit mode.
+
+Requires `marimo` to be installed in the current environment: `pip install marimo`.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--edit` - Creates editable version of workspace dashboard in current directory if it does not exist there yet and launches it in edit mode.
+
+</details>
+
+### `dlthub local pipeline failed-jobs`
+
+Displays information on all the failed loads in all completed packages, failed jobs and associated error messages.
+
+**Usage**
+
+```sh
+dlthub local pipeline failed-jobs [-h] [pipeline_name]
+```
+
+**Description**
+
+This command scans all the load packages looking for failed jobs and then displays information on
+files that got loaded and the failure message from the destination.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub local pipeline drop-pending-packages`
+
+[Deprecated: use abort-packages] Deletes all extracted and normalized packages including those that are partially loaded.
+
+**Usage**
+
+```sh
+dlthub local pipeline drop-pending-packages [-h] [pipeline_name]
+```
+
+**Description**
+
+DEPRECATED: use `abort-packages` instead. That command properly records failed jobs
+and resyncs pipeline state from the destination.
+
+Removes all extracted and normalized packages in the pipeline's working dir.
+`dlt` keeps extracted and normalized load packages in the pipeline working directory. When the `run` method is called, it will attempt to normalize and load
+pending packages first. This command removes such packages. Note that **pipeline state** is not reverted to the state at which the deleted packages
+were created. Using the `sync` sub-command is recommended if your destination supports state sync.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub local pipeline abort-packages`
+
+Safely cancels pending loads: marks packages as aborted, records failed jobs, then resyncs pipeline state from the destination.
+
+**Usage**
+
+```sh
+dlthub local pipeline abort-packages [-h] [pipeline_name]
+```
+
+**Description**
+
+Use this when a load is stuck or you want to discard pending work without losing track of what
+happened. The oldest normalized package (the one being loaded) is aborted: its retry/pending
+jobs move to failed_jobs so they stay visible in `failed-jobs` output and the package completes
+as aborted. All other pending packages, extracted ones included, are deleted. It then
+restores local pipeline state and schemas from the snapshot
+taken when the oldest pending package started and you can safely re-extract and re-run.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub local pipeline sync`
+
+Drops the local state of the pipeline and resets all the schemas and restores it from destination. The destination state, data and schemas are left intact.
+
+**Usage**
+
+```sh
+dlthub local pipeline sync [-h] [--destination DESTINATION] [--dataset-name
+    DATASET_NAME] [pipeline_name]
+```
+
+**Description**
+
+This command will remove the pipeline working directory with all pending packages, not synchronized
+state changes, and schemas and retrieve the last synchronized data from the destination. If you drop
+the dataset the pipeline is loading to, this command results in a complete reset of the pipeline state.
+
+In case of a pipeline without a working directory, this command may be used to create one from the
+destination. In order to do that, you need to pass the dataset name and destination name to the CLI
+and provide the credentials to connect to the destination (i.e., in `.dlt/secrets.toml`) placed in the
+folder where you run it.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--destination DESTINATION` - Sync from this destination when local pipeline state is missing.
+* `--dataset-name DATASET_NAME` - Dataset name to sync from when local pipeline state is missing.
+
+</details>
+
+### `dlthub local pipeline trace`
+
+Displays last run trace, use -v or -vv for more info.
+
+**Usage**
+
+```sh
+dlthub local pipeline trace [-h] [pipeline_name]
+```
+
+**Description**
+
+Displays the trace of the last pipeline run containing the start date of the run, elapsed time, and the
+same information for all the steps (`extract`, `normalize`, and `load`). If any of the steps failed,
+you'll see the message of the exceptions that caused that problem. Successful `load` and `run` steps
+will display the load info instead.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub local pipeline schema`
+
+Displays default schema.
+
+**Usage**
+
+```sh
+dlthub local pipeline schema [-h] [--format {json,yaml,dbml,dot,mermaid}]
+    [--remove-defaults] [pipeline_name]
+```
+
+**Description**
+
+Displays the default schema for the selected pipeline.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--format {json,yaml,dbml,dot,mermaid}` - Display schema in this format
+* `--remove-defaults` - Does not show default hint values
+
+</details>
+
+### `dlthub local pipeline drop`
+
+Selectively drop tables and reset state.
+
+**Usage**
+
+```sh
+dlthub local pipeline drop [-h] [--destination DESTINATION] [--dataset-name
+    DATASET_NAME] [--drop-all] [--state-paths [STATE_PATHS ...]] [--schema
+    SCHEMA_NAME] [--state-only] [pipeline_name] [resources ...]
+```
+
+**Description**
+
+Selectively drop tables and reset state.
+
+```sh
+dlt pipeline <pipeline name> drop [resource_1] [resource_2]
+```
+
+Drops tables generated by selected resources and resets the state associated with them. Mainly used
+to force a full refresh on selected tables. In the example below, we drop all tables generated by
+the `repo_events` resource in the GitHub pipeline:
+
+```sh
+dlt pipeline github_events drop repo_events
+```
+
+`dlt` will inform you of the names of dropped tables and the resource state slots that will be
+reset:
+
+```text
+About to drop the following data in dataset airflow_events_1 in destination dlt.destinations.duckdb:
+Selected schema:: github_repo_events
+Selected resource(s):: ['repo_events']
+Table(s) to drop:: ['issues_event', 'fork_event', 'pull_request_event', 'pull_request_review_event', 'pull_request_review_comment_event', 'watch_event', 'issue_comment_event', 'push_event__payload__commits', 'push_event']
+Resource(s) state to reset:: ['repo_events']
+Source state path(s) to reset:: []
+Do you want to apply these changes? [y/N]
+```
+
+As a result of the command above the following will happen:
+
+1. All the indicated tables will be dropped in the destination. Note that `dlt` drops the nested
+   tables as well.
+2. All the indicated tables will be removed from the indicated schema.
+3. The state for the resource `repo_events` was found and will be reset.
+4. New schema and state will be stored in the destination.
+
+The `drop` command accepts several advanced settings:
+
+1. You can use regexes to select resources. Prepend the `re:` string to indicate a regex pattern. The example
+   below will select all resources starting with `repo`:
+
+```sh
+dlt pipeline github_events drop "re:^repo"
+```
+
+2. You can drop all tables in the indicated schema:
+
+```sh
+dlt pipeline chess drop --drop-all
+```
+
+3. You can indicate additional state slots to reset by passing JsonPath to the source state. In the example
+   below, we reset the `archives` slot in the source state:
+
+```sh
+dlt pipeline chess_pipeline drop --state-paths archives
+```
+
+This will select the `archives` key in the `chess` source.
+
+```json
+{
+  "sources":{
+    "chess": {
+      "archives": [
+        "https://api.chess.com/pub/player/magnuscarlsen/games/2022/05"
+      ]
+    }
+  }
+}
+```
+
+**This command is still experimental** and the interface will most probably change.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+* `resources` - One or more resources to drop. can be exact resource name(s) or regex pattern(s). regex patterns must start with re:
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--destination DESTINATION` - Sync from this destination when local pipeline state is missing.
+* `--dataset-name DATASET_NAME` - Dataset name to sync from when local pipeline state is missing.
+* `--drop-all` - Drop all resources found in schema. supersedes [resources] argument.
+* `--state-paths [STATE_PATHS ...]` - State keys or json paths to drop
+* `--schema SCHEMA_NAME` - Schema name to drop from (if other than default schema).
+* `--state-only` - Only wipe state for matching resources without dropping tables.
+
+</details>
+
+### `dlthub local pipeline load-package`
+
+Displays information on a load package or acts on it (abort, fail-job, ...).
+
+**Usage**
+
+```sh
+dlthub local pipeline load-package [-h] [pipeline_name] [load-id]
+    [{info,row-counts,abort,job,fail-job}] [job]
+```
+
+**Description**
+
+Shows information on a load package with a given `load_id`, or runs an action on it. The `load_id`
+parameter defaults to the most recent package. Package information includes its state
+(`COMPLETED/PROCESSED`) and list of all jobs in a package with their statuses, file sizes, types,
+and in case of failed jobs—the error messages from the destination. With the verbose flag set
+(`-v`), you can also see the list of all tables and columns created at the destination during the
+loading of that package.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub local pipeline`](#dlthub-local-pipeline).
+
+**Positional arguments**
+
+* `pipeline_name` - Pipeline name
+* `load-id` - Load id of completed or normalized package. defaults to the most recent package.
+* `job` - Pattern for the `job` action, or job id / file name for `fail-job`.
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+## `dlthub init`
+
+Initialize a new dlthub workspace.
+
+**Usage**
+
+```sh
+dlthub init [-h] [--name NAME] [--force] [--dependencies
+    {auto,pyproject,requirements}] [--dry-run]
+```
+
+**Description**
+
+Creates local workspace files: config, secrets, gitignore and Python pyproject/requirements.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--name NAME` - Workspace name (defaults to current directory basename).
+* `--force` - Overwrite existing pyproject.toml/requirements.txt/.gitignore/config.toml.
+* `--dependencies {auto,pyproject,requirements}` - Dependency file to scaffold. `auto` (default) uses pyproject.toml when uv is on path and requirements.txt otherwise. `pyproject` / `requirements` force the choice.
+* `--dry-run` - Print the file plan without writing anything.
+
+</details>
+
+## `dlthub ai`
+
+Use AI-powered development tools and utilities.
+
+**Usage**
+
+```sh
+dlthub ai [-h] {status,init,secrets,toolkit,mcp} ...
+```
+
+**Description**
+
+Configure your LLM-enabled IDE and MCP server.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub`](#dlthub).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`status`](#dlthub-ai-status) - Show ai setup status: dlt version, agent, toolkits, readiness checks
+* [`init`](#dlthub-ai-init) - Install initial ai rules and skills for your ai coding agent
+* [`secrets`](#dlthub-ai-secrets) - Manage secrets files used by dlt
+* [`toolkit`](#dlthub-ai-toolkit) - Manage ai toolkit plugins (list, info, install)
+* [`mcp`](#dlthub-ai-mcp) - Run or install the dlt mcp server
+
+</details>
+
+### `dlthub ai status`
+
+Show AI setup status: dlt version, agent, toolkits, readiness checks.
+
+**Usage**
+
+```sh
+dlthub ai status [-h]
+```
+
+**Description**
+
+Show AI setup status: dlt version, agent, toolkits, readiness checks.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai`](#dlthub-ai).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub ai init`
+
+Install initial AI rules and skills for your AI coding agent.
+
+**Usage**
+
+```sh
+dlthub ai init [-h] [--agent {claude,cursor,codex}] [--location LOCATION]
+    [--branch BRANCH] [--overwrite]
+```
+
+**Description**
+
+Install initial AI rules and skills for your AI coding agent.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai`](#dlthub-ai).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--agent {claude,cursor,codex}` - Ai coding agent to install for. auto-detected if omitted.
+* `--location LOCATION` - Advanced. git url or local path to ai workbench repository.
+* `--branch BRANCH` - Advanced. git branch to fetch from.
+* `--overwrite` - Overwrite existing files instead of skipping them and remove files the installed version shipped but the new one does not.
+
+</details>
+
+### `dlthub ai secrets`
+
+Manage secrets files used by dlt.
+
+**Usage**
+
+```sh
+dlthub ai secrets [-h] {list,view-redacted,update-fragment} ...
+```
+
+**Description**
+
+List, view (redacted), or update secret files used by dlt providers.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai`](#dlthub-ai).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+**Available subcommands**
+
+* [`list`](#dlthub-ai-secrets-list) - List secret file locations from providers
+* [`view-redacted`](#dlthub-ai-secrets-view-redacted) - Print secrets toml with all values replaced by '***'
+* [`update-fragment`](#dlthub-ai-secrets-update-fragment) - Merge a toml fragment into the secrets file
+
+</details>
+
+### `dlthub ai secrets list`
+
+List secret file locations from providers.
+
+**Usage**
+
+```sh
+dlthub ai secrets list [-h]
+```
+
+**Description**
+
+List secret file locations from providers.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai secrets`](#dlthub-ai-secrets).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub ai secrets view-redacted`
+
+Print secrets TOML with all values replaced by '***'.
+
+**Usage**
+
+```sh
+dlthub ai secrets view-redacted [-h] [--path PATH]
+```
+
+**Description**
+
+Without --path, shows the unified view merged from all project secret files. With --path, shows that exact file.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai secrets`](#dlthub-ai-secrets).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--path PATH` - Show this exact file instead of the unified provider view
+
+</details>
+
+### `dlthub ai secrets update-fragment`
+
+Merge a TOML fragment into the secrets file.
+
+**Usage**
+
+```sh
+dlthub ai secrets update-fragment [-h] --path PATH [fragment]
+```
+
+**Description**
+
+Merge a TOML fragment into the secrets file.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai secrets`](#dlthub-ai-secrets).
+
+**Positional arguments**
+
+* `fragment` - Toml fragment string to merge; reads from stdin if omitted
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--path PATH` - Path to the secrets toml file to write to
+
+</details>
+
+### `dlthub ai toolkit`
+
+Manage AI toolkit plugins (list, info, install).
+
+**Usage**
+
+```sh
+dlthub ai toolkit [-h] {list,info,install} ...
+```
+
+**Description**
+
+Manage AI toolkit plugins (list, info, install).
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai`](#dlthub-ai).
+
+**Positional arguments**
+
+* `list` - List available toolkits
+* `info` - Show toolkit contents and components
+* `install` - Install toolkit components into project
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+
+</details>
+
+### `dlthub ai toolkit list`
+
+List available toolkits.
+
+**Usage**
+
+```sh
+dlthub ai toolkit list [-h] [--location LOCATION] [--branch BRANCH]
+```
+
+**Description**
+
+List available toolkits.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai toolkit`](#dlthub-ai-toolkit).
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--location LOCATION` - Advanced. git url or local path to toolkit repository.
+* `--branch BRANCH` - Advanced. git branch to fetch toolkit from.
+
+</details>
+
+### `dlthub ai toolkit info`
+
+Show toolkit contents and components.
+
+**Usage**
+
+```sh
+dlthub ai toolkit info [-h] [--location LOCATION] [--branch BRANCH] name
+```
+
+**Description**
+
+Show toolkit contents and components.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai toolkit`](#dlthub-ai-toolkit).
+
+**Positional arguments**
+
+* `name` - Toolkit name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--location LOCATION` - Advanced. git url or local path to toolkit repository.
+* `--branch BRANCH` - Advanced. git branch to fetch toolkit from.
+
+</details>
+
+### `dlthub ai toolkit install`
+
+Install toolkit components into project.
+
+**Usage**
+
+```sh
+dlthub ai toolkit install [-h] [--location LOCATION] [--branch BRANCH] [--agent
+    {claude,cursor,codex}] [--overwrite] [--strict] name
+```
+
+**Description**
+
+Install toolkit components into project.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai toolkit`](#dlthub-ai-toolkit).
+
+**Positional arguments**
+
+* `name` - Toolkit name
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--location LOCATION` - Advanced. git url or local path to toolkit repository.
+* `--branch BRANCH` - Advanced. git branch to fetch toolkit from.
+* `--agent {claude,cursor,codex}` - Ai coding agent to install for. auto-detected if omitted.
+* `--overwrite` - Overwrite existing files instead of skipping them and remove files the installed version shipped but the new one does not.
+* `--strict` - Fail on validation warnings (invalid frontmatter, etc.).
+
+</details>
+
+### `dlthub ai mcp`
+
+Run or install the dlt MCP server.
+
+**Usage**
+
+```sh
+dlthub ai mcp [-h] [--stdio] [--sse] [--port PORT] [--features [FEATURES ...]]
+    [--no-default-features] [--access ACCESS] {run,install} ...
+```
+
+**Description**
+
+Run or install the dlt MCP server.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlthub ai`](#dlthub-ai).
+
+**Positional arguments**
+
+* `run` - Start the mcp server (default)
+* `install` - Install mcp server config into the current project
+
+**Options**
+
+* `-h, --help` - Show this help message and exit
+* `--stdio` - Use stdio transport mode
+* `--sse` - Use legacy sse transport instead of streamable-http
+* `--port PORT` - Port for the mcp server (default: 8000)
+* `--features [FEATURES ...]` - Mcp features to enable/disable. default: context, pipeline, secrets, toolkit, workspace. use +name to add, -name to remove (e.g. --features=-secrets,+context)
+* `--no-default-features` - Serve only the features named by --features, without the defaults above
+* `--access ACCESS` - Access the caller was granted, as `axis:verb,verb` pairs (e.g. data:read,local:read). tools requiring more are not served. `axis:` alone grants nothing on that axis. everything is served when omitted.
+
+</details>
+
+### `dlthub ai mcp run`
+
+Start the MCP server (default).
+
+**Usage**
+
+```sh
+dlthub ai mcp run [-h] [--stdio] [--sse] [--port PORT] [--features [FEATURES
+    ...]] [--no-default-features] [--access ACCESS]
+```
+
+**Description**
+
+Start the MCP server (default).
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+

@@ -1,0 +1,3245 @@
+
+# function from: https://github.com/dlt-hub/verified-sources/tree/master/sources/zendesk
+def get_pages(
+    url: str,
+    endpoint: str,
+    auth: tuple[str, str],
+    data_point_name: str,
+    params: Optional[dict[str, Any]] = None,
+) -> Iterable[list[dict[str, Any]]]:
+    """
+    Makes a request to a paginated endpoint and returns a generator of data items per page.
+
+    Args:
+        url (str): The base URL.
+        endpoint (str): The url to the endpoint, e.g. /api/v2/calls
+        auth (Tuple[str, str]): Credentials for authentication.
+        data_point_name (str): The key which data items are nested under in the response object (e.g. calls)
+        params (Optional[Dict[str, Any]], optional): Optional dict of query params to include in the request.
+
+    Yields:
+        List[Dict[str, Any]]: Generator of pages, each page is a list of dict data items.
+    """
+    # update the page size to enable cursor pagination
+    params = params or {}
+    params["per_page"] = 1000
+    headers = None
+
+    # make request and keep looping until there is no next page
+    get_url = f"{url}{endpoint}"
+    while get_url:
+        response = client.get(get_url, headers=headers, auth=auth, params=params)
+        response.raise_for_status()
+        response_json = response.json()
+        result = response_json[data_point_name]
+        yield result
+
+        get_url = None
+        # See https://developer.zendesk.com/api-reference/ticketing/ticket-management/incremental_exports/#json-format
+        if not response_json["end_of_stream"]:
+            get_url = response_json["next_page"]
+
+
+if __name__ == "__main__":
+    # create a pipeline with an appropriate name
+    pipeline = dlt.pipeline(
+        pipeline_name="qdrant_zendesk_pipeline",
+        destination="qdrant",
+        dataset_name="zendesk_data",
+    )
+
+    # here we instantiate the source
+    source = zendesk_support()
+    # ...and apply special hints on the ticket resource to tell qdrant which fields to embed
+    qdrant_adapter(source.tickets_data, embed=["subject", "description"])
+
+    # run the dlt pipeline and print info about the load process
+    load_info = pipeline.run(source)
+
+    print(load_info)
+
+    # getting the authenticated Qdrant client to connect to your Qdrant database
+    with pipeline.destination_client() as destination_client:
+        from qdrant_client import QdrantClient
+
+        qdrant_client: QdrantClient = destination_client.db_client  # type: ignore
+        # view Qdrant collections you'll find your dataset here:
+        print(qdrant_client.get_collections())
+
+        # query Qdrant with prompt: getting tickets info close to "cancellation"
+        response = qdrant_client.query(
+            "zendesk_data_tickets_data",  # tickets_data collection
+            query_text="cancel subscription",  # prompt to search
+            limit=3,  # limit the number of results to the nearest 3 embeddings
+        )
+
+        assert len(response) <= 3 and len(response) > 0
+```
+
+
+===== FILE: docs/website/docs/examples/transformers.md =====
+
+---
+title: Pokemon details in parallel using transformers
+description: Learn how to use dlt transformers and how to speed up your loads with parallelism
+keywords: [transformers, parallelism, example]
+---
+# Pokemon details in parallel using transformers
+
+For this example, we will be loading Pokemon data from the [PokeAPI](https://pokeapi.co/) with the help of transformers to load
+Pokemon details in parallel.
+
+We'll learn how to:
+
+- create 2 [transformers](../general-usage/resource.md#process-resources-with-dlttransformer) and connect them to a resource with the pipe operator `|`;
+- [load these transformers in parallel](../reference/performance.md#parallelism-within-a-pipeline) using the `@dlt.defer` decorator;
+- [configure parallelism](../reference/performance.md#parallel-pipeline-config-example) in the `config.toml` file;
+- deselect the main resource, so it will not be loaded into the database;
+- importing and using a pre-configured `requests` library with automatic retries (`from dlt.sources.helpers import requests`).
+
+## Full source code
+
+```py execute
+import dlt
+from dlt.sources.helpers import requests
+
+
+@dlt.source(max_table_nesting=2)
+def source(pokemon_api_url: str):
+    # note that we deselect `pokemon_list` - we do not want it to be loaded
+    @dlt.resource(write_disposition="replace", selected=False)
+    def pokemon_list():
+        """Retrieve a first page of Pokemons and yield it. We do not retrieve all the pages in this example"""
+        yield requests.get(pokemon_api_url).json()["results"]
+
+    # transformer that retrieves a list of objects in parallel
+    @dlt.transformer
+    def pokemon(pokemons):
+        """Yields details for a list of `pokemons`"""
+
+        # @dlt.defer marks a function to be executed in parallel
+        # in a thread pool
+        @dlt.defer
+        def _get_pokemon(_pokemon):
+            return requests.get(_pokemon["url"]).json()
+
+        # call and yield the function result normally, the @dlt.defer takes care of parallelism
+        for _pokemon in pokemons:
+            yield _get_pokemon(_pokemon)
+
+    # a special case where just one item is retrieved in transformer
+    # a whole transformer may be marked for parallel execution
+    @dlt.transformer(parallelized=True)
+    def species(pokemon_details):
+        """Yields species details for a pokemon"""
+        species_data = requests.get(pokemon_details["species"]["url"]).json()
+        # link back to pokemon so we have a relation in loaded data
+        species_data["pokemon_id"] = pokemon_details["id"]
+        # You can return the result instead of yield since the transformer only generates one result
+        return species_data
+
+    # create two simple pipelines with | operator
+    # 1. send list of pokemons into `pokemon` transformer to get pokemon details
+    # 2. send pokemon details into `species` transformer to get species details
+    # NOTE: dlt is smart enough to get data from pokemon_list and pokemon details once
+
+    return (pokemon_list | pokemon, pokemon_list | pokemon | species)
+
+
+if __name__ == "__main__":
+    # build duck db pipeline
+    pipeline = dlt.pipeline(
+        pipeline_name="pokemon", destination="duckdb", dataset_name="pokemon_data"
+    )
+
+    # the pokemon_list resource does not need to be loaded
+    pipeline.run(source("https://pokeapi.co/api/v2/pokemon"))
+
+    last_trace = pipeline.last_trace
+    assert last_trace is not None
+    normalize_info = last_trace.last_normalize_info
+    assert normalize_info is not None
+
+    row_counts = dict(normalize_info.row_counts)
+    assert row_counts["pokemon"] == 20
+    assert row_counts["species"] == 20
+    assert "pokemon_list" not in row_counts
+```
+
+
+===== FILE: docs/website/docs/general-usage/credentials/advanced.md =====
+
+---
+title: Access to configuration in code
+description: Access configuration via dlt function arguments or explicitly
+keywords: [credentials, secrets.toml, secrets, config, configuration, environment variables, provider]
+---
+# Access to configuration in code
+
+## Access to configuration in dlt decorated functions
+
+`dlt` automatically generates configuration **specs** for functions decorated with `@dlt.source`, `@dlt.resource`, and `@dlt.destination`, without additional code needed. You can configure these functions using any of the [standard configuration methods](setup.md) including environment variables and TOML files. You can call them like regular Python functions - dlt injects configuration values for any argument you don't explicitly provide.
+
+### Injection rules
+
+1. Arguments passed explicitly are **never injected**. This makes the injection mechanism optional. Example with the Pipedrive source:
+
+  ```py
+  import os
+  from typing import Iterator
+  from dlt.extract import DltResource
+
+  @dlt.source(name="pipedrive")
+  def pipedrive_source(
+      pipedrive_api_key: str = dlt.secrets.value,
+      since_timestamp: pendulum.DateTime | str | None = "1970-01-01 00:00:00",
+  ) -> Iterator[DltResource]:
+    ...
+
+  my_key = os.environ["MY_PIPEDRIVE_KEY"]
+  my_source = pipedrive_source(pipedrive_api_key=my_key)
+  ```
+
+  You can specify `pipedrive_api_key` explicitly if you prefer not to use the [standard options](setup) for credential handling.
+
+2. Required arguments (without default values) **are never injected** and must be specified explicitly when calling. Example:
+
+  ```py
+  @dlt.source
+  def slack_data(channels_list: list[str], api_key: str = dlt.secrets.value):
+    ...
+  ```
+
+  The `channels_list` argument won't be injected and will produce an error if not specified explicitly.
+
+3. Arguments with default values are injected if found in config providers. Otherwise, the default values from the function signature are used. Example:
+
+  ```py
+  from dlt.common.typing import TAnyDateTime
+
+  START_DATE: pendulum.DateTime = pendulum.DateTime(2024, 1, 1)
+
+  @dlt.source
+  def slack_source(
+    page_size: int = 100,
+    access_token: str = dlt.secrets.value,
+    start_date: TAnyDateTime | None = START_DATE
+  ):
+    ...
+  ```
+
+  `dlt` first searches for `page_size`, `access_token`, and `start_date` in config providers in a [specific order](setup). If these values aren't found, it falls back to the default values.
+
+4. Arguments with special defaults `dlt.secrets.value` and `dlt.config.value` **must be injected** (or explicitly passed). If not found in config providers, `dlt` raises an exception.
+
+  Additionally, `dlt.secrets.value` indicates to `dlt` that the value is a secret, meaning it will only be injected from secure config providers.
+
+### Add typing to your sources and resources
+
+We recommend adding type annotations to your function signatures. This requires minimal effort and provides several important benefits:
+
+1. You won't receive invalid data types in your code.
+2. `dlt` automatically parses and converts types for you, eliminating the need for manual parsing.
+3. `dlt` can generate sample config and secret files for your source automatically.
+4. You can request [built-in and custom credentials](complex_types) (connection strings, AWS/GCP/Azure credentials).
+5. You can specify multiple possible types via `Union`, such as OAuth or API Key authorization.
+
+Example:
+
+```py
+from dlt.common.configuration.specs import GcpServiceAccountCredentials
+
+@dlt.source
+def google_sheets(
+    spreadsheet_id: str = dlt.config.value,
+    tab_names: list[str] = dlt.config.value,
+    credentials: GcpServiceAccountCredentials = dlt.secrets.value,
+    only_strings: bool = False
+):
+    ...
+```
+
+Benefits:
+
+1. You'll receive a properly typed list of strings as `tab_names`.
+2. You'll receive properly configured Google credentials (see [GCP Credential Configuration](complex_types#gcp-credentials)), which users can provide in different forms:
+
+  * `service.json` as a string or dictionary (in code or via config providers)
+  * Connection string (used in SQL Alchemy)
+  * Default credentials if nothing is passed (such as those available on Cloud Function runners)
+
+## Organize configuration and secrets with sections
+
+`dlt` organizes configuration and secrets sections in a **configuration layout** that integrates with the [injection mechanism](#injection-rules). This structure applies to all [configuration providers](setup), including TOML files, environment variables, and other sources.
+
+This hierarchical structure efficiently handles simple cases while supporting more complex scenarios, such as multiple sources with different credentials or multiple pipelines sharing configuration in the same project.
+
+```text
+pipeline_name
+    |
+    |-sources
+        |-<source 1 module name>
+            |-<source function 1 name>
+                |- {all source and resource options and secrets}
+            |-<source function 2 name>
+                |- {all source and resource options and secrets}
+        |-<source 2 module>
+            |...
+
+        |-extract
+            |- extract options for resources i.e., parallelism settings, maybe retries
+    |-destination
+        |- <destination name>
+            |- {destination options}
+                |-credentials
+                    |-{credentials options}
+    |-schema
+        |-<schema name>
+            |-schema settings: not implemented but I'll let people set nesting level, name convention, normalizer, etc. here
+    |-load
+    |-normalize
+```
+
+When using TOML files, this structure is represented as nested sections with dotted keys. For environment variables and other config providers, the layout is flattened using double underscores (e.g., `PIPELINE_NAME__SOURCES__MODULE_NAME__FUNCTION_NAME__OPTION`).
+
+### Compact sources layout
+
+When a source's **section** (typically the module name) differs from its **name** (the function name), `dlt` also accepts a shorter configuration path that uses the source name directly under `sources`:
+
+```text
+sources.<name>.<key>
+```
+
+This is in addition to the full path `sources.<section>.<name>.<key>`. Both the full path and the section path (`sources.<section>.<key>`) take precedence over the compact path. This is particularly useful when you [rename a source](../source.md#rename-the-source) with `.clone()`:
+
+```toml
+# compact layout — just the source name
+[sources.my_db.credentials]
+password="..."
+
+# full layout — section + name (takes precedence)
+[sources.my_db_module.my_db.credentials]
+password="..."
+```
+
+## Access configs and secrets in code
+
+While `dlt` handles credentials automatically, you can also access them directly in your code. The `dlt.secrets` and `dlt.config` objects provide dictionary-like access to configuration values and secrets, enabling custom preprocessing if required. You can also store custom settings in the same configuration files.
+
+```py notype
+# Use `dlt.secrets` and `dlt.config` to explicitly retrieve values from providers
+source_instance = google_sheets(
+    dlt.config["sheet_id"],
+    dlt.config["my_section.tabs"],
+    dlt.secrets["my_section.gcp_credentials"]
+)
+
+source_instance.run(destination="bigquery")
+```
+
+`dlt.config` and `dlt.secrets` function as dictionaries. `dlt` examines all [config providers](setup) - environment variables, TOML files, etc. - to populate these dictionaries. You can also use `dlt.config.get()` or `dlt.secrets.get()` to retrieve a value and convert it to a specific type:
+
+```py
+from dlt.common.configuration.specs import GcpServiceAccountCredentials
+
+credentials = dlt.secrets.get("my_section.gcp_credentials", GcpServiceAccountCredentials)
+```
+
+This creates a `GcpServiceAccountCredentials` instance from the values stored under the `my_section.gcp_credentials` key.
+
+## Write configs and secrets in code
+
+You can also set values programmatically using `dlt.config` and `dlt.secrets`:
+
+```py notype
+dlt.config["sheet_id"] = "23029402349032049"
+dlt.secrets["destination.postgres.credentials"] = BaseHook.get_connection('postgres_dsn').extra
+```
+
+This effectively mocks the TOML provider with your specified values.
+
+## Configure destination credentials in code
+
+You can programmatically set destination credentials when needed. This example demonstrates how to use [GcpServiceAccountCredentials](complex_types#gcp-credentials) **spec** with a BigQuery destination:
+
+```py
+import os
+
+import dlt
+from dlt.sources.credentials import GcpServiceAccountCredentials
+from dlt.destinations import bigquery
+
+# Retrieve credentials from environment variable
+creds_dict = os.getenv('BIGQUERY_CREDENTIALS')
+
+# Create and initialize credentials instance
+gcp_credentials = GcpServiceAccountCredentials()
+gcp_credentials.parse_native_representation(creds_dict)
+
+# Pass credentials to the BigQuery destination
+pipeline = dlt.pipeline(destination=bigquery(credentials=gcp_credentials))
+pipeline.run([{"key1": "value1"}], table_name="temp")
+```
+
+### Google Sheets source example
+
+This example demonstrates a `google_sheets` source function that reads selected tabs from Google Sheets:
+
+```py
+@dlt.source
+def google_sheets(
+    spreadsheet_id=dlt.config.value,
+    tab_names=dlt.config.value,
+    credentials=dlt.secrets.value,
+    only_strings=False
+):
+    # Handle credentials as either dictionary or string
+    if isinstance(credentials, str):
+        credentials = json.loads(credentials)
+    # Handle tabs as either list or comma-separated string
+    if isinstance(tab_names, str):
+      tab_names = tab_names.split(",")
+    sheets = build('sheets', 'v4', credentials=ServiceAccountCredentials.from_service_account_info(credentials))  # ty: ignore
+    tabs = []
+    for tab_name in tab_names:
+        data = _get_sheet(sheets, spreadsheet_id, tab_name)  # ty: ignore[unresolved-reference]
+        tabs.append(dlt.resource(data, name=tab_name))
+    return tabs
+```
+
+The `@dlt.source` decorator makes all arguments in the function configurable. The special defaults `dlt.secrets.value` and `dlt.config.value` indicate to `dlt` that these arguments are required and must either be passed explicitly or exist in the configuration. Additionally, `dlt.secrets.value` designates an argument as a secret.
+
+In this example:
+
+- `spreadsheet_id` is a **required config** argument
+- `tab_names` is a **required config** argument
+- `credentials` is a **required secret** argument (Google Sheets credentials as a dictionary)
+- `only_strings` is an **optional config** argument with a default value
+
+:::tip
+`dlt.resource` functions in the same way, so [standalone resources](../resource.md#declare-a-standalone-resource) (not defined as inner functions of a **source**) follow the same injection rules
+:::
+
+## Write custom specs
+
+**Custom specifications** let you take full control over the function arguments. You can:
+
+- Control which values should be injected, the types, default values.
+- Specify optional and final fields.
+- Form hierarchical configurations (specs in specs).
+- Provide your own handlers for `on_partial` (called before failing on missing config key) or `on_resolved`.
+- Provide your own native value parsers.
+- Provide your own default credentials logic.
+- Utilize Python dataclass functionality.
+- Utilize Python `dict` functionality (`specs` instances can be created from dicts and serialized from dicts).
+
+In fact, `dlt` synthesizes a unique spec for each decorated function. For example, in the case of `google_sheets`, the following class is created:
+
+```py notype
+from dlt.common.configuration import configspec, with_config, BaseConfiguration
+
+@configspec
+class GoogleSheetsConfiguration(BaseConfiguration):
+  tab_names: list[str] = None  # mandatory
+  credentials: GcpServiceAccountCredentials = None # mandatory secret
+  only_strings: bool | None = False
+```
+
+### All specs derive from [BaseConfiguration](https://github.com/dlt-hub/dlt/blob/devel/dlt/common/configuration/specs/base_configuration.py#L170)
+
+This class serves as a foundation for creating configuration objects with specific characteristics:
+
+- It provides methods to parse and represent the configuration in native form (`parse_native_representation` and `to_native_representation`).
+
+- It defines methods for accessing and manipulating configuration fields.
+
+- It implements a dictionary-compatible interface on top of the dataclass. This allows instances of this class to be treated like dictionaries.
+
+- It defines helper functions for checking if a certain attribute is present, if a field is valid, and for calling methods in the method resolution order (MRO).
+
+More information about this class can be found in the class docstrings.
+
+### All credentials derive from [CredentialsConfiguration](https://github.com/dlt-hub/dlt/blob/devel/dlt/common/configuration/specs/base_configuration.py#L307)
+
+This class is a subclass of `BaseConfiguration` and is meant to serve as a base class for handling various types of credentials. It defines methods for initializing credentials, converting them to native representations, and generating string representations while ensuring sensitive information is appropriately handled.
+
+More information about this class can be found in the class docstrings.
+
+
+===== FILE: docs/website/docs/general-usage/credentials/complex_types.md =====
+
+---
+title: Built-in credentials
+description: Configure access to AWS, Azure, Google Cloud and other systems
+keywords: [credentials, secrets.toml, secrets, config, configuration, environment
+      variables, specs]
+---
+# Built-in credentials
+
+## Overview
+
+`dlt` provides built-in credential (**specs**) for seamless integration with common external systems. These specs can be configured using the methods described in the [overview](setup.md) documentation. For major cloud providers like AWS, Azure, and Google Cloud, `dlt` also calls client-specific code to authenticate users and can automatically retrieve default credentials from the running environment. Additionally, `dlt` understands common string representations for credentials such as connection strings or service json, making it easier to work with different credential formats beyond the typical dictionary representation.
+
+:::tip
+Learn about the authentication methods supported by the `dlt` RestAPI Client in detail in the [RESTClient section](../../dlt-ecosystem/verified-sources/rest_api/advanced.md#authentication).
+:::
+
+## Example with ConnectionStringCredentials
+
+`ConnectionStringCredentials` handles database connection strings:
+
+```py
+from dlt.sources.credentials import ConnectionStringCredentials
+
+@dlt.source
+def query(sql: str, dsn: ConnectionStringCredentials = dlt.secrets.value):
+  ...
+```
+
+The source above executes the `sql` against the database defined in `dsn`. `ConnectionStringCredentials` ensures you get the correct values with the correct types and understands the relevant native form of the credentials.
+
+Below are examples of how you can set credentials in `secrets.toml` and `config.toml` files.
+
+### Dictionary form
+
+```toml
+[dsn]
+database="dlt_data"
+password="loader"
+username="loader"
+host="localhost"
+```
+
+### Native form
+
+```toml
+dsn="postgres://loader:loader@localhost:5432/dlt_data"
+```
+
+### Mixed form
+
+If all credentials, except the password, are provided explicitly in the code, `dlt` will look for the password in `secrets.toml`.
+
+```toml
+dsn.password="loader"
+```
+
+You can explicitly provide credentials in various forms:
+
+```py notype
+query("SELECT * FROM customers", "postgres://loader@localhost:5432/dlt_data") # type: ignore[arg-type]
+# or
+query("SELECT * FROM customers", {"database": "dlt_data", "username": "loader"}) # type: ignore[arg-type]
+```
+
+## Credentials
+
+`dlt` offers some ready-made credentials you can reuse:
+
+```py
+from dlt.sources.credentials import ConnectionStringCredentials
+from dlt.sources.credentials import OAuth2Credentials
+from dlt.sources.credentials import GcpServiceAccountCredentials, GcpOAuthCredentials
+from dlt.sources.credentials import AwsCredentials
+from dlt.sources.credentials import AzureCredentials
+```
+
+### ConnectionStringCredentials
+
+The `ConnectionStringCredentials` class handles connection string credentials for SQL database connections. It includes attributes for the driver name, database name, username, password, host, port, and additional query parameters. This class provides methods for parsing and generating connection strings.
+
+#### Usage
+
+```py
+from dlt.common.configuration.specs import ConnectionStringCredentials
+
+credentials = ConnectionStringCredentials()
+
+# Set the necessary attributes
+credentials.drivername = "postgresql"
+credentials.database = "my_database"
+credentials.username = "my_user"
+credentials.password = "my_password"  # type: ignore
+credentials.host = "localhost"
+credentials.port = 5432
+
+# Convert credentials to a connection string
+connection_string = credentials.to_native_representation()
+
+# Parse a connection string and update credentials
+native_value = "postgresql://my_user:my_password@localhost:5432/my_database"
+credentials.parse_native_representation(native_value)
+
+# Get a URL representation of the connection
+url_representation = credentials.to_url()
+```
+
+Above, you can find an example of how to use this spec with sources and TOML files.
+
+### OAuth2Credentials
+
+The `OAuth2Credentials` class handles OAuth 2.0 credentials, including client ID, client secret, refresh token, and access token. It also allows for the addition of scopes and provides methods for client authentication.
+
+Usage:
+
+```py
+from dlt.common.configuration.specs import OAuth2Credentials
+
+oauth_credentials = OAuth2Credentials(
+    client_id="CLIENT_ID",
+    client_secret="CLIENT_SECRET",  # type: ignore
+    refresh_token="REFRESH_TOKEN",  # type: ignore
+    scopes=["scope1", "scope2"]
+)
+
+# Authorize the client
+oauth_credentials.auth()
+
+# Add additional scopes
+oauth_credentials.add_scopes(["scope3", "scope4"])
+```
+
+`OAuth2Credentials` is a base class to implement actual OAuth; for example, it is a base class for [GcpOAuthCredentials](#gcpoauthcredentials).
+
+:::note Default credentials, handover, and refresh
+When you access cloud storage (the `filesystem` destination, `dlt.dataset`, or `delta`/`iceberg`/`lance` tables), `dlt` resolves your credentials and passes them to the underlying data-access library — `fsspec` (s3fs/adlfs/gcsfs), DuckDB, the `object_store` Rust crate (used by `delta` and `lance`), or `pyarrow`/`pyiceberg`. The same rule applies to all of them:
+
+- **Default credentials**, resolved from the environment, are **handed over**: `dlt` lets the library resolve and **refresh** them through its own provider chain. This matters for long-running reads, where a temporary token would otherwise expire mid-read. `dlt` freezes only the cases a given library cannot resolve itself.
+- **Static credentials** (keys, SAS tokens, connection strings, service principals) and **external sessions** (a session or credential object you pass explicitly) are **not** handed over to the library's own chain — `dlt` uses exactly the identity you provided, snapshotting it to keys or a bearer token where needed (in-process `fsspec` may instead receive the live credential object).
+
+The **Credential handover** table in each section below shows what each library receives.
+:::
+
+### GCP credentials
+
+#### Examples
+
+* [Google Analytics verified source](https://github.com/dlt-hub/verified-sources/blob/master/sources/google_analytics/__init__.py): an example of how to use GCP Credentials.
+* [Google Analytics example](https://github.com/dlt-hub/verified-sources/blob/master/sources/google_analytics/setup_script_gcp_oauth.py): how you can get the refresh token using `dlt.secrets.value`.
+
+#### Types
+
+* [GcpServiceAccountCredentials](#gcpserviceaccountcredentials).
+* [GcpOAuthCredentials](#gcpoauthcredentials).
+
+#### GcpServiceAccountCredentials
+
+The `GcpServiceAccountCredentials` class manages GCP Service Account credentials. This class provides methods to retrieve native credentials for Google clients.
+
+##### Usage
+
+- You may just pass the `service.json` as a string or dictionary (in code and via config providers).
+- Or default credentials will be used.
+
+```py
+from dlt.common.configuration.specs import GcpServiceAccountCredentials
+
+gcp_credentials = GcpServiceAccountCredentials()
+# Parse a native value (ServiceAccountCredentials)
+# Accepts a native value, which can be either an instance of ServiceAccountCredentials
+# or a serialized services.json.
+# Parses the native value and updates the credentials.
+gcp_native_value = {"private_key": ".."} # or "path/to/services.json"
+gcp_credentials.parse_native_representation(gcp_native_value)
+```
+
+or more preferred use:
+
+```py
+import dlt
+from dlt.sources.credentials import GcpServiceAccountCredentials
+from google.analytics import BetaAnalyticsDataClient
+
+@dlt.source
+def google_analytics(
+    property_id: str = dlt.config.value,
+    credentials: GcpServiceAccountCredentials = dlt.secrets.value,
+):
+    # Retrieve native credentials for Google clients
+    # For example, build the service object for Google Analytics PI.
+    client = BetaAnalyticsDataClient(credentials=credentials.to_native_credentials())
+
+    # Get a string representation of the credentials
+    # Returns a string representation of the credentials in the format client_email@project_id.
+    credentials_str = str(credentials)
+    ...
+```
+
+while `secrets.toml` looks as follows:
+
+```toml
+[sources.google_analytics.credentials]
+client_id = "client_id" # please set me up!
+client_secret = "client_secret" # please set me up!
+refresh_token = "refresh_token" # please set me up!
+project_id = "project_id" # please set me up!
+```
+
+and `config.toml`:
+
+```toml
+[sources.google_analytics]
+property_id = "213025502"
+```
+
+#### GcpOAuthCredentials
+
+The `GcpOAuthCredentials` class is responsible for handling OAuth2 credentials for desktop applications in Google Cloud Platform (GCP). It can parse native values either as `GoogleOAuth2Credentials` or as serialized OAuth client secrets JSON. This class provides methods for authentication and obtaining access tokens.
+
+##### Usage
+
+```py
+from dlt.common.configuration.specs import GcpOAuthCredentials
+
+oauth_credentials = GcpOAuthCredentials()
+
+# Accepts a native value, which can be either an instance of GoogleOAuth2Credentials
+# or serialized OAuth client secrets JSON.
+# Parses the native value and updates the credentials.
+native_value_oauth = {"client_secret": ...}
+oauth_credentials.parse_native_representation(native_value_oauth)
+```
+
+Or more preferred use:
+
+```py notype
+import dlt
+from dlt.sources.credentials import GcpOAuthCredentials
+
+@dlt.source
+def google_analytics(
+    property_id: str = dlt.config.value,
+    credentials: GcpOAuthCredentials = dlt.secrets.value,
+):
+    # Authenticate and get access token
+    credentials.auth(scopes=["scope1", "scope2"])
+
+    # Retrieve native credentials for Google clients
+    # For example, build the service object for Google Analytics API.
+    client = BetaAnalyticsDataClient(credentials=credentials.to_native_credentials())
+
+    # Get a string representation of the credentials
+    # Returns a string representation of the credentials in the format client_id@project_id.
+    credentials_str = str(credentials)
+    ...
+```
+
+While `secrets.toml` looks as follows:
+
+```toml
+[sources.google_analytics.credentials]
+client_id = "client_id" # please set me up!
+client_secret = "client_secret" # please set me up!
+refresh_token = "refresh_token" # please set me up!
+project_id = "project_id" # please set me up!
+```
+
+And `config.toml`:
+
+```toml
+[sources.google_analytics]
+property_id = "213025502"
+```
+
+In order for the `auth()` method to succeed:
+
+- You must provide valid `client_id`, `client_secret`, `refresh_token`, and `project_id` to get a current **access token** and authenticate with OAuth. Keep in mind that the `refresh_token` must contain all the scopes that are required for your access.
+- If the `refresh_token` is not provided, and you run the pipeline from a console or a notebook, `dlt` will use InstalledAppFlow to run the desktop authentication flow.
+
+#### Defaults
+
+If configuration values are missing, `dlt` uses **Application Default Credentials** (ADC, via `google.auth.default()`) if available — read more about [Google defaults](https://googleapis.dev/python/google-auth/latest/user-guide.html#application-default-credentials). ADC resolves from the `GOOGLE_APPLICATION_CREDENTIALS` service-account file, `gcloud` user credentials, or the GCE/GKE metadata server, and the resolved tokens are **refreshed** by the library performing the access.
+
+- `dlt` will try to fetch the `project_id` from default credentials. If the project id is missing, it will look for `project_id` in the secrets. So it is normal practice to pass partial credentials (just `project_id`) and take the rest from defaults.
+
+#### Credential handover
+
+On default (ADC) credentials `dlt` hands over to the consumer so it resolves and refreshes via ADC itself; explicit service-account credentials are passed as-is.
+
+| consumer                      | default credentials (ADC)                                                                                                         | explicit service account           |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| `fsspec` / gcsfs              | gcsfs resolves & refreshes via Google ADC                                                                                         | service account credentials        |
+| DuckDB                        | no native GCS credential chain — `dlt` reads via `fsspec`/gcsfs (which refreshes), or via HMAC keys on the S3-compatibility layer | HMAC keys (S3-compatibility layer) |
+| `object_store` (delta, lance) | handed over (empty options) → the crate resolves & refreshes via ADC. OAuth user credentials are not supported with `delta`       | service-account JSON               |
+| `pyarrow` / pyiceberg         | `project-id` only → pyarrow `GcsFileSystem` resolves & refreshes via ADC                                                          | service-account JSON / OAuth token |
+
+#### External sessions
+
+Pass a native `google.auth` credentials object (or a serialized `service.json`) as the credentials value to use an exact identity; it is used as-is, for example:
+
+```py
+from google.oauth2.service_account import Credentials
+from dlt.sources.credentials import GcpServiceAccountCredentials
+
+# a native google credentials object (or a serialized service.json string) is used as-is
+native = Credentials.from_service_account_file("path/to/service.json")
+gcp_credentials = GcpServiceAccountCredentials()
+gcp_credentials.parse_native_representation(native)
+```
+
+### AwsCredentials
+
+The `AwsCredentials` class is responsible for handling AWS credentials, including access keys, session tokens, profile names, region names, and endpoint URLs. It inherits the ability to manage default credentials and extends it with methods for handling partial credentials and converting credentials to a botocore session.
+
+#### Usage
+
+```py
+from dlt.common.configuration.specs import AwsCredentials
+
+aws_credentials = AwsCredentials()
+# Set the necessary attributes
+aws_credentials.aws_access_key_id = "ACCESS_KEY_ID"
+aws_credentials.aws_secret_access_key = "SECRET_ACCESS_KEY"
+aws_credentials.region_name = "us-east-1"
+```
+
+or
+
+```py
+# Imports an external botocore session and sets the credentials properties accordingly.
+import botocore.session
+from dlt.common.configuration.specs import AwsCredentials
+
+aws_credentials = AwsCredentials()
+session = botocore.session.get_session()
+aws_credentials.parse_native_representation(session)
+print(aws_credentials.aws_access_key_id)
+```
+
+or more preferred use:
+
+```py notype
+@dlt.source
+def aws_readers(
+    bucket_url: str = dlt.config.value,
+    credentials: AwsCredentials = dlt.secrets.value,
+):
+    ...
+    # Convert credentials to s3fs format
+    s3fs_credentials = credentials.to_s3fs_credentials()
+    print(s3fs_credentials["key"])
+
+    # Get AWS credentials from botocore session
+    aws_credentials = credentials.to_native_credentials()
+    print(aws_credentials.access_key)
+    ...
+```
+
+while `secrets.toml` looks as follows:
+
+```toml
+[sources.aws_readers.credentials]
+aws_access_key_id = "key_id"
+aws_secret_access_key = "access_key"
+region_name = "region"
+```
+
+and `config.toml`:
+
+```toml
+[sources.aws_readers]
+bucket_url = "bucket_url"
+```
+
+#### Defaults
+
+If configuration is not provided, `dlt` resolves AWS credentials from the **botocore default provider chain** as present on the machine or runtime:
+
+- environment variables, `~/.aws/config` and `~/.aws/credentials` (the `default` profile, or `profile_name` if set), SSO, web identity (EKS IRSA), assume-role, and the EC2/ECS instance metadata service.
+- `region_name` is taken from the resolved session.
+
+These default credentials are **refreshable**: temporary tokens (for example an ECS task role) are renewed for as long as the connection lives.
+
+#### Credential handover
+
+On default credentials `dlt` hands over so the consumer resolves and **refreshes** the credentials itself; static and external-session credentials are frozen.
+
+| consumer                      | default credentials                                                                                                                                         | static / external session                    |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `fsspec` / s3fs               | static key/secret/token omitted → s3fs resolves & refreshes via its own aiobotocore chain                                                                   | frozen key/secret/token                      |
+| DuckDB                        | `PROVIDER credential_chain` + `REFRESH auto` (re-runs the full AWS chain on token expiry)                                                                   | frozen `KEY_ID` / `SECRET` / `SESSION_TOKEN` |
+| `object_store` (delta, lance) | handed over **only** for self-refreshing creds (EC2 IMDS / ECS); deferred creds (IRSA / SSO / assume-role) are frozen because the crate cannot resolve them | frozen key/secret/token                      |
+| `pyarrow` / pyiceberg         | static keys omitted → pyarrow `S3FileSystem` resolves & refreshes via the AWS chain (region/endpoint preserved)                                             | frozen key/secret/token                      |
+
+#### External sessions
+
+Pass your own `boto3`/`botocore` session to use an exact identity. `dlt` always **freezes** the session's current credentials (it does not refresh them, just like static keys):
+
+```py
+import botocore.session
+from dlt.sources.credentials import AwsCredentials
+
+# snapshot the credentials of an explicit boto session (e.g. a specific SSO profile)
+aws_credentials = AwsCredentials.from_session(botocore.session.get_session())
+```
+
+This is the way to force a specific local or dev identity for consumers that would otherwise resolve their own chain.
+
+### AzureCredentials
+
+The `AzureCredentials` class is responsible for handling Azure Blob Storage credentials, including account name, account key, Shared Access Signature (SAS) token, and SAS token permissions. It inherits the ability to manage default credentials and extends it with methods for handling partial credentials and converting credentials to a format suitable for interacting with Azure Blob Storage using the adlfs library.
+
+#### Usage
+
+```py notype
+az_credentials = AzureCredentials()
+# Set the necessary attributes
+az_credentials.azure_storage_account_name = "ACCOUNT_NAME"
+az_credentials.azure_storage_account_key = "ACCOUNT_KEY"
+```
+
+or more preferred use:
+
+```py notype
+@dlt.source
+def azure_readers(
+    bucket_url: str = dlt.config.value,
+    credentials: AzureCredentials = dlt.secrets.value,
+):
+    ...
+    # Generate a SAS token
+    credentials.create_sas_token()
+    print(credentials.azure_storage_sas_token)
+
+    # Convert credentials to adlfs format
+    adlfs_credentials = credentials.to_adlfs_credentials()
+    print(adlfs_credentials["account_name"])
+
+    # to_native_credentials() is not yet implemented
+    ...
+```
+
+while `secrets.toml` looks as follows:
+
+```toml
+[sources.azure_readers.credentials]
+azure_storage_account_name = "account_name"
+azure_storage_account_key = "account_key"
+```
+
+and `config.toml`:
+
+```toml
+[sources.azure_readers]
+bucket_url = "bucket_url"
+```
+
+#### Defaults
+
+If configuration is not provided, `dlt` uses `DefaultAzureCredential`, which resolves from (in order) an environment service principal, AKS workload identity, managed identity (IMDS), the shared token cache, and the Azure CLI (`az login`), among others. The resulting tokens are **refreshed** by whichever library performs the access.
+
+#### Credential handover
+
+On default credentials `dlt` hands over so the consumer resolves and **refreshes** the credentials itself; static credentials and external sessions are frozen.
+
+| consumer                      | default credentials                                                                                                                                                                                    | static (account key / SAS / service principal)                           | external session                                                     |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `fsspec` / adlfs              | `anon=False` → adlfs resolves & refreshes via its own `DefaultAzureCredential`                                                                                                                         | account key / SAS / service principal                                    | the live credential object is passed to adlfs (refreshes in-process) |
+| DuckDB                        | `PROVIDER credential_chain` (env / workload / managed identity / `az` CLI, refreshes)                                                                                                                  | connection string / `PROVIDER service_principal`                         | frozen bearer token via `PROVIDER access_token`                      |
+| `object_store` (delta, lance) | handed over — the crate resolves & refreshes env service principal / workload identity / managed identity                                                                                              | account key / SAS / service principal                                    | frozen bearer token                                                  |
+| `pyarrow` / pyiceberg         | handed over → adlfs resolves & refreshes via its own `DefaultAzureCredential`, **but only when `AZURE_STORAGE_ANON=false`** is set (pyiceberg passes no `anon` flag, so adlfs is anonymous by default) | account key / SAS / service principal (service principal auto-refreshes) | **not supported — raises**                                           |
+
+#### External sessions
+
+Pass any azure-identity credential to pin an exact identity. `dlt` **freezes** a bearer token from it for the cross-process consumers (object_store, DuckDB) and passes the live credential to adlfs:
+
+```py
+from azure.identity import AzureCliCredential
+from dlt.sources.credentials import AzureCredentials
+
+# freeze your local `az login` identity (or pass DefaultAzureCredential(), a ManagedIdentityCredential, etc.)
+az_credentials = AzureCredentials.from_credential(AzureCliCredential())
+az_credentials.azure_storage_account_name = "myaccount"
+```
+
+## Working with alternatives of credentials (Union types)
+
+If your source/resource allows for many authentication methods, you can support those seamlessly for your user. The user just passes the right credentials, and `dlt` will inject the right type into your decorated function.
+
+Example:
+
+```py notype
+@dlt.source
+def zen_source(credentials: Union[ZenApiKeyCredentials, ZenEmailCredentials, str] = dlt.secrets.value, some_option: bool = False):
+  # Depending on what the user provides in config, ZenApiKeyCredentials or ZenEmailCredentials will be injected into the `credentials` argument. Both classes implement `auth` so you can always call it.
+  credentials.auth() # type: ignore[union-attr]
+  return dlt.resource([credentials], name="credentials")
+
+# Pass native value
+os.environ["CREDENTIALS"] = "email:mx:pwd"
+assert list(zen_source())[0].email == "mx"
+
+# Pass explicit native value
+assert list(zen_source("secret:🔑:secret"))[0].api_secret == "secret"
+# Pass explicit dict
+assert list(zen_source(credentials={"email": "emx", "password": "pass"}))[0].email == "emx"
+```
+
+:::info
+This applies not only to credentials but to [all specs](advanced.md#write-custom-specs).
+:::
+
+:::tip
+Check out the [complete example](https://github.com/dlt-hub/dlt/blob/devel/tests/common/configuration/test_spec_union.py), to learn how to create unions of credentials that derive from the common class, so you can handle it seamlessly in your code.
+:::
+
+
+===== FILE: docs/website/docs/general-usage/credentials/index.md =====
+
+---
+title: Configure credentials and pipelines
+description: How to configure dlt pipelines and set up credentials
+keywords: [credentials, secrets.toml, secrets, config, configuration, environment variables]
+---
+# Configure credentials and pipelines
+
+The configuration mechanism in `dlt` provides a flexible, secure way to define credentials to external systems and other settings separately from your code.
+
+## Key features
+
+1. **Separation of secrets and configs from code** - The main role of the configuration system is to keep sensitive information out of your source code.
+
+2. **Built-in credentials** - `dlt` provides built-in support for most common systems with default/machine credential access.
+
+3. **Auto-generated configurations** - For functions decorated with `@dlt.source`, `@dlt.resource`, and `@dlt.destination`, `dlt` automatically generates appropriate configuration specs so they behave like built-in configs and credentials.
+
+4. **Comprehensive configurability** - Nearly all aspects of `dlt` are configurable, including pipelines, normalizers, loaders, and logging, allowing you to change behavior without modifying code. This capability enables performance optimization and other adjustments at runtime.
+
+- [Setup](./setup.md)
+- [Advanced](./advanced.md)
+- [Vaults](./vaults.md)
+- [Complex types](./complex_types.md)
+
+
+===== FILE: docs/website/docs/general-usage/credentials/setup.md =====
+
+---
+title: Overview
+description: Learn where configs are stored and how to write them
+keywords: [credentials, secrets.toml, secrets, config, configuration, environment variables, provider]
+---
+# Overview
+
+## Key features
+
+1. **Separation of secrets and configs from code** - The main role of the configuration system is to keep sensitive information out of your source code.
+
+2. **Built-in credentials** - `dlt` provides built-in support for most common systems with default/machine credential access.
+
+3. **Auto-generated configurations** - For functions decorated with `@dlt.source`, `@dlt.resource`, and `@dlt.destination`, `dlt` automatically generates appropriate configuration specs so they behave like built-in configs and credentials.
+
+4. **Comprehensive configurability** - Nearly all aspects of `dlt` are configurable, including pipelines, normalizers, loaders, and logging, allowing you to change behavior without modifying code. This capability enables performance optimization and other adjustments at runtime.
+
+`dlt` retrieves configuration and secrets from several [locations](#choose-where-to-store-configuration) like environment variables, dedicated
+files or secure vaults. It understands both simple and verbose layouts of [configuration sections](#select-a-configuration-layout). You can use one of
+[built-in](#use-built-in-credential-types) credentials for popular external systems. Functions decorated with `@dlt.source`, `@dlt.resource`, or `@dlt.destination` can be configured without writing additional code - `dlt` will automatically [inject](advanced/#injection-rules) missing arguments (like passwords or API keys) when you call them.
+
+## Choose where to store configuration
+
+`dlt` looks for configuration and secrets in various locations (environment variables, toml files or secure vaults) through **config providers** that are queried when your pipeline runs. You can pick a single location or combine them - for example, define secret `api_key` in environment variables and `api_url` in a TOML file. Providers are queried in the following order:
+
+1. [Environment Variables](#environment-variables): If a value is found in an environment variable, `dlt` uses it and doesn't check lower-priority providers.
+
+2. [secrets.toml and config.toml files](#secretstoml-and-configtoml): These files store configuration values and secrets. `secrets.toml` contains sensitive information, while `config.toml` holds non-sensitive configuration.
+
+3. [Vaults](#vaults): Credentials stored in secure vaults like Google Secrets Manager, Azure Key Vault, or AWS Secrets Manager. Airflow Variables are also included here.
+
+4. [Custom Providers](#custom-providers) added with `register_provider`: These are custom implementations you can create to use your own configuration formats or perform specialized preprocessing.
+
+5. [Default Argument Values](./advanced#injection-rules): The values specified in the function signature.
+
+:::tip
+Make sure your pipeline name contains only alphanumeric characters, hyphens (`-`), and underscores (`_`). Avoid whitespace and other punctuation to ensure compatibility with all configuration providers.
+:::
+
+## Select a configuration layout
+
+You can define configuration in different ways depending on your project's complexity. For a simple pipeline with a single source and destination, your configuration can be straightforward:
+
+Simplest **source** configuration:
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+]}>
+  <TabItem value="toml">
+
+```toml
+api_key="some_value"
+```
+
+  </TabItem>
+  <TabItem value="env">
+
+```sh
+export API_KEY="some_value"
+```
+
+  </TabItem>
+</Tabs>
+
+For **destination**, you typically need to configure [credentials](#use-built-in-credential-types) which group multiple related keys together. `dlt` places these under a `credentials` section.
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+]}>
+  <TabItem value="toml">
+
+```toml
+[credentials]
+user="dlthub"
+password="some_value"
+```
+
+  </TabItem>
+  <TabItem value="env">
+
+```sh
+export CREDENTIALS__USER="dlthub"
+export CREDENTIALS__PASSWORD="some_value"
+```
+
+  </TabItem>
+</Tabs>
+
+### Recommended section layout
+
+When using multiple sources with potentially conflicting argument names, or multiple destinations where you want separate credentials, you can organize your config keys with **sections**. Here's the **recommended section layout** that is most often used in this documentation
+and is also generated by `dlt init` command.
+
+* Use `sources` and `destination` top-level sections to separate their configurations
+* Use the Python module name where the source function is defined to separate configuration of sources defined in different modules
+* Use destination type to separate destinations
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+]}>
+  <TabItem value="toml">
+
+```toml
+# source defined in notion.py
+[sources.notion]
+api_key="some_value"
+```
+
+  </TabItem>
+  <TabItem value="env">
+
+```sh
+export SOURCES__NOTION__API_KEY="some_value"
+```
+
+  </TabItem>
+</Tabs>
+
+Destination:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+]}>
+  <TabItem value="toml">
+
+```toml
+# use postgres destination
+[destination.postgres.credentials]
+user="dlthub"
+password="some_value"
+
+```
+
+  </TabItem>
+  <TabItem value="env">
+
+```sh
+export DESTINATION__POSTGRES__CREDENTIALS__USER="dltHub"
+export DESTINATION__POSTGRES__CREDENTIALS__PASSWORD="some_value"
+```
+
+  </TabItem>
+</Tabs>
+
+Refer to [Add credentials](../../walkthroughs/add_credentials.md) guide for more examples and tips
+how to configure particular source and destination.
+
+### How dlt looks for values
+
+`dlt` starts looking for a particular value with all possible sections present and if value is not found,
+it will eliminate the rightmost section and try again.
+
+For example, if the source function is in module `notion.py`:
+
+```py
+# module: notion.py
+
+@dlt.source
+def notion_databases(api_key: str = dlt.secrets.value):
+    pass
+```
+
+`dlt` will search for the following keys in this order:
+
+1. `sources.notion.notion_databases.api_key`
+2. `sources.notion.api_key`
+3. `sources.api_key`
+4. `api_key`
+
+When a source's **section differs from its name** (e.g., after using `.clone(name="my_db", section="my_db_module")`), `dlt` also checks a **compact path** using just the source name:
+
+1. `sources.my_db_module.my_db.api_key` (full path)
+2. `sources.my_db_module.api_key`
+3. `sources.my_db.api_key` (compact path)
+4. `sources.api_key`
+5. `api_key`
+
+Both the full path and the section path take precedence over the compact path. This lets you use simple, readable keys like `sources.my_db.credentials` instead of the longer `sources.my_db_module.my_db.credentials`.
+
+Similarly with destination credentials. In that case `credentials` sections is considered a required grouping
+and won't be eliminated:
+
+1. `destination.postgres.credentials.password`
+2. `destination.credentials.password`
+3. `credentials.password`
+
+:::tip
+For more detailed information about configuration organization, see [configuration and secrets structure](advanced.md#organize-configuration-and-secrets-with-sections).
+:::
+
+:::tip
+You can use pipeline name to create separate configurations for each pipeline in your project. Configuration values are searched first with the pipeline name prefix, then without it:
+
+```toml
+[pipeline_name_1.sources.google_sheets.credentials]
+client_email = "<client_email_1>"
+private_key = "<private_key_1>"
+project_id = "<project_id_1>"
+
+[pipeline_name_2.sources.google_sheets.credentials]
+client_email = "<client_email_2>"
+private_key = "<private_key_2>"
+project_id = "<project_id_2>"
+```
+
+:::
+
+### Use built-in credential types
+
+Credentials are groups of configs and secrets that are defined together in order to access external systems.
+`dlt` implements several [built-in credential types](./complex_types) to access AWS, Azure, Google Cloud and other common systems
+
+Some of the credential types give you options how you specify them:
+For example, to connect to a `sql_database` source, you can either use a connection string:
+
+```toml
+[sources.sql_database]
+credentials="snowflake://user:password@service-account/database?warehouse=warehouse_name&role=role"
+```
+
+Or set up the connection parameters separately:
+
+```toml
+[sources.sql_database.credentials]
+drivername="snowflake"
+username="user"
+password="password"
+database="database"
+host="service-account"
+warehouse="warehouse_name"
+role="role"
+```
+
+:::tip
+`dlt` can discover **default credentials** of all major cloud providers: it is able to use what is already present in
+the runtime environment: i.e. when running in Colab or Google VM it has access to cloud credentials and if
+nothing is specified in the configuration it will use them instead.
+:::
+
+## Environment variables
+
+Environment variables provide a convenient way to specify configuration and secrets, especially in deployment environments. When using environment variables, names are capitalized and sections are separated with double underscores (`__`).
+
+For example, to set the Facebook Ads access token:
+
+```sh
+export SOURCES__FACEBOOK_ADS__ACCESS_TOKEN="<access_token>"
+```
+
+or when you want to pass a list or dict of values:
+
+```sh
+export DESTINATION__DUCKDB__CREDENTIALS__PRAGMAS="[\"enable_logging\"]"
+```
+
+Note that you can use environment variables to pass dictionaries and lists: those must be passed as Python literals (not JSON!).
+You may also need to escape quotation marks, depending on your shell.
+
+See the [examples section](#examples) for more details on setting up credentials with environment variables.
+
+:::tip
+For local development, you can use [python-dotenv](https://pypi.org/project/python-dotenv/) to automatically load variables from an `.env` file, making credential management easier and more secure.
+:::
+
+:::tip
+Environment variables can also retrieve secret values from `/run/secrets/<secret-name>` to seamlessly work with **Kubernetes/Docker secrets**.
+
+For these secrets, `dlt` uses an alternative name format with lowercase letters, dashes (`-`) as separators, and underscores converted to dashes. For example, `sources--facebook-ads--access-token` would be checked for the above environment variable.
+
+Only values marked as secrets (with `dlt.secrets.value` or using types like `TSecretStrValue`) are checked this way. Remember to name your secrets appropriately in Kubernetes resources or Docker Compose files.
+:::
+
+## Vaults
+
+`dlt` may read configuration from secure vaults - specialized services for storing credentials.
+
+* For Google Cloud Secrets Manager, see our [example walkthrough](../../walkthroughs/add_credentials.md#retrieving-credentials-from-google-cloud-secret-manager) and [reference](vaults.md#configure-google-secret-provider)
+
+* For Airflow Variable see the [reference and examples](vaults.md#configure-airflow-variables-as-provider)
+
+* For other vault integrations like AWS Secrets Manager or Azure Key Vault we are happy to take contributions. There's an abstract class (look for `VaultDocProvider`) that does all the heavy lifting.
+
+## secrets.toml and config.toml
+
+The TOML configuration provider uses two separate files:
+
+**config.toml**:
+
+- Contains non-sensitive configuration data that defines pipeline behavior
+- Includes settings like file paths, database hosts, timeouts, API URLs, and performance options
+- Values are accessible in code through the `dlt.config` dictionary
+- Can be safely committed to version control
+
+**secrets.toml**:
+
+- Contains sensitive information that must be kept confidential
+- Includes credentials like passwords, API keys, and private keys
+- Values are accessible in code through the `dlt.secrets` dictionary
+- Should never be committed to version control
+
+By default, the `.gitignore` file in your project prevents `secrets.toml` from being added to version control, while `config.toml` can be freely included.
+
+### File locations
+
+The TOML provider loads files from the `.dlt` folder **relative to your current working directory**.
+
+For example, if your working directory is `my_dlt_project` with this structure:
+
+```text
+my_dlt_project:
+  |
+  pipelines/
+    |---- .dlt/secrets.toml
+    |---- google_sheets.py
+```
+
+When you run:
+
+```sh
+python pipelines/google_sheets.py
+```
+
+`dlt` will look for secrets in `my_dlt_project/.dlt/secrets.toml` and ignore `my_dlt_project/pipelines/.dlt/secrets.toml`.
+
+If you change your working directory to `pipelines` and run:
+
+```sh
+python google_sheets.py
+```
+
+`dlt` will look for `my_dlt_project/pipelines/.dlt/secrets.toml` instead.
+
+### Special locations
+
+The TOML provider also reads configuration from special locations depending on your runtime environment:
+
+1. **Home directory**: If available, `dlt` checks `~/.dlt/` for `config.toml` and `secrets.toml`. These values are merged with project-specific configurations, with project values taking precedence. This is useful for sharing global settings (like telemetry preferences) across all pipelines on a machine.
+
+2. **Google Colab**: When running in Colab, you can use Colab Secrets named `secrets.toml` and `config.toml`. The provider reads these as if they were TOML files. This functionality is disabled if files exist in the `.dlt` folder.
+
+3. **Streamlit**: When running in Streamlit without local `.dlt/secrets.toml`, the provider uses Streamlit secrets. You can add `dlt` secrets directly to your Streamlit secrets.
+
+## Custom providers
+
+You can create and register your own configuration providers to customize how `dlt` accesses configuration values. The simplest approach is to write a function that returns a nested dictionary where keys correspond to sections and argument names.
+
+This example demonstrates how to create a custom provider that loads configuration from a JSON file:
+
+```py
+import dlt
+from dlt.common import json
+from dlt.common.configuration.providers import CustomLoaderDocProvider
+
+# Create a function that loads a dictionary
+def load_config():
+    with open("config.json", "rb") as f:
+        return json.load(f)
+
+# Create the custom provider
+provider = CustomLoaderDocProvider(
+    "my_json_provider", 
+    load_config, 
+    supports_secrets=False
+)
+
+# Register the provider with dlt
+dlt.config.register_provider(provider)
+```
+
+:::tip
+Check out our example YAML provider that supports switchable configuration profiles.
+:::
+
+## Examples
+
+### Configure both config and secrets
+
+This example uses the [Notion](../../dlt-ecosystem/verified-sources/notion) source and [filesystem](../../dlt-ecosystem/destinations/filesystem) destination to demonstrate how to organize configuration in TOML files using the [recommended section layout](#recommended-section-layout).
+
+The Notion source is defined in a file named `notion.py`, so we use that module name in the configuration. We configure the `api_key` in our configuration while passing the list of database IDs explicitly in code. For the filesystem destination, we split configuration between `config.toml` (for `bucket_url`) and `secrets.toml` (for AWS credentials).
+
+```py
+import dlt
+
+@dlt.source
+def notion_databases(
+    database_ids = None,
+    api_key: str = dlt.secrets.value,  # mark argument to be injected as secret
+):
+   ...
+
+# Pass database_id in code, let `dlt` inject api_key
+sales_database = notion_databases(  # type: ignore
+  database_ids=[
+            {
+                "id": "a94223535c674d33a24e313e7921ce15",
+                "use_name": "sales_alias",
+            }
+        ]
+)
+```
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+#### config.toml
+
+```toml
+[runtime]
+log_level="INFO"
+
+# Do not compress files sent to the filesystem bucket
+[normalize.data_writer]
+disable_compression=true
+
+# Recommended sections for the destination (destination.module)
+[destination.filesystem]
+bucket_url = "s3://[your_bucket_name]"
+```
+
+#### secrets.toml
+
+```toml
+# Recommended sections for sources (sources.module)
+[sources.notion]
+api_key = "your-notion-api-key"  # Will be injected to api_key argument
+
+# Recommended sections for destination credentials
+[destination.filesystem.credentials]
+aws_access_key_id = "ABCDEFGHIJKLMNOPQRST" 
+aws_secret_access_key = "1234567890_access_key" 
+```
+
+  </TabItem>
+
+  <TabItem value="env">
+
+```sh
+# Environment variables for both config and secrets follow the same format
+export RUNTIME__LOG_LEVEL="INFO"
+export DESTINATION__FILESYSTEM__BUCKET_URL="s3://[your_bucket_name]"
+export NORMALIZE__DATA_WRITER__DISABLE_COMPRESSION="true"
+export SOURCES__NOTION__API_KEY="your-notion-api-key"
+export DESTINATION__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID="ABCDEFGHIJKLMNOPQRST"
+export DESTINATION__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY="1234567890_access_key"
+```
+
+  </TabItem>
+
+  <TabItem value="code">
+
+```py
+import os
+import dlt
+import botocore.session
+from dlt.common.credentials import AwsCredentials
+
+# Set configuration values directly in code
+# Via environment variables
+os.environ["RUNTIME__LOG_LEVEL"] = "INFO"
+os.environ["DESTINATION__FILESYSTEM__BUCKET_URL"] = "s3://[your_bucket_name]"
+os.environ["NORMALIZE__DATA_WRITER__DISABLE_COMPRESSION"] = "true"
+
+# Or directly through dlt.config
+dlt.config["runtime.log_level"] = "INFO"
+dlt.config["destination.filesystem.bucket_url"] = "s3://[your_bucket_name]"
+dlt.config["normalize.data_writer.disable_compression"] = "true"
+
+# For secrets, avoid hardcoding - use existing environment variables
+os.environ["SOURCES__NOTION__API_KEY"] = os.environ.get("NOTION_KEY", "")
+
+# Or use credentials from third-party providers
+credentials = AwsCredentials()
+session = botocore.session.get_session()
+credentials.parse_native_representation(session)
+dlt.secrets["destination.filesystem.credentials"] = credentials
+```
+
+  </TabItem>
+
+</Tabs>
+
+:::warning
+While you can put all configuration and credentials in `secrets.toml` for convenience, sensitive information should never be placed in `config.toml` or other non-secure locations. `dlt` will raise an exception if it detects secrets in inappropriate locations.
+:::
+
+### Use different Google credentials for source and destination
+
+This example shows how to configure different credentials for Google-based sources and destinations:
+
+#### Option 1: Share credentials between source and destination
+
+If you want both the BigQuery destination and Google Sheets source to use the same credentials:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+```toml
+[credentials]
+client_email = "<client_email_for_both>"
+private_key = "<private_key_for_both>"
+project_id = "<project_id_for_both>"
+```
+
+  </TabItem>
+
+  <TabItem value="env">
+
+```sh
+export CREDENTIALS__CLIENT_EMAIL="<client_email_for_both>"
+export CREDENTIALS__PRIVATE_KEY="<private_key_for_both>"
+export CREDENTIALS__PROJECT_ID="<project_id_for_both>"
+```
+
+  </TabItem>
+
+ <TabItem value="code">
+
+```py
+import os
+
+# Avoid setting secrets directly in code
+# Instead, use existing environment variables
+os.environ["CREDENTIALS__CLIENT_EMAIL"] = os.environ.get("GOOGLE_CLIENT_EMAIL", "")
+os.environ["CREDENTIALS__PRIVATE_KEY"] = os.environ.get("GOOGLE_PRIVATE_KEY", "")
+os.environ["CREDENTIALS__PROJECT_ID"] = os.environ.get("GOOGLE_PROJECT_ID", "")
+```
+
+  </TabItem>
+
+</Tabs>
+
+#### Option 2: Use separate credentials for sources and destinations
+
+To keep source and destination credentials separate:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+```toml
+# Google Sheets credentials
+[sources.credentials]
+client_email = "<sheets_client_email>"
+private_key = "<sheets_private_key>"
+project_id = "<sheets_project_id>"
+
+# BigQuery credentials
+[destination.credentials]
+client_email = "<bigquery_client_email>"
+private_key = "<bigquery_private_key>"
+project_id = "<bigquery_project_id>"
+```
+
+  </TabItem>
+
+  <TabItem value="env">
+
+```sh
+# Google Sheets credentials
+export SOURCES__CREDENTIALS__CLIENT_EMAIL="<sheets_client_email>"
+export SOURCES__CREDENTIALS__PRIVATE_KEY="<sheets_private_key>"
+export SOURCES__CREDENTIALS__PROJECT_ID="<sheets_project_id>"
+
+# BigQuery credentials
+export DESTINATION__CREDENTIALS__CLIENT_EMAIL="<bigquery_client_email>"
+export DESTINATION__CREDENTIALS__PRIVATE_KEY="<bigquery_private_key>"
+export DESTINATION__CREDENTIALS__PROJECT_ID="<bigquery_project_id>"
+```
+
+  </TabItem>
+
+ <TabItem value="code">
+
+```py
+import dlt
+import os
+
+# For destination credentials, use existing environment variables
+os.environ["DESTINATION__CREDENTIALS__CLIENT_EMAIL"] = os.environ.get("BIGQUERY_CLIENT_EMAIL", "")
+os.environ["DESTINATION__CREDENTIALS__PRIVATE_KEY"] = os.environ.get("BIGQUERY_PRIVATE_KEY", "")
+os.environ["DESTINATION__CREDENTIALS__PROJECT_ID"] = os.environ.get("BIGQUERY_PROJECT_ID", "")
+
+# For source credentials, set values in dlt.secrets
+dlt.secrets["sources.credentials.client_email"] = os.environ.get("SHEETS_CLIENT_EMAIL", "")
+dlt.secrets["sources.credentials.private_key"] = os.environ.get("SHEETS_PRIVATE_KEY", "")
+dlt.secrets["sources.credentials.project_id"] = os.environ.get("SHEETS_PROJECT_ID", "")
+```
+
+  </TabItem>
+
+</Tabs>
+
+With this setup, `dlt` looks for destination credentials in this order:
+
+```sh
+destination.bigquery.credentials --> Not found
+destination.credentials --> Found
+```
+
+And for source credentials:
+
+```sh
+sources.google_sheets_module.google_sheets_function.credentials --> Not found
+sources.google_sheets_function.credentials --> Not found
+sources.credentials --> Found
+```
+
+### Configure credentials for multiple sources and destinations
+
+When working with multiple Google-based sources and destinations, you can use recommended sections layout:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+```toml
+# Google Sheets credentials
+[sources.google_sheets.credentials]
+client_email = "<sheets_client_email>"
+private_key = "<sheets_private_key>"
+project_id = "<sheets_project_id>"
+
+# Google Analytics credentials
+[sources.google_analytics.credentials]
+client_email = "<analytics_client_email>"
+private_key = "<analytics_private_key>"
+project_id = "<analytics_project_id>"
+
+# BigQuery credentials
+[destination.bigquery.credentials]
+client_email = "<bigquery_client_email>"
+private_key = "<bigquery_private_key>"
+project_id = "<bigquery_project_id>"
+```
+
+  </TabItem>
+
+  <TabItem value="env">
+
+```sh
+# Google Sheets credentials
+export SOURCES__GOOGLE_SHEETS__CREDENTIALS__CLIENT_EMAIL="<sheets_client_email>"
+export SOURCES__GOOGLE_SHEETS__CREDENTIALS__PRIVATE_KEY="<sheets_private_key>"
+export SOURCES__GOOGLE_SHEETS__CREDENTIALS__PROJECT_ID="<sheets_project_id>"
+
+# Google Analytics credentials
+export SOURCES__GOOGLE_ANALYTICS__CREDENTIALS__CLIENT_EMAIL="<analytics_client_email>"
+export SOURCES__GOOGLE_ANALYTICS__CREDENTIALS__PRIVATE_KEY="<analytics_private_key>"
+export SOURCES__GOOGLE_ANALYTICS__CREDENTIALS__PROJECT_ID="<analytics_project_id>"
+
+# BigQuery credentials
+export DESTINATION__BIGQUERY__CREDENTIALS__CLIENT_EMAIL="<bigquery_client_email>"
+export DESTINATION__BIGQUERY__CREDENTIALS__PRIVATE_KEY="<bigquery_private_key>"
+export DESTINATION__BIGQUERY__CREDENTIALS__PROJECT_ID="<bigquery_project_id>"
+```
+
+  </TabItem>
+
+ <TabItem value="code">
+
+```py
+import os
+import dlt
+
+# For Analytics credentials
+os.environ["SOURCES__GOOGLE_ANALYTICS__CREDENTIALS__CLIENT_EMAIL"] = os.environ.get("ANALYTICS_CLIENT_EMAIL", "")
+os.environ["SOURCES__GOOGLE_ANALYTICS__CREDENTIALS__PRIVATE_KEY"] = os.environ.get("ANALYTICS_PRIVATE_KEY", "")
+os.environ["SOURCES__GOOGLE_ANALYTICS__CREDENTIALS__PROJECT_ID"] = os.environ.get("ANALYTICS_PROJECT_ID", "")
+
+# For BigQuery credentials
+os.environ["DESTINATION__BIGQUERY__CREDENTIALS__CLIENT_EMAIL"] = os.environ.get("BIGQUERY_CLIENT_EMAIL", "")
+os.environ["DESTINATION__BIGQUERY__CREDENTIALS__PRIVATE_KEY"] = os.environ.get("BIGQUERY_PRIVATE_KEY", "")
+os.environ["DESTINATION__BIGQUERY__CREDENTIALS__PROJECT_ID"] = os.environ.get("BIGQUERY_PROJECT_ID", "")
+
+# For Google Sheets credentials
+dlt.secrets["sources.google_sheets.credentials.client_email"] = os.environ.get("SHEETS_CLIENT_EMAIL", "")
+dlt.secrets["sources.google_sheets.credentials.private_key"] = os.environ.get("SHEETS_PRIVATE_KEY", "")
+dlt.secrets["sources.google_sheets.credentials.project_id"] = os.environ.get("SHEETS_PROJECT_ID", "")
+```
+
+  </TabItem>
+
+</Tabs>
+
+### Configure multiple instances of the same source
+
+If you need to extract data from the same source type with different configurations, you can run them in different pipeline names:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+```toml
+[pipeline_name_1.sources.sql_database]
+credentials="snowflake://user1:password1@service-account/database1?warehouse=warehouse_name&role=role1"
+
+[pipeline_name_2.sources.sql_database]
+credentials="snowflake://user2:password2@service-account/database2?warehouse=warehouse_name&role=role2"
+```
+
+  </TabItem>
+
+  <TabItem value="env">
+
+```sh
+export PIPELINE_NAME_1__SOURCES__SQL_DATABASE__CREDENTIALS="snowflake://user1:password1@service-account/database1?warehouse=warehouse_name&role=role1"
+export PIPELINE_NAME_2__SOURCES__SQL_DATABASE__CREDENTIALS="snowflake://user2:password2@service-account/database2?warehouse=warehouse_name&role=role2"
+```
+
+  </TabItem>
+
+ <TabItem value="code">
+
+```py
+import os
+import dlt
+
+# Use existing environment variables to set credentials
+os.environ["PIPELINE_NAME_1__SOURCES__SQL_DATABASE__CREDENTIALS"] = os.environ.get("SQL_CREDENTIAL_STRING_1", "")
+
+# Or set values directly in dlt.secrets
+dlt.secrets["pipeline_name_2.sources.sql_database.credentials"] = os.environ.get("SQL_CREDENTIAL_STRING_2", "")
+```
+
+  </TabItem>
+
+</Tabs>
+
+:::tip
+You have additional options for using multiple instances of the same source:
+
+1. Use the `clone()` method as explained in the [sql_database documentation](../../dlt-ecosystem/verified-sources/sql_database/advanced.md#configure-many-sources-side-by-side-with-custom-sections).
+
+2. Create [named destinations](../destination.md#configure-multiple-destinations-of-the-same-type) to use the same destination type with different configurations.
+:::
+
+## Troubleshoot configuration errors
+
+If `dlt` can't find a required configuration value or secret, it raises a `ConfigFieldMissingException` that provides detailed information about what was searched for and where.
+
+For example, running the `chess.py` example without providing the password:
+
+```sh
+$ CREDENTIALS="postgres://loader@localhost:5432/dlt_data" python chess.py
+...
+dlt.common.configuration.exceptions.ConfigFieldMissingException: Following fields are missing: ['password'] in configuration with spec PostgresCredentials
+        for field "password" config providers and keys were tried in the following order:
+                In Environment Variables key CHESS_GAMES__DESTINATION__POSTGRES__CREDENTIALS__PASSWORD was not found.
+                In Environment Variables key CHESS_GAMES__DESTINATION__CREDENTIALS__PASSWORD was not found.
+                In Environment Variables key CHESS_GAMES__CREDENTIALS__PASSWORD was not found.
+                In secrets.toml key chess_games.destination.postgres.credentials.password was not found.
+                In secrets.toml key chess_games.destination.credentials.password was not found.
+                In secrets.toml key chess_games.credentials.password was not found.
+                In Environment Variables key DESTINATION__POSTGRES__CREDENTIALS__PASSWORD was not found.
+                In Environment Variables key DESTINATION__CREDENTIALS__PASSWORD was not found.
+                In Environment Variables key CREDENTIALS__PASSWORD was not found.
+                In secrets.toml key destination.postgres.credentials.password was not found.
+                In secrets.toml key destination.credentials.password was not found.
+                In secrets.toml key credentials.password was not found.
+Please refer to https://dlthub.com/docs/general-usage/credentials/ for more information
+```
+
+This error message shows exactly:
+
+1. Which field is missing (`password` in this case)
+2. All the keys and locations `dlt` checked, in order of priority
+3. That it first looked with the pipeline name (`chess_games`) prefix, then without it
+4. That it searched environment variables first, then `secrets.toml`
+
+Note that `config.toml` wasn't checked since it's not appropriate for storing secrets.
+
+
+===== FILE: docs/website/docs/general-usage/credentials/vaults.md =====
+
+---
+title: Vault providers
+description: Learn how to configure Google Secrets, AWS Secrets Manager and Airflow providers
+---
+# Vault providers
+
+## How vault providers work
+
+`dlt` can read configuration and secrets from “vault” providers by reconstructing a secrets.toml-like document from one or more secrets stored in a vault. Internally this is handled by a vault-backed provider that:
+
+* looks up entire TOML fragments (recommended) and single values (optional), then merges them into a working in-memory TOML document
+* caches all retrieved values for the lifetime of the process to minimize repeated calls
+* optionally pre-lists all available keys to avoid unnecessary lookups for non-existent secrets
+
+Supported providers include:
+
+* [Google Cloud Secret Manager](#configure-google-secret-provider)
+* [AWS Secrets Manager](#configure-aws-secrets-manager-provider)
+* [Airflow Variables](#configure-airflow-variables-as-provider)
+
+For other vault integrations like Azure Key Vault we are happy to take contributions. There's an abstract class (look for `VaultDocProvider`) that does all the heavy lifting.
+
+## Lookup and merge strategy
+
+On first access to any configuration value, the vault provider tries to populate its in-memory TOML document by fetching and merging known fragments, in the following order:
+
+1. Global `dlt_secrets_toml`. It first tries a special key `dlt_secrets_toml` that may contain an entire `secrets.toml` as a single secret.
+2. Pipeline-scoped `dlt_secrets_toml`. If you request a value for a specific pipeline, it also attempts to fetch a pipeline-scoped `<pipeline_name>.dlt_secrets_toml`.
+3. Known sections and names:
+
+  * The provider knows about these top-level sections: **sources** and **destination**.
+  * It will probe short-to-long paths so that more specific fragments override less specific ones:
+  * **`sources`** and **`sources.<source_name>`**
+  * **`destination`** and **`destination.<destination_name>`**
+  * The above both globally and pipeline-scoped when a pipeline name is provided.
+
+4. Single-value lookups (optional). If enabled, the provider may also fetch single values when a TOML fragment was not found. This can incur many calls because a single configuration may probe several possible locations.
+
+### Merging behavior
+
+Fragments are TOML documents and are merged into the in-memory configuration in the order they are found. More specific fragments (for example `destination.bigquery` over `destination`) override settings from more general fragments.
+
+### Caching
+
+Every successful or failed lookup (including “not found”) is cached for the lifetime of the process. Changes in the vault will not be picked up until the process restarts.
+
+## Configure the vault provider
+
+You can tune the provider to reduce the number of vault calls:
+
+### only_secrets (default varies by provider)
+
+When true, the provider only fetches values that are marked as secrets by `dlt` (for example, destination credentials and values annotated as secret). Non-secret settings are skipped.
+
+### only_toml_fragments (default varies by provider)
+
+When true, the provider fetches only the known TOML fragments (for example `destination`, `destination.bigquery`, `sources`, `sources.facebook`, and `dlt_secrets_toml`). Single-value lookups are skipped.
+
+### list_secrets (default false)
+
+When true, the provider lists all available secret names once and then avoids lookups for keys that do not exist. This can save many calls, but requires additional permissions (see the provider examples below).
+If you enable `list_secrets` while also enabling `only_secrets` and/or `only_toml_fragments`, note that some lookups may still be skipped by design.
+
+:::tip
+
+* Prefer TOML fragments (**destination**, **destination.**, **sources**, **sources.**, **dlt_secrets_toml**) to minimize the number of round trips.
+* Enable `list_secrets` whenever you can. It will radically reduce the number of calls to the vault's backend.
+* Keep `only_secrets=true` when you want to restrict vault calls to secret-typed configuration (for example credentials), and provide non-secret config via environment or files.
+:::
+
+## Configure Google Secret Provider
+
+Required permissions:
+
+* `roles/secretmanager.secretAccessor` to read particular secrets (required)
+* `roles/secretmanager.secretViewer` to list available secrets (required when `list_secrets=true`)
+
+### Activate Google Secret Provider
+
+To activate the Google Secrets Provider, you need to configure it. The simplest way is to add the configuration to your `secrets.toml` file or add it to environment variables. You can omit the credentials section if your environment already has default Google credentials with the necessary permissions.
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+]}>
+  <TabItem value="toml">
+
+```toml
+[providers]
+enable_google_secrets = true  # google secrets provider is disabled by default
+
+[providers.google_secrets]
+only_secrets = false
+only_toml_fragments = false
+list_secrets = true  # we recommend pre-listing secrets to minimize calls to google backend
+
+[providers.google_secrets.credentials]
+project_id = "<project_id>"
+private_key = "-----BEGIN PRIVATE KEY-----\n....\n-----END PRIVATE KEY-----\n"
+client_email = "....gserviceaccount.com"
+```
+
+  </TabItem>
+  <TabItem value="env">
+
+```sh
+PROVIDERS__ENABLE_GOOGLE_SECRETS="true"
+
+PROVIDERS__GOOGLE_SECRETS__ONLY_SECRETS="false"
+PROVIDERS__GOOGLE_SECRETS__ONLY_TOML_FRAGMENTS="false"
+PROVIDERS__GOOGLE_SECRETS__LIST_SECRETS="true"
+
+PROVIDERS__GOOGLE_SECRETS__CREDENTIALS__PROJECT_ID="<project_id>"
+PROVIDERS__GOOGLE_SECRETS__CREDENTIALS__PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n....\n-----END PRIVATE KEY-----\n"
+PROVIDERS__GOOGLE_SECRETS__CREDENTIALS__CLIENT_EMAIL="....gserviceaccount.com"
+```
+
+  </TabItem>
+</Tabs>
+
+Alternative vault configuration when listing secrets is not available:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+]}>
+  <TabItem value="toml">
+
+```toml
+[providers]
+enable_google_secrets = true  # google secrets provider is disabled by default
+
+[providers.google_secrets]
+only_secrets = false
+only_toml_fragments = false
+list_secrets = false  # listing not available: dlt does direct lookups, needs only secretAccessor
+```
+
+  </TabItem>
+  <TabItem value="env">
+
+```sh
+PROVIDERS__ENABLE_GOOGLE_SECRETS="true"
+
+PROVIDERS__GOOGLE_SECRETS__ONLY_SECRETS="false"
+PROVIDERS__GOOGLE_SECRETS__ONLY_TOML_FRAGMENTS="false"
+PROVIDERS__GOOGLE_SECRETS__LIST_SECRETS="false"
+```
+
+  </TabItem>
+</Tabs>
+
+### Naming convention for Google Secrets
+
+You can now add secrets to Google Secrets directly. To optimize performance, use TOML fragments to reduce backend calls. Please, read carefully the description of naming convention for Google Secrets used by dlt:
+
+Secret names are normalized to contain letters, digits, hyphens (-), and underscores (_).
+
+* Punctuation (except `-` and `_`) and whitespace are removed.
+* Sections are joined with hyphens, for example:
+  * `destination.bigquery.credentials.project_id` → `destination-bigquery-credentials-project_id`
+  * `sources.pipedrive.pipedrive_api_key` → `sources-pipedrive-pipedrive_api_key`
+  * `destination.bigquery` → `destination-bigquery`
+  * `my_pipeline.dlt_secrets_toml` → `my_pipeline-dlt_secrets_toml`
+
+Below you will find examples grouped by storage type, simplest first.
+
+### Store your whole `secrets.toml` (simplest)
+
+**secret name: `dlt_secrets_toml`**
+
+One secret holding your `secrets.toml` content, written exactly as you would locally. dlt probes this key first, so no naming convention is needed.
+
+```toml
+[destination.motherduck.credentials]
+password = "<motherduck_token>"
+database = "<database>"
+```
+
+The value can hold as many sections as you like, your whole `secrets.toml` or just the one credential block you need (as above). You can also scope it to a single pipeline with a secret named `<pipeline_name>-dlt_secrets_toml`.
+
+### Store per-section fragments
+
+Each secret's value is a TOML block with its own `[section]` header.
+
+**secret name: `destination`**
+
+```toml
+[destination]
+postgres.credentials = "postgresql://loader:***@host:5432/postgres"
+```
+
+**secret name: `destination-bigquery-credentials`**
+
+```toml
+[destination.bigquery.credentials]
+project_id = "<project_id>"
+private_key = "-----BEGIN PRIVATE KEY-----\n....\n-----END PRIVATE KEY-----\n"
+client_email = "....gserviceaccount.com"
+```
+
+**secret name: `destination-filesystem`**
+
+(whole `filesystem` destination configuration)
+
+```toml
+[destination.filesystem]
+bucket_url = "s3://bucket/path"
+
+[destination.filesystem.credentials]
+region_name = "eu-central-1"
+aws_access_key_id = "..."
+aws_secret_access_key = "..."
+```
+
+**secret name: `sources-mongodb`**
+
+```toml
+[sources.mongodb]
+connection_url = "mongodb+srv://user:***@host/db?authSource=admin&tls=true"
+```
+
+### Store single values
+
+Each secret's value is a bare string with no TOML header. This requires more vault calls.
+
+For example, the following keys would be fetched similarly to environment variables:
+
+* `sources-pipedrive-pipedrive_api_key`
+* `destination-bigquery-credentials-project_id`
+* `destination-bigquery-credentials-private_key`
+* `destination-bigquery-credentials-client_email`
+* `destination-bigquery-location`
+
+### Notes on `list_secrets`
+
+When `list_secrets=true`, the provider will pre-list all secret names to skip lookups for non-existent keys.
+If the service account lacks `roles/secretmanager.secretViewer`, listing will fail and the provider will raise a configuration error.
+
+## Configure AWS Secrets Manager provider
+
+:::info
+By default, all dlt secrets live under the **`dlt/` name prefix**: the provider reads `dlt/dlt_secrets_toml`, `dlt/sources/pipedrive` etc. AWS Secrets Manager is typically shared by many services in an account - the prefix namespaces dlt secrets and lets you scope IAM read access to `secret:dlt/*`. Change or remove the prefix with the `secret_name_prefix` setting ([see below](#change-or-remove-the-secret-name-prefix)).
+:::
+
+Required IAM permissions:
+
+* `secretsmanager:GetSecretValue` on secrets under the name prefix (required)
+* `secretsmanager:ListSecrets` to list available secrets (required when `list_secrets=true`)
+* `kms:Decrypt` on the corresponding KMS key when secrets are encrypted with a customer managed key
+
+### Activate AWS Secrets Manager provider
+
+To activate the provider, add the configuration to your `secrets.toml` file or to environment variables. You can omit the credentials section entirely if your environment provides default AWS credentials (environment variables, shared config/credentials files, IAM roles for EC2/ECS/EKS). Note that the AWS region must resolve in that case, for example via `AWS_DEFAULT_REGION` or your profile.
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+]}>
+  <TabItem value="toml">
+
+```toml
+[providers]
+enable_aws_secrets = true  # aws secrets manager provider is disabled by default
+
+[providers.aws_secrets]
+only_secrets = false
+only_toml_fragments = false
+list_secrets = true  # we recommend pre-listing secrets to minimize calls to aws backend
+
+[providers.aws_secrets.credentials]
+aws_access_key_id = "..."
+aws_secret_access_key = "..."
+region_name = "eu-central-1"
+```
+
+  </TabItem>
+  <TabItem value="env">
+
+```sh
+PROVIDERS__ENABLE_AWS_SECRETS="true"
+
+PROVIDERS__AWS_SECRETS__ONLY_SECRETS="false"
+PROVIDERS__AWS_SECRETS__ONLY_TOML_FRAGMENTS="false"
+PROVIDERS__AWS_SECRETS__LIST_SECRETS="true"
+
+PROVIDERS__AWS_SECRETS__CREDENTIALS__AWS_ACCESS_KEY_ID="..."
+PROVIDERS__AWS_SECRETS__CREDENTIALS__AWS_SECRET_ACCESS_KEY="..."
+PROVIDERS__AWS_SECRETS__CREDENTIALS__REGION_NAME="eu-central-1"
+```
+
+  </TabItem>
+</Tabs>
+
+You can also use a named profile from your AWS config files:
+
+```toml
+[providers.aws_secrets.credentials]
+profile_name = "dlt-secrets"
+```
+
+### Naming convention for AWS secrets
+
+AWS secret names may contain letters, digits and the `/_+=.@-` characters. dlt normalizes each name component (whitespace and punctuation other than `-` and `_` are removed), joins components with slashes and prepends the name prefix, so secret names form paths:
+
+* `destination.bigquery.credentials.project_id` → `dlt/destination/bigquery/credentials/project_id`
+* `sources.pipedrive.pipedrive_api_key` → `dlt/sources/pipedrive/pipedrive_api_key`
+* `destination.bigquery` → `dlt/destination/bigquery`
+* `my_pipeline.dlt_secrets_toml` → `dlt/my_pipeline/dlt_secrets_toml`
+
+All storage types described for [Google Secrets](#naming-convention-for-google-secrets) work the same way: a whole `secrets.toml` under the `dlt/dlt_secrets_toml` name (recommended), per-section TOML fragments (for example `dlt/destination/filesystem` or `dlt/sources/mongodb`), and single values.
+
+### JSON secrets
+
+Secret values may be TOML, YAML or JSON documents - dlt detects the format automatically. Key/value secrets created in the AWS console are stored as JSON strings and work as fragments out of the box. For example, a secret named `dlt/sources/mongodb` may hold either of:
+
+```toml
+[sources.mongodb]
+connection_url = "mongodb+srv://user:***@host/db?authSource=admin&tls=true"
+```
+
+```json
+{"sources": {"mongodb": {"connection_url": "mongodb+srv://user:***@host/db?authSource=admin&tls=true"}}}
+```
+
+### Change or remove the secret name prefix
+
+The `secret_name_prefix` (default `dlt/`) is prepended verbatim to all secret names and secret listing only requests names starting with it. Set your own namespace or an empty string to look up unprefixed secret names:
+
+```toml
+[providers.aws_secrets]
+secret_name_prefix = "team/dlt/"  # or "" to read e.g. plain `sources/pipedrive`
+```
+
+Because IAM policies match the name portion of secret ARNs, you can scope read access to the dlt namespace. Secret ARNs end with six random characters, so prefix wildcards are the natural way to grant access:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": "arn:aws:secretsmanager:*:*:secret:dlt/*"
+        }
+    ]
+}
+```
+
+Note that `secretsmanager:ListSecrets` cannot be limited to particular secrets - the prefix narrows what dlt fetches and lists, not what the principal is allowed to list.
+
+## Configure Airflow Variables as provider
+
+You can use Airflow Variables to store secrets and TOML fragments.
+
+### Activate and configure Airflow Provider
+
+The Airflow provider is automatically activated when Airflow is installed and usually requires no additional setup. However, you can optionally enable variable listing to reduce the number of backend calls. `list_secrets=true` is a useful optimization, especially for Airflow 3.0.
+
+```toml
+[providers.airflow_secrets]
+list_secrets = true
+```
+
+:::tip
+You can also disable the Airflow provider, for example, by setting the following environment variable:
+`PROVIDERS__ENABLE_AIRFLOW_SECRETS=False`
+:::
+
+### Add Airflow Variables with secrets
+
+Now you can create Airflow Variables whose values are either:
+
+* entire TOML fragments (recommended), such as **destination**, **sources.**, or a pipeline-scoped `dlt_secrets_toml`
+* single values (optional)
+
+Provider behavior is the same as with other vaults:
+
+* it probes `dlt_secrets_toml` first, then known sections (sources and destination), both globally and pipeline-scoped
+* if `only_toml_fragments=true`, it will not attempt single-value lookups
+* it caches lookups for the lifetime of the process
+
+Examples of values stored in Airflow Variables with following names:
+
+**variable name: `my_pipeline.dlt_secrets_toml`**
+
+(entire secrets TOML scoped for a pipeline):
+
+```toml
+[destination.bigquery]
+location = "US"
+
+[destination.bigquery.credentials]
+project_id = "<project_id>"
+private_key = "-----BEGIN PRIVATE KEY-----\n....\n-----END PRIVATE KEY-----\n"
+client_email = "....gserviceaccount.com"
+
+[sources.pipedrive]
+pipedrive_api_key = "..."
+```
+
+**variable name: `destination`**
+
+```toml
+[destination]
+postgres.credentials = "postgresql://loader:***@host:5432/postgres"
+```
+
+**variable name: `sources.mongodb`**
+
+```toml
+[sources.mongodb]
+connection_url = "mongodb+srv://user:***@host/db?authSource=admin&tls=true"
+```
+
+Provider behavior is the same as with other vaults:
+
+* it probes `dlt_secrets_toml` first, then known sections (sources and destination), both globally and pipeline-scoped
+* if `only_toml_fragments=true`, it will not attempt single-value lookups
+* it caches lookups for the lifetime of the process
+
+
+===== FILE: docs/website/docs/general-usage/customising-pipelines/pseudonymizing_columns.md =====
+
+---
+title: Pseudonymizing columns
+description: Pseudonymizing (or anonymizing) columns by replacing the special characters
+keywords: [pseudonymize, anonymize, columns, special characters]
+---
+# Pseudonymizing columns
+
+Pseudonymization is a deterministic way to hide personally identifiable information (PII), enabling us to consistently achieve the same mapping. If instead you wish to anonymize, you can delete the data or replace it with a constant. In the example below, we create a dummy source with a PII column called "name", which we replace with deterministic hashes (i.e., replacing the German umlaut).
+
+```py
+import dlt
+import hashlib
+
+@dlt.source
+def dummy_source(prefix: str = None):
+    @dlt.resource
+    def dummy_data():
+        for _ in range(3):
+            yield {'id': _, 'name': f'Jane Washington {_}'}
+    return dummy_data(),
+
+def pseudonymize_name(doc):
+    '''
+    Pseudonymization is a deterministic type of PII-obscuring.
+    Its role is to allow identifying users by their hash,
+    without revealing the underlying info.
+    '''
+    # add a constant salt to generate
+    salt = 'WI@N57%zZrmk#88c'
+    salted_string = doc['name'] + salt
+    sh = hashlib.sha256()
+    sh.update(salted_string.encode())
+    hashed_string = sh.digest().hex()
+    doc['name'] = hashed_string
+    return doc
+
+# run it as is
+for row in dummy_source().dummy_data.add_map(pseudonymize_name):
+    print(row)
+
+#{'id': 0, 'name': '96259edb2b28b48bebce8278c550e99fbdc4a3fac8189e6b90f183ecff01c442'}
+#{'id': 1, 'name': '92d3972b625cbd21f28782fb5c89552ce1aa09281892a2ab32aee8feeb3544a1'}
+#{'id': 2, 'name': '443679926a7cff506a3b5d5d094dc7734861352b9e0791af5d39db5a7356d11a'}
+
+# Or create an instance of the data source, modify the resource and run the source.
+
+# 1. Create an instance of the source so you can edit it.
+source_instance = dummy_source()
+# 2. Modify this source instance's resource
+data_resource = source_instance.dummy_data.add_map(pseudonymize_name)
+# 3. Inspect your result
+for row in source_instance:
+    print(row)
+
+pipeline = dlt.pipeline(pipeline_name='example', destination='bigquery', dataset_name='normalized_data')
+load_info = pipeline.run(source_instance)
+```
+
+## Data masking for SQL database sources
+
+For production use cases with SQL database sources, you'll want a reusable masking function that takes column names as parameters, supports multiple masking methods (replace with asterisks or nullify), and works with all `sql_database` backends (PyArrow, Pandas, SQLAlchemy).
+
+See the full data masking for a production-ready implementation using closures.
+
+
+===== FILE: docs/website/docs/general-usage/customising-pipelines/removing_columns.md =====
+
+---
+title: Removing columns
+description: Removing columns by passing a list of column names
+keywords: [deleting, removing, columns, drop]
+---
+# Removing columns
+
+Removing columns before loading data into a database is a reliable method to eliminate sensitive or unnecessary fields. For example, in the given scenario, a source is created with a "country_id" column, which is then excluded from the database before loading.
+
+Let's create a sample pipeline demonstrating the process of removing a column.
+
+1. Create a source function that creates dummy data as follows:
+
+   ```py
+   import dlt
+
+   # This function creates a dummy data source.
+   @dlt.source
+   def dummy_source():
+       @dlt.resource(write_disposition="replace")
+       def dummy_data():
+           for i in range(3):
+               yield {"id": i, "name": f"Jane Washington {i}", "country_code": 40 + i}
+
+       return dummy_data()
+   ```
+
+   This function creates three columns: `id`, `name`, and `country_code`.
+
+2. Next, create a function to filter out columns from the data before loading it into a database as follows:
+
+   ```py
+   from typing import Optional
+
+   def remove_columns(doc: dict, remove_columns: Optional[list[str]] = None) -> dict:
+       if remove_columns is None:
+           remove_columns = []
+
+       # Iterating over the list of columns to be removed
+       for column_name in remove_columns:
+           # Removing the column if it exists in the document
+           if column_name in doc:
+               del doc[column_name]
+
+       return doc
+   ```
+
+   `doc`: The document (dict) from which columns will be removed.
+
+   `remove_columns`: List of column names to be removed, defaults to None.
+
+3. Next, declare the columns to be removed from the table, and then modify the source as follows:
+
+   ```py notype
+   # Example columns to remove:
+   remove_columns_list = ["country_code"]
+
+   # Create an instance of the source so you can edit it.
+   source_instance = dummy_source()
+
+   # Modify this source instance's resource
+   source_instance.dummy_data.add_map(
+       lambda doc: remove_columns(doc, remove_columns_list)
+   )
+   ```
+
+4. You can optionally inspect the result:
+
+   ```py notype
+   for row in source_instance:
+       print(row)
+   #{'id': 0, 'name': 'Jane Washington 0'}
+   #{'id': 1, 'name': 'Jane Washington 1'}
+   #{'id': 2, 'name': 'Jane Washington 2'}
+   ```
+
+5. At last, create a pipeline:
+
+   ```py
+   # Integrating with a dlt pipeline
+   pipeline = dlt.pipeline(
+       pipeline_name='example',
+       destination='bigquery',
+       dataset_name='filtered_data'
+   )
+   # Run the pipeline with the transformed source
+   load_info = pipeline.run(data_source)
+   print(load_info)
+   ```
+
+
+===== FILE: docs/website/docs/general-usage/customising-pipelines/renaming_columns.md =====
+
+---
+title: Renaming columns
+description: Renaming columns by replacing the special characters
+keywords: [renaming, columns, special characters]
+---
+# Renaming columns
+
+## Renaming columns by replacing the special characters
+
+In the example below, we create a dummy source with special characters in the name. We then write a function that we intend to apply to the resource to modify its output (i.e., replacing the German umlaut): `replace_umlauts_in_dict_keys`.
+
+```py
+import dlt
+
+# create a dummy source with umlauts (special characters) in key names (um)
+@dlt.source
+def dummy_source(prefix: str = None):
+    @dlt.resource
+    def dummy_data():
+        for _ in range(100):
+            yield {f'Objekt_{_}': {'Größe': _, 'Äquivalenzprüfung': True}}
+    return dummy_data(),
+
+def replace_umlauts_in_dict_keys(d):
+    """
+    Replaces umlauts in dictionary keys with standard characters.
+    """
+    umlaut_map =  {'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss', 'Ä': 'Ae', 'Ö': 'Oe', 'Ü': 'Ue'}
+    result = {}
+    for k, v in d.items():
+        new_key = ''.join(umlaut_map.get(c, c) for c in k)
+        if isinstance(v, dict):
+            result[new_key] = replace_umlauts_in_dict_keys(v)
+        else:
+            result[new_key] = v
+    return result
+
+# We can add the map function to the resource
+
+# 1. Create an instance of the source so you can edit it.
+source_instance = dummy_source()
+
+# 2. Modify this source instance's resource
+source_instance.dummy_data().add_map(replace_umlauts_in_dict_keys)
+
+# 3. Inspect your result
+for row in source_instance:
+    print(row)
+
+# {'Objekt_0': {'Groesse': 0, 'Aequivalenzpruefung': True}}
+# ...
+```
+
+
+===== FILE: docs/website/docs/general-usage/data-enrichments/currency_conversion_data_enrichment.md =====
+
+---
+title:  Currency-conversion data enrichment
+description: Converting the monetary value in one currency to another using the latest market rates.
+keywords: [data enrichment, currency conversion, latest market rates]
+---
+# Data enrichment part two: Currency conversion data enrichment
+
+Currency conversion data enrichment means adding additional information to currency-related data.
+Often, you have a dataset of monetary value in one currency. For various reasons such as reporting,
+analysis, or global operations, it may be necessary to convert these amounts into different currencies.
+
+## Currency conversion process
+
+Here is a step-by-step process for currency conversion data enrichment:
+
+1. Define base and target currencies, e.g., USD (base) to EUR (target).
+1. Obtain current exchange rates from a reliable source like a financial data API.
+1. Convert the monetary values at obtained exchange rates.
+1. Include metadata like conversion rate, date, and time.
+1. Save the updated dataset in a data warehouse or lake using a data pipeline.
+
+We use the [ExchangeRate-API](https://app.exchangerate-api.com/) to fetch the latest currency
+conversion rates. However, you can use any service you prefer.
+
+:::note
+ExchangeRate-API free tier offers 1500 free calls monthly. For production, consider
+upgrading to a higher plan.
+:::
+
+## Creating data enrichment pipeline
+
+You can either follow the example in the linked Colab notebook or follow this documentation to
+create the currency conversion data enrichment pipeline.
+
+### A. Colab notebook
+
+The Colab notebook combines three data enrichment processes for a sample dataset; its second part
+contains "Data enrichment part two: Currency conversion data enrichment".
+
+Here's the link to the notebook:
+**[Colab Notebook](https://colab.research.google.com/drive/1ZKEkf1LRSld7CWQFS36fUXjhJKPAon7P?usp=sharing).**
+
+### B. Create a pipeline
+
+Alternatively, to create a data enrichment pipeline, you can start by creating the following
+directory structure:
+
+```text
+currency_conversion_enrichment/
+├── .dlt/
+│   └── secrets.toml
+└── currency_enrichment_pipeline.py
+```
+
+### 1. Creating resource
+
+`dlt` works on the principle of [sources](../../general-usage/source.md) and
+[resources.](../../general-usage/resource.md)
+
+1. The last part of our data enrichment ([part one](../../general-usage/data-enrichments/user_agent_device_data_enrichment.md))
+   involved enriching the data with user-agent device data. This included adding two new columns to the dataset as follows:
+
+  - `device_price_usd`: average price of the device in USD.
+
+  - `price_updated_at`: time at which the price was updated.
+
+1. The columns initially present prior to the data enrichment were:
+
+  - `user_id`: Web trackers typically assign a unique ID to users for tracking their journeys and
+     interactions over time.
+
+  - `device_name`: User device information helps in understanding the user base's device.
+
+  - `page_referer`: The referer URL is tracked to analyze traffic sources and user navigation
+     behavior.
+
+1. Here's the resource that yields the sample data as discussed above:
+
+   ```py
+   @dlt.resource()
+   def enriched_data_part_two():
+       data_enrichment_part_one = [
+           {
+                "user_id": 1,
+                "device_name": "Sony Experia XZ",
+                "page_referer": "https://b2venture.lightning.force.com/",
+                "device_price_usd": 313.01,
+                "price_updated_at": "2024-01-15 04:08:45.088499+00:00"
+           },
+       ]
+       """
+       Similar data for the other users.
+       """
+       for user_data in data_enrichment_part_one:
+           yield user_data
+   ```
+
+   > `data_enrichment_part_one` holds the enriched data from part one. It can also be directly used
+   > in part two as demonstrated in
+   > **[Colab Notebook](https://colab.research.google.com/drive/1ZKEkf1LRSld7CWQFS36fUXjhJKPAon7P?usp=sharing).**
+
+### 2. Create `converted_amount` function
+
+This function retrieves conversion rates for currency pairs that either haven't been fetched before
+or were last updated more than 24 hours ago from the ExchangeRate-API, using information stored in
+the `dlt` [state](../../general-usage/state.md).
+
+The first step is to register on [ExchangeRate-API](https://app.exchangerate-api.com/) and obtain the
+API token.
+
+1. In the `.dlt` folder, there's a file called `secrets.toml`. It's where you store sensitive
+   information securely, like access tokens. Keep this file safe. Here's its format for service
+   account authentication:
+
+   ```toml
+   [sources]
+   api_key= "Please set me up!"  # ExchangeRate-API key
+   ```
+
+1. Create the `converted_amount` function as follows:
+
+   ```py
+   import datetime
+
+   import dlt
+   import requests
+
+   # @dlt.transformer(data_from=enriched_data_part_two)
+   def converted_amount(record):
+        """
+        Converts an amount from base currency to target currency using the latest exchange rate.
+
+        This function retrieves the current exchange rate from an external API and
+        applies it to the specified amount in the record. It handles updates to the exchange rate
+        if the current rate is over 12 hours old.
+
+        Args:
+            record (dict): A dictionary containing the 'device_price_usd' key with the value to be converted.
+
+        Yields:
+            dict: A dictionary containing the original amount in USD, converted amount in EUR,
+                  the exchange rate, and the last update time of the rate.
+
+        Note:
+            The base currency (USD) and target currency (EUR) are hard coded in this function,
+            but that can be changed.
+            The API key is retrieved from the `dlt` secrets.
+        """
+        # Hardcoded base and target currencies
+        base_currency = "USD"
+        target_currency = "EUR"
+
+        # Retrieve the API key from DLT secrets
+        api_key: str = dlt.secrets.get("sources.api_key")
+
+        # Initialize or retrieve the state for currency rates
+        rates_state = dlt.current.resource_state().setdefault("rates", {})
+        currency_pair_key = f"{base_currency}-{target_currency}"
+        currency_pair_state = rates_state.setdefault(currency_pair_key, {
+            "last_update": datetime.datetime.min,
+            "rate": None
+        })
+
+        # Update the exchange rate if it's older than 12 hours
+        if (currency_pair_state.get("rate") is None or
+            (datetime.datetime.now(datetime.timezone.utc) - currency_pair_state["last_update"] >= datetime.timedelta(hours=12))):
+            url = f"https://v6.exchangerate-api.com/v6/{api_key}/pair/{base_currency}/{target_currency}"
+            response = requests.get(url)
+            if response.status_code == 200:
+                data = response.json()
+                currency_pair_state.update({
+                    "rate": data.get("conversion_rate"),
+                    "last_update": datetime.datetime.fromtimestamp(data.get("time_last_update_unix"), tz=datetime.timezone.utc)
+                })
+                print(f"The latest rate of {data.get('conversion_rate')} for the currency pair {currency_pair_key} is fetched and updated.")
+            else:
+                raise Exception(f"Error fetching the exchange rate: HTTP {response.status_code}")
+
+        # Convert the amount using the retrieved or stored exchange rate
+        amount = record['device_price_usd']
+        rate = currency_pair_state["rate"]
+        yield {
+            "actual_amount": amount,
+            "base_currency": base_currency,
+            "converted_amount": round(amount * rate, 2),
+            "target_currency": target_currency,
+            "rate": rate,
+            "rate_last_updated": currency_pair_state["last_update"],
+        }
+    ```
+
+1. Next, follow the instructions in
+   [Destinations](../../dlt-ecosystem/destinations/duckdb.md) to add credentials for
+   your chosen destination. This will ensure that your data is properly routed to its final
+   destination.
+
+### 3. Create your pipeline
+
+1. In creating the pipeline, the `converted_amount` can be used in the following ways:
+
+  - Add map function
+  - Transformer function
+
+   The `dlt` library's `transformer` and `add_map` functions serve distinct purposes in data
+   processing.
+
+   `Transformers` are a form of `dlt resource` that takes input from other resources
+   via the `data_from` argument to enrich or transform the data.
+   [Click here.](../../general-usage/resource.md#process-resources-with-dlttransformer)
+
+   Conversely, `add_map` used to customize a resource applies transformations at an item level
+   within a resource. It's useful for tasks like anonymizing individual data records. More on this
+   can be found under [Customize resources](../../general-usage/resource.md#customize-resources) in the
+   documentation.
+
+1. Here, we create the pipeline and use the `add_yield_map` functionality (since `converted_amount` is a generator function that yields items, we use `add_yield_map` instead of `add_map`):
+
+   ```py notype
+   # Create the pipeline
+   pipeline = dlt.pipeline(
+       pipeline_name="data_enrichment_two",
+       destination="duckdb",
+       dataset_name="currency_conversion_enrichment",
+   )
+
+   # Run the pipeline with the transformed source
+   load_info = pipeline.run(enriched_data_part_two.add_yield_map(converted_amount))
+
+   print(load_info)
+   ```
+
+   :::info
+   Please note that the same outcome can be achieved by using the `@dlt.transformer` decorator function.
+   To do so, you need to add the transformer decorator at the top of the `converted_amount` function.
+   For `pipeline.run`, you can use the following code:
+
+   ```py notype
+   # using converted_amount as a transformer function
+   load_info = pipeline.run(
+       enriched_data_part_two | converted_amount,
+       table_name="data_enrichment_part_two"
+   )
+   ```
+
+   This will execute the `converted_amount` function with the data enriched in part one and return
+   the converted currencies.
+   :::
+
+### Run the pipeline
+
+1. Install necessary dependencies for the preferred
+   [destination](../../dlt-ecosystem/destinations/), for example, duckdb:
+
+   ```sh
+   pip install "dlt[duckdb]"
+   ```
+
+1. Run the pipeline with the following command:
+
+   ```sh
+   python currency_enrichment_pipeline.py
+   ```
+
+1. To ensure that everything loads as expected, use the command:
+
+   ```sh
+   dlt pipeline <pipeline_name> show
+   ```
+
+   For example, the "pipeline_name" for the above pipeline example is `data_enrichment_two`; you can
+   use any custom name instead.
+
+
+===== FILE: docs/website/docs/general-usage/data-enrichments/url-parser-data-enrichment.md =====
+
+---
+title:  URL-parser data enrichment
+description: Enriching the url with various parameters.
+keywords: [data enrichment, url parser, referer data enrichment]
+---
+# Data enrichment part three: URL parser data enrichment
+
+URL parser data enrichment involves extracting various URL components to gain additional insights and
+context about the URL. This extracted information can be used for data analysis, marketing, SEO, and
+more.
+
+## URL parsing process
+
+Here is a step-by-step process for URL parser data enrichment:
+
+1. Get the URL data that needs to be parsed from a source or create one.
+2. Send the URL data to an API like [URL Parser API](https://urlparse.com/).
+3. Receive the parsed URL data.
+4. Include metadata like conversion rate, date, and time.
+5. Save the updated dataset in a data warehouse or lake using a data pipeline.
+
+We use **[URL Parse API](https://urlparse.com/)** to extract information about the URL. However,
+you can use any API you prefer.
+
+:::tip
+`URL Parse API` is free, with a 1000 requests/hour limit, which can be increased upon request.
+:::
+
+By default, the URL Parse API will return a JSON response like:
+
+```json
+{
+    "authority": "urlparse.com",
+    "domain": "urlparse.com",
+    "domain_label": "urlparse",
+    "file": "/",
+    "fragment": null,
+    "host": "urlparse.com",
+    "href": "https://urlparse.com/",
+    "is_valid": true,
+    "origin": "https://urlparse.com",
+    "params": null,
+    "path": "/",
+    "port": null,
+    "query": null,
+    "request_url": "https://urlparse.com",
+    "scheme": "https",
+    "subdomains": null,
+    "tld": "com"
+}
+```
+
+## Creating a data enrichment pipeline
+
+You can either follow the example in the linked Colab notebook or follow this documentation to
+create the URL-parser data enrichment pipeline.
+
+### A. Colab notebook
+
+This Colab notebook outlines a three-part data enrichment process for a sample dataset:
+
+- User-agent device data enrichment
+- Currency conversion data enrichment
+- URL-parser data enrichment
+
+This document focuses on the URL-parser data enrichment (Part Three). For a comprehensive
+understanding, you may explore all three enrichments sequentially in the notebook:
+[Colab Notebook](https://colab.research.google.com/drive/1ZKEkf1LRSld7CWQFS36fUXjhJKPAon7P?usp=sharing).
+
+### B. Create a pipeline
+
+Alternatively, to create a data enrichment pipeline, you can start by creating the following
+directory structure:
+
+```text
+url_parser_enrichment/
+├── .dlt/
+│   └── secrets.toml
+└── url_enrichment_pipeline.py
+```
+
+### 1. Creating resource
+
+`dlt` works on the principle of [sources](../../general-usage/source.md) and
+[resources.](../../general-usage/resource.md)
+
+This data resource yields data typical of what many web analytics and tracking tools can collect.
+However, the specifics of what data is collected and how it's used can vary significantly among
+different tracking services.
+
+Let's examine a synthetic dataset created for this article. It includes:
+
+- `user_id`: Web trackers typically assign a unique ID to users for tracking their journeys and
+  interactions over time.
+
+- `device_name`: User device information helps in understanding the user base's device preferences.
+
+- `page_refer`: The referer URL is tracked to analyze traffic sources and user navigation behavior.
+
+Here's the resource that yields the sample data as discussed above:
+
+```py
+import dlt
+
+@dlt.resource(write_disposition="append")
+def tracked_data():
+    """
+    A generator function that yields a series of dictionaries, each representing
+    user tracking data.
+
+    This function is decorated with `dlt.resource` to integrate into the DLT (Data
+    Loading Tool) pipeline. The `write_disposition` parameter is set to "append" to
+    ensure that data from this generator is appended to the existing data in the
+    destination table.
+
+    Yields:
+        dict: A dictionary with keys 'user_id', 'device_name', and 'page_referer',
+        representing the user's tracking data including their device and the page
+        they were referred from.
+    """
+
+    # Sample data representing tracked user data
+    sample_data = [
+        {
+            "user_id": 1,
+            "device_name": "Sony Experia XZ",
+            "page_referer": "https://b2venture.lightning.force.com/"
+        },
+        # ... similar data for the other users
+    ]
+
+    # Yielding each user's data as a dictionary
+    for user_data in sample_data:
+        yield user_data
+```
+
+### 2. Create `url_parser` function
+
+We use a free service called [URL Parse API](https://urlparse.com/), to parse the URLs. You don’t
+need to register to use this service nor get an API key.
+
+1. Create a `url_parser` function as follows:
+
+   ```py
+   import requests
+
+   def url_parser(record):
+       """
+       Send a URL to a parsing service and return the parsed data.
+
+       This function sends a URL to a specified API endpoint for URL parsing.
+
+       Parameters:
+       record (dict): A dictionary containing the 'page_referer' key with the URL to be parsed.
+
+       Returns:
+       dict: Parsed URL data in JSON format if the request is successful.
+       None: If the request fails (e.g., an invalid URL or server error).
+       """
+       # Define the API endpoint URL for the URL parsing service
+       api_url = "https://api.urlparse.com/v1/query"
+       url = record['page_referer']
+       # Send a POST request to the API with the URL to be parsed
+       response = requests.post(api_url, json={"url": url})
+
+       # Check if the response from the API is successful (HTTP status code 200)
+       if response.status_code == 200:
+           # If successful, return the parsed data in JSON format
+           return response.json()
+       else:
+           # If the request failed, print an error message with the status code and return None
+           print(f"Request for {url} failed with status code: {response.status_code}")
+           return None
+   ```
+
+### 3. Create your pipeline
+
+1. In creating the pipeline, the `url_parser` can be used in the following ways:
+
+  - Add map function
+  - Transformer function
+
+   The `dlt` library's `transformer` and `add_map` functions serve distinct purposes in data
+   processing.
+
+   `Transformers` are a form of `dlt resource` that takes input from other resources
+   via the `data_from` argument to enrich or transform the data.
+   [Click here.](../../general-usage/resource.md#process-resources-with-dlttransformer)
+
+   Conversely, `add_map` is used to customize a resource and applies transformations at an item level
+   within a resource. It's useful for tasks like anonymizing individual data records. More on this
+   can be found under [Customize resources](../../general-usage/resource.md#customize-resources) in
+   the documentation.
+
+1. Here, we create the pipeline and use the `add_map` functionality:
+
+   ```py notype
+   # Create the pipeline
+   pipeline = dlt.pipeline(
+       pipeline_name="data_enrichment_three",
+       destination="duckdb",
+       dataset_name="user_device_enrichment",
+   )
+
+   # Run the pipeline with the transformed source
+   load_info = pipeline.run(tracked_data.add_map(url_parser))
+
+   print(load_info)
+   ```
+
+   :::info
+   Please note that the same outcome can be achieved by using the transformer function. To
+   do so, you need to add the transformer decorator at the top of the `url_parser` function. For
+   `pipeline.run`, you can use the following code:
+
+   ```py notype
+   # using url_parser as a transformer function
+   load_info = pipeline.run(
+       tracked_data | url_parser,
+       table_name="url_parser"
+   )
+   ```
+
+   This will execute the `url_parser` function with the tracked data and return the parsed URL.
+   :::
+
+### Run the pipeline
+
+1. Install necessary dependencies for the preferred
+   [destination](../../dlt-ecosystem/destinations/), for example, duckdb:
+
+   ```sh
+   pip install "dlt[duckdb]"
+   ```
+
+1. Run the pipeline with the following command:
+
+   ```sh
+   python url_enrichment_pipeline.py
+   ```
+
+1. To ensure that everything loads as expected, use the command:
+
+   ```sh
+   dlt pipeline <pipeline_name> show
+   ```
+
+   For example, the "pipeline_name" for the above pipeline example is `data_enrichment_three`; you
+   can use any custom name instead.
+
+
+===== FILE: docs/website/docs/general-usage/data-enrichments/user_agent_device_data_enrichment.md =====
+
+---
+title:  User-agent device data enrichment
+description: Enriching the user-agent device data with average device price.
+keywords: [data enrichment, user-agent data, device enrichment]
+---
+# Data enrichment part one: User-agent device data enrichment
+
+Data enrichment enhances raw data with valuable information from multiple sources, increasing its analytical and decision-making value.
+
+This part covers enriching sample data with device price. Understanding the price segment of the device that the user used to access your service can be helpful in personalized marketing, customer segmentation, and more.
+
+This documentation will discuss how to enrich user device information with the average market price.
+
+## Setup guide
+
+We use SerpAPI to retrieve device prices using Google Shopping, but alternative services or APIs are viable.
+
+:::note
+SerpAPI's free tier offers 100 free calls monthly. For production, consider upgrading to a higher plan.
+:::
+
+## Creating a data enrichment pipeline
+
+You can either follow the example in the linked Colab notebook or follow this documentation to create the user-agent device data enrichment pipeline.
+
+### A. Colab notebook
+
+The Colab notebook combines three data enrichment processes for a sample dataset, starting with "Data enrichment part one: User-agent device data".
+
+Here's the link to the notebook:
+**[Colab Notebook](https://colab.research.google.com/drive/1ZKEkf1LRSld7CWQFS36fUXjhJKPAon7P?usp=sharing).**
+
+### B. Create a pipeline
+
+Alternatively, to create a data enrichment pipeline, you can start by creating the following directory structure:
+
+```text
+user_device_enrichment/
+├── .dlt/
+│   └── secrets.toml
+└── device_enrichment_pipeline.py
+```
+
+### 1. Creating resource
+
+`dlt` works on the principle of [sources](../source) and [resources.](../resource)
+
+This data resource yields data typical of what many web analytics and tracking tools can collect. However, the specifics of what data is collected and how it's used can vary significantly among different tracking services.
+
+Let's examine a synthetic dataset created for this article. It includes:
+
+`user_id`: Web trackers typically assign a unique ID to users for tracking their journeys and interactions over time.
+
+`device_name`: User device information helps in understanding the user base's device preferences.
+
+`page_refer`: The referer URL is tracked to analyze traffic sources and user navigation behavior.
+
+Here's the resource that yields the sample data as discussed above:
+
+```py
+import dlt
+
+@dlt.resource(write_disposition="append")
+def tracked_data():
+    """
+    A generator function that yields a series of dictionaries, each representing
+    user tracking data.
+
+    This function is decorated with `dlt.resource` to integrate into the DLT (Data
+    Loading Tool) pipeline. The `write_disposition` parameter is set to "append" to
+    ensure that data from this generator is appended to the existing data in the
+    destination table.
+
+    Yields:
+        dict: A dictionary with keys 'user_id', 'device_name', and 'page_referer',
+        representing the user's tracking data including their device and the page
+        they were referred from.
+    """
+
+    # Sample data representing tracked user data
+    sample_data = [
+        {"user_id": 1, "device_name": "Sony Experia XZ", "page_referer":
+        "https://b2venture.lightning.force.com/"},
+        {"user_id": 2, "device_name": "Samsung Galaxy S23 Ultra 5G",
+        "page_referer": "https://techcrunch.com/2023/07/20/can-dlthub-solve-the-python-library-problem-for-ai-dig-ventures-thinks-so/"},
+        {"user_id": 3, "device_name": "Apple iPhone 14 Pro Max",
+        "page_referer": "https://dlthub.com/success-stories/freelancers-perspective/"},
+        {"user_id": 4, "device_name": "OnePlus 11R",
+        "page_referer": "https://www.reddit.com/r/dataengineering/comments/173kp9o/ideas_for_data_validation_on_data_ingestion/"},
+        {"user_id": 5, "device_name": "Google Pixel 7 Pro", "page_referer": "https://pypi.org/"},
+    ]
+
+    # Yielding each user's data as a dictionary
+    for user_data in sample_data:
+        yield user_data
+```
+
+### 2. Create `fetch_average_price` function
+
+This particular function retrieves the average price of a device by utilizing SerpAPI and Google shopping listings. To filter the data, the function uses dlt state, and only fetches prices from SerpAPI for devices that have not been updated in the most recent run or for those that were loaded more than 180 days in the past.
+
+The first step is to register on [SerpAPI](https://serpapi.com/) and obtain the API token key.
+
+1. In the `.dlt` folder, there's a file called `secrets.toml`. It's where you store sensitive information securely, like access tokens. Keep this file safe. Here's its format for service account authentication:
+
+   ```toml
+   [sources]
+   api_key= "Please set me up!"  # Serp Api key.
+   ```
+
+1. Replace the value of the `api_key`.
+
+1. Create the `fetch_average_price()` function as follows:
+
+   ```py
+   import datetime
+
+   import requests
+
+   # Uncomment transformer function if it is to be used as a transformer,
+   # otherwise, it is being used with the `add_map` functionality.
+
+   # @dlt.transformer(data_from=tracked_data)
+   def fetch_average_price(user_tracked_data):
+       """
+       Fetches the average price of a device from an external API and
+       updates the user_data dictionary.
+
+       This function retrieves the average price of a device specified in the
+       user_data dictionary by making an API request. The price data is cached
+       in the device_info state to reduce API calls. If the data for the device
+       is older than 180 days, a new API request is made.
+
+       Args:
+           user_tracked_data (dict): A dictionary containing user data, including
+           the device name.
+
+       Returns:
+           dict: The updated user_data dictionary with added device price and
+           updated timestamp.
+       """
+
+       # Retrieve the API key from dlt secrets
+       api_key: str = dlt.secrets.get("sources.api_key")
+
+       # Get the current resource state for device information
+       device_info = dlt.current.resource_state().setdefault("devices", {})
+
+       # Current timestamp for checking the last update
+       current_timestamp = datetime.datetime.now()
+
+       # Print the current device information
+       # print(device_info) # if you need to check state
+
+       # Extract the device name from user data
+       device = user_tracked_data['device_name']
+       device_data = device_info.get(device, {})
+
+       # Calculate the time since the last update
+       last_updated = (
+           current_timestamp -
+           device_data.get('timestamp', datetime.datetime.min)
+       )
+       # Check if the device is not in state or data is older than 180 days
+       if device not in device_info or last_updated > datetime.timedelta(days=180):
+           try:
+               # Make an API request to fetch device prices
+               response = requests.get("https://serpapi.com/search", params={
+                   "engine": "google_shopping", "q": device,
+                   "api_key": api_key, "num": 10
+               })
+           except requests.RequestException as e:
+               print(f"Request failed: {e}")
+               return None
+
+           if response.status_code != 200:
+               print(f"Failed to retrieve data: {response.status_code}")
+               return None
+
+           # Process the response to extract prices
+           results = response.json().get("shopping_results", [])
+           prices = []
+           for r in results:
+               if r.get("price"):
+                   # Split the price string and convert each part to float
+                   price = r.get("price")
+                   price_parts = price.replace('$', '').replace(',', '').split()
+                   for part in price_parts:
+                       try:
+                           prices.append(float(part))
+                       except ValueError:
+                           pass  # Ignore parts that can't be converted to float
+
+           # Calculate the average price and update the device_info
+           device_price = round(sum(prices) / len(prices), 2) if prices else None
+           device_info[device] = {
+               'timestamp': current_timestamp,
+               'price': device_price
+           }
+
+           # Add the device price and timestamp to the user data
+           user_tracked_data['device_price_USD'] = device_price
+           user_tracked_data['price_updated_at'] = current_timestamp
+
+       else:
+           # Use cached price data if available and not outdated
+           user_tracked_data['device_price_USD'] = device_data.get('price')
+           user_tracked_data['price_updated_at'] = device_data.get('timestamp')
+
+       return user_tracked_data
+   ```
+
+### 3. Create your pipeline
+
+1. In creating the pipeline, the `fetch_average_price` can be used in the following ways:
+
+  - Add map function
+  - Transformer function
+
+   The `dlt` library's `transformer` and `add_map` functions serve distinct purposes in data
+   processing.
+
+   `Transformers` are a form of `dlt resource` that takes input from other resources
+   via the `data_from` argument to enrich or transform the data. To read more:
+   [Click here.](../../general-usage/resource#process-resources-with-dlttransformer)
+

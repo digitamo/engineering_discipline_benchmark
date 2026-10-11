@@ -1,0 +1,2240 @@
+diff --git a/dlt/common/data_types/type_helpers.py b/dlt/common/data_types/type_helpers.py
+index 24619ee35..62ab47bf2 100644
+--- a/dlt/common/data_types/type_helpers.py
++++ b/dlt/common/data_types/type_helpers.py
+@@ -156,6 +156,15 @@ def _text_to_wei(value: str) -> Wei:
+         raise ValueError(trim_value)
+ 
+ 
++def _float_to_decimal(value: float) -> Decimal:
++    """Uses `str` that produces most precise stable decimal representaion of given `value`"""
++    return Decimal(str(value))
++
++
++def _float_to_wei(value: float) -> Wei:
++    return Wei(str(value))
++
++
+ def _numeric_to_bigint(value: Any) -> int:
+     if value % 1 != 0:
+         raise ValueError(value)
+@@ -206,12 +215,12 @@ _COERCE_DISPATCH: Dict[Tuple[TDataType, TDataType], Callable[[Any], Any]] = {
+     # to decimal
+     ("decimal", "text"): _text_to_decimal,
+     ("decimal", "bigint"): Decimal,
+-    ("decimal", "double"): Decimal,
++    ("decimal", "double"): _float_to_decimal,
+     ("decimal", "wei"): Decimal,
+     # to wei
+     ("wei", "text"): _text_to_wei,
+     ("wei", "bigint"): Wei,
+-    ("wei", "double"): Wei,
++    ("wei", "double"): _float_to_wei,
+     ("wei", "decimal"): Wei,
+     # to bool
+     ("bool", "text"): str2bool,
+diff --git a/docs/website/docs/general-usage/schema.md b/docs/website/docs/general-usage/schema.md
+index c47de0566..38d3c54e0 100644
+--- a/docs/website/docs/general-usage/schema.md
++++ b/docs/website/docs/general-usage/schema.md
+@@ -200,6 +200,12 @@ On the other hand, if the `id` field was already a string, then introducing new
+ 
+ Now go ahead and try to add a new record where `id` is a float number; you should see a new field `id__v_double` in the schema.
+ 
++#### Float to decimal coercion
++
++When coercing a Python `float` (IEEE 754 double-precision binary) to `decimal` or `wei`, `dlt` converts via `str()` first to avoid binary expansion artifacts. For example, `34.7` as a float would expand to `34.700000000000002842...` if passed directly to `Decimal()`, so `dlt` uses `Decimal(str(34.7))` which preserves `34.7`.
++
++This follows user intent when a decimal type is explicitly chosen over float, but it is **not mathematically precise** — the `str()` conversion finds the first stable decimal representation and discards the unstable binary tail. If your decimals represent currency or require exact precision, avoid storing them as floats in the source data. Use `Decimal('34.70')` or strings instead.
++
+ #### No-coercion normalizer
+ 
+ If you use `relational_no_coercion` (see [Data normalizer](#data-normalizer)), **every** type mismatch produces a variant column. No cross-type conversion is attempted. For example, sending `"200"` to a `bigint` column creates `col__v_text` instead of parsing it as an integer. This gives you stricter schema control: the original values are always preserved exactly as received, and mismatches are immediately visible as separate columns.
+diff --git a/tests/common/schema/test_coercion.py b/tests/common/schema/test_coercion.py
+index d0f67fd6d..a8e7a1efe 100644
+--- a/tests/common/schema/test_coercion.py
++++ b/tests/common/schema/test_coercion.py
+@@ -138,7 +138,7 @@ def test_coerce_to_numeric(dec_cls: Type[Any], data_type: TDataType) -> None:
+     # mind that 1276.37 does not have binary representation as used in float
+     v = coerce_value(data_type, "double", 1276.37)
+     assert type(v) is dec_cls
+-    assert v.quantize(Decimal("1.00")) == dec_cls("1276.37")
++    assert v == dec_cls("1276.37")
+ 
+     # wei to decimal and reverse
+     v = coerce_value(data_type, "decimal", Decimal("1276.37"))
+@@ -153,6 +153,25 @@ def test_coerce_to_numeric(dec_cls: Type[Any], data_type: TDataType) -> None:
+         coerce_value(data_type, "text", "p912.12")
+ 
+ 
++def test_coerce_double_to_decimal_no_float_expansion() -> None:
++    """Decimal(str(float)) should not exhibit IEEE 754 double-precision expansion."""
++    # 34.7 as float would expand to 34.70000000000000284... with Decimal(34.7)
++    # using Decimal(str(34.7)) preserves "34.7"
++    result = coerce_value("decimal", "double", 34.7)
++    assert result == Decimal("34.7")
++    assert str(result) == "34.7"
++
++    # same issue applies to Wei which extends Decimal
++    result = coerce_value("wei", "double", 34.7)
++    assert result == Wei("34.7")
++    assert str(result) == "34.7"
++
++    # get the "binary" float by quantizing properly and avoid casting
++    qd = Decimal.from_float(34.70000000000000284).quantize(Decimal("1." + "0" * 15))
++    # 15 digits scale, round up
++    assert qd == Decimal("34.700000000000003")
++
++
+ def test_coerce_type_from_hex_text() -> None:
+     # hex text into various types
+     assert coerce_value("wei", "text", " 0xff") == 255
+
+
+===== COMMIT 00e5ca61 =====
+
+
+commit 00e5ca613
+Author: rudolfix
+Date: 2026-05-27
+
+    documents the order of PipelineTasksGroup and dlt.pipeline creation (#3982)
+
+diff --git a/dlt/helpers/airflow_helper.py b/dlt/helpers/airflow_helper.py
+index f62ac0b03..a74d5ce93 100644
+--- a/dlt/helpers/airflow_helper.py
++++ b/dlt/helpers/airflow_helper.py
+@@ -414,12 +414,14 @@ class PipelineTasksGroup(TaskGroup):
+             Any: Airflow tasks created in order of creation.
+         """
+ 
+-        # make sure that pipeline was created after dag was initialized
++        # make sure that pipeline was created after PipelineTasksGroup was instantiated
+         if not pipeline.pipelines_dir.startswith(os.environ[DLT_DATA_DIR]):
+             raise ValueError(
+-                "Please create your Pipeline instance after AirflowTasks are created. The dlt"
+-                f" pipelines directory {pipeline.pipelines_dir} is not set correctly"
+-                f" ({os.environ[DLT_DATA_DIR]} expected)."
++                f"Pipeline {pipeline.pipeline_name} has pipelines_dir set to"
++                f" '{pipeline.pipelines_dir}' but a fresh random working directory under"
++                f" '{os.environ[DLT_DATA_DIR]}' is expected. Instantiate PipelineTasksGroup"
++                " BEFORE creating the Pipeline so dlt.pipeline() picks up the per-worker"
++                f" random working directory set by PipelineTasksGroup in {DLT_DATA_DIR}."
+             )
+ 
+         with self:
+diff --git a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
+index 92b9f6d3c..2fb242a6c 100644
+--- a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
++++ b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md
+@@ -152,7 +152,7 @@ def load_data():
+     # Import your source from the pipeline script
+     from pipeline_or_source_script import source
+ 
+-    # Modify the pipeline parameters
++    # Create the pipeline after instance of `PipelineTasksGroup` is created
+     pipeline = dlt.pipeline(
+         pipeline_name='pipeline_name',
+         dataset_name='dataset_name',
+@@ -226,6 +226,10 @@ load_data()
+ When you run the `load_data` DAG above, Airflow will call the `source` function every 30 seconds (by default) to be able to monitor the tasks. Make sure that your source function does not perform any long-lasting operations, e.g., reflecting the source database. In the case of [sql_database](../../dlt-ecosystem/verified-sources/sql_database/index.md), we added an option to delay database reflection until data is accessed by a resource.
+ :::
+ 
++:::caution
++Always instantiate `PipelineTasksGroup` **before** creating the `dlt.pipeline`. The constructor of `PipelineTasksGroup` overrides the `DLT_DATA_DIR` environment variable to a fresh random per-worker directory so that Airflow workers, which are reused across DAG runs, do not leak pipeline state between runs.
++:::
++
+ ### 3. Import sources and move the relevant code from the pipeline script
+ 
+ You should now move your working code from the pipeline script you previously ran to the newly created DAG script.
+diff --git a/tests/helpers/airflow_tests/test_airflow_wrapper.py b/tests/helpers/airflow_tests/test_airflow_wrapper.py
+index b92195df5..a74891164 100644
+--- a/tests/helpers/airflow_tests/test_airflow_wrapper.py
++++ b/tests/helpers/airflow_tests/test_airflow_wrapper.py
+@@ -1016,3 +1016,36 @@ def test_on_before_run() -> None:
+                 mock.call(f'on_before_run test: {pendulum.tomorrow().format("YYYY-MM-DD")}'),
+             ]
+         )
++
++
++def test_pipeline_created_before_task_group_raises() -> None:
++    # creating dlt.pipeline before PipelineTasksGroup uses a pipelines_dir that does not
++    # match the per-worker random dir set by PipelineTasksGroup. add_run must surface a
++    # clear error pointing at the ordering and the workaround.
++    @dag(schedule=None, start_date=DEFAULT_DATE, catchup=False, default_args=default_args)
++    def dag_wrong_order():
++        early_pipeline = dlt.pipeline(
++            pipeline_name="pipeline_wrong_order",
++            dataset_name="mock_data_" + uniq_id(),
++            destination=dlt.destinations.duckdb(credentials=":pipeline:"),
++        )
++        tasks = PipelineTasksGroup(
++            "pipeline_wrong_order",
++            local_data_folder=get_test_storage_root(),
++            wipe_local_data=False,
++        )
++        with pytest.raises(ValueError) as exc_info:
++            tasks.add_run(
++                early_pipeline,
++                mock_data_source(),
++                decompose="none",
++                trigger_rule="all_done",
++                retries=0,
++            )
++        message = str(exc_info.value)
++        assert "PipelineTasksGroup" in message
++        assert "BEFORE creating the Pipeline" in message
++        assert "DLT_DATA_DIR" in message
++        assert "pipelines_dir" in message
++
++    dag_wrong_order()
+
+
+===== COMMIT 38a0a24d =====
+
+
+commit 38a0a24d9
+Author: elvis kahoro
+Date: 2026-05-26
+
+    Update README.md (#3971)
+
+diff --git a/README.md b/README.md
+index 1948779dc..ff3cd5c37 100644
+--- a/README.md
++++ b/README.md
+@@ -124,7 +124,7 @@ Please read [CONTRIBUTING](CONTRIBUTING.md) before you make a PR.
+   </a>
+ </p>
+ 
+-[Blacksmith](https://blacksmith.sh/?utm_source=dlt&utm_medium=readme&utm_campaign=sponsorship) is a CI/CD platform that accelerates GitHub Actions by reducing queue times and improving build performance. It helps teams run workflows faster and more efficiently, making it easier to maintain a smooth development pipeline. We're grateful to Blacksmith for sponsoring dlt with free CI/CD minutes, which helps us keep builds fast and our costs lower.
++[Blacksmith](https://blacksmith.sh/?utm_source=dlt&utm_medium=readme&utm_campaign=sponsorship) is a drop-in replacement for GitHub-hosted runners that speed up our CI/CD pipelines by 2x and up to 75% cheaper. We're grateful to Blacksmith for sponsoring us with free CI/CD minutes--which helps us keep builds fast and our costs lower.
+ 
+ ## License
+ 
+
+
+===== COMMIT a0114a2c =====
+
+
+commit a0114a2c7
+Author: Jsu
+Date: 2026-05-26
+
+    typos: wether -> whether, invididual -> individual (#3973)
+
+diff --git a/dlt/dataset/dataset.py b/dlt/dataset/dataset.py
+index 087d91e4d..607c917d3 100644
+--- a/dlt/dataset/dataset.py
++++ b/dlt/dataset/dataset.py
+@@ -163,7 +163,7 @@ class Dataset:
+     def sqlglot_schema(self) -> SQLGlotSchema:
+         """SQLGlot schema of the dataset derived from all dlt schemas."""
+         # NOTE: no cache for now, it is probably more expensive to compute the current schema hash
+-        # to see wether this is stale than to compute a new sqlglot schema
++        # to see whether this is stale than to compute a new sqlglot schema
+         return lineage.create_sqlglot_schema(
+             {self.dataset_name: list(self.schemas)}, dialect=self.destination_dialect
+         )
+diff --git a/dlt/destinations/impl/dremio/sql_client.py b/dlt/destinations/impl/dremio/sql_client.py
+index c9299df95..9354020f1 100644
+--- a/dlt/destinations/impl/dremio/sql_client.py
++++ b/dlt/destinations/impl/dremio/sql_client.py
+@@ -158,7 +158,7 @@ class DremioSqlClient(SqlClientBase[pydremio.DremioConnection]):
+         return isinstance(ex, (pyarrow.lib.ArrowInvalid, pydremio.MalformedQueryError))
+ 
+     def create_dataset(self) -> None:
+-        # We create a sentinel table which defines wether we consider the dataset created
++        # We create a sentinel table which defines whether we consider the dataset created
+         sentinel_table_name = self.make_qualified_table_name(self.SENTINEL_TABLE_NAME)
+         self.execute_sql(f"CREATE TABLE {sentinel_table_name} (_dlt_id BIGINT)")
+ 
+diff --git a/dlt/extract/hints.py b/dlt/extract/hints.py
+index efff31d3e..e90346efc 100644
+--- a/dlt/extract/hints.py
++++ b/dlt/extract/hints.py
+@@ -212,12 +212,12 @@ class DltResourceHints:
+ 
+     @property
+     def has_dynamic_table_name(self) -> bool:
+-        """Tells the extractor wether computed table name may change based on invididual data items"""
++        """Tells the extractor whether computed table name may change based on individual data items"""
+         return self._table_name_hint_fun is not None
+ 
+     @property
+     def has_other_dynamic_hints(self) -> bool:
+-        """Tells the extractor wether computed hints may change based on invididual data items"""
++        """Tells the extractor whether computed hints may change based on individual data items"""
+         return self._table_has_other_dynamic_hints
+ 
+     @property
+
+
+===== COMMIT 2b92d086 =====
+
+
+commit 2b92d0864
+Author: Jorrit Sandbrink
+Date: 2026-05-26
+
+    add spn fabric token refresh automation (#3925)
+
+diff --git a/.github/workflows/test_destinations_remote.yml b/.github/workflows/test_destinations_remote.yml
+index 5931b11dd..523281b10 100644
+--- a/.github/workflows/test_destinations_remote.yml
++++ b/.github/workflows/test_destinations_remote.yml
+@@ -158,6 +158,7 @@ jobs:
+               filesystem_drivers: "[\"memory\"]"
+               extras: "--extra fabric"
+               pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
++              post_secrets_commands: "uv run python tests/load/fabric/refresh_spn_fabric_token.py"
+ 
+             # Postgres and Redshift (used to be test_destinations.yml)
+             - name: redshift
+@@ -245,6 +246,10 @@ jobs:
+       - name: create secrets.toml
+         run: pwd && echo "$DLT_SECRETS_TOML" > tests/.dlt/secrets.toml
+ 
++      - name: Run post secrets commands
++        run: ${{ matrix.post_secrets_commands }}
++        if: ${{ matrix.post_secrets_commands }}
++
+       # NOTE: essential tests are always run
+       - name: Run essential tests Linux
+         run: make test-dest-remote-essential
+diff --git a/tests/load/fabric/refresh_spn_fabric_token.py b/tests/load/fabric/refresh_spn_fabric_token.py
+new file mode 100644
+index 000000000..5d1126c04
+--- /dev/null
++++ b/tests/load/fabric/refresh_spn_fabric_token.py
+@@ -0,0 +1,42 @@
++# https://learn.microsoft.com/en-us/fabric/data-warehouse/service-principals#token-renewal-and-initialization-requirements
++
++import os
++
++import requests
++
++from azure.identity import ClientSecretCredential
++
++import dlt
++from dlt.destinations.impl.fabric.configuration import FabricCredentials
++
++
++def main() -> None:
++    # get SPN credentials
++    os.environ["DLT_PROJECT_DIR"] = "tests"
++    credentials = dlt.secrets.get("destination.fabric.credentials", FabricCredentials)
++    if credentials is None:
++        raise RuntimeError("`destination.fabric.credentials` is not configured.")
++
++    # get bearer token
++    token = (
++        ClientSecretCredential(
++            tenant_id=credentials.azure_tenant_id,
++            client_id=credentials.azure_client_id,
++            client_secret=credentials.azure_client_secret,
++        )
++        .get_token("https://api.fabric.microsoft.com/.default")
++        .token
++    )
++
++    # call public Fabric API endpoint to refresh token (any endpoint will do)
++    response = requests.get(
++        "https://api.fabric.microsoft.com/v1/workspaces",
++        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
++        timeout=30,
++    )
++    response.raise_for_status()
++    print("Refreshed Fabric SPN token successfully.")
++
++
++if __name__ == "__main__":
++    main()
+
+
+===== COMMIT 86d7dbdd =====
+
+
+commit 86d7dbdd3
+Author: Alberto
+Date: 2026-05-26
+
+    feat (dlthub pro): static_egress_ips (#3961)
+
+diff --git a/dlt/_workspace/deployment/decorators.py b/dlt/_workspace/deployment/decorators.py
+index 943985d45..c26bd6842 100644
+--- a/dlt/_workspace/deployment/decorators.py
++++ b/dlt/_workspace/deployment/decorators.py
+@@ -371,7 +371,8 @@ def job(
+ 
+         require: Runtime resource requirements. Accepts `TRequireSpec` with:
+             `dependency_groups`, `profile` (workspace profile), `machine`
+-            (machine spec), `region` (runner placement).
++            (machine spec), `region` (runner placement), `static_egress_ips`
++            (static outbound IPs for third-party allowlists).
+ 
+         deliver: A `@dlt.source`, standalone `@dlt.resource`, or called source
+             instance for delivery association.
+@@ -472,7 +473,7 @@ def interactive(
+             `tags`, `starred`, `manual`. The `interface` argument is merged
+             into expose automatically.
+         require: Runtime resource requirements. Accepts `TRequireSpec` with:
+-            `dependency_groups`, `profile`, `machine`, `region`.
++            `dependency_groups`, `profile`, `machine`, `region`, `static_egress_ips`.
+         spec: Optional configuration spec class.
+ 
+     Returns:
+@@ -539,7 +540,7 @@ def pipeline_run(
+         expose: UI presentation (`TJobExposeSpec`): `tags`, `starred`, `manual`.
+ 
+         require: Resource requirements (`TRequireSpec`): `dependency_groups`,
+-            `profile`, `machine`, `region`.
++            `profile`, `machine`, `region`, `static_egress_ips`.
+ 
+         interval: Overall time range for interval-based scheduling.
+ 
+diff --git a/dlt/_workspace/deployment/typing.py b/dlt/_workspace/deployment/typing.py
+index 61091f732..f34a15de5 100644
+--- a/dlt/_workspace/deployment/typing.py
++++ b/dlt/_workspace/deployment/typing.py
+@@ -106,6 +106,8 @@ class TRequireSpec(TypedDict, total=False):
+     """Runner region for placement (e.g. `"us-east-1"`, `"eu-west"`)."""
+     timezone: str
+     """IANA timezone for cron ticks and intervals (e.g. `"America/New_York"`). Default: UTC."""
++    static_egress_ips: bool
++    """When `True`, route outbound traffic through the workspace static egress IPs."""
+ 
+ 
+ class TEntryPoint(TypedDict):
+diff --git a/docs/website/docs/hub/runtime/job-configuration.md b/docs/website/docs/hub/runtime/job-configuration.md
+index 21397c7b4..e9f248493 100644
+--- a/docs/website/docs/hub/runtime/job-configuration.md
++++ b/docs/website/docs/hub/runtime/job-configuration.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Job configuration
+ description: Per-job options on the dltHub platform — execution timeouts, dependency groups, and TOML configuration sections
+-keywords: [dlthub platform, job configuration, timeout, dependency groups, execute, require, expose, section]
++keywords: [dlthub platform, job configuration, timeout, dependency groups, static egress, execute, require, expose, section]
+ ---
+ 
+ # Job configuration
+@@ -44,6 +44,25 @@ def transform(run_context: TJobRunContext):
+ 
+ The dltHub platform composes the execution environment from the workspace's base dependencies plus the job's declared groups.
+ 
++## Static egress IPs
++
++Use this when you must whitelist outbound IP addresses so external systems can grant your jobs access to private resources. Opt in per job so outbound requests use your workspace's static egress IPs:
++
++```py
++@run.pipeline(my_pipeline, require={"static_egress_ips": True})
++def sync_from_vendor():
++    ...
++```
++
++Static egress routing forces job traffic through the US region. See [Regions and data residency](regions.md) for how regional data planes relate to your organization.
++
++The static egress IPs are:
++- 4.205.113.62
++- 44.221.24.144
++- 34.193.87.36
++- 98.80.106.70
++- 54.81.217.233
++
+ ## Job configuration via TOML
+ 
+ Jobs read configuration through dlt's standard config system. The default section is the containing module name:
+diff --git a/tests/workspace/deployment/test_decorators.py b/tests/workspace/deployment/test_decorators.py
+index 0c16b9d30..b6b1f948b 100644
+--- a/tests/workspace/deployment/test_decorators.py
++++ b/tests/workspace/deployment/test_decorators.py
+@@ -368,9 +368,21 @@ def test_job_definition_omits_unset_fields() -> None:
+     assert "tags" not in job_def
+     assert "deliver" not in job_def
+     assert "expose" not in job_def
++    assert "require" not in job_def
+     assert job_def["triggers"] == []
+ 
+ 
++def test_require_static_egress_ips_stored_on_job_definition() -> None:
++    """`require.static_egress_ips` is passed through to the job definition."""
++
++    @job(require={"static_egress_ips": True})
++    def vendor_sync():
++        pass
++
++    job_def = vendor_sync.to_job_definition()
++    assert job_def["require"]["static_egress_ips"] is True
++
++
+ def test_config_key_discovery() -> None:
+     """Config keys from dlt.config.value defaults are discovered in job definition."""
+ 
+
+
+===== COMMIT 67266602 =====
+
+
+commit 672666028
+Author: Elisabeth Reitmayr
+Date: 2026-05-26
+
+    docs CI: smarter verify-redirects and dedicated CI step (#3970)
+
+diff --git a/.github/workflows/build_docs.yml b/.github/workflows/build_docs.yml
+index fbbb040dd..baf963d12 100644
+--- a/.github/workflows/build_docs.yml
++++ b/.github/workflows/build_docs.yml
+@@ -32,3 +32,6 @@ jobs:
+ 
+       - name: Install python dependencies
+         run: cd docs/website && npm run build
++
++      - name: Verify redirects
++        run: cd docs/website && npm run verify-redirects
+diff --git a/docs/website/README.md b/docs/website/README.md
+index aff106c60..a196c6d8d 100644
+--- a/docs/website/README.md
++++ b/docs/website/README.md
+@@ -64,7 +64,34 @@ For most authoring purposes, once you are happy with your changes running locall
+ $ npm run build
+ ```
+ 
+-That command generates static content into the `build` directory, which can be served using any static contents hosting service, for example, `npm run serve`
++That command generates static content into the `build` directory, which can be served using `npm run serve`.
++
++### What `npm run build` does
++
++The full build runs these steps in order:
++
++1. **`npm run update-versions`** — clones `dlt`, checks out the `master` branch, freezes the content into `versioned_docs/version-master/`. This is the **master snapshot** (served at `/docs/`); your branch is served at `/docs/devel/`. See [Docs versions](#docs-versions) below.
++2. **`make preprocess-docs`** (from `docs/`) — Python preprocessor: expands `<!--@@@DLT_SNIPPET-->` markers, generates the API reference, etc.
++3. **`docusaurus build --out-dir build/docs`** — the static site build itself. Fails on broken internal markdown links.
++4. **`node scripts/verify-llms-txt.js`** — checks the generated `llms.txt` index against the sidebar.
++
++### Running individual checks
++
++After a full build, you can re-run the verifiers standalone — useful when iterating on one concern without rebuilding everything:
++
++```
++$ npm run verify-llms          # llms.txt index check
++$ npm run verify-redirects     # redirect targets check
++```
++
++**`verify-redirects` is no longer part of `npm run build` — CI runs it as a dedicated `Verify redirects` step in `.github/workflows/build_docs.yml`.** To reproduce CI locally:
++
++```
++$ npm run build
++$ npm run verify-redirects
++```
++
++Run this whenever you add or change entries in `redirects.js`. See [Redirects](#redirects) below for how to interpret the output (errors vs. devel-only warnings)
+ 
+ ## Deployment
+ 
+@@ -78,7 +105,14 @@ This will build the project fully and serve via a local wrangler webserver which
+ 
+ ## Redirects
+ 
+-Simple redirects are managed with the cloudflare worker in `worker.js`. 
++Redirects are defined in [`redirects.js`](redirects.js) as one shared list, consumed in two places:
++
++- **Cloudflare worker (`worker.ts`)** — serves the redirects in production.
++- **`scripts/verify-redirects.js`** — runs in CI to check every `to` target resolves to an HTML page in `build/docs/`.
++
++The docs site builds two snapshots: `master` (frozen at the last `dlt` release, mounted at `/docs/`) and `devel` (your current branch, mounted at `/docs/devel/`). Verification checks targets against master first. If a target only resolves under `build/docs/devel/<path>` it emits a **warning** ("devel-only — awaits next release") instead of an error. This is the expected state during a docs restructure: once the next `dlt` release refreshes master, the warning auto-clears. Targets that resolve in neither snapshot still error and block CI.
++
++Verification runs as a dedicated `Verify redirects` step in `.github/workflows/build_docs.yml`, after the docs build.
+ 
+ ## Docs versions
+ 
+@@ -152,7 +186,7 @@ Hub pages receive special treatment in swizzled theme components:
+ - **`src/theme/DocBreadcrumbs`** — When the current URL contains `/hub/`, a dltHub logo is rendered next to the breadcrumb trail (via the `breadcrumbsContainerPlus` CSS class and an `<img>` tag).
+ - **`src/components/DltHubFeatureAdmonition.js`** — A reusable admonition component imported by hub pages to display licensing/feature notices.
+ 
+-In production, the Cloudflare worker (`worker.js`) redirects the legacy `/plus/` URL prefix to `/hub/`.
++In production, the Cloudflare worker (`worker.ts`) redirects the legacy `/plus/` URL prefix to `/hub/`.
+ 
+ ## Page overlays (Root.js)
+ 
+diff --git a/docs/website/docs/hub/getting-started/runtime-tutorial.md b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+index d2e49bd09..fe03693af 100644
+--- a/docs/website/docs/hub/getting-started/runtime-tutorial.md
++++ b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+@@ -219,7 +219,7 @@ To stop a schedule, remove the trigger from the decorator (or remove the job fro
+ ## Review and manage jobs in the UI
+ 
+ The command line is great for development, but the dltHub web UI gives you a bird's-eye view of everything running in the cloud.
+-Visit [dlthub.app](https://dlthub.app)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
++Visit [app.dlthub.com](https://app.dlthub.com)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
+ 
+ 1. A list of existing jobs.
+ 2. An overview of scheduled runs.
+diff --git a/docs/website/package.json b/docs/website/package.json
+index 10ada4f97..17f0cc241 100644
+--- a/docs/website/package.json
++++ b/docs/website/package.json
+@@ -4,7 +4,7 @@
+   "private": true,
+   "scripts": {
+     "start": "cd .. && make preprocess-docs && concurrently --kill-others \"make preprocess-docs-watch \" \"cd website && docusaurus start\"",
+-    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js && node scripts/verify-redirects.js",
++    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js",
+     "clear": "docusaurus clear",
+     "serve": "docusaurus serve --dir build/docs",
+     "clear-versions": "node tools/clear_versions.js",
+diff --git a/docs/website/scripts/verify-redirects.js b/docs/website/scripts/verify-redirects.js
+index 663802d2f..6632bae14 100644
+--- a/docs/website/scripts/verify-redirects.js
++++ b/docs/website/scripts/verify-redirects.js
+@@ -21,6 +21,7 @@ const redirects = require('../redirects.js');
+ // ---------------------------------------------------------------------------
+ let errors = 0;
+ let warnings = 0;
++let develOnlyWarnings = 0;
+ 
+ function error(msg) {
+   console.error(`  ERROR: ${msg}`);
+@@ -44,6 +45,14 @@ function targetExists(rel) {
+   return candidates.some((c) => fs.existsSync(c));
+ }
+ 
++function targetExistsOnDevel(rel) {
++  const candidates = [
++    path.join(BUILD_DIR, 'devel', rel + '.html'),
++    path.join(BUILD_DIR, 'devel', rel, 'index.html'),
++  ];
++  return candidates.some((c) => fs.existsSync(c));
++}
++
+ // ---------------------------------------------------------------------------
+ // Main
+ // ---------------------------------------------------------------------------
+@@ -92,9 +101,15 @@ for (const r of redirects) {
+ 
+   checked++;
+   const rel = r.to.replace(/^\/docs\//, '').replace(/\/$/, '');
+-  if (!targetExists(rel)) {
+-    error(`redirect target ${r.to} has no HTML page (from: ${r.from}, checked ${rel}.html and ${rel}/index.html)`);
++  if (targetExists(rel)) {
++    continue;
++  }
++  if (targetExistsOnDevel(rel)) {
++    warn(`(devel-only): ${r.to} — resolves on devel, awaits next release (from: ${r.from})`);
++    develOnlyWarnings++;
++    continue;
+   }
++  error(`redirect target ${r.to} has no HTML page (from: ${r.from}, checked ${rel}.html and ${rel}/index.html)`);
+ }
+ 
+ if (skipped > 0) {
+@@ -102,7 +117,12 @@ if (skipped > 0) {
+ }
+ 
+ if (errors === 0) {
+-  ok(`all ${checked} checked redirect targets resolve to existing pages`);
++  if (develOnlyWarnings === 0) {
++    ok(`all ${checked} checked redirect targets resolve to existing pages`);
++  } else {
++    const masterResolved = checked - develOnlyWarnings;
++    ok(`${masterResolved}/${checked} checked redirect targets resolve in master; ${develOnlyWarnings} resolve only on devel (await next release)`);
++  }
+ }
+ 
+ // Summary
+
+
+===== COMMIT ecb61edf =====
+
+
+commit ecb61edf3
+Author: Jean-Baptiste Braun
+Date: 2026-05-22
+
+    fix(sftp): cap paramiko<5 in sftp extra (#3931) (#3966)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index c0d6b9bc8..63b077c75 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -118,7 +118,8 @@ hf = [
+     "pyarrow>=21.0.0",  # minimum version that supports CDC (https://huggingface.co/blog/parquet-cdc)
+ ]
+ sftp = [
+-    "paramiko>=3.3.0"
++    # paramiko 5.0.0 dropped GSSAPI support and broke SFTP filesystem (#3931). cap until upgrade evaluated.
++    "paramiko>=3.3.0,<5"
+ ]
+ http = [
+     "aiohttp>3.9.0"
+diff --git a/uv.lock b/uv.lock
+index 994f11e5c..a72952fa6 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2855,7 +2855,7 @@ requires-dist = [
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.6.7,!=3.9.11,!=3.9.12,!=3.9.13,!=3.9.14,!=3.10.1,<4" },
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.10.1" },
+     { name = "packaging", specifier = ">=21.1" },
+-    { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.3.0" },
++    { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.3.0,<5" },
+     { name = "pathvalidate", specifier = ">=2.5.2" },
+     { name = "pendulum", specifier = ">=2.1.2" },
+     { name = "pendulum", marker = "python_full_version >= '3.14'", specifier = ">=3.0.0" },
+
+
+===== COMMIT 6f10e633 =====
+
+
+commit 6f10e633e
+Author: Alberto
+Date: 2026-05-22
+
+    Change workers to blacksmith (#3873)
+
+diff --git a/.github/workflows/build_docs.yml b/.github/workflows/build_docs.yml
+index b4f35c9fe..fbbb040dd 100644
+--- a/.github/workflows/build_docs.yml
++++ b/.github/workflows/build_docs.yml
+@@ -7,7 +7,7 @@ on:
+ jobs:
+   build_docs:
+     name: docs | build docs
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+       - name: Check out
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 6380a3121..39beef10a 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -13,7 +13,7 @@ jobs:
+       fail-fast: true
+       matrix:
+         os:
+-          - ubuntu-latest
++          - blacksmith-8vcpu-ubuntu-2404
+         python-version: ["3.10", "3.11", "3.12", "3.13"]
+ 
+     defaults:
+@@ -64,7 +64,7 @@ jobs:
+   matrix_job_required_check:
+     name: lint | code & tests
+     needs: run_lint
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-2vcpu-ubuntu-2404
+     if: always()
+     steps:
+       - name: Check matrix job results
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 629a9f288..189c16940 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -21,7 +21,7 @@ jobs:
+   authorize_secrets:
+     name: secrets available (internal PRs only)
+     if: ${{ github.event.pull_request.head.repo.full_name == github.repository && (github.event.action == 'opened' || github.event.action == 'synchronize') }}
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-2vcpu-ubuntu-2404
+     steps:
+       - run: true
+ 
+diff --git a/.github/workflows/test_common.yml b/.github/workflows/test_common.yml
+index 6dc7839e1..753bb930b 100644
+--- a/.github/workflows/test_common.yml
++++ b/.github/workflows/test_common.yml
+@@ -21,45 +21,45 @@ jobs:
+         include:
+ 
+           # macos tests
+-          - os: macos-latest
++          - os: blacksmith-12vcpu-macos-latest
+             python-version: "3.11"
+             shell: bash
+ 
+           # linux tests
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.10"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.12"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.13"
+             shell: bash
+ 
+-          - os: "macos-14"
++          - os: blacksmith-12vcpu-macos-latest
+             python-version: "3.14"
+             shell: bash
+ 
+           # linux test with minimal dependencies
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+             uv_sync_args: '--resolution lowest-direct' # could also be 'direct'
+ 
+           # linux test with newest available allowed packages (will update lockfile, should not be committed if run locally)
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+             uv_sync_args: '--upgrade' # could also be 'direct'
+ 
+           # windows tests
+-          - os: windows-latest
++          - os: blacksmith-8vcpu-windows-2025
+             python-version: "3.11"
+             shell: cmd
+-          - os: windows-latest
++          - os: blacksmith-8vcpu-windows-2025
+             python-version: "3.13"
+             shell: cmd
+ 
+diff --git a/.github/workflows/test_destinations_local.yml b/.github/workflows/test_destinations_local.yml
+index cc9281f0f..89e79a043 100644
+--- a/.github/workflows/test_destinations_local.yml
++++ b/.github/workflows/test_destinations_local.yml
+@@ -89,7 +89,7 @@ jobs:
+     defaults:
+       run:
+         shell: bash
+-    runs-on: "ubuntu-latest"
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     # Service containers to run with `container-job`
+     services:
+diff --git a/.github/workflows/test_sources_local.yml b/.github/workflows/test_sources_local.yml
+index 18dbf155d..d4ed62253 100644
+--- a/.github/workflows/test_sources_local.yml
++++ b/.github/workflows/test_sources_local.yml
+@@ -39,7 +39,7 @@ jobs:
+     defaults:
+       run:
+         shell: bash
+-    runs-on: "ubuntu-latest"
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+       - name: Check out
+diff --git a/.github/workflows/test_tools_airflow.yml b/.github/workflows/test_tools_airflow.yml
+index a4721fbfe..2ad85a6f7 100644
+--- a/.github/workflows/test_tools_airflow.yml
++++ b/.github/workflows/test_tools_airflow.yml
+@@ -7,7 +7,7 @@ on:
+ jobs:
+   run_airflow:
+     name: tools | airflow ${{ matrix.airflow-version }} tests
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+     strategy:
+       fail-fast: false
+       matrix:
+diff --git a/.github/workflows/test_tools_build_images.yml b/.github/workflows/test_tools_build_images.yml
+index 124687ef9..79cf25b1c 100644
+--- a/.github/workflows/test_tools_build_images.yml
++++ b/.github/workflows/test_tools_build_images.yml
+@@ -7,7 +7,7 @@ on:
+ jobs:
+   run_airflow:
+     name: tools | docker images build
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+       - name: Check out
+diff --git a/.github/workflows/test_tools_dashboard.yml b/.github/workflows/test_tools_dashboard.yml
+index c5c101935..25cb8a896 100644
+--- a/.github/workflows/test_tools_dashboard.yml
++++ b/.github/workflows/test_tools_dashboard.yml
+@@ -22,40 +22,40 @@ jobs:
+         include:
+ 
+           # macos tests
+-          - os: "macos-14"
++          - os: blacksmith-12vcpu-macos-latest
+             python-version: "3.12"
+             shell: bash
+ 
+           # linux tests
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.10"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.12"
+             shell: bash
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.13"
+             shell: bash
+ 
+           # linux test with minimal dependencies
+-          - os: ubuntu-latest
++          - os: blacksmith-8vcpu-ubuntu-2404
+             python-version: "3.11"
+             shell: bash
+             uv_sync_args: '--resolution lowest-direct' # could also be 'direct'
+ 
+           # mac test with newest available allowed packages (will update lockfile, should not be committed if run locally)
+           # TODO: revert to linux
+-          - os: "macos-14"
++          - os: blacksmith-12vcpu-macos-latest
+             python-version: "3.11"
+             shell: bash
+             uv_sync_args: '--upgrade' # could also be 'direct'
+ 
+ 
+           # windows tests
+-          - os: windows-latest
++          - os: blacksmith-8vcpu-windows-2025
+             python-version: "3.12"
+             shell: cmd
+ 
+@@ -113,7 +113,7 @@ jobs:
+   matrix_job_required_check:
+     name: common | common tests
+     needs: run_common
+-    runs-on: ubuntu-latest
++    runs-on: blacksmith-2vcpu-ubuntu-2404
+     if: always()
+     steps:
+       - name: Check matrix job results
+diff --git a/.github/workflows/test_tools_dbt_cloud.yml b/.github/workflows/test_tools_dbt_cloud.yml
+index 8a45f89fc..0f83b1afc 100644
+--- a/.github/workflows/test_tools_dbt_cloud.yml
++++ b/.github/workflows/test_tools_dbt_cloud.yml
+@@ -19,7 +19,7 @@ jobs:
+     defaults:
+       run:
+         shell: bash
+-    runs-on: "ubuntu-latest"
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+ 
+diff --git a/.github/workflows/test_tools_dbt_runner.yml b/.github/workflows/test_tools_dbt_runner.yml
+index 9f1cae2c1..d1377a1a1 100644
+--- a/.github/workflows/test_tools_dbt_runner.yml
++++ b/.github/workflows/test_tools_dbt_runner.yml
+@@ -16,7 +16,7 @@ jobs:
+     defaults:
+       run:
+         shell: bash
+-    runs-on: "ubuntu-latest"
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+ 
+
+
+===== COMMIT ead29e31 =====
+
+
+commit ead29e315
+Author: Anton Burnashev
+Date: 2026-05-20
+
+    Rename dlthub-runtime to dlthub-platform (#3957)
+
+diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md b/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md
+index 66aaafa9d..6cba60c89 100644
+--- a/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md
++++ b/docs/website/docs/dlt-ecosystem/llm-tooling/explore-and-transform.md
+@@ -170,5 +170,5 @@ By the end of this guide you should have:
+ - A working `@dlt.hub.transformation` script that populates the CDM
+ 
+ Next steps:
+-- [Deploy and schedule your pipeline](llm-native-workflow.md#handover-to-other-toolkits) with the `dlthub-runtime` toolkit
++- [Deploy and schedule your pipeline](llm-native-workflow.md#handover-to-other-toolkits) with the `dlthub-platform` toolkit
+ - [Replace the local destination with your data warehouse](../../walkthroughs/share-a-dataset.md)
+\ No newline at end of file
+diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+index 7ba63c1b5..3b1e56d3d 100644
+--- a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
++++ b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+@@ -299,11 +299,11 @@ Once your pipeline is validated, you can continue to the next phase of the data
+   Two skills drive the workflow: `/explore-data` (entry point skill) connects to your data, profiles it by mapping the intent to the available data and identifying potential gaps, while `/build-notebook` assembles the charts into a marimo dashboard and launches it in your browser.
+   The toolkit is designed for iterative development: create one chart and launch the notebook, then iterate — add or refine charts and re-launch.
+ 
+-- **`dlthub-runtime`** — deploy, schedule, and monitor your pipeline in production
++- **`dlthub-platform`** — deploy, schedule, and monitor your pipeline in production
+ 
+ ```sh
+ uv run dlthub ai toolkit install data-exploration
+-uv run dlthub ai toolkit install dlthub-runtime
++uv run dlthub ai toolkit install dlthub-platform
+ ```
+ 
+ ## Results
+diff --git a/docs/website/docs/hub/getting-started/installation.md b/docs/website/docs/hub/getting-started/installation.md
+index b058b41a0..76fe0010b 100644
+--- a/docs/website/docs/hub/getting-started/installation.md
++++ b/docs/website/docs/hub/getting-started/installation.md
+@@ -62,7 +62,7 @@ If you don't have `uv` yet, either [install it first](#configuration-of-the-pyth
+ pipx run dlthub-start
+ ```
+ 
+-Either way, it prompts for a workspace name, scaffold, and which AI agents to wire up (Claude / Cursor / Codex), scaffolds a workspace with `.dlt/.workspace` already set, vendors the AI toolkits (`rest-api-pipeline`, `transformations`, `dlthub-runtime`, `data-exploration`), and runs `uv sync` so `dlt[hub]` and all workspace dependencies are installed.
++Either way, it prompts for a workspace name, scaffold, and which AI agents to wire up (Claude / Cursor / Codex), scaffolds a workspace with `.dlt/.workspace` already set, vendors the AI toolkits (`rest-api-pipeline`, `transformations`, `dlthub-platform`, `data-exploration`), and runs `uv sync` so `dlt[hub]` and all workspace dependencies are installed.
+ 
+ For the recommended defaults non-interactively, pass a name explicitly:
+ 
+diff --git a/tests/workspace/cli/dlthub/ai/utils.py b/tests/workspace/cli/dlthub/ai/utils.py
+index 779f25bc5..79a0d879a 100644
+--- a/tests/workspace/cli/dlthub/ai/utils.py
++++ b/tests/workspace/cli/dlthub/ai/utils.py
+@@ -19,7 +19,7 @@ from dlt._workspace.cli.dlthub.ai.utils import (
+ from dlt._workspace.cli.dlthub.ai.typing import TToolkitIndexEntry, TToolkitInfo
+ 
+ # known toolkits in the repo (init is now visible)
+-KNOWN_TOOLKITS = ["data-exploration", "init", "rest-api-pipeline", "dlthub-runtime"]
++KNOWN_TOOLKITS = ["data-exploration", "init", "rest-api-pipeline", "dlthub-platform"]
+ INSTALLABLE_TOOLKITS = [t for t in KNOWN_TOOLKITS if t != "init"]
+ AGENT_NAMES = ["claude", "cursor", "codex"]
+ 
+
+
+===== COMMIT af227334 =====
+
+
+commit af227334a
+Author: Alena Astrakhantseva
+Date: 2026-05-20
+
+    Update the app link in runtime-tutorial.md (#3959)
+
+diff --git a/docs/website/docs/hub/getting-started/runtime-tutorial.md b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+index d2e49bd09..fe03693af 100644
+--- a/docs/website/docs/hub/getting-started/runtime-tutorial.md
++++ b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+@@ -219,7 +219,7 @@ To stop a schedule, remove the trigger from the decorator (or remove the job fro
+ ## Review and manage jobs in the UI
+ 
+ The command line is great for development, but the dltHub web UI gives you a bird's-eye view of everything running in the cloud.
+-Visit [dlthub.app](https://dlthub.app)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
++Visit [app.dlthub.com](https://app.dlthub.com)—or open it from the CLI with `uv run dlthub show`—to access the dashboard. You will find:
+ 
+ 1. A list of existing jobs.
+ 2. An overview of scheduled runs.
+
+
+===== COMMIT 0b3cd347 =====
+
+
+commit 0b3cd3474
+Author: Anton Burnashev
+Date: 2026-05-20
+
+    fix: update redirect paths for hub introduction (#3958)
+
+diff --git a/docs/website/redirects.js b/docs/website/redirects.js
+index 36047e00f..c8d6ae18a 100644
+--- a/docs/website/redirects.js
++++ b/docs/website/redirects.js
+@@ -19,7 +19,7 @@ const REDIRECTS = [
+     },
+     {
+         from: "/docs/hub",
+-        to: "/docs/hub/intro"
++        to: "/docs/hub/introduction"
+     },
+ 
+     // docs section redirects
+@@ -130,7 +130,11 @@ const REDIRECTS = [
+     },
+     {
+         from: "/docs/hub/reference",
+-        to: "/docs/hub/intro"
++        to: "/docs/hub/introduction"
++    },
++    {
++        from: "/docs/hub/intro",
++        to: "/docs/hub/introduction"
+     },
+     {
+         from: "/docs/general-usage/connectors",
+
+
+===== COMMIT 68b6276c =====
+
+
+commit 68b6276c0
+Author: rudolfix
+Date: 2026-05-20
+
+    fixes docs redirects
+
+diff --git a/docs/website/redirects.js b/docs/website/redirects.js
+index 36047e00f..4428255ae 100644
+--- a/docs/website/redirects.js
++++ b/docs/website/redirects.js
+@@ -19,7 +19,7 @@ const REDIRECTS = [
+     },
+     {
+         from: "/docs/hub",
+-        to: "/docs/hub/intro"
++        to: "/docs/hub/introduction"
+     },
+ 
+     // docs section redirects
+@@ -130,7 +130,7 @@ const REDIRECTS = [
+     },
+     {
+         from: "/docs/hub/reference",
+-        to: "/docs/hub/intro"
++        to: "/docs/hub/introduction"
+     },
+     {
+         from: "/docs/general-usage/connectors",
+
+
+===== COMMIT f3c2f2f8 =====
+
+
+commit f3c2f2f88
+Author: Thierry Jean
+Date: 2026-05-20
+
+    show dltHub sidebar (#3954)
+
+diff --git a/docs/website/docusaurus.config.js b/docs/website/docusaurus.config.js
+index b8f446495..b28a5f33a 100644
+--- a/docs/website/docusaurus.config.js
++++ b/docs/website/docusaurus.config.js
+@@ -156,6 +156,12 @@ const config = {
+             position: 'left',
+             label: 'dlt',
+           },
++          {
++            type: 'docSidebar',
++            sidebarId: 'hubSidebar',
++            position: 'left',
++            label: 'dltHub',
++          },
+           {
+             type: 'docSidebar',
+             sidebarId: 'cookbookSidebar',
+
+
+===== COMMIT b6e112e0 =====
+
+
+commit b6e112e0b
+Author: Anton Burnashev
+Date: 2026-05-19
+
+    docs: add incremental transformations (#3946)
+
+diff --git a/docs/website/docs/general-usage/dataset-access/dataset.md b/docs/website/docs/general-usage/dataset-access/dataset.md
+index 2f74c789c..64d66bc49 100644
+--- a/docs/website/docs/general-usage/dataset-access/dataset.md
++++ b/docs/website/docs/general-usage/dataset-access/dataset.md
+@@ -171,6 +171,8 @@ The translation from `Incremental` to SQL follows these rules:
+ - `on_cursor_value_missing="include"` translates to `... OR cursor IS NULL`; `"exclude"` to `... AND cursor IS NOT NULL`. `"raise"` cannot raise mid-query in SQL pushdown, so it falls back to `IS NOT NULL` and emits a warning when the cursor column is nullable.
+ - `lag` is applied to the lower bound exactly as it would be during a resource extraction.
+ 
++See [Incremental transformations](../../hub/features/transformations/index.md#incremental-transformations) for using this in `@dlt.hub.transformation`, including stateful cursors, scheduler-owned windows, and `_dlt_loads.inserted_at` load-time cursors.
++
+ ### Join related tables
+ 
+ The `join()` method follows relationships already defined in the dlt schema. It can resolve direct schema references between tables as well as multi-hop parent/child paths when one table is an ancestor or descendant of the other. This makes `join()` well suited for navigating nested tables created by dlt and tables connected by explicit references. Joined columns are appended from the target table only and are prefixed with the target table name, or with the alias you provide.
+diff --git a/docs/website/docs/hub/features/transformations/index.md b/docs/website/docs/hub/features/transformations/index.md
+index 1d243bc62..b420a6c42 100644
+--- a/docs/website/docs/hub/features/transformations/index.md
++++ b/docs/website/docs/hub/features/transformations/index.md
+@@ -121,6 +121,86 @@ You can also write transformations directly using Pandas or Polars DataFrames an
+ <!--@@@DLT_SNIPPET ./transformation-snippets.py::arrow_dataframe_operations-->
+ 
+ 
++## Incremental transformations
++
++When source data keeps growing, rerunning the same full transformation every time is slow and expensive.
++
++Incremental transformations let each run work on the right slice of source data instead of the whole dataset. Each slice is defined by a _cursor_: a column whose values dlt compares against a range to decide if a row is in scope. Common choices are `created_at`, `updated_at`, an increasing `id`, or the dlt-managed `_dlt_loads.inserted_at`.
++
++There are two common ways to choose the slice:
++
++- [Use the scheduler interval](#the-scheduler-interval). dltHub Platform uses this approach: the scheduler sets `[start, end)` interval this run is responsible for.
++- [Continue from the previous run](#continue-from-the-previous-run). dltHub stores the last cursor value it processed and the next run starts after that value.
++
++### The scheduler interval
++
++Use a scheduler interval when the orchestrator decides what time range each run should process. This is the natural fit for cron schedules, retries, and backfills because the run does not depend on what happened in a previous run.
++
++Set `allow_external_schedulers=True` on the cursor and dltHub Platform owns the interval: its cron schedules set `DLT_INTERVAL_START` and `DLT_INTERVAL_END`, which are picksed up to filter the source data.
++
++Here's an example. The transformation below reads the `orders` table and writes only the rows whose `created_at` falls in the `[start, end)` window to a new table `orders_window`.
++
++Given an `orders` table with one row per day:
++
++| id | created_at |
++| --- | --- |
++| 1  | 2026-01-01 |
++| 2  | 2026-01-02 |
++| …  | … |
++| 10 | 2026-01-10 |
++
++and a scheduler window of `[2026-01-05, 2026-01-10)`, the run writes ids 5 to 9 to `orders_window` (id 10 is excluded by the open upper bound).
++
++<!--@@@DLT_SNIPPET ./transformation-snippets.py::incremental_scheduler_window_definition-->
++
++Re-running the same `[start, end)` (start is included, end is excluded) interval produces the same transformation input, which makes this pattern a good fit for partition backfills and idempotent retries.
++
++### Continue from the previous run
++
++Use a stateful cursor for runs not tied to an external scheduler, where each run should continue from the last successful one. dltHub stores the cursor state internally and uses it in the next run of the transformation.
++
++The transformation below appends rows from `orders` whose `created_at` is later than the persisted `last_value` to a new table `recent_orders`.
++
++:::note Implicit cursor
++The cursor below is declared on the decorator; the body yields a bare relation (Ibis expressions and raw SQL strings work too) and dltHub applies the filter automatically. The [scheduler example above](#the-scheduler-interval) shows the alternative form, with the cursor as a function argument.
++:::
++
++<!--@@@DLT_SNIPPET ./transformation-snippets.py::incremental_stateful_cursor_definition-->
++
++Now suppose `orders` is loaded in two batches:
++
++| batch   | ids    | `created_at`              |
++| ---     | ---    | ---                       |
++| initial | 1..3   | 2026-01-01 .. 2026-01-03  |
++| later   | 4..5   | 2026-01-04 .. 2026-01-05  |
++
++The first run has no `last_value` yet, so it starts from `initial_value` (`2000-01-01`), writes the three initial rows to `recent_orders`, and advances `last_value` to `2026-01-03`. The next run sees the two later rows fall past `last_value`, appends them, and advances `last_value` to `2026-01-05`.
++
++:::caution Set `range_start="open"` on stateful cursors
++A stateful cursor persists `last_value` after each run. With the default `range_start="closed"`, the next run's filter is `cursor >= last_value`, so the row at the boundary is re-emitted every time. Set `range_start="open"` to make the filter `cursor > last_value` and exclude the boundary row.
++:::
++
++### Cursor column choices
++
++Use a domain cursor when the source table has a column that represents creation or update order. For append-only data, `created_at` or an increasing `id` is usually enough. For mutable data, use a cursor that changes whenever the row changes, such as `updated_at`; rows whose cursor value does not advance are intentionally ignored by the next stateful run.
++
++Use `_dlt_loads.inserted_at` when the source table has no domain timestamp and you want to process data by the time dltHub loaded it. A dotted cursor path such as `_dlt_loads.inserted_at` tells dltHub to follow the schema reference from the base table to `_dlt_loads`, join it, and filter on the joined column. The join is filter-only: columns from `_dlt_loads` are not added to the destination table.
++
++<!--@@@DLT_SNIPPET ./transformation-snippets.py::incremental_load_time_cursor_definition-->
++
++:::note
++Under the hood, when dltHub can run the transformation directly as SQL/model job, the source query is modified to include the cursor filter. When the transformation is materialized first, for example if source and destination are different physical engines, or when you yield Python objects such as lists, Arrow tables, or DataFrames, filtering happens during extraction.
++:::
++
++### State and safety rules
++
++- `LIMIT` is rejected on stateful relation incrementals. Advancing state from a limited result can skip rows that were not returned. Remove the limit or use an explicit bounded window.
++- SQL-based cursors support `max` and `min` last-value functions. Custom Python `last_value_func` callables cannot be pushed down to SQL.
++- Null handling follows `on_cursor_value_missing`. For SQL pushdown, `"include"` adds `OR cursor IS NULL`; `"exclude"` adds `AND cursor IS NOT NULL`; `"raise"` cannot raise in the middle of a query and falls back to excluding null cursor values when needed.
++
++For lower-level cursor rules, including range inclusivity and `lag`, see [Filter to an incremental cursor](../../../general-usage/dataset-access/dataset.md#filter-to-an-incremental-cursor) and [Cursor-based incremental loading](../../../general-usage/incremental/cursor.md).
++
++
+ ## Schema evolution and hints lineage
+ 
+ When executing transformations, `dlt` computes the resulting schema before the transformation is executed. This allows `dlt` to:
+@@ -140,7 +220,7 @@ You can inspect the computed result schema during development by looking at the
+ ### Column level hint forwarding
+ 
+ When creating or updating tables with transformation resources, `dlt` will also forward certain column hints to the new tables. In our fruitshop source, we have applied a custom hint named
+-`x-annotation-pii` set to True for the `name` column, which indicates that this column contains PII (personally identifiable information). 
++`x-annotation-pii` set to True for the `name` column, which indicates that this column contains PII (personally identifiable information).
+ Downstream of the transformation layer, we may want to know which columns originate from columns that contain private data:
+ 
+ <!--@@@DLT_SNIPPET ./transformation-snippets.py::column_level_lineage-->
+@@ -267,22 +347,3 @@ This script demonstrates:
+ - Loading only the aggregated results to a production warehouse (Postgres)
+ - Reducing warehouse compute costs by performing transformations locally in DuckDB
+ - Using multiple pipelines in a single workflow for different stages of processing
+-
+-### Incremental transformations example
+-
+-:::info
+-This example demonstrates how to perform incremental transformations using an incremental primary key from the original tables. We're actively working to make incremental transformations based on `_dlt_load_id`s even easier in the near future.
+-:::
+-
+-<!--@@@DLT_SNIPPET ./transformation-snippets.py::incremental_transformations-->
+-
+-This example demonstrates how you can incrementally transform incoming new data for the customers table into a cleaned_customers table where the name column has been removed. It:
+- * Uses primary key-based incremental loading to process only new data
+- * Tracks the highest ID processed so far to filter out already processed records
+- * Handles first-time runs with the PipelineNeverRan exception
+- * Removes sensitive data (name column) during the transformation
+- * Uses write_disposition="append" to add only new records to the destination table
+- * Can be run repeatedly as new data arrives, processing only the delta
+-
+-
+-
+diff --git a/docs/website/docs/hub/features/transformations/transformation-snippets.py b/docs/website/docs/hub/features/transformations/transformation-snippets.py
+index b78987627..6c2e98a9c 100644
+--- a/docs/website/docs/hub/features/transformations/transformation-snippets.py
++++ b/docs/website/docs/hub/features/transformations/transformation-snippets.py
+@@ -371,47 +371,190 @@ def in_transit_transformations_snippet() -> None:
+     }
+ 
+ 
+-def incremental_transformations_snippet(fruitshop_pipeline: dlt.Pipeline) -> None:
+-    # @@@DLT_SNIPPET_START incremental_transformations
+-    from dlt.pipeline.exceptions import PipelineNeverRan
++def incremental_stateful_cursor_snippet() -> None:
++    # @@@DLT_SNIPPET_START incremental_stateful_cursor
++    from typing import Any, Iterator, List
+ 
++    import dlt
++    from dlt.common.pendulum import pendulum
++    from dlt.destinations import duckdb
++
++    @dlt.resource(name="orders", primary_key="id", write_disposition="append")
++    def orders(rows: List[Any]) -> Iterator[Any]:
++        yield rows
++
++    pipeline = dlt.pipeline(
++        "orders_stateful",
++        destination=duckdb("./orders_stateful.duckdb"),
++        dev_mode=True,
++    )
++    pipeline.run(
++        orders(
++            [
++                {
++                    "id": 1,
++                    "amount": 100,
++                    "created_at": pendulum.datetime(2026, 1, 1, tz="UTC"),
++                },
++                {
++                    "id": 2,
++                    "amount": 200,
++                    "created_at": pendulum.datetime(2026, 1, 2, tz="UTC"),
++                },
++                {
++                    "id": 3,
++                    "amount": 300,
++                    "created_at": pendulum.datetime(2026, 1, 3, tz="UTC"),
++                },
++            ]
++        )
++    )
++
++    # @@@DLT_SNIPPET_START incremental_stateful_cursor_definition
+     @dlt.hub.transformation(
+         write_disposition="append",
+         primary_key="id",
++        incremental=dlt.sources.incremental(
++            "created_at",
++            initial_value=pendulum.datetime(2000, 1, 1, tz="UTC"),
++            range_start="open",
++        ),
+     )
+-    def cleaned_customers(dataset: dlt.Dataset) -> Any:
+-        # get newest primary key from the output dataset
+-        max_pimary_key = -1
+-        try:
+-            output_dataset = dlt.current.pipeline().dataset()
+-            if output_dataset.schema.tables.get("cleaned_customers"):
+-                max_pimary_key_expr = (
+-                    output_dataset.table("cleaned_customers").to_ibis().id.max()
+-                )
+-                max_pimary_key = output_dataset(max_pimary_key_expr).fetchscalar()
+-        except PipelineNeverRan:
+-            # we get this exception if the destination dataset has not been run yet
+-            # so we can assume that all customers are new
+-            pass
+-
+-        # return filtered transformation
+-        customers_table = dataset.table("customers").to_ibis()
+-
+-        # filter only new customers and exclude the name column in the result
+-        yield customers_table.filter(customers_table.id > max_pimary_key).drop(
+-            customers_table.name
++    def recent_orders(dataset: dlt.Dataset) -> Any:
++        yield dataset.table("orders")
++
++    # @@@DLT_SNIPPET_END incremental_stateful_cursor_definition
++
++    pipeline.run(recent_orders(pipeline.dataset()))
++
++    # More orders arrive.
++    pipeline.run(
++        orders(
++            [
++                {
++                    "id": 4,
++                    "amount": 400,
++                    "created_at": pendulum.datetime(2026, 1, 4, tz="UTC"),
++                },
++                {
++                    "id": 5,
++                    "amount": 500,
++                    "created_at": pendulum.datetime(2026, 1, 5, tz="UTC"),
++                },
++            ]
+         )
++    )
+ 
+-    # create a warehouse dataset, would ordinarily be snowflake or some other warehousing destination
+-    warehouse_pipeline = dlt.pipeline(
+-        "warehouse", destination="duckdb", dataset_name="cleaned_customers"
++    # Second run: only the new rows land
++    pipeline.run(recent_orders(pipeline.dataset()))
++    # @@@DLT_SNIPPET_END incremental_stateful_cursor
++
++    ids = sorted(row[0] for row in pipeline.dataset().table("recent_orders").fetchall())
++    assert ids == [1, 2, 3, 4, 5]
++
++
++def incremental_load_time_cursor_snippet() -> None:
++    # @@@DLT_SNIPPET_START incremental_load_time_cursor
++    from typing import Any, Iterator, List
++
++    import dlt
++    from dlt.common.pendulum import pendulum
++    from dlt.destinations import duckdb
++
++    @dlt.resource(name="orders", primary_key="id", write_disposition="append")
++    def orders(rows: List[Any]) -> Iterator[Any]:
++        yield rows
++
++    pipeline = dlt.pipeline(
++        "orders_by_load",
++        destination=duckdb("./orders_by_load.duckdb"),
++        dev_mode=True,
+     )
+-    warehouse_pipeline.run(cleaned_customers(fruitshop_pipeline.dataset()))
++    pipeline.run(orders([{"id": 1}, {"id": 2}, {"id": 3}]))
++
++    # @@@DLT_SNIPPET_START incremental_load_time_cursor_definition
++    @dlt.hub.transformation(write_disposition="append")
++    def orders_by_load(
++        dataset: dlt.Dataset,
++        loaded_at: dlt.sources.incremental[pendulum.DateTime] = dlt.sources.incremental(
++            "_dlt_loads.inserted_at",
++            initial_value=pendulum.datetime(2000, 1, 1, tz="UTC"),
++            range_start="open",
++        ),
++    ) -> Any:
++        yield dataset.table("orders").incremental(loaded_at)
++
++    # @@@DLT_SNIPPET_END incremental_load_time_cursor_definition
++
++    pipeline.run(orders_by_load(pipeline.dataset()))
++
++    pipeline.run(orders([{"id": 4}, {"id": 5}]))
+ 
+-    # new items get added to the input dataset
+-    # ...
++    pipeline.run(orders_by_load(pipeline.dataset()))
++    # @@@DLT_SNIPPET_END incremental_load_time_cursor
+ 
+-    # run the transformation again, only new customers are processed and appended to the destination table
+-    warehouse_pipeline.run(cleaned_customers(fruitshop_pipeline.dataset()))
++    ids = sorted(
++        row[0] for row in pipeline.dataset().table("orders_by_load").fetchall()
++    )
++    assert ids == [1, 2, 3, 4, 5]
++
++
++def incremental_scheduler_window_snippet() -> None:
++    # @@@DLT_SNIPPET_START incremental_scheduler_window
++    import os
++    from typing import Any, Iterator, List
++
++    import dlt
++    from dlt.common.pendulum import pendulum
++    from dlt.destinations import duckdb
++
++    @dlt.resource(name="orders", primary_key="id", write_disposition="append")
++    def orders(rows: List[Any]) -> Iterator[Any]:
++        yield rows
++
++    pipeline = dlt.pipeline(
++        "orders_window",
++        destination=duckdb("./orders_window.duckdb"),
++        dev_mode=True,
++    )
++    pipeline.run(
++        orders(
++            [
++                {"id": i, "created_at": pendulum.datetime(2026, 1, i, tz="UTC")}
++                for i in range(1, 11)
++            ]
++        )
++    )
+ 
+-    # @@@DLT_SNIPPET_END incremental_transformations
++    # @@@DLT_SNIPPET_START incremental_scheduler_window_definition
++    @dlt.hub.transformation(write_disposition="replace")
++    def orders_window(
++        dataset: dlt.Dataset,
++        window: dlt.sources.incremental[pendulum.DateTime] = dlt.sources.incremental(
++            "created_at",
++            initial_value=pendulum.datetime(2000, 1, 1, tz="UTC"),
++            allow_external_schedulers=True,
++            range_start="closed",
++            range_end="open",
++        ),
++    ) -> Any:
++        yield dataset.table("orders").incremental(window)
++
++    # @@@DLT_SNIPPET_END incremental_scheduler_window_definition
++
++    os.environ["DLT_INTERVAL_START"] = "2026-01-05T00:00:00+00:00"
++    os.environ["DLT_INTERVAL_END"] = "2026-01-10T00:00:00+00:00"
++    pipeline.run(orders_window(pipeline.dataset()))  # ids 5..9 land
++
++    pipeline.run(orders_window(pipeline.dataset()))
++
++    os.environ["DLT_INTERVAL_START"] = "2026-01-02T00:00:00+00:00"
++    os.environ["DLT_INTERVAL_END"] = "2026-01-05T00:00:00+00:00"
++    pipeline.run(orders_window(pipeline.dataset()))  # ids 2..4 land
++    # @@@DLT_SNIPPET_END incremental_scheduler_window
++
++    os.environ.pop("DLT_INTERVAL_START", None)
++    os.environ.pop("DLT_INTERVAL_END", None)
++
++    ids = sorted(row[0] for row in pipeline.dataset().table("orders_window").fetchall())
++    assert ids == [2, 3, 4]
+diff --git a/docs/website/docs/hub/getting-started/runtime-tutorial.md b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+index a339996e5..d2e49bd09 100644
+--- a/docs/website/docs/hub/getting-started/runtime-tutorial.md
++++ b/docs/website/docs/hub/getting-started/runtime-tutorial.md
+@@ -363,6 +363,10 @@ uv run dlthub run jaffle_transformations.py
+ 
+ This uploads the transformation script, runs it on managed infrastructure, and streams logs back to your terminal. You can also schedule this job (declare a `trigger=` on the decorator and run `dlthub deploy`) and monitor it via the dltHub UI.
+ 
++### Incremental transformations on a schedule
++
++When a transformation runs on a dltHub Platform cron schedule, let the schedule own the cursor window. Set `allow_external_schedulers=True` on a `dlt.sources.incremental` argument and the cursor takes its `[start, end)` bounds from the scheduled interval. Re-running the same window produces the same output, so retries and missed-run backfills are idempotent. See [Incremental transformations](../features/transformations/index.md#incremental-transformations) for the full model and examples.
++
+ ## Next steps
+ 
+ You've completed the introductory tutorial for the managed dltHub Platform: you've learned how to deploy pipelines, run interactive notebooks, and add transformations.
+
+
+===== COMMIT 4ef030e1 =====
+
+
+commit 4ef030e1e
+Author: Anton Burnashev
+Date: 2026-05-19
+
+    fix(docs): fix bare relative links (#3953)
+
+diff --git a/docs/website/docs/dlt-ecosystem/file-formats.md b/docs/website/docs/dlt-ecosystem/file-formats.md
+index f774c2c25..686d0409b 100644
+--- a/docs/website/docs/dlt-ecosystem/file-formats.md
++++ b/docs/website/docs/dlt-ecosystem/file-formats.md
+@@ -10,7 +10,7 @@ keywords: [loader file format, jsonl, parquet, csv, insert-values, insert]
+ 
+ To set the pipeline's loader file format, you can either:
+ 
+-1. Set the parameter at the resource level: `@dlt.resource(file_format=...)` ([learn more](../../general-usage/resource#pick-loader-file-format-for-a-particular-resource))
++1. Set the parameter at the resource level: `@dlt.resource(file_format=...)` ([learn more](../general-usage/resource.md#pick-loader-file-format-for-a-particular-resource))
+ 
+ 2. Set the parameter at the pipeline level: `pipeline.run(..., loader_file_format=...)`
+ 
+diff --git a/docs/website/docs/dlt-ecosystem/transformations/dbt/dbt.md b/docs/website/docs/dlt-ecosystem/transformations/dbt/dbt.md
+index df343a606..8d8632fec 100644
+--- a/docs/website/docs/dlt-ecosystem/transformations/dbt/dbt.md
++++ b/docs/website/docs/dlt-ecosystem/transformations/dbt/dbt.md
+@@ -197,4 +197,4 @@ DBT_CLOUD__ACCOUNT_ID
+ DBT_CLOUD__JOB_ID
+ ```
+ 
+-For more information, read the [Credentials](../../../general-usage/credentials) documentation.
++For more information, read the [Credentials](../../../general-usage/credentials/index.md) documentation.
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md b/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md
+index 0ab7c8731..26b1fae85 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md
+@@ -98,7 +98,7 @@ print(pipeline.last_trace.last_normalize_info)
+ 
+ ### Prerequisites
+ 
+-Please make sure the `dlt` library is installed. Refer to the [installation guide](../../../intro).
++Please make sure the `dlt` library is installed. Refer to the [installation guide](../../../intro.md).
+ 
+ ### Initialize the filesystem source
+ 
+@@ -110,7 +110,7 @@ To get started with your data pipeline, follow these steps:
+    dlt init filesystem duckdb
+    ```
+ 
+-   The [dlt init command](../../../reference/command-line-interface) will initialize
++   The [dlt init command](../../../reference/command-line-interface.md) will initialize
+    [the pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/filesystem_pipeline.py)
+    with the filesystem as the source and [duckdb](../../destinations/duckdb.md) as the destination.
+ 
+@@ -200,7 +200,7 @@ You don't need any credentials for the local filesystem.
+ 
+ ### Add credentials to dlt pipeline
+ 
+-To provide credentials to the filesystem source, you can use [any method available](../../../general-usage/credentials/setup) in dlt.
++To provide credentials to the filesystem source, you can use [any method available](../../../general-usage/credentials/setup.md) in dlt.
+ One of the easiest ways is to use configuration files. The `.dlt` folder in your working directory contains two files: `config.toml` and `secrets.toml`. Sensitive information, like passwords and access tokens, should only be put into `secrets.toml`, while any other configuration, like the path to a bucket, can be specified in `config.toml`.
+ 
+ <Tabs
+@@ -312,7 +312,7 @@ export SOURCES__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY = "Please set me
+ ```
+ 
+ :::tip
+-dlt supports more ways of authorizing with cloud storage, including identity-based and default credentials. To learn more about adding credentials to your pipeline, please refer to the [Configuration and secrets section](../../../general-usage/credentials/complex_types#gcp-credentials).
++dlt supports more ways of authorizing with cloud storage, including identity-based and default credentials. To learn more about adding credentials to your pipeline, please refer to the [Configuration and secrets section](../../../general-usage/credentials/complex_types.md#gcp-credentials).
+ :::
+ 
+ ## Usage
+@@ -389,7 +389,7 @@ filesystem_pipe = filesystem(
+ - `read_csv_duckdb()` - processes CSV files using DuckDB, which usually shows better performance than Pandas. Control batch size with `chunk_size` (defaults to 5000 rows). Set `use_pyarrow=True` to yield Arrow format instead of JSON. Accepts additional `**duckdb_kwargs` passed to DuckDB's `read_csv()`.
+ 
+ :::tip
+-We advise that you give each resource a [specific name](../../../general-usage/resource#duplicate-and-rename-resources) before loading with `pipeline.run`. This will ensure that data goes to a table with the name you want and that each pipeline uses a [separate state for incremental loading.](../../../general-usage/state#read-and-write-pipeline-state-in-a-resource)
++We advise that you give each resource a [specific name](../../../general-usage/resource.md#duplicate-and-rename-resources) before loading with `pipeline.run`. This will ensure that data goes to a table with the name you want and that each pipeline uses a [separate state for incremental loading.](../../../general-usage/state.md#read-and-write-pipeline-state-in-a-resource)
+ :::
+ 
+ ### 3. Create and run a pipeline
+@@ -404,7 +404,7 @@ info = pipeline.run(filesystem_pipe)
+ print(info)
+ ```
+ 
+-For more information on how to create and run the pipeline, read the [Walkthrough: Run a pipeline](../../../walkthroughs/run-a-pipeline).
++For more information on how to create and run the pipeline, read the [Walkthrough: Run a pipeline](../../../walkthroughs/run-a-pipeline.md).
+ 
+ ### 4. Apply hints
+ 
+@@ -431,7 +431,7 @@ Here are a few simple ways to load your data incrementally:
+ 3. [Combine loading only updated files and records](#combine-loading-only-updated-files-and-records). Finally, you can combine both methods. It could be useful if new records could be added to existing files, so you not only want to filter the modified files, but also the modified records.
+ 
+ #### Load files based on modification date
+-For example, to load only new CSV files with [incremental loading](../../../general-usage/incremental-loading), you can use the `apply_hints` method.
++For example, to load only new CSV files with [incremental loading](../../../general-usage/incremental-loading.md), you can use the `apply_hints` method.
+ 
+ ```py
+ import dlt
+@@ -625,7 +625,7 @@ print(load_info)
+ 
+ ## Standalone filesystem resource
+ 
+-You can use the [standalone filesystem](../../../general-usage/resource#declare-a-standalone-resource) resource to list files in cloud storage or a local filesystem. This allows you to customize file readers or manage files using [fsspec](https://filesystem-spec.readthedocs.io/en/latest/index.html).
++You can use the [standalone filesystem](../../../general-usage/resource.md#declare-a-standalone-resource) resource to list files in cloud storage or a local filesystem. This allows you to customize file readers or manage files using [fsspec](https://filesystem-spec.readthedocs.io/en/latest/index.html).
+ 
+ ```py
+ from dlt.sources.filesystem import filesystem
+
+
+===== COMMIT d3128451 =====
+
+
+commit d31284517
+Author: Anton Burnashev
+Date: 2026-05-19
+
+    fix(docs): restore /release-highlights navbar route (#3952)
+
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 532714a9a..5e98cf4bf 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -64,6 +64,12 @@ const sidebars = {
+         {
+           type: 'category',
+           label: 'Release highlights',
++          link: {
++            type: 'generated-index',
++            title: 'Release highlights',
++            slug: '/release-highlights',
++            keywords: ['release notes', 'release highlights'],
++          },
+           items: [
+             { type: 'doc', id: 'release-notes/1.21.2', label: '1.21.2' },
+             { type: 'doc', id: 'release-notes/1.19', label: '1.19' },
+
+
+===== COMMIT 2999fa12 =====
+
+
+commit 2999fa12a
+Author: Violetta Mishechkina
+Date: 2026-05-18
+
+    Add the doc with a oss-paid split (#3745)
+
+diff --git a/docs/website/docs/hub/oss-and-dlthub.md b/docs/website/docs/hub/oss-and-dlthub.md
+new file mode 100644
+index 000000000..20b82de88
+--- /dev/null
++++ b/docs/website/docs/hub/oss-and-dlthub.md
+@@ -0,0 +1,74 @@
++---
++title: dlt and dltHub
++description: A map of the dlt and dltHub ecosystem
++keywords: [dlt, dlthub, open source, source available, pricing, license, workspace, workbench, skills, ai, agent]
++---
++
++:::note
++**dltHub offers two products**: dlt (open source) and **dltHub** (commercial, license-gated). This page explains both products and how they relate.
++
++- **dlt** — the open source ingestion library, Apache 2.0.
++- **dltHub** — the agentic platform that deploys, monitors, and scales dlt pipelines, with a managed runtime, data quality, transformations, and AI tooling for coding agents. **All dltHub components are license-gated.**
++:::
++
++## The two products at a glance
++
++dlt is free and open source under Apache 2.0, dltHub is a paid product.
++
++| Capability | dlt | dltHub |
++|---|---|---|
++| Build ingestion pipelines using [dlt verified sources](../dlt-ecosystem/verified-sources) (except premium sources) | ✅ | ✅ |
++| Build pipelines with the [dltHub AI Workbench](https://github.com/dlt-hub/dlthub-ai-workbench) | — | ✅ |
++| [Data quality metrics & checks](features/quality/data-quality) | — | ✅ |
++| Build transformation pipelines (dltHub/dbt) | — | ✅ |
++| Managed runtime: deploy, run/schedule pipelines, serve data apps, monitor jobs | — | ✅ |
++| Premium sources ([MS SQL](ecosystem/ms-sql)) and destinations ([Iceberg](ecosystem/iceberg), [Delta](ecosystem/delta), [Snowflake + Iceberg/Open Catalog](ecosystem/snowflake_plus)) | — | ✅ |
++
++## dlt (OSS)
++
++dlt is the open source ingestion library, distributed under Apache 2.0. 
++
++| Component | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | How to access it                                                                               | Get started                                                                                                                                                                                           |
++|---|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
++| **dlt library** | The Python pipeline engine: extract, normalize, load. Includes schema inference and evolution, incremental loading, write dispositions, pipeline state, and the `dlt pipeline …` CLI for inspection.                                                                                                                                                                                                                                                                                                                                                                                                                       | [dlt](https://github.com/dlt-hub/dlt) — Apache 2.0, on [PyPI](https://pypi.org/project/dlt/) | [Intro](../intro.md) · [Tutorial](../tutorial/sql-database.md) · `pip install dlt`                                                                                                                    |
++| **Core sources** | Three flexible, generic sources shipped with the library that cover most ingestion scenarios out of the box: <ul><li>[`rest_api`](../dlt-ecosystem/verified-sources/rest_api) (any REST API via declarative config for endpoints, pagination, and auth)</li> <li>[`sql_database`](../dlt-ecosystem/verified-sources/sql_database) (30+ SQL databases via SQLAlchemy / PyArrow / pandas / ConnectorX with table reflection)</li> <li>[`filesystem`](../dlt-ecosystem/verified-sources/filesystem) (local and cloud storage — S3, GCS, Azure Blob, Google Drive, SFTP — with native CSV / Parquet / JSONL support)</li></ul> | Distributed with [dlt library](https://github.com/dlt-hub/dlt/tree/devel/dlt/sources)        | [REST API](../dlt-ecosystem/verified-sources/rest_api) · [SQL Database](../dlt-ecosystem/verified-sources/sql_database) · [Filesystem & Cloud Storages](../dlt-ecosystem/verified-sources/filesystem) |
++| **Verified sources** | A curated set of dltHub-maintained connectors (for example, Kafka, MongoDB, Postgres CDC, Stripe, Hubspot, …) pulled into your project with `dlt init <source> <destination>` .                                                                                                                                                                                                                                                                                                                                                                                                                                                     | [`dlt-hub/verified-sources`](https://github.com/dlt-hub/verified-sources)                    | [Verified sources docs](../dlt-ecosystem/verified-sources) · `dlt init -l` to list available sources                                                                                                  |
++
++**dlt is a good fit if:** You want a lightweight, code-first ingestion library, are comfortable managing orchestration, scheduling, and operations yourself, or you need to deploy on-prem, on a VPS, or in any environment where managed cloud solution is not an option. dlt runs anywhere Python runs, with no platform dependency.
++
++
++## dltHub
++
++dltHub is a managed cloud platform for running your dlt pipelines, transformations, and notebooks. You can work with dltHub in two complementary ways:
++
++- **Web UI** at [dlthub.app](https://app.dlthub.com) — sign up to deploy, schedule, monitor pipelines, manage profiles, browse datasets.
++- **Locally, from the CLI or Python** — bootstrap a new workspace in one command:
++  ```sh
++  uvx create-dlthub-workspace my-project
++  ```
++  This creates a runnable workspace with the AI Workbench, example pipelines, and the [`dlt[hub]`](getting-started/installation.md) extra installed. To add dltHub to an existing project instead, run:
++  ```sh
++  pip install "dlt[hub]"
++  ```
++  Either way, you get the dltHub workspace + dashboard, the AI development tooling (`dlthub ai`, MCP server, AI Workbench), per-source contexts, and the `dlthub` library that adds data quality, transformations, and premium sources/destinations. A trial license can be [self-issued](getting-started/installation.md#self-licensing) for 30 days.
++
++Every component below is part of dltHub and requires a license. Most components are source-available under their own licenses; all are distributed through the `dlthub` PyPI package or the dltHub repositories.
++
++| Component | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                         | How to access it                                                                                                                                                                                 | Get started                                                                                                                         |
++|---|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------|
++| **dltHub Platform** | The hosted Web UI and managed runtime at [dlthub.app](https://dlthub.app/) — deploy and schedule pipelines, monitor runs, manage workspaces and profiles, browse datasets, collaborate.                                                                                                                                                                                                                                                            | [dlthub.app](https://app.dlthub.com/)                                                                                                                                                              | [Platform](https://app.dlthub.com/) · [Runtime overview](runtime/overview.md) · [Runtime tutorial](getting-started/runtime-tutorial.md) |
++| **AI Toolkits** | The dltHub AI Workbench: a collection of toolkits made of skills, rules, workflows, and MCP wiring that drive agentic pipeline development inside Claude Code, Cursor, and Codex.                                                                                                                                                                                                                                                                  | [`dlt-hub/dlthub-ai-workbench`](https://github.com/dlt-hub/dlthub-ai-workbench) — source-available under [its own license](https://github.com/dlt-hub/dlthub-ai-workbench/blob/master/LICENSE) | [LLM-native workflow walkthrough](../dlt-ecosystem/llm-tooling/llm-native-workflow.md)                                              |
++| **dltHub Context** | Per-source LLM contexts (specs, endpoint documentation, prompts) that prime your coding assistant for thousands of APIs. Automatically used by AI Workbench                                                                                                                                                                                                                                                                                        | Browse and copy contexts at [dlthub.com/context](https://dlthub.com/context)                                                                   | [Build a source with AI](workspace/init.md#llm-native-setup)                                                                        |
++| **`dlthub` library** | Python package shipped via `dlt[hub]`. Adds the production capabilities: [data quality](features/quality/data-quality.md), [Python transformations](features/transformations/index.md) (`@dlt.hub.transformation`) and [dbt transformations](features/transformations/dbt-transformations.md), and premium sources/destinations such as [Iceberg / DuckLake](ecosystem/iceberg.md) and [MSSQL Change Tracking](ecosystem/ms-sql.md). | On [PyPI](https://pypi.org/project/dlthub/)                                                                                                                                                    | [Installation](getting-started/installation.md) · [Self-issue trial license](getting-started/installation.md#self-licensing)        |
++
++**dltHub is a good fit if:** You are running pipelines in production, want a coding agent to do the heavy lifting with tooling that supports the generation of production-grade code, need transformations or data quality checks, if you want managed infrastructure, or if you are working as a team.
++
++:::tip
++For tier breakdown (Pro / Scale / Enterprise), see [the intro](intro.md#tiers--licensing).
++If you have a specific question, feature request, or unique use case, feel free to [reach out](https://dlthub.com/contact).
++:::
++
++
++## Getting started
++
++We recommend starting with the [dltHub AI workbench](https://github.com/dlt-hub/dlthub-ai-workbench) to get started quickly while following dltHub best practices.
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 3c45d0fe9..af32da4db 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -414,6 +414,7 @@ const sidebars = {
+       label: 'Getting started',
+       items: [
+         'hub/intro',
++        'hub/oss-and-dlthub',
+         'hub/getting-started/installation',
+         'hub/getting-started/runtime-tutorial',
+       ]
+
+
+===== COMMIT 25e5f8ed =====
+
+
+commit 25e5f8ed6
+Author: elvis kahoro
+Date: 2026-05-15
+
+    docs: add Blacksmith sponsor section to README
+
+diff --git a/.github/assets/blacksmith-logo.svg b/.github/assets/blacksmith-logo.svg
+new file mode 100644
+index 000000000..3f6a87ab4
+--- /dev/null
++++ b/.github/assets/blacksmith-logo.svg
+@@ -0,0 +1,15 @@
++<svg width="334" height="77" viewBox="0 0 334 77" fill="none" xmlns="http://www.w3.org/2000/svg">
++<rect width="334" height="77" fill="#F0FB29"/>
++<path d="M21.8622 43.668C20.5836 43.668 19.5802 43.2387 18.8522 42.38C18.1242 41.512 17.7602 40.2567 17.7602 38.614C17.7602 37.7927 17.8536 37.0693 18.0402 36.444C18.2269 35.8187 18.4976 35.2913 18.8522 34.862C19.2069 34.4327 19.6362 34.1107 20.1402 33.896C20.6536 33.672 21.2276 33.56 21.8622 33.56C22.7116 33.56 23.4209 33.7467 23.9902 34.12C24.5689 34.4933 25.0216 35.044 25.3482 35.772L24.0182 36.5C23.8502 36.0333 23.5889 35.6647 23.2342 35.394C22.8889 35.114 22.4316 34.974 21.8622 34.974C21.1062 34.974 20.5136 35.2307 20.0842 35.744C19.6549 36.2573 19.4402 36.9667 19.4402 37.872V39.356C19.4402 40.2613 19.6549 40.9707 20.0842 41.484C20.5136 41.9973 21.1062 42.254 21.8622 42.254C22.4502 42.254 22.9262 42.1047 23.2902 41.806C23.6636 41.498 23.9389 41.106 24.1162 40.63L25.3902 41.4C25.0636 42.1093 24.6062 42.6647 24.0182 43.066C23.4302 43.4673 22.7116 43.668 21.8622 43.668ZM26.6473 43.5V42.212H27.9773V35.016H26.6473V33.728H30.9033V35.016H29.5593V42.212H30.9033V43.5H26.6473ZM36.0881 36.22H37.6141V37.424H37.6841C37.8428 36.9853 38.0994 36.6493 38.4541 36.416C38.8181 36.1733 39.2428 36.052 39.7281 36.052C40.6521 36.052 41.3661 36.388 41.8701 37.06C42.3741 37.7227 42.6261 38.656 42.6261 39.86C42.6261 41.064 42.3741 42.002 41.8701 42.674C41.3661 43.3367 40.6521 43.668 39.7281 43.668C39.2428 43.668 38.8181 43.5467 38.4541 43.304C38.0994 43.0613 37.8428 42.7253 37.6841 42.296H37.6141V46.3H36.0881V36.22ZM39.2661 42.352C39.7981 42.352 40.2228 42.184 40.5401 41.848C40.8574 41.5027 41.0161 41.05 41.0161 40.49V39.23C41.0161 38.67 40.8574 38.222 40.5401 37.886C40.2228 37.5407 39.7981 37.368 39.2661 37.368C38.7994 37.368 38.4074 37.4847 38.0901 37.718C37.7728 37.942 37.6141 38.2407 37.6141 38.614V41.106C37.6141 41.4793 37.7728 41.7827 38.0901 42.016C38.4074 42.24 38.7994 42.352 39.2661 42.352ZM47.2293 43.668C46.7253 43.668 46.2633 43.5793 45.8433 43.402C45.4326 43.2247 45.0826 42.9727 44.7933 42.646C44.5039 42.31 44.2799 41.9087 44.1213 41.442C43.9626 40.966 43.8833 40.4387 43.8833 39.86C43.8833 39.2813 43.9626 38.7587 44.1213 38.292C44.2799 37.816 44.5039 37.4147 44.7933 37.088C45.0826 36.752 45.4326 36.4953 45.8433 36.318C46.2633 36.1407 46.7253 36.052 47.2293 36.052C47.7333 36.052 48.1906 36.1407 48.6013 36.318C49.0213 36.4953 49.3759 36.752 49.6653 37.088C49.9546 37.4147 50.1786 37.816 50.3373 38.292C50.4959 38.7587 50.5753 39.2813 50.5753 39.86C50.5753 40.4387 50.4959 40.966 50.3373 41.442C50.1786 41.9087 49.9546 42.31 49.6653 42.646C49.3759 42.9727 49.0213 43.2247 48.6013 43.402C48.1906 43.5793 47.7333 43.668 47.2293 43.668ZM47.2293 42.408C47.7519 42.408 48.1719 42.2493 48.4893 41.932C48.8066 41.6053 48.9653 41.12 48.9653 40.476V39.244C48.9653 38.6 48.8066 38.1193 48.4893 37.802C48.1719 37.4753 47.7519 37.312 47.2293 37.312C46.7066 37.312 46.2866 37.4753 45.9693 37.802C45.6519 38.1193 45.4933 38.6 45.4933 39.244V40.476C45.4933 41.12 45.6519 41.6053 45.9693 41.932C46.2866 42.2493 46.7066 42.408 47.2293 42.408ZM51.4519 36.22H52.9359L53.6779 39.272L54.3359 42.03H54.3779L55.1339 39.272L56.0159 36.22H57.3879L58.2839 39.272L59.0539 42.03H59.0959L59.7399 39.272L60.4959 36.22H61.9099L59.9499 43.5H58.2279L57.2759 40.182L56.6879 38.138H56.6599L56.0859 40.182L55.1199 43.5H53.4399L51.4519 36.22ZM66.1238 43.668C65.6011 43.668 65.1344 43.5793 64.7238 43.402C64.3131 43.2247 63.9631 42.9727 63.6738 42.646C63.3844 42.31 63.1604 41.9087 63.0018 41.442C62.8524 40.966 62.7778 40.4387 62.7778 39.86C62.7778 39.2813 62.8524 38.7587 63.0018 38.292C63.1604 37.816 63.3844 37.4147 63.6738 37.088C63.9631 36.752 64.3131 36.4953 64.7238 36.318C65.1344 36.1407 65.6011 36.052 66.1238 36.052C66.6558 36.052 67.1224 36.1453 67.5238 36.332C67.9344 36.5187 68.2751 36.78 68.5458 37.116C68.8164 37.4427 69.0171 37.8253 69.1478 38.264C69.2878 38.7027 69.3578 39.174 69.3578 39.678V40.252H64.3598V40.49C64.3598 41.05 64.5231 41.512 64.8498 41.876C65.1858 42.2307 65.6618 42.408 66.2778 42.408C66.7258 42.408 67.1038 42.31 67.4118 42.114C67.7198 41.918 67.9811 41.652 68.1958 41.316L69.0918 42.198C68.8211 42.646 68.4291 43.0053 67.9158 43.276C67.4024 43.5373 66.8051 43.668 66.1238 43.668ZM66.1238 37.242C65.8624 37.242 65.6198 37.2887 65.3958 37.382C65.1811 37.4753 64.9944 37.606 64.8358 37.774C64.6864 37.942 64.5698 38.1427 64.4858 38.376C64.4018 38.6093 64.3598 38.866 64.3598 39.146V39.244H67.7478V39.104C67.7478 38.544 67.6031 38.096 67.3138 37.76C67.0244 37.4147 66.6278 37.242 66.1238 37.242ZM71.0471 43.5V36.22H72.5731V37.62H72.6431C72.7457 37.2467 72.9604 36.92 73.2871 36.64C73.6137 36.36 74.0664 36.22 74.6451 36.22H75.0511V37.69H74.4491C73.8424 37.69 73.3757 37.788 73.0491 37.984C72.7317 38.18 72.5731 38.4693 72.5731 38.852V43.5H71.0471ZM79.1941 43.668C78.6714 43.668 78.2048 43.5793 77.7941 43.402C77.3834 43.2247 77.0334 42.9727 76.7441 42.646C76.4548 42.31 76.2308 41.9087 76.0721 41.442C75.9228 40.966 75.8481 40.4387 75.8481 39.86C75.8481 39.2813 75.9228 38.7587 76.0721 38.292C76.2308 37.816 76.4548 37.4147 76.7441 37.088C77.0334 36.752 77.3834 36.4953 77.7941 36.318C78.2048 36.1407 78.6714 36.052 79.1941 36.052C79.7261 36.052 80.1928 36.1453 80.5941 36.332C81.0048 36.5187 81.3454 36.78 81.6161 37.116C81.8868 37.4427 82.0874 37.8253 82.2181 38.264C82.3581 38.7027 82.4281 39.174 82.4281 39.678V40.252H77.4301V40.49C77.4301 41.05 77.5934 41.512 77.9201 41.876C78.2561 42.2307 78.7321 42.408 79.3481 42.408C79.7961 42.408 80.1741 42.31 80.4821 42.114C80.7901 41.918 81.0514 41.652 81.2661 41.316L82.1621 42.198C81.8914 42.646 81.4994 43.0053 80.9861 43.276C80.4728 43.5373 79.8754 43.668 79.1941 43.668ZM79.1941 37.242C78.9328 37.242 78.6901 37.2887 78.4661 37.382C78.2514 37.4753 78.0648 37.606 77.9061 37.774C77.7568 37.942 77.6401 38.1427 77.5561 38.376C77.4721 38.6093 77.4301 38.866 77.4301 39.146V39.244H80.8181V39.104C80.8181 38.544 80.6734 38.096 80.3841 37.76C80.0948 37.4147 79.6981 37.242 79.1941 37.242ZM88.6954 42.296H88.6254C88.4667 42.7253 88.2054 43.0613 87.8414 43.304C87.4867 43.5467 87.0667 43.668 86.5814 43.668C85.6574 43.668 84.9434 43.3367 84.4394 42.674C83.9354 42.002 83.6834 41.064 83.6834 39.86C83.6834 38.656 83.9354 37.7227 84.4394 37.06C84.9434 36.388 85.6574 36.052 86.5814 36.052C87.0667 36.052 87.4867 36.1733 87.8414 36.416C88.2054 36.6493 88.4667 36.9853 88.6254 37.424H88.6954V33.14H90.2214V43.5H88.6954V42.296ZM87.0434 42.352C87.5101 42.352 87.9021 42.24 88.2194 42.016C88.5367 41.7827 88.6954 41.4793 88.6954 41.106V38.614C88.6954 38.2407 88.5367 37.942 88.2194 37.718C87.9021 37.4847 87.5101 37.368 87.0434 37.368C86.5114 37.368 86.0867 37.5407 85.7694 37.886C85.4521 38.222 85.2934 38.67 85.2934 39.23V40.49C85.2934 41.05 85.4521 41.5027 85.7694 41.848C86.0867 42.184 86.5114 42.352 87.0434 42.352ZM95.7111 33.14H97.2371V37.424H97.3071C97.4658 36.9853 97.7225 36.6493 98.0771 36.416C98.4411 36.1733 98.8658 36.052 99.3511 36.052C100.275 36.052 100.989 36.388 101.493 37.06C101.997 37.7227 102.249 38.656 102.249 39.86C102.249 41.064 101.997 42.002 101.493 42.674C100.989 43.3367 100.275 43.668 99.3511 43.668C98.8658 43.668 98.4411 43.5467 98.0771 43.304C97.7225 43.0613 97.4658 42.7253 97.3071 42.296H97.2371V43.5H95.7111V33.14ZM98.8891 42.352C99.4211 42.352 99.8458 42.184 100.163 41.848C100.48 41.5027 100.639 41.05 100.639 40.49V39.23C100.639 38.67 100.48 38.222 100.163 37.886C99.8458 37.5407 99.4211 37.368 98.8891 37.368C98.4225 37.368 98.0305 37.4847 97.7131 37.718C97.3958 37.942 97.2371 38.2407 97.2371 38.614V41.106C97.2371 41.4793 97.3958 41.7827 97.7131 42.016C98.0305 42.24 98.4225 42.352 98.8891 42.352ZM108.367 36.22H109.837L106.771 44.942C106.687 45.1847 106.589 45.39 106.477 45.558C106.374 45.7353 106.248 45.8753 106.099 45.978C105.959 46.09 105.786 46.1693 105.581 46.216C105.375 46.272 105.133 46.3 104.853 46.3H103.971V45.054H105.203L105.623 43.822L102.977 36.22H104.503L105.959 40.504L106.379 42.086H106.449L106.911 40.504L108.367 36.22Z" fill="#202020"/>
++<path d="M193.764 16.0294H126V38.5C138.28 38.5 148.272 48.2483 148.581 60.3903L148.589 60.9706H193.764V16.0294Z" fill="#202020"/>
++<path fill-rule="evenodd" clip-rule="evenodd" d="M226.735 18.9287H229.679V25.1522H226.735V27.7148H229.679V33.9382H226.735V36.8669H211.647V27.7148H214.591V25.1522H211.647V16H226.735V18.9287ZM214.959 33.5722H226.367V28.0809H214.959V33.5722ZM214.959 24.7861H226.367V19.2948H214.959V24.7861Z" fill="#202020"/>
++<path d="M237.772 33.5722H249.548V36.8669H234.46V16H237.772V33.5722Z" fill="#202020"/>
++<path fill-rule="evenodd" clip-rule="evenodd" d="M269.418 18.9287H272.362V36.8669H269.05V28.0809H257.642V36.8669H254.33V18.9287H257.274V16H269.418V18.9287ZM257.642 24.7861H269.05V19.2948H257.642V24.7861Z" fill="#202020"/>
++<path d="M292.231 18.9287H295.175V22.2235H291.863V19.2948H280.455V33.5722H291.863V30.6435H295.175V33.9382H292.231V36.8669H280.087V33.9382H277.143V18.9287H280.087V16H292.231V18.9287Z" fill="#202020"/>
++<path d="M303.269 24.7861H311.733V21.8574H314.677V16H317.989V22.2235H315.045V25.1522H312.101V27.7148H315.045V30.6435H317.989V36.8669H314.677V31.0096H311.733V28.0809H303.269V36.8669H299.957V16H303.269V24.7861Z" fill="#202020"/>
++<path d="M226.735 43.0618H229.679V46.3565H226.367V43.4278H214.959V48.9191H226.735V51.8478H229.679V58.0713H226.735V61H214.591V58.0713H211.647V54.7765H214.959V57.7052H226.367V52.2139H214.591V49.2852H211.647V43.0618H214.591V40.1331H226.735V43.0618Z" fill="#202020"/>
++<path d="M242.191 43.0618H244.767V40.1331H251.023V43.0618H253.967V61H250.655V43.4278H245.135V61H241.823V43.4278H236.303V61H232.991V43.0618H235.935V40.1331H242.191V43.0618Z" fill="#202020"/>
++<path d="M263.535 43.0618H266.111V40.1331H272.368V43.4278H266.479V57.7052H272.368V61H266.111V58.0713H263.535V61H257.279V57.7052H263.167V43.4278H257.279V40.1331H263.535V43.0618Z" fill="#202020"/>
++<path d="M284.88 43.0618H287.456V40.1331H296.656V43.4278H287.824V61H284.512V43.4278H275.68V40.1331H284.88V43.0618Z" fill="#202020"/>
++<path d="M303.28 48.9191H314.688V40.1331H318V61H314.688V52.2139H303.28V61H299.968V40.1331H303.28V48.9191Z" fill="#202020"/>
++</svg>
+diff --git a/README.md b/README.md
+index 810507ef2..1948779dc 100644
+--- a/README.md
++++ b/README.md
+@@ -116,6 +116,16 @@ Please read [CONTRIBUTING](CONTRIBUTING.md) before you make a PR.
+ - Significant changes require tests and docs and in many cases writing tests will be more laborious than writing code
+ - Bugfixes and improvements are welcome! You'll get help with writing tests and docs + a decent review.
+ 
++## Sponsors
++
++<p>
++  <a href="https://blacksmith.sh/?utm_source=dlt&utm_medium=readme&utm_campaign=sponsorship" target="_blank">
++    <img src=".github/assets/blacksmith-logo.svg" alt="Blacksmith" width="240" />
++  </a>
++</p>
++
++[Blacksmith](https://blacksmith.sh/?utm_source=dlt&utm_medium=readme&utm_campaign=sponsorship) is a CI/CD platform that accelerates GitHub Actions by reducing queue times and improving build performance. It helps teams run workflows faster and more efficiently, making it easier to maintain a smooth development pipeline. We're grateful to Blacksmith for sponsoring dlt with free CI/CD minutes, which helps us keep builds fast and our costs lower.
++
+ ## License
+ 
+ `dlt` is released under the [Apache 2.0 License](LICENSE.txt).
+
+
+===== COMMIT 4b58a3aa =====
+
+
+commit 4b58a3aa5
+Author: Anton Burnashev
+Date: 2026-05-15
+
+    fix: scope fruit_pipeline fixture to module to avoid duckdb lock race (#3932)
+
+diff --git a/tests/e2e/helpers/dashboard/conftest.py b/tests/e2e/helpers/dashboard/conftest.py
+index efee490b1..f9652b1c4 100644
+--- a/tests/e2e/helpers/dashboard/conftest.py
++++ b/tests/e2e/helpers/dashboard/conftest.py
+@@ -40,7 +40,7 @@ def simple_incremental_pipeline() -> Any:
+     return po
+ 
+ 
+-@pytest.fixture()
++@pytest.fixture(scope="module")
+ def fruit_pipeline() -> Any:
+     pf = dlt.pipeline(pipeline_name="fruit_pipeline", destination="duckdb")
+     pf.run(fruitshop_source())
+diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
+index d63aa8f1d..008000f61 100644
+--- a/tests/e2e/helpers/dashboard/test_e2e.py
++++ b/tests/e2e/helpers/dashboard/test_e2e.py
+@@ -19,6 +19,9 @@ from tests.utils import (
+     autouse_test_storage,
+     preserve_environ,
+     deactivate_pipeline,
++    auto_module_test_storage,
++    auto_module_test_run_context,
++    preserve_module_environ,
+ )
+ from dlt._workspace.helpers.dashboard import strings as app_strings, utils
+ 
+
+
+===== COMMIT fe0f10f6 =====
+
+
+commit fe0f10f61
+Author: Junhyuk Lee
+Date: 2026-05-14
+
+    fix(databricks): replace deprecated `_user_agent_entry` with `user_agent_entry` (#3935)
+
+diff --git a/dlt/destinations/impl/databricks/configuration.py b/dlt/destinations/impl/databricks/configuration.py
+index 4e795fac3..9a256317c 100644
+--- a/dlt/destinations/impl/databricks/configuration.py
++++ b/dlt/destinations/impl/databricks/configuration.py
+@@ -165,8 +165,8 @@ class DatabricksCredentials(CredentialsConfiguration):
+         )
+ 
+         if self.user_agent_entry:
+-            conn_params["_user_agent_entry"] = (
+-                conn_params.get("_user_agent_entry") or self.user_agent_entry
++            conn_params["user_agent_entry"] = (
++                conn_params.get("user_agent_entry") or self.user_agent_entry
+             )
+ 
+         if self.client_id and self.client_secret:
+diff --git a/tests/load/databricks/test_databricks_configuration.py b/tests/load/databricks/test_databricks_configuration.py
+index 21ca0cd60..7413baccf 100644
+--- a/tests/load/databricks/test_databricks_configuration.py
++++ b/tests/load/databricks/test_databricks_configuration.py
+@@ -51,7 +51,7 @@ def test_databricks_credentials_to_connector_params():
+     assert params["extra_a"] == "a"
+     assert params["extra_b"] == "b"
+     assert params["_socket_timeout"] == credentials.socket_timeout
+-    assert params["_user_agent_entry"] == DATABRICKS_APPLICATION_ID
++    assert params["user_agent_entry"] == DATABRICKS_APPLICATION_ID
+ 
+     displayable_location = str(credentials)
+     assert displayable_location.startswith(
+
+
+===== COMMIT 9ee723fe =====
+
+
+commit 9ee723fe1
+Author: Travior
+Date: 2026-05-08
+
+    Fix Pydantic annotation metadata handling across 2.10-2.13 (#3863)
+
+diff --git a/dlt/common/libs/pydantic.py b/dlt/common/libs/pydantic.py
+index cdd843bec..dbb36d93e 100644
+--- a/dlt/common/libs/pydantic.py
++++ b/dlt/common/libs/pydantic.py
+@@ -46,6 +46,7 @@ try:
+         raise ImportError(f"Found pydantic {PYDANTIC_VERSION} but dlt requires pydantic>=2.0")
+     from pydantic import (
+         BaseModel,
++        Field,
+         ValidationError,
+         Json,
+         create_model,
+@@ -127,29 +128,19 @@ def _build_discriminator_map(
+         return None
+ 
+     ann = root_field.annotation
+-    discriminator: Optional[str] = None
++    discriminator = _get_field_discriminator(root_field)
+     union_args: Tuple[Any, ...] = ()
+ 
+-    if is_annotated(ann):
++    if root_field.discriminator is not None:
++        # on pydantic >= 2.13 the discriminator is stored on the field object, and the
++        # annotation may be either the bare union or Annotated[Union[A, B], <other metadata>]
++        union_ann = get_args(ann)[0] if is_annotated(ann) else ann
++        union_args = get_args(union_ann)
++    elif is_annotated(ann):
++        # on pydantic < 2.13 `ann` is an annotated union type, e.g. Annotated[Union[A, B], Field(discriminator="kind")]
+         args = get_args(ann)
+-        # metadata may be FieldInfo directly or wrapped in a tuple by _process_annotation
+-        for a in args[1:]:
+-            items = a if isinstance(a, (list, tuple)) else (a,)
+-            for item in items:
+-                if isinstance(item, FieldInfo) and isinstance(item.discriminator, str):
+-                    discriminator = item.discriminator
+-                    break
+-            if discriminator:
+-                break
+         union_args = get_args(args[0])
+ 
+-    # pydantic 2.13+: annotation is plain Union (not Annotated), discriminator
+-    # is on root_field directly
+-    if not discriminator and isinstance(root_field.discriminator, str):
+-        discriminator = root_field.discriminator
+-    if not union_args:
+-        union_args = get_args(ann)
+-
+     if not discriminator or not union_args:
+         return None
+ 
+@@ -162,6 +153,25 @@ def _build_discriminator_map(
+     return discriminator, mapping
+ 
+ 
++def _get_field_discriminator(field: FieldInfo) -> Optional[str]:
++    # pydantic >= 2.13 stores the discriminator field name directly on the field object
++    if isinstance(field.discriminator, str):
++        return field.discriminator
++
++    if not is_annotated(field.annotation):
++        return None
++
++    # on pydantic < 2.13 `ann` is an annotated union type, e.g. Annotated[Union[A, B], Field(discriminator="kind")]
++    args = get_args(field.annotation)
++    for a in args[1:]:
++        items = a if isinstance(a, (list, tuple)) else (a,)
++        for item in items:
++            if isinstance(item, FieldInfo) and isinstance(item.discriminator, str):
++                return item.discriminator
++
++    return None
++
++
+ def resolve_variant_model(
+     model: Type[BaseModel],
+     item: Any,
+@@ -344,7 +354,9 @@ def apply_schema_contract_to_model(
+                 {"__module__": model.__module__},
+             )
+         else:
+-            model = create_model(model.__name__ + "Any", **{n: (Any, None) for n in model.model_fields})  # type: ignore
++            model = create_model(
++                model.__name__ + "Any", **{n: (Any, None) for n in model.model_fields}
++            )  # type: ignore
+     elif data_mode == "discard_value":
+         raise NotImplementedError(
+             "`data_mode='discard_value'`. Cannot discard defined fields with validation errors"
+@@ -369,7 +381,7 @@ def apply_schema_contract_to_model(
+         """Recursively recreates models with applied schema contract"""
+         if is_annotated(t_):
+             a_t, *a_m = get_args(t_)
+-            return Annotated[_process_annotation(a_t), tuple(a_m)]  # type: ignore[return-value]
++            return Annotated[(_process_annotation(a_t), *a_m)]  # type: ignore[return-value]
+         origin = get_origin(t_)
+         # tuple must be checked before is_list_generic_type (tuple is a Sequence)
+         if origin is tuple:
+@@ -417,13 +429,23 @@ def apply_schema_contract_to_model(
+     if getattr(model, "__pydantic_root_model__", False):
+         root_field = model.model_fields.get("root")
+         if root_field:
+-            processed_ann = _process_annotation(_rebuild_annotated(root_field))
+-            # preserve discriminator that pydantic 2.13+ strips from Annotated metadata
+-            if isinstance(root_field.discriminator, str) and not is_annotated(processed_ann):
+-                processed_ann = Annotated[processed_ann, FieldInfo(discriminator=root_field.discriminator)]  # type: ignore[assignment]
++            # on pydantic >= 2.13 `_rebuild_annotated` might not return an annotated type,
++            # so processed_ann could be the bare Union type, e.g. Union[A, B]
++            processed_ann: Any = _process_annotation(_rebuild_annotated(root_field))
++            discriminator = _get_field_discriminator(root_field)
++            if discriminator is not None and root_field.discriminator is not None:
++                if is_annotated(processed_ann):
++                    # we have other metadata (besides the discriminator) that we should preserve
++                    args = get_args(processed_ann)
++                    processed_ann = Annotated[
++                        (args[0], Field(discriminator=discriminator), *args[1:])
++                    ]
++                else:
++                    # no other metadata, so we can rebuild the annotated type with the discriminator
++                    processed_ann = Annotated[processed_ann, Field(discriminator=discriminator)]
+             new_rm = type(
+                 model.__name__ + "Extra" + extra.title(),
+-                (PydanticRootModel[processed_ann],),  # type: ignore[valid-type]
++                (PydanticRootModel[processed_ann],),
+                 {"__module__": model.__module__},
+             )
+             if original_dlt_config:
+@@ -431,7 +453,7 @@ def apply_schema_contract_to_model(
+             return new_rm
+ 
+     processed_fields = {
+-        n: (_process_annotation(_rebuild_annotated(f)), f) for n, f in model.model_fields.items()
++        n: (_process_annotation(f.annotation), f) for n, f in model.model_fields.items()
+     }
+ 
+     # use __base__ to inherit validators (@field_validator, @model_validator)
+diff --git a/tests/libs/test_pydantic.py b/tests/libs/test_pydantic.py
+index f2e1caec0..0e55685f3 100644
+--- a/tests/libs/test_pydantic.py
++++ b/tests/libs/test_pydantic.py
+@@ -47,6 +47,8 @@ from dlt.common.libs.pydantic import (
+ )
+ from dlt.common.warnings import Dlt100DeprecationWarning
+ from pydantic import (
++    AfterValidator,
++    VERSION as PYDANTIC_VERSION,
+     UUID4,
+     BaseModel,
+     Field,
+@@ -1126,6 +1128,178 @@ def test_apply_contract_root_model_discriminator_preserved() -> None:
+         mutated.model_validate({"kind": "unknown", "id": 3})
+ 
+ 
++def test_apply_contract_root_model_preserves_root_after_validator() -> None:
++    """Root-level validator metadata must survive RootModel reconstruction."""
++
++    def validate_click(value: Any) -> Any:
++        if isinstance(value, Click) and value.element_id == "forbidden":
++            raise ValueError("forbidden element")
++        return value
++
++    class Click(BaseModel):
++        kind: Literal["click"]
++        element_id: str
++
++    class Purchase(BaseModel):
++        kind: Literal["purchase"]
++        amount: float
++
++    U = Annotated[
++        Union[Click, Purchase],
++        Field(discriminator="kind"),
++        AfterValidator(validate_click),
++    ]
++
++    class Event(RootModel[U]):
++        pass
++
++    mutated: Any = apply_schema_contract_to_model(Event, "freeze", "freeze")
++    validated = mutated.model_validate({"kind": "click", "element_id": "btn_1"})
++
++    assert isinstance(validated.root, Click)
++    assert validated.root.kind == "click"
++    with pytest.raises(ValidationError, match="forbidden element"):
++        mutated.model_validate({"kind": "click", "element_id": "forbidden"})
++
++
++def test_apply_contract_preserves_non_root_after_validator() -> None:
++    """Non-root Annotated validator metadata must survive model reconstruction."""
++
++    def reject_negative(value: int) -> int:
++        if value < 0:
++            raise ValueError("negative value")
++        return value
++
++    class ModelWithAnnotatedValidator(BaseModel):
++        value: Annotated[int, AfterValidator(reject_negative)]
++
++    mutated: Any = apply_schema_contract_to_model(ModelWithAnnotatedValidator, "freeze", "freeze")
++    validated = mutated.model_validate({"value": 1})
++
++    assert validated.value == 1
++    with pytest.raises(ValidationError, match="negative value"):
++        mutated.model_validate({"value": -1})
++
++
++def test_apply_contract_preserves_multiple_annotated_metadata_entries() -> None:
++    """Annotated metadata entries stay separate after model reconstruction."""
++
++    class Child(BaseModel):
++        x: int
++
++    class ModelWithAnnotatedMetadata(BaseModel):
++        field: Annotated[Child, "meta1", "meta2"]
++
++    mutated: Any = apply_schema_contract_to_model(ModelWithAnnotatedMetadata, "freeze", "freeze")
++    rebuilt = mutated.model_fields["field"].rebuild_annotation()
++
++    assert get_origin(rebuilt) is Annotated
++    assert get_args(rebuilt)[1:] == ("meta1", "meta2")
++
++
++def test_apply_contract_preserves_nested_annotated_metadata_entries() -> None:
++    """Nested Annotated metadata entries must remain separate slots, not be packed
++    into a single tuple, when _process_annotation recurses through containers."""
++
++    class Child(BaseModel):
++        x: int
++
++    class M(BaseModel):
++        items: List[Annotated[Child, "meta1", "meta2"]]
++
++    mutated: Any = apply_schema_contract_to_model(M, "freeze", "freeze")
++    inner = get_args(mutated.model_fields["items"].annotation)[0]
++    inner_args = get_args(inner)
++
++    assert inner_args[0].__name__.endswith("ExtraForbid")
++    assert inner_args[1:] == ("meta1", "meta2")
++
++
++def test_apply_contract_non_root_discriminated_union_with_validator() -> None:
++    """Non-root field with a discriminated union plus extra metadata keeps both
++    the discriminator and the validator after model reconstruction."""
++
++    class Click(BaseModel):
++        kind: Literal["click"]
++        element_id: str
++
++    class Purchase(BaseModel):
++        kind: Literal["purchase"]
++        amount: float
++
++    def reject_forbidden(value: Any) -> Any:
++        if isinstance(value, Click) and value.element_id == "forbidden":
++            raise ValueError("forbidden element")
++        return value
++
++    class Container(BaseModel):
++        event: Annotated[
++            Union[Click, Purchase],
++            Field(discriminator="kind"),
++            AfterValidator(reject_forbidden),
++        ]
++
++    mutated: Any = apply_schema_contract_to_model(Container, "freeze", "freeze")
++
++    ok = mutated.model_validate({"event": {"kind": "click", "element_id": "btn_1"}})
++    assert ok.event.kind == "click"
++    with pytest.raises(ValidationError):
++        mutated.model_validate({"event": {"kind": "unknown", "element_id": "btn_1"}})
++
++    with pytest.raises(ValidationError, match="forbidden element"):
++        mutated.model_validate({"event": {"kind": "click", "element_id": "forbidden"}})
++
++
++@pytest.mark.skipif(
++    tuple(int(part) for part in PYDANTIC_VERSION.split(".")[:2]) < (2, 13),
++    reason="Requires pydantic >= 2.13 field.discriminator behavior",
++)
++def test_build_discriminator_map_preserves_new_root_discriminator_with_extra_metadata() -> None:
++    """Discriminator extraction works when pydantic stores it on the root field."""
++
++    def validate_event(value: Any) -> Any:
++        return value
++
++    class Click(BaseModel):
++        kind: Literal["click"]
++        element_id: str
++
++    class Purchase(BaseModel):
++        kind: Literal["purchase"]
++        amount: float
++
++    U = Annotated[
++        Union[Click, Purchase],
++        AfterValidator(validate_event),
++        Field(discriminator="kind"),
++    ]
++
++    class Event(RootModel[U]):
++        pass
++
++    root_field = Event.model_fields["root"]
++    assert root_field.discriminator == "kind"
++
++    result = _build_discriminator_map(Event)
++    assert result is not None
++    disc_field, mapping = result
++    assert disc_field == "kind"
++    assert set(mapping.keys()) == {"click", "purchase"}
++
++    mutated: Any = apply_schema_contract_to_model(Event, "freeze", "freeze")
++    root_field = mutated.model_fields["root"]
++    assert root_field.discriminator == "kind"
++
++    result = _build_discriminator_map(mutated)
++    assert result is not None
++    disc_field, mapping = result
++    assert disc_field == "kind"
++    assert set(mapping.keys()) == {"click", "purchase"}
++
++    validated = mutated.model_validate({"kind": "click", "element_id": "btn_1"})
++    assert validated.model_dump() == {"kind": "click", "element_id": "btn_1"}
++
++
+ def test_extra_schema_contract_conflict_warning() -> None:
+     """Warns when model extra contradicts schema_contract columns setting."""
+ 
+
+
+===== COMMIT bd2b69bc =====
+
+
+commit bd2b69bc2
+Author: Thierry Jean
+Date: 2026-05-05
+
+    docs(cookbook): add Arize Phoenix example (#3914)
+

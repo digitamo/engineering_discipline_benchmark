@@ -1,0 +1,2997 @@
+diff --git a/dlt/_workspace/cli/_init_command.py b/dlt/_workspace/cli/_init_command.py
+index 77914dd58..0710f075f 100644
+--- a/dlt/_workspace/cli/_init_command.py
++++ b/dlt/_workspace/cli/_init_command.py
+@@ -35,7 +35,7 @@ from dlt._workspace.cli._pipeline_files import (
+     TVerifiedSourceFileEntry,
+     TVerifiedSourceFileIndex,
+ )
+-from dlt._workspace.cli.exceptions import CliCommandInnerException
++from dlt._workspace.cli.exceptions import CliCommandException, CliCommandInnerException
+ from dlt._workspace.cli._ai_command import SUPPORTED_IDES, TSupportedIde
+ 
+ 
+@@ -173,6 +173,27 @@ def init_pipeline_at_destination(
+             - The type of the source (e.g., "template", "core", "verified").
+             - Name of the selected ide for dlthub sources (defaults to "cursor")
+     """
++    # extract source name from dlthub source name: dlthub:<name>
++    # TODO: add new source type
++    is_dlthub_source, display_source_name, source_name = _get_source_display_name(source_name)
++    # source and destination names are used as Python identifiers in generated code
++    if not is_valid_schema_name(display_source_name):
++        fmt.error(
++            "Source name %s is not a valid Python identifier. Use snake_case names"
++            " containing only lowercase letters, numbers and underscores (max %d"
++            " characters)."
++            % (fmt.bold(display_source_name), InvalidSchemaName.MAXIMUM_SCHEMA_NAME_LENGTH)
++        )
++        raise CliCommandException()
++    if destination_type and not is_valid_schema_name(destination_type):
++        fmt.error(
++            "Destination name %s is not a valid Python identifier. Use snake_case"
++            " names containing only lowercase letters, numbers and underscores (max"
++            " %d characters)."
++            % (fmt.bold(destination_type), InvalidSchemaName.MAXIMUM_SCHEMA_NAME_LENGTH)
++        )
++        raise CliCommandException()
++
+     # try to import the destination and get config spec
+     if destination_type:
+         destination_reference = Destination.from_reference(destination_type)
+@@ -184,9 +205,6 @@ def init_pipeline_at_destination(
+ 
+     # discover type of source
+     source_type: files_ops.TSourceType = "template"
+-    # extract source name from dlthub source name: dlthub:<name>
+-    # TODO: add new source type
+-    is_dlthub_source, display_source_name, source_name = _get_source_display_name(source_name)
+     if source_name in files_ops.get_sources_names(core_sources_storage, source_type="core"):
+         source_type = "core"
+     # do not look into verified sources when setting up dlthub source
+@@ -271,8 +289,6 @@ def init_pipeline_at_destination(
+             remote_modified = {file_name: None for file_name in source_configuration.files}
+         else:
+             # is single file template source
+-            if not is_valid_schema_name(source_name):
+-                raise InvalidSchemaName(source_name)
+             source_configuration = files_ops.get_template_configuration(
+                 templates_storage, source_name, display_source_name
+             )
+diff --git a/dlt/sources/sql_database/helpers.py b/dlt/sources/sql_database/helpers.py
+index b11f9749c..43e464d48 100644
+--- a/dlt/sources/sql_database/helpers.py
++++ b/dlt/sources/sql_database/helpers.py
+@@ -5,7 +5,6 @@ from typing import (
+     Callable,
+     Any,
+     Dict,
+-    Iterable,
+     List,
+     Literal,
+     Optional,
+@@ -325,11 +324,20 @@ class TableLoader(BaseTableLoader):
+                 )
+                 yield df
+             elif self.backend == "pyarrow":
+-                yield row_tuples_to_arrow(
++                # add columns present in cursor but missing from schema hints
++                for col_name in columns:
++                    if col_name not in self.columns:
++                        self.columns[col_name] = {"name": col_name}
++                # build arrow table using cursor column order for correct
++                # positional mapping (self.columns may be in schema order
++                # after merge_columns reordering)
++                cursor_columns = {c: self.columns[c] for c in columns}
++                table = row_tuples_to_arrow(
+                     partition,
+-                    columns=_add_missing_columns(self.columns, columns),
++                    columns=cursor_columns,
+                     tz=backend_kwargs.get("tz", "UTC"),
+                 )
++                yield table
+ 
+ 
+ class ConnectorXTableLoader(BaseTableLoader):
+@@ -518,6 +526,21 @@ def table_rows(
+             # Handle callable columns hint (can't resolve without data item)
+             columns_hints = resource.columns
+ 
++    # warn about and remove columns_hints entries that don't match any
++    # reflected source column.
++    source_columns = {c.name for c in table.columns}
++    unmatched = [c for c in columns_hints if c not in source_columns]
++    if unmatched:
++        logger.warning(
++            "Resource columns %s for table '%s' do not match any reflected"
++            " source columns and will be ignored. Note: source column names"
++            " are not normalized at this stage. Use the original database"
++            " column names in apply_hints.",
++            unmatched,
++            table.name,
++        )
++        columns_hints = {c: columns_hints[c] for c in columns_hints if c not in unmatched}
++
+     # determine loader class from registry
+     if table_loader_class is None:
+         table_loader_class = get_table_loader_class(backend)
+@@ -586,16 +609,6 @@ def remove_nullability_adapter(table: Table) -> Table:
+     return table
+ 
+ 
+-def _add_missing_columns(
+-    schema_columns: TTableSchemaColumns, result_columns: Iterable[str]
+-) -> TTableSchemaColumns:
+-    """Adds columns present in cursor but not present in schema"""
+-    for column_name in result_columns:
+-        if column_name not in schema_columns:
+-            schema_columns[column_name] = {"name": column_name}
+-    return schema_columns
+-
+-
+ def _execute_table_adapter(
+     table: Table,
+     adapter: Optional[TTableAdapter],
+diff --git a/tests/load/sources/sql_database/postgres_source.py b/tests/load/sources/sql_database/postgres_source.py
+index e42e4853a..e4c7beb31 100644
+--- a/tests/load/sources/sql_database/postgres_source.py
++++ b/tests/load/sources/sql_database/postgres_source.py
+@@ -191,6 +191,15 @@ class PostgresSourceDB:
+         _make_precision_table("has_precision", False)
+         _make_precision_table("has_precision_nullable", True)
+ 
++        Table(
++            "camelCaseTable",
++            self.metadata,
++            Column("userId", Integer(), primary_key=True, autoincrement=True),
++            Column("firstName", Text(), nullable=False),
++            Column("isActive", Boolean(), nullable=False),
++            Column("createdAt", DateTime(timezone=True), nullable=False),
++        )
++
+         if self.with_unsupported_types:
+             Table(
+                 "has_unsupported_types",
+@@ -386,11 +395,30 @@ class PostgresSourceDB:
+             conn.execute(table_pk.insert().values(rows_pk))
+             conn.execute(table_fk.insert().values(rows_fk))
+ 
++    def _fake_camel_case_data(self, n: int = 100) -> None:
++        table = self.metadata.tables[f"{self.schema}.camelCaseTable"]
++        # not added to table_infos: camelCase name is not directly
++        # queryable in destinations that normalise identifiers
++        person = mimesis.Person()
++        dev = mimesis.Development()
++        dt = mimesis.Datetime()
++        rows = [
++            dict(
++                firstName=person.name(),
++                isActive=dev.boolean(),
++                createdAt=dt.datetime(timezone="UTC"),
++            )
++            for _ in range(n)
++        ]
++        with self.engine.begin() as conn:
++            conn.execute(table.insert().values(rows))
++
+     def insert_data(self) -> None:
+         self._fake_chat_data()
+         self._fake_precision_data("has_precision")
+         self._fake_precision_data("has_precision_nullable", null_n=10)
+         self._fake_composite_foreign_key_data()
++        self._fake_camel_case_data()
+         if self.with_unsupported_types:
+             self._fake_unsupported_data()
+ 
+diff --git a/tests/load/sources/sql_database/test_sql_database_source.py b/tests/load/sources/sql_database/test_sql_database_source.py
+index de62e7d81..8c14ee52d 100644
+--- a/tests/load/sources/sql_database/test_sql_database_source.py
++++ b/tests/load/sources/sql_database/test_sql_database_source.py
+@@ -153,6 +153,220 @@ def test_pyarrow_applies_hints_before_extract(
+     assert pa.types.is_float64(numeric_col_schema_in_parquet)
+ 
+ 
++@pytest.mark.parametrize("backend", ["sqlalchemy", "pyarrow", "pandas", "connectorx"])
++@pytest.mark.parametrize(
++    "defer_table_reflect",
++    [False, True],
++    ids=lambda x: "defer_table_reflect" + ("_true" if x else "=false"),
++)
++def test_apply_hints_column_order(
++    postgres_db: PostgresSourceDB,
++    defer_table_reflect: bool,
++    backend: TableBackend,
++) -> None:
++    """Reproduces #3604: apply_hints with complete column hints causes merge_columns
++    to reorder incomplete reflected columns, breaking positional data mapping.
++
++    With reflection_level="minimal", reflected columns lack data_type (incomplete).
++    When apply_hints provides data_type (complete), merge_columns pops the incomplete
++    column and re-adds it at the end of the dict, changing the column order.
++    The reordered columns no longer match the SQL cursor's positional data.
++    """
++    # for arrow-based backends, verify types directly on yielded tables
++    if backend in ("pyarrow", "pandas"):
++        resource = sql_table(
++            credentials=postgres_db.credentials,
++            schema=postgres_db.schema,
++            table="has_precision",
++            backend=backend,
++            reflection_level="minimal",
++            defer_table_reflect=defer_table_reflect,
++        )
++        resource.apply_hints(
++            columns={
++                "bool_col": {"data_type": "bool"},
++                "date_col": {"data_type": "date"},
++            },
++        )
++        items = list(resource.add_limit(1, count_rows=True))
++        for item in items:
++            # pandas DataFrames are converted to arrow for type checking
++            if hasattr(item, "columns") and hasattr(item, "index") and len(item.index) > 0:
++                at = pa.Table.from_pandas(item)
++            elif isinstance(item, pa.Table) and item.num_rows > 0:
++                at = item
++            else:
++                continue
++            # bool_col must actually contain boolean data, not dates or other types
++            assert pa.types.is_boolean(at.schema.field("bool_col").type)
++            # date_col must NOT be boolean (pandas with minimal reflection may yield string)
++            assert not pa.types.is_boolean(at.schema.field("date_col").type)
++            break
++        else:
++            raise AssertionError("No non-empty arrow/pandas items yielded")
++
++    # end-to-end: data is correctly mapped after loading
++    resource2 = sql_table(
++        credentials=postgres_db.credentials,
++        schema=postgres_db.schema,
++        table="has_precision",
++        backend=backend,
++        reflection_level="minimal",
++        defer_table_reflect=defer_table_reflect,
++    )
++    resource2.apply_hints(
++        columns={
++            "bool_col": {"data_type": "bool"},
++            "date_col": {"data_type": "date"},
++        },
++    )
++    pipeline = make_pipeline("duckdb")
++    load_info = pipeline.run(resource2.add_limit(1, count_rows=True))
++    assert_load_info(load_info)
++
++    with pipeline.sql_client() as client:
++        rows = client.execute_sql("SELECT bool_col, date_col FROM has_precision LIMIT 1")
++        row = rows[0]
++        assert isinstance(row[0], (bool, int))  # bool_col should be boolean
++        assert hasattr(row[1], "year")  # date_col should be date-like
++
++
++@pytest.mark.parametrize("backend", ["sqlalchemy", "pyarrow", "pandas", "connectorx"])
++@pytest.mark.parametrize(
++    "defer_table_reflect",
++    [False, True],
++    ids=lambda x: "deferred" if x else "non_deferred",
++)
++def test_non_snake_case_columns(
++    postgres_db: PostgresSourceDB, defer_table_reflect: bool, backend: TableBackend
++) -> None:
++    """Verifies all backends work with non-snake-case column names.
++
++    Data items from the resource must use the original camelCase column
++    names. pipeline.run normalizes them to snake_case for the destination.
++    """
++    resource = sql_table(
++        credentials=postgres_db.credentials,
++        schema=postgres_db.schema,
++        table="camelCaseTable",
++        backend=backend,
++        reflection_level="full",
++        defer_table_reflect=defer_table_reflect,
++    )
++    resource.apply_hints(
++        columns={
++            "isActive": {"data_type": "bool"},
++            "createdAt": {"data_type": "timestamp"},
++        },
++    )
++
++    items = list(resource.add_limit(1, count_rows=True))
++
++    # extract column names from the first non-empty data item
++    keys = None
++    for item in items:
++        if isinstance(item, dict):
++            keys = list(item.keys())
++            break
++        elif isinstance(item, list) and len(item) > 0:
++            keys = list(item[0].keys())
++            break
++        elif isinstance(item, pa.Table) and item.num_rows > 0:
++            keys = item.column_names
++            break
++        elif hasattr(item, "columns") and hasattr(item, "index") and len(item.index) > 0:
++            keys = item.columns.tolist()
++            break
++    assert keys is not None, "No non-empty data items yielded"
++    assert "isActive" in keys
++    assert "createdAt" in keys
++    assert "firstName" in keys
++
++    # end-to-end: normalized names in destination, data still correct
++    resource2 = sql_table(
++        credentials=postgres_db.credentials,
++        schema=postgres_db.schema,
++        table="camelCaseTable",
++        backend=backend,
++        reflection_level="full",
++        defer_table_reflect=defer_table_reflect,
++    )
++    pipeline = make_pipeline("duckdb")
++    load_info = pipeline.run(resource2.add_limit(1, count_rows=True))
++    assert_load_info(load_info)
++
++    with pipeline.sql_client() as client:
++        rows = client.execute_sql(
++            "SELECT first_name, is_active, created_at FROM camel_case_table LIMIT 1"
++        )
++        row = rows[0]
++        assert isinstance(row[0], str)
++        assert isinstance(row[1], (bool, int))
++        assert hasattr(row[2], "year")
++
++
++@pytest.mark.parametrize(
++    "defer_table_reflect",
++    [False, True],
++    ids=lambda x: "deferred" if x else "non_deferred",
++)
++def test_pyarrow_normalized_hints_on_camel_case_columns(
++    postgres_db: PostgresSourceDB, defer_table_reflect: bool, caplog: Any
++) -> None:
++    """When users pass normalized (snake_case) names in apply_hints while
++    database columns are camelCase, table_rows warns and strips the
++    unmatched columns before passing them to the loader.
++
++    Hints:
++      - "is_active" with data_type (complete/bound) — normalized form of "isActive"
++      - "created_at" without data_type (incomplete/unbound) — normalized form of "createdAt"
++    """
++    import logging
++
++    resource = sql_table(
++        credentials=postgres_db.credentials,
++        schema=postgres_db.schema,
++        table="camelCaseTable",
++        backend="pyarrow",
++        reflection_level="minimal",
++        defer_table_reflect=defer_table_reflect,
++    )
++    resource.apply_hints(
++        columns={
++            "is_active": {"data_type": "bool"},  # normalized, won't match "isActive"
++            "created_at": {"name": "created_at"},  # normalized, no data_type, unbound
++        },
++    )
++
++    pipeline = make_pipeline("duckdb")
++    # temporarily enable propagation so caplog captures dlt logger output
++    dlt_logger = logging.getLogger("dlt")
++    dlt_logger.propagate = True
++    try:
++        with caplog.at_level(logging.WARNING, logger="dlt"):
++            load_info = pipeline.run(resource.add_limit(1, count_rows=True))
++    finally:
++        dlt_logger.propagate = False
++    assert_load_info(load_info)
++
++    # warning was emitted about unmatched columns
++    warning_messages = [r.message for r in caplog.records if "do not match" in r.message]
++    assert len(warning_messages) == 1, f"Expected 1 warning, got: {warning_messages}"
++    assert "is_active" in warning_messages[0]
++    assert "created_at" in warning_messages[0]
++    assert "camelCaseTable" in warning_messages[0]
++
++    # data is correct in destination: snake_case names, proper types
++    with pipeline.sql_client() as client:
++        rows = client.execute_sql(
++            "SELECT first_name, is_active, created_at FROM camel_case_table LIMIT 1"
++        )
++        row = rows[0]
++        assert isinstance(row[0], str)
++        assert isinstance(row[1], (bool, int))
++        assert hasattr(row[2], "year")
++
++
+ def test_sqlalchemy_no_quoted_name(postgres_db: PostgresSourceDB, mocker: MockerFixture) -> None:
+     """
+     Ensures that table names internally passed as `quoted_name` to `sql_table` are not persisted
+diff --git a/tests/workspace/cli/test_init_command.py b/tests/workspace/cli/test_init_command.py
+index c5ae35d86..4e46b97dc 100644
+--- a/tests/workspace/cli/test_init_command.py
++++ b/tests/workspace/cli/test_init_command.py
+@@ -126,6 +126,26 @@ def test_init_command_pipeline_default_template(
+     assert len(visitor.known_resource_calls) == 1
+ 
+ 
++@pytest.mark.parametrize(
++    "source_name,destination",
++    [
++        ("robin-ai", "bigquery"),  # hyphen
++        ("dlthub:robin-ai", "bigquery"),  # dlthub prefix with hyphen
++        ("123source", "bigquery"),  # starts with digit
++        ("my source", "bigquery"),  # space
++        ("valid_source", "big-query"),  # invalid destination
++    ],
++    ids=["hyphen", "dlthub_hyphen", "digit_start", "space", "invalid_dest"],
++)
++def test_init_command_invalid_identifiers(
++    repo_dir: str, workspace_files: FileStorage, source_name: str, destination: str
++) -> None:
++    from dlt._workspace.cli.exceptions import CliCommandException
++
++    with pytest.raises(CliCommandException):
++        _init_command.init_command(source_name, destination, repo_dir)
++
++
+ def test_default_source_file_selection() -> None:
+     templates_storage = files_ops.get_single_file_templates_storage()
+ 
+@@ -701,7 +721,6 @@ def test_init_all_vibe_sources_together(workspace_files: FileStorage) -> None:
+     random_vibez = [
+         "news_api",
+         "alpaca",
+-        "robin",
+         "kwanko",
+         "powerlink",
+         "mysql_instance",
+@@ -709,7 +728,7 @@ def test_init_all_vibe_sources_together(workspace_files: FileStorage) -> None:
+         "coalesce",
+         "jobnimbus",
+         "perplexity_ai",
+-        "wordpress_site",
++        "robin_api",
+     ]
+ 
+     for source_name in random_vibez:
+
+
+===== COMMIT c466cfca =====
+
+
+commit c466cfca1
+Author: rudolfix
+Date: 2026-02-16
+
+    (feat) adds dlt source preprocessors to source factory (#3636)
+
+diff --git a/.github/workflows/test_destinations_remote.yml b/.github/workflows/test_destinations_remote.yml
+index 53b51744e..71fe9c6f2 100644
+--- a/.github/workflows/test_destinations_remote.yml
++++ b/.github/workflows/test_destinations_remote.yml
+@@ -118,7 +118,7 @@ jobs:
+               destinations: "[\"mssql\"]"
+               filesystem_drivers: "[\"memory\"]"
+               extras: "--extra mssql --extra s3 --extra gs --extra az --extra parquet --group adbc"
+-              pre_install_commands: "sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
++              pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
+               post_install_commands: "uv run dbc install mssql"
+               always_run_all_tests: true
+ 
+@@ -127,14 +127,14 @@ jobs:
+               destinations: "[\"synapse\"]"
+               filesystem_drivers: "[\"memory\"]"
+               extras: "--extra synapse --extra parquet"
+-              pre_install_commands: "sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
++              pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
+ 
+             # Fabric
+             - name: fabric
+               destinations: "[\"fabric\"]"
+               filesystem_drivers: "[\"memory\"]"
+               extras: "--extra fabric"
+-              pre_install_commands: "sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
++              pre_install_commands: "sudo apt-get update && sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
+ 
+             # Postgres and Redshift (used to be test_destinations.yml)
+             - name: redshift
+diff --git a/.github/workflows/test_hub.yml b/.github/workflows/test_hub.yml
+index d7f210e28..4b3bb611d 100644
+--- a/.github/workflows/test_hub.yml
++++ b/.github/workflows/test_hub.yml
+@@ -65,6 +65,7 @@ jobs:
+       # NOTE: needed for mssql source tests in plus
+       - name: Install ODBC driver for SQL Server
+         run: |
++          sudo apt-get update
+           sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18
+         if: matrix.os == 'ubuntu-latest'
+ 
+diff --git a/.github/workflows/test_sources_local.yml b/.github/workflows/test_sources_local.yml
+index 87f33632a..18dbf155d 100644
+--- a/.github/workflows/test_sources_local.yml
++++ b/.github/workflows/test_sources_local.yml
+@@ -71,6 +71,7 @@ jobs:
+ 
+       - name: Install dependencies
+         run: |
++          sudo apt-get update
+           sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18
+           uv sync --group pipeline --group sources --extra duckdb --extra parquet --extra filesystem --extra cli --extra sql_database --group adbc ${{ matrix.dbms_extras }}
+ 
+diff --git a/dlt/extract/decorators.py b/dlt/extract/decorators.py
+index e2f6da0a2..241bcce5c 100644
+--- a/dlt/extract/decorators.py
++++ b/dlt/extract/decorators.py
+@@ -4,6 +4,7 @@ from types import ModuleType
+ from functools import update_wrapper, wraps
+ from typing import (
+     Any,
++    Awaitable,
+     Callable,
+     Dict,
+     Iterator,
+@@ -18,12 +19,12 @@ from typing import (
+ from typing_extensions import TypeVar, Self
+ 
+ from dlt.common import logger
+-from dlt.common.configuration import with_config, get_fun_spec, known_sections, configspec
++from dlt.common.configuration import with_config, get_fun_spec, known_sections
+ from dlt.common.configuration.container import Container
+ from dlt.common.configuration.exceptions import ContextDefaultCannotBeCreated
+ from dlt.common.configuration.inject import set_fun_spec
+ from dlt.common.configuration.resolve import inject_section
+-from dlt.common.configuration.specs import BaseConfiguration, ContainerInjectableContext
++from dlt.common.configuration.specs import BaseConfiguration
+ from dlt.common.configuration.specs.config_section_context import ConfigSectionContext
+ from dlt.common.exceptions import ArgumentsOverloadException
+ from dlt.common.pipeline import PipelineContext
+@@ -108,6 +109,20 @@ class DltSourceFactoryWrapper(SourceFactory[TSourceFunParams, TDltSourceImpl]):
+         self.spec: Type[BaseConfiguration] = None
+         self.parallelized: bool = None
+         self._impl_cls: Type[TDltSourceImpl] = DltSource  # type: ignore[assignment]
++        self._postprocessors: List[
++            Callable[[TDltSourceImpl], Union[TDltSourceImpl, Awaitable[TDltSourceImpl]]]
++        ] = []
++
++    def add_postprocessor(
++        self, func: Callable[[TDltSourceImpl], Union[TDltSourceImpl, Awaitable[TDltSourceImpl]]]
++    ) -> None:
++        """Adds a callback that receives and returns a DltSource after it is created."""
++        self._postprocessors.append(func)
++
++    def _apply_postprocessors(self, source: TDltSourceImpl) -> TDltSourceImpl:
++        for func in self._postprocessors:
++            source = func(source)  # type: ignore[assignment]
++        return source
+ 
+     def clone(
+         self,
+@@ -159,6 +174,7 @@ class DltSourceFactoryWrapper(SourceFactory[TSourceFunParams, TDltSourceImpl]):
+         # also remember original source function
+         ovr._f = self._f
+         ovr.ref = self.ref
++        ovr._postprocessors = list(self._postprocessors)
+         ovr._update_wrapper()
+         # try to bind _f
+         ovr.wrap()
+@@ -183,7 +199,7 @@ class DltSourceFactoryWrapper(SourceFactory[TSourceFunParams, TDltSourceImpl]):
+                 resource.apply_hints(schema_contract=self.schema_contract)
+         else:
+             source = self._deco_f(*args, **kwargs)
+-        return source
++        return self._apply_postprocessors(source)
+ 
+     def bind(self, f: AnyFun) -> Self:
+         """Binds wrapper to the original source function and registers the source reference. This method is called only once by the decorator"""
+diff --git a/dlt/extract/pipe.py b/dlt/extract/pipe.py
+index 3c4f908d5..383c77a7d 100644
+--- a/dlt/extract/pipe.py
++++ b/dlt/extract/pipe.py
+@@ -16,7 +16,13 @@ from typing import (
+ )
+ 
+ from dlt.common.reflection.inspect import isasyncgenfunction, isgeneratorfunction
+-from dlt.common.typing import AnyFun, AnyType, TDataItems, resolve_single_annotation
++from dlt.common.typing import (
++    AnyFun,
++    AnyType,
++    TDataItems,
++    is_subclass,
++    resolve_single_annotation,
++)
+ from dlt.common.utils import get_callable_name, uniq_id
+ 
+ from dlt.extract.exceptions import (
+@@ -353,8 +359,7 @@ class Pipe(SupportsPipe):
+                 return_annotation = resolve_single_annotation(
+                     sig.return_annotation, globalns=globals()
+                 )
+-                if inspect.isclass(return_annotation):
+-                    return issubclass(return_annotation, DltResource)
++                return is_subclass(return_annotation, DltResource)
+ 
+         return False
+ 
+diff --git a/dlt/extract/reference.py b/dlt/extract/reference.py
+index 05178b345..08b83864c 100644
+--- a/dlt/extract/reference.py
++++ b/dlt/extract/reference.py
+@@ -1,17 +1,17 @@
+ from abc import ABC, abstractmethod
+-from importlib import import_module
+ from typing import (
++    Awaitable,
+     Callable,
+     Dict,
+     List,
+     Any,
+     Generic,
+     Tuple,
++    Union,
+     overload,
+     ClassVar,
+     Type,
+ )
+-from typing_extensions import Self, TypeVar
+ 
+ from dlt.common import logger
+ from dlt.common.configuration.specs import BaseConfiguration, known_sections
+@@ -20,7 +20,7 @@ from dlt.common.reflection.ref import object_from_ref
+ from dlt.common.runtime.run_context import get_plugin_modules
+ from dlt.common.schema import Schema
+ from dlt.common.schema.typing import TSchemaContract
+-from dlt.common.typing import ParamSpec
++from dlt.common.typing import ParamSpec, Self, TypeVar
+ from dlt.common.warnings import Dlt04DeprecationWarning, deprecated
+ 
+ from dlt.extract.source import DltSource
+@@ -31,14 +31,36 @@ TSourceFunParams = ParamSpec("TSourceFunParams")
+ 
+ 
+ class SourceFactory(ABC, Generic[TSourceFunParams, TDltSourceImpl]):
++    name: str
++    """Name of the source which is also the name of the associated schema."""
++    section: str
++    """Configuration section right after 'sources' in default layout."""
++    max_table_nesting: int
++    """Maximum depth of nested table above which remaining nodes are loaded as structs or JSON."""
++    root_key: bool
++    """Enables merging on all resources by propagating root foreign key to nested tables."""
++    schema: Schema
++    """An explicit `Schema` instance to be associated with the source."""
++    schema_contract: TSchemaContract
++    """Schema contract settings that will be applied to this source."""
++    spec: Type[BaseConfiguration]
++    """A specification of configuration and secret values required by the source."""
++    parallelized: bool
++    """If `True`, resource generators will be extracted in parallel with other resources."""
++
++    # TODO: model after Destination, which also needs to be broken down into reference and factory
++    ref: "SourceReference"
++
+     def __call__(
+         self, *args: TSourceFunParams.args, **kwargs: TSourceFunParams.kwargs
+     ) -> TDltSourceImpl:
+         pass
+ 
+-    # TODO: make factory to expose SourceReference with actual spec, name and section
+-    # model after Destination, which also needs to be broken down into reference and factory
+-    ref: "SourceReference"
++    @abstractmethod
++    def add_postprocessor(
++        self, func: Callable[[TDltSourceImpl], Union[TDltSourceImpl, Awaitable[TDltSourceImpl]]]
++    ) -> None:
++        """Adds a callback that receives and returns a DltSource after it is created."""
+ 
+     @abstractmethod
+     def clone(
+diff --git a/tests/extract/test_decorators.py b/tests/extract/test_decorators.py
+index 9a5bef302..ad6172f09 100644
+--- a/tests/extract/test_decorators.py
++++ b/tests/extract/test_decorators.py
+@@ -1,6 +1,7 @@
+ from functools import wraps
+ import inspect
+ import os
++import sys
+ from typing import Awaitable, Callable, List, Optional, Dict, Iterator, Any, cast
+ 
+ import pytest
+@@ -842,7 +843,7 @@ def test_source_reference_with_args() -> None:
+         "shorthand.with_shorthand_registry", _impl_sig=with_shorthand_registry
+     ).clone(section="changed")
+     # reveal_type(ref_t)
+-    assert ref_t.section == "changed"  # type: ignore[attr-defined]
++    assert ref_t.section == "changed"
+     # here source has correctly typed signature from with_shorthand_registry
+     source = ref_t(["A", "B"])
+     assert source.section == "changed"
+@@ -900,13 +901,13 @@ def test_source_reference_auto_import() -> None:
+     SourceReference.SOURCES.clear()
+     # make sure to import resource first
+     ref = SourceReference.find("tests.extract.cases.section_source.named_module.resource_f_2")
+-    assert ref.section == "name_overridden"  # type: ignore[attr-defined]
++    assert ref.section == "name_overridden"
+     assert list(ref("A")) == ["A"]
+     # TODO: fix double references (with renamed section and without, should be only 2 sections here)
+     assert len(SourceReference.SOURCES) == 4
+ 
+     ref = SourceReference.find("tests.extract.cases.section_source.named_module.source_f_1")
+-    assert ref.section == "name_overridden"  # type: ignore[attr-defined]
++    assert ref.section == "name_overridden"
+ 
+ 
+ def test_source_reference_from_type() -> None:
+@@ -949,8 +950,8 @@ def test_source_factory_clone(cloner: str) -> None:
+     assert list(source) == ["AXA"]
+ 
+     # there are some overrides from decorator
+-    assert with_shorthand_registry.name == "shorthand_registry"  # type: ignore
+-    assert with_shorthand_registry.section == "shorthand"  # type: ignore
++    assert with_shorthand_registry.name == "shorthand_registry"
++    assert with_shorthand_registry.section == "shorthand"
+ 
+     # creates clones
+     source_f_1: DltSourceFactoryWrapper[Any, DltSource] = factory(  # type: ignore
+@@ -1420,6 +1421,19 @@ def test_resource_returning_resource() -> None:
+     assert list(r) == [1, 2, 3]
+ 
+ 
++@pytest.mark.skipif(sys.version_info < (3, 10), reason="list[] syntax requires Python 3.10+")
++def test_resource_with_non_class_return_annotation() -> None:
++    @dlt.resource
++    def customers(i: int = 0) -> list[dict[str, Any]]:
++        return [{"id": idx, "name": f"customer_{idx}"} for idx in range(i)]
++
++    assert list(customers(3)) == [
++        {"id": 0, "name": "customer_0"},
++        {"id": 1, "name": "customer_1"},
++        {"id": 2, "name": "customer_2"},
++    ]
++
++
+ def test_resource_rename_credentials_separation():
+     os.environ["SOURCES__TEST_DECORATORS__REGULAR_SIGNATURE__SECRET_END"] = "5"
+     assert list(regular_signature(1)) == [1, 2, 3, 4]
+@@ -1711,3 +1725,69 @@ def test_parallelized_resource_decorator() -> None:
+     with pytest.raises(StopIteration):
+         # Inner generator is also closed
+         next(gen_orig)
++
++
++def test_source_postprocessor() -> None:
++    @dlt.source
++    def multi_resource():
++        return dlt.resource([1, 2, 3], name="alpha"), dlt.resource([4, 5], name="beta")
++
++    # add a postprocessor that selects only one resource
++    multi_resource.add_postprocessor(lambda s: s.with_resources("alpha"))
++
++    source = multi_resource()
++    assert "alpha" in source.selected_resources
++    assert "beta" not in source.selected_resources
++    assert list(source) == [1, 2, 3]
++
++
++def test_source_multiple_postprocessors() -> None:
++    call_order: List[str] = []
++
++    @dlt.source
++    def ordered_source():
++        return dlt.resource([1, 2, 3], name="data")
++
++    def first(s: DltSource) -> DltSource:
++        call_order.append("first")
++        return s
++
++    def second(s: DltSource) -> DltSource:
++        call_order.append("second")
++        return s
++
++    ordered_source.add_postprocessor(first)
++    ordered_source.add_postprocessor(second)
++
++    ordered_source()
++    assert call_order == ["first", "second"]
++
++
++def test_source_postprocessor_preserved_on_clone() -> None:
++    @dlt.source
++    def cloneable():
++        return dlt.resource([1, 2, 3], name="alpha"), dlt.resource([4, 5], name="beta")
++
++    cloneable.add_postprocessor(lambda s: s.with_resources("alpha"))
++
++    cloned = cloneable.clone(section="new_section")
++    source = cloned()
++    assert list(source) == [1, 2, 3]
++
++
++@pytest.mark.asyncio
++async def test_async_source_postprocessor() -> None:
++    @dlt.source
++    async def async_multi():
++        return dlt.resource([1, 2, 3], name="alpha"), dlt.resource([4, 5], name="beta")
++
++    async def select_alpha(s: Awaitable[DltSource]) -> DltSource:
++        source = await s
++        return source.with_resources("alpha")
++
++    async_multi.add_postprocessor(select_alpha)  # type: ignore[arg-type]
++
++    source = await async_multi()  # type: ignore[misc]
++    assert "alpha" in source.selected_resources
++    assert "beta" not in source.selected_resources
++    assert list(source) == [1, 2, 3]
+diff --git a/tests/pipeline/test_max_nesting.py b/tests/pipeline/test_max_nesting.py
+index 5f57e219a..ea246ed11 100644
+--- a/tests/pipeline/test_max_nesting.py
++++ b/tests/pipeline/test_max_nesting.py
+@@ -181,7 +181,7 @@ def test_update_table_nesting_level_source():
+     )
+ 
+     # change the max_table_nesting level of the source and load another formerly unloaded resource
+-    source.max_table_nesting = 4  # type: ignore
++    source.max_table_nesting = 4
+     pipeline.run(source().with_resources("base_table_1", "base_table_2"))
+ 
+     # for base_table_1 it will stay the same since it is already loaded
+@@ -222,7 +222,7 @@ def test_nesting_levels_reset_after_drop(nesting_defininition_location: str):
+     if nesting_defininition_location == "resource":
+         base_table_1.max_table_nesting = 3
+     else:
+-        source.max_table_nesting = 3  # type: ignore[attr-defined]
++        source.max_table_nesting = 3
+     pipeline.run(source())
+ 
+     all_table_names = pipeline.default_schema.data_table_names()
+
+
+===== COMMIT e24d8df7 =====
+
+
+commit e24d8df7f
+Author: Travior
+Date: 2026-02-15
+
+    feat/2673 snowflake swap replace (#3540)
+
+diff --git a/dlt/destinations/impl/snowflake/configuration.py b/dlt/destinations/impl/snowflake/configuration.py
+index 18269a3e7..604d018a8 100644
+--- a/dlt/destinations/impl/snowflake/configuration.py
++++ b/dlt/destinations/impl/snowflake/configuration.py
+@@ -173,6 +173,9 @@ class SnowflakeClientConfiguration(DestinationClientDwhWithStagingConfiguration)
+     use_vectorized_scanner: bool = False
+     """Whether to use or not use the vectorized scanner in COPY INTO"""
+ 
++    enable_atomic_swap: bool = False
++    """When enabled and using the `staging-optimized` replace strategy, tables will be atomically swapped using `ALTER TABLE ... SWAP WITH ...` instead of being cloned. This preserves permissions and enables zero-downtime loading."""
++
+     use_decfloat: bool = False
+     """Whether to use DECFLOAT type for unbound decimals instead of DECIMAL"""
+ 
+diff --git a/dlt/destinations/impl/snowflake/factory.py b/dlt/destinations/impl/snowflake/factory.py
+index 611f059e6..2bb16f171 100644
+--- a/dlt/destinations/impl/snowflake/factory.py
++++ b/dlt/destinations/impl/snowflake/factory.py
+@@ -173,6 +173,7 @@ class snowflake(Destination[SnowflakeClientConfiguration, "SnowflakeClient"]):
+         query_tag: Optional[str] = None,
+         create_indexes: bool = False,
+         use_decfloat: bool = False,
++        enable_atomic_swap: bool = False,
+         destination_name: str = None,
+         environment: str = None,
+         **kwargs: Any,
+@@ -192,6 +193,7 @@ class snowflake(Destination[SnowflakeClientConfiguration, "SnowflakeClient"]):
+             use_decfloat (bool, optional): Whether to use DECFLOAT type for unbound decimals. DECFLOAT stores
+                 exact decimal values with up to 36 significant digits and a dynamic exponent.
+                 Only works with text-based staging formats (jsonl, csv) - not parquet.
++            enable_atomic_swap (bool, optional): Whether to use atomic swap when replacing with replace strategy `staging-optimized`.
+             destination_name (str, optional): Name of the destination. Defaults to None.
+             environment (str, optional): Environment name. Defaults to None.
+             **kwargs (Any, optional): Additional arguments forwarded to the destination config
+@@ -204,6 +206,7 @@ class snowflake(Destination[SnowflakeClientConfiguration, "SnowflakeClient"]):
+             query_tag=query_tag,
+             create_indexes=create_indexes,
+             use_decfloat=use_decfloat,
++            enable_atomic_swap=enable_atomic_swap,
+             destination_name=destination_name,
+             environment=environment,
+             **kwargs,
+diff --git a/dlt/destinations/impl/snowflake/snowflake.py b/dlt/destinations/impl/snowflake/snowflake.py
+index 70737d234..9fb6f43e0 100644
+--- a/dlt/destinations/impl/snowflake/snowflake.py
++++ b/dlt/destinations/impl/snowflake/snowflake.py
+@@ -1,4 +1,4 @@
+-from typing import Optional, Sequence, List, Dict, Literal
++from typing import Optional, Sequence, List, Dict, Literal, Any
+ 
+ from dlt.common import logger
+ from dlt.common.data_writers.escape import escape_snowflake_literal
+@@ -14,6 +14,8 @@ from dlt.common.destination.client import (
+ )
+ from dlt.common.schema.utils import get_columns_names_with_prop
+ from dlt.common.storages.file_storage import FileStorage
++from dlt.destinations.sql_jobs import SqlStagingReplaceFollowupJob
++from dlt.destinations.sql_client import SqlClientBase
+ from dlt.common.schema import TColumnSchema, Schema, TColumnHint
+ from dlt.common.schema.typing import TColumnType, TTableSchema
+ 
+@@ -48,6 +50,25 @@ class SnowflakeMergeJob(SqlMergeFollowupJob):
+         return sql
+ 
+ 
++class SnowflakeStagingReplaceJob(SqlStagingReplaceFollowupJob):
++    @classmethod
++    def generate_sql(
++        cls,
++        table_chain: Sequence[PreparedTableSchema],
++        sql_client: SqlClientBase[Any],
++    ) -> List[str]:
++        sql: List[str] = []
++        for table in table_chain:
++            with sql_client.with_staging_dataset():
++                staging_table_name = sql_client.make_qualified_table_name(table["name"])
++            table_name = sql_client.make_qualified_table_name(table["name"])
++            sql.append(
++                f"ALTER TABLE {table_name} SWAP WITH {staging_table_name}",
++            )
++
++        return sql
++
++
+ class SnowflakeLoadJob(RunnableLoadJob, HasFollowupJobs):
+     def __init__(
+         self,
+@@ -163,6 +184,17 @@ class SnowflakeClient(SqlJobClientWithStagingDataset, SupportsStagingDestination
+     ) -> List[FollowupJobRequest]:
+         return [SnowflakeMergeJob.from_table_chain(table_chain, self.sql_client)]
+ 
++    def _create_replace_followup_jobs(
++        self, table_chain: Sequence[PreparedTableSchema]
++    ) -> List[FollowupJobRequest]:
++        root_table = table_chain[0]
++        if (
++            root_table["x-replace-strategy"] == "staging-optimized"  # type: ignore[typeddict-item]
++            and self.config.enable_atomic_swap
++        ):
++            return [SnowflakeStagingReplaceJob.from_table_chain(table_chain, self.sql_client)]
++        return super()._create_replace_followup_jobs(table_chain)
++
+     def _make_add_column_sql(
+         self, new_columns: Sequence[TColumnSchema], table: PreparedTableSchema = None
+     ) -> List[str]:
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+index 0e3fecbd4..dadc7e5e1 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+@@ -169,6 +169,34 @@ All write dispositions are supported.
+ 
+ If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be dropped and recreated with a [clone command](https://docs.snowflake.com/en/sql-reference/sql/create-clone) from the staging tables.
+ 
++#### Atomic swap replacement
++
++Snowflake supports atomic table swapping as an optional optimization when using the `staging-optimized` replace strategy. When enabled via the `enable_atomic_swap` configuration option, destination and staging tables are swapped using Snowflake's `ALTER TABLE ... SWAP WITH ...` functionality instead of the default clone operation.
++
++Each table retains its original permissions after swapping, so you must ensure any `FUTURE GRANT`s configured on the staging schema are appropriate for your use case. Additionally, dlt does not automatically drop staging tables, which means the previous production table (with all its permissions) becomes the staging table for the next load.
++
++To enable atomic swap, add the following to your configuration:
++
++```toml
++[destination.snowflake]
++enable_atomic_swap = true
++```
++
++Or via environment variable:
++```text
++DESTINATION__SNOWFLAKE__ENABLE_ATOMIC_SWAP=true
++```
++
++Or as an argument to `dlt.destinations.snowflake`:
++```py
++import dlt
++
++pipeline = dlt.pipeline(
++    pipeline_name="...",
++    destination=dlt.destinations.snowflake(enable_atomic_swap=True),
++)
++```
++
+ ### Data loading
+ 
+ The data is loaded using an internal Snowflake stage. We use the `PUT` command and per-table built-in stages by default. Stage files are kept by default, unless specified otherwise via the `keep_staged_files` parameter:
+diff --git a/tests/load/pipeline/test_replace_disposition.py b/tests/load/pipeline/test_replace_disposition.py
+index 1c3b0d493..124bc0be5 100644
+--- a/tests/load/pipeline/test_replace_disposition.py
++++ b/tests/load/pipeline/test_replace_disposition.py
+@@ -446,3 +446,82 @@ def test_replace_sql_queries(
+         else:
+             assert clone_sql_generator_spy.call_count == 1
+             assert insert_sql_generator_spy.call_count == 0
++
++
++@pytest.mark.essential
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(
++        default_sql_configs=True,
++        subset=["snowflake"],
++    ),
++    ids=lambda x: x.name,
++)
++def test_snowflake_atomic_swap_replace(
++    destination_config: DestinationTestConfiguration,
++    mocker: MockerFixture,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Test Snowflake atomic swap with sequential loads, nested tables, and empty resource."""
++    from dlt.destinations.sql_jobs import SqlStagingFollowupJob, SqlStagingReplaceFollowupJob
++    from dlt.destinations.impl.snowflake.snowflake import SnowflakeStagingReplaceJob
++
++    monkeypatch.setenv("DESTINATION__REPLACE_STRATEGY", "staging-optimized")
++    monkeypatch.setenv("DESTINATION__SNOWFLAKE__ENABLE_ATOMIC_SWAP", "true")
++
++    clone_spy = mocker.spy(SqlStagingReplaceFollowupJob, "_generate_clone_sql")
++    insert_spy = mocker.spy(SqlStagingFollowupJob, "_generate_insert_sql")
++    swap_spy = mocker.spy(SnowflakeStagingReplaceJob, "generate_sql")
++
++    pipeline = destination_config.setup_pipeline("snowflake_atomic_swap_test", dev_mode=True)
++
++    @dlt.resource(name="items", write_disposition="replace", primary_key="id")
++    def load_items(offset):
++        for i in range(offset, offset + 3):
++            yield {
++                "id": i,
++                "name": f"item {i}",
++                "sub_items": [
++                    {"id": i * 100 + 1, "name": f"sub {i * 100 + 1}"},
++                    {"id": i * 100 + 2, "name": f"sub {i * 100 + 2}"},
++                ],
++            }
++
++    # first load: nested data via swap
++    info = pipeline.run(load_items(0), **destination_config.run_kwargs)
++    assert_load_info(info)
++
++    assert swap_spy.call_count == 1
++    assert clone_spy.call_count == 0
++    assert insert_spy.call_count == 0
++    for sql_stmt in swap_spy.return_value:
++        assert "SWAP WITH" in sql_stmt
++
++    assert load_table_counts(pipeline, "items", "items__sub_items") == {
++        "items": 3,
++        "items__sub_items": 6,
++    }
++
++    # second load: different data, verifies full replacement after prior swap
++    swap_spy.reset_mock()
++    info = pipeline.run(load_items(100), **destination_config.run_kwargs)
++    assert_load_info(info)
++
++    assert swap_spy.call_count == 1
++    assert load_table_counts(pipeline, "items", "items__sub_items") == {
++        "items": 3,
++        "items__sub_items": 6,
++    }
++    table_dicts = load_tables_to_dicts(pipeline, "items")
++    assert {int(r["id"]) for r in table_dicts["items"]} == {100, 101, 102}
++
++    # third load: empty resource clears all tables
++    @dlt.resource(name="items", write_disposition="replace", primary_key="id")
++    def load_items_empty():
++        if False:
++            yield
++
++    swap_spy.reset_mock()
++    info = pipeline.run(load_items_empty(), **destination_config.run_kwargs)
++    assert_load_info(info)
++    assert_empty_tables(pipeline, "items", "items__sub_items")
+
+
+===== COMMIT c4b3cd9c =====
+
+
+commit c4b3cd9cf
+Author: rudolfix
+Date: 2026-02-14
+
+    detect when running via agent (#3628)
+
+diff --git a/dlt/common/runtime/exec_info.py b/dlt/common/runtime/exec_info.py
+index 04ac091d6..a08554434 100644
+--- a/dlt/common/runtime/exec_info.py
++++ b/dlt/common/runtime/exec_info.py
+@@ -61,6 +61,14 @@ def exec_info_names() -> List[TExecInfoNames]:
+         names.append("gcp_cloud_function")
+     if is_streamlit():
+         names.append("streamlit")
++    if is_claude_code():
++        names.append("claude_code")
++    if is_claude_code_cli():
++        names.append("claude_code_cli")
++    if is_cursor():
++        names.append("cursor")
++    if is_codex():
++        names.append("codex")
+     return names
+ 
+ 
+@@ -76,6 +84,47 @@ def is_streamlit() -> bool:
+     return "STREAMLIT_SERVER_PORT" in os.environ
+ 
+ 
++def is_claude_code() -> bool:
++    """Return True if running under Claude Code (CLI or API).
++
++    Detects CLAUDECODE environment variable set by Claude Code.
++    https://code.claude.com/docs/en/settings
++    """
++    return os.environ.get("CLAUDECODE") == "1"
++
++
++def is_claude_code_cli() -> bool:
++    """Return True if running under Claude Code CLI specifically.
++
++    Detects CLAUDECODE=1 and CLAUDE_CODE_ENTRYPOINT=cli environment variables.
++    Note: Both claude_code and claude_code_cli will be present when running via CLI.
++    https://code.claude.com/docs/en/settings
++    """
++    return os.environ.get("CLAUDECODE") == "1" and os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "cli"
++
++
++def is_cursor() -> bool:
++    """Return True if running in Cursor IDE Agent.
++
++    Detects CURSOR_AGENT environment variable set when Cursor Agent is running.
++    https://cursor.com/docs/agent/terminal
++    """
++    return os.environ.get("CURSOR_AGENT") == "1"
++
++
++def is_codex() -> bool:
++    """Return True if running in OpenAI Codex.
++
++    Detects CODEX_CI, CODEX_THREAD_ID, or CODEX_SANDBOX environment variables.
++    https://developers.openai.com/codex/cli/features/
++    """
++    return (
++        os.environ.get("CODEX_CI") == "1"
++        or os.environ.get("CODEX_THREAD_ID") is not None
++        or os.environ.get("CODEX_SANDBOX") is not None
++    )
++
++
+ def is_notebook() -> bool:
+     try:
+         return bool(str(get_ipython()))  # type: ignore
+diff --git a/dlt/common/runtime/typing.py b/dlt/common/runtime/typing.py
+index 29df6b3a0..480f6b872 100644
+--- a/dlt/common/runtime/typing.py
++++ b/dlt/common/runtime/typing.py
+@@ -18,6 +18,10 @@ TExecInfoNames = Literal[
+     "dagster",
+     "prefect",
+     "marimo",
++    "claude_code",
++    "claude_code_cli",
++    "cursor",
++    "codex",
+ ]
+ 
+ 
+diff --git a/tests/common/configuration/utils.py b/tests/common/configuration/utils.py
+index 1adb0cac7..7d59fb694 100644
+--- a/tests/common/configuration/utils.py
++++ b/tests/common/configuration/utils.py
+@@ -112,18 +112,9 @@ class InstrumentedConfiguration(BaseConfiguration):
+ 
+ 
+ @pytest.fixture(scope="function")
+-def environment() -> Any:
+-    saved_environ = environ.copy()
+-    # preserve these explicitly
+-    preserved = {
+-        DLT_TEST_STORAGE_ROOT: saved_environ.get(DLT_TEST_STORAGE_ROOT),
+-        PYTEST_XDIST_WORKER: saved_environ.get(PYTEST_XDIST_WORKER),
+-    }
++def environment(preserve_environ) -> Any:
+     environ.clear()
+-    environ.update({k: v for k, v in preserved.items() if v is not None})
+-    yield environ
+-    environ.clear()
+-    environ.update(saved_environ)
++    return environ
+ 
+ 
+ @pytest.fixture(autouse=True)
+diff --git a/tests/common/conftest.py b/tests/common/conftest.py
+new file mode 100644
+index 000000000..0e84c4108
+--- /dev/null
++++ b/tests/common/conftest.py
+@@ -0,0 +1 @@
++from tests.utils import preserve_environ
+diff --git a/tests/common/runners/test_runners.py b/tests/common/runners/test_runners.py
+index 8b897d476..e3fa86458 100644
+--- a/tests/common/runners/test_runners.py
++++ b/tests/common/runners/test_runners.py
+@@ -3,7 +3,7 @@ import pytest
+ import sys
+ import time
+ import multiprocessing
+-from typing import ClassVar, Tuple, Type
++from typing import ClassVar, Iterator, Tuple, Type
+ 
+ from dlt.common.runtime import signals
+ from dlt.common.configuration import resolve_configuration, configspec
+@@ -76,10 +76,14 @@ _counter = 0
+ 
+ 
+ @pytest.fixture(autouse=True)
+-def default_args() -> None:
++def default_args() -> Iterator[None]:
+     signals._received_signal = 0
+     global _counter
+     _counter = 0
++    try:
++        yield
++    finally:
++        signals._received_signal = 0
+ 
+ 
+ # test runner functions
+diff --git a/tests/common/runners/utils.py b/tests/common/runners/utils.py
+index 3d6adbf70..00dc1bd1b 100644
+--- a/tests/common/runners/utils.py
++++ b/tests/common/runners/utils.py
+@@ -16,8 +16,10 @@ ALL_METHODS = set(multiprocessing.get_all_start_methods()).intersection(["fork",
+ @pytest.fixture(autouse=True)
+ def mp_method_auto() -> Iterator[None]:
+     method = multiprocessing.get_start_method()
+-    yield
+-    multiprocessing.set_start_method(method, force=True)
++    try:
++        yield
++    finally:
++        multiprocessing.set_start_method(method, force=True)
+ 
+ 
+ class _TestRunnableWorkerMethod(Runnable[Executor]):
+diff --git a/tests/common/runtime/test_exec_info.py b/tests/common/runtime/test_exec_info.py
+new file mode 100644
+index 000000000..ee92c23a5
+--- /dev/null
++++ b/tests/common/runtime/test_exec_info.py
+@@ -0,0 +1,142 @@
++import pytest
++
++from dlt.common.runtime.exec_info import (
++    exec_info_names,
++    is_aws_lambda,
++    is_claude_code,
++    is_claude_code_cli,
++    is_codespaces,
++    is_codex,
++    is_cursor,
++    is_gcp_cloud_function,
++    is_github_actions,
++    is_running_in_airflow_task,
++    is_streamlit,
++)
++from dlt.common.typing import DictStrStr
++
++from tests.common.configuration.utils import environment
++
++
++@pytest.mark.parametrize(
++    "env_var,detect_fn",
++    [
++        ("CODESPACES", is_codespaces),
++        ("GITHUB_ACTIONS", is_github_actions),
++        ("STREAMLIT_SERVER_PORT", is_streamlit),
++        ("AWS_LAMBDA_FUNCTION_NAME", is_aws_lambda),
++        ("FUNCTION_NAME", is_gcp_cloud_function),
++        ("AIRFLOW_CTX_TASK_ID", is_running_in_airflow_task),
++    ],
++    ids=[
++        "codespaces",
++        "github-actions",
++        "streamlit",
++        "aws-lambda",
++        "gcp-cloud-function",
++        "airflow-task",
++    ],
++)
++def test_env_presence_detection(env_var: str, detect_fn, environment: DictStrStr) -> None:
++    assert detect_fn() is False
++    environment[env_var] = "1"
++    assert detect_fn() is True
++
++
++def test_is_claude_code(environment: DictStrStr) -> None:
++    assert is_claude_code() is False
++
++    # wrong value does not trigger
++    environment["CLAUDECODE"] = "0"
++    assert is_claude_code() is False
++
++    environment["CLAUDECODE"] = "1"
++    assert is_claude_code() is True
++
++
++def test_is_claude_code_cli(environment: DictStrStr) -> None:
++    assert is_claude_code_cli() is False
++
++    # only CLAUDECODE — not enough
++    environment["CLAUDECODE"] = "1"
++    assert is_claude_code_cli() is False
++
++    # only entrypoint — not enough
++    del environment["CLAUDECODE"]
++    environment["CLAUDE_CODE_ENTRYPOINT"] = "cli"
++    assert is_claude_code_cli() is False
++
++    # both set
++    environment["CLAUDECODE"] = "1"
++    assert is_claude_code_cli() is True
++
++
++def test_is_cursor(environment: DictStrStr) -> None:
++    assert is_cursor() is False
++
++    # empty or "0" must not trigger
++    environment["CURSOR_AGENT"] = ""
++    assert is_cursor() is False
++    environment["CURSOR_AGENT"] = "0"
++    assert is_cursor() is False
++
++    environment["CURSOR_AGENT"] = "1"
++    assert is_cursor() is True
++
++
++def test_is_codex(environment: DictStrStr) -> None:
++    assert is_codex() is False
++
++    # wrong CODEX_CI value alone
++    environment["CODEX_CI"] = "0"
++    assert is_codex() is False
++
++    # each trigger independently
++    environment["CODEX_CI"] = "1"
++    assert is_codex() is True
++
++    del environment["CODEX_CI"]
++    environment["CODEX_THREAD_ID"] = "thread-abc"
++    assert is_codex() is True
++
++    del environment["CODEX_THREAD_ID"]
++    environment["CODEX_SANDBOX"] = "/tmp/sandbox"
++    assert is_codex() is True
++
++
++@pytest.mark.parametrize(
++    "env_vars,expected_names",
++    [
++        ({"CLAUDECODE": "1"}, ["claude_code"]),
++        (
++            {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"},
++            ["claude_code", "claude_code_cli"],
++        ),
++        ({"CURSOR_AGENT": "1"}, ["cursor"]),
++        ({"CODEX_CI": "1"}, ["codex"]),
++        ({"CODEX_THREAD_ID": "t-1"}, ["codex"]),
++        (
++            {"CLAUDECODE": "1", "CURSOR_AGENT": "1", "CODEX_CI": "1"},
++            ["claude_code", "cursor", "codex"],
++        ),
++    ],
++    ids=[
++        "claude-code-only",
++        "claude-code-cli",
++        "cursor",
++        "codex-ci",
++        "codex-thread-id",
++        "all-agents",
++    ],
++)
++def test_exec_info_names_includes_agents(env_vars, expected_names, environment: DictStrStr) -> None:
++    environment.update(env_vars)
++    names = exec_info_names()
++    for expected in expected_names:
++        assert expected in names
++
++
++def test_exec_info_names_excludes_agents_when_absent(environment: DictStrStr) -> None:
++    names = exec_info_names()
++    agent_names = {"claude_code", "claude_code_cli", "cursor", "codex"}
++    assert agent_names.isdisjoint(set(names))
+diff --git a/tests/common/runtime/test_signals.py b/tests/common/runtime/test_signals.py
+index 1dfcbe753..eccde4e2e 100644
+--- a/tests/common/runtime/test_signals.py
++++ b/tests/common/runtime/test_signals.py
+@@ -15,9 +15,11 @@ pytestmark = pytest.mark.serial
+ 
+ @pytest.fixture(autouse=True)
+ def clear_signal() -> Iterator[None]:
+-    yield
+-    signals.exit_event.clear()
+-    signals._clear_signals()
++    try:
++        yield
++    finally:
++        signals.exit_event.clear()
++        signals._clear_signals()
+ 
+ 
+ def test_sleep() -> None:
+diff --git a/tests/conftest.py b/tests/conftest.py
+index c08240bc1..679d2c968 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -72,7 +72,6 @@ def pytest_xdist_setupnodes(config, specs):
+         "ducklake",
+         "httpfs",
+         "iceberg",
+-        "lance",
+         "motherduck",
+         "parquet",
+         "postgres_scanner",
+@@ -80,12 +79,21 @@ def pytest_xdist_setupnodes(config, specs):
+         "sqlite_scanner",
+     ]
+ 
++    community_extensions = [
++        "lance",
++    ]
++
+     with duckdb.connect() as conn:
+         for ext in extensions:
+             try:
+                 conn.execute(f"INSTALL {ext}")
+             except Exception:
+                 pass  # extension might not be available
++        for ext in community_extensions:
++            try:
++                conn.execute(f"INSTALL {ext} FROM community")
++            except Exception:
++                pass  # extension might not be available
+ 
+ 
+ def pytest_configure(config):
+diff --git a/tests/helpers/dbt_tests/local/utils.py b/tests/helpers/dbt_tests/local/utils.py
+index 06abccf59..d74cfb5ab 100644
+--- a/tests/helpers/dbt_tests/local/utils.py
++++ b/tests/helpers/dbt_tests/local/utils.py
+@@ -59,11 +59,13 @@ def setup_rasa_runner_client(
+     with cm_yield_client(destination_name, FIXTURES_DATASET_NAME) as client:
+         # emit environ so credentials are passed to dbt profile
+         add_config_to_env(client.config, ("DLT",))
+-        yield
+-        # delete temp schemas
+-        dataset_name = f"{destination_dataset_name}_views"
+-        delete_dataset(client.sql_client, dataset_name)
+-        dataset_name = f"{destination_dataset_name}_staging"
+-        delete_dataset(client.sql_client, dataset_name)
+-        dataset_name = f"{destination_dataset_name}_event"
+-        delete_dataset(client.sql_client, dataset_name)
++        try:
++            yield
++        finally:
++            # delete temp schemas
++            dataset_name = f"{destination_dataset_name}_views"
++            delete_dataset(client.sql_client, dataset_name)
++            dataset_name = f"{destination_dataset_name}_staging"
++            delete_dataset(client.sql_client, dataset_name)
++            dataset_name = f"{destination_dataset_name}_event"
++            delete_dataset(client.sql_client, dataset_name)
+diff --git a/tests/load/filesystem/utils.py b/tests/load/filesystem/utils.py
+index 80be6b18a..cb2c50360 100644
+--- a/tests/load/filesystem/utils.py
++++ b/tests/load/filesystem/utils.py
+@@ -101,9 +101,10 @@ def self_signed_cert() -> Iterator[str]:
+         cert_file.write(cert.public_bytes(serialization.Encoding.PEM))
+         cert_path = cert_file.name
+ 
+-    yield cert_path
+-
+-    os.remove(cert_path)
++    try:
++        yield cert_path
++    finally:
++        os.remove(cert_path)
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/load/utils.py b/tests/load/utils.py
+index 6796efa4a..6bf665815 100644
+--- a/tests/load/utils.py
++++ b/tests/load/utils.py
+@@ -1243,19 +1243,21 @@ def yield_client_with_storage(
+ 
+     with cm_yield_client(destination, dataset_name, default_config_values, schema_name) as client:
+         client.initialize_storage()
+-        yield client
+-        if client.is_storage_initialized():
+-            try:
+-                client.drop_storage()
+-            except Exception as exc:
+-                print(f"drop dataset {dataset_name}: {exc}")
+-        if isinstance(client, WithStagingDataset):
+-            with client.with_staging_dataset():
+-                if client.is_storage_initialized():
+-                    try:
+-                        client.drop_storage()
+-                    except Exception as exc:
+-                        print(f"drop dataset {dataset_name} STAGING: {exc}")
++        try:
++            yield client
++        finally:
++            if client.is_storage_initialized():
++                try:
++                    client.drop_storage()
++                except Exception as exc:
++                    print(f"drop dataset {dataset_name}: {exc}")
++            if isinstance(client, WithStagingDataset):
++                with client.with_staging_dataset():
++                    if client.is_storage_initialized():
++                        try:
++                            client.drop_storage()
++                        except Exception as exc:
++                            print(f"drop dataset {dataset_name} STAGING: {exc}")
+ 
+ 
+ def delete_dataset(client: SqlClientBase[Any], normalized_dataset_name: str) -> None:
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index 3d7372316..ad00f35df 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -97,9 +97,6 @@ def test_default_pipeline() -> None:
+     # this is a name of executing test harness or blank pipeline on windows
+     possible_names = ["dlt_pytest", "dlt_pipeline"]
+     assert p.pipeline_name in possible_names
+-    assert p.pipelines_dir == os.path.abspath(
+-        os.path.join(get_test_storage_root(), ".dlt", "pipelines")
+-    )
+     # default dataset name is not created until a destination that requires it is set
+     assert p.dataset_name is None
+     assert p.destination is None
+@@ -119,6 +116,13 @@ def test_default_pipeline() -> None:
+     assert p.default_schema_name in ["dlt_pytest", "dlt"]
+ 
+ 
++def test_default_pipelines_dir() -> None:
++    p = dlt.pipeline("test_pipeline" + uniq_id())
++    assert p.pipelines_dir == os.path.abspath(
++        os.path.join(get_test_storage_root(), ".dlt", "pipelines")
++    )
++
++
+ def test_pipeline_runtime_configuration() -> None:
+     c = resolve.resolve_configuration(PipelineConfiguration())
+     assert c.pipeline_name.startswith("dlt_")
+@@ -149,9 +153,6 @@ def test_default_pipeline_dataset_layout(environment) -> None:
+         dataset_name_layout % "dlt_pipeline_dataset",
+     ]
+     assert p.pipeline_name in possible_names
+-    assert p.pipelines_dir == os.path.abspath(
+-        os.path.join(get_test_storage_root(), ".dlt", "pipelines")
+-    )
+     # dataset that will be used to load data is the pipeline name
+     assert p.dataset_name in possible_dataset_names
+     assert p.default_schema_name is None
+diff --git a/tests/utils.py b/tests/utils.py
+index 2da8d1604..d92524a92 100644
+--- a/tests/utils.py
++++ b/tests/utils.py
+@@ -371,10 +371,12 @@ class MockableRunContext(RunContext):
+ def auto_unload_modules() -> Iterator[None]:
+     """Unload all modules inspected in this tests"""
+     prev_modules = dict(sys.modules)
+-    yield
+-    mod_diff = set(sys.modules.keys()) - set(prev_modules.keys())
+-    for mod in mod_diff:
+-        del sys.modules[mod]
++    try:
++        yield
++    finally:
++        mod_diff = set(sys.modules.keys()) - set(prev_modules.keys())
++        for mod in mod_diff:
++            del sys.modules[mod]
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -383,14 +385,16 @@ def deactivate_pipeline(preserve_environ) -> Iterator[None]:
+     container = Container()
+     if container[PipelineContext].is_active():
+         container[PipelineContext].deactivate()
+-    yield
+-    if container[PipelineContext].is_active():
+-        # take existing pipeline
+-        # NOTE: no more needed. test storage is wiped fully when test starts
+-        # p = dlt.pipeline()
+-        # p._wipe_working_folder()
+-        # deactivate context
+-        container[PipelineContext].deactivate()
++    try:
++        yield
++    finally:
++        if container[PipelineContext].is_active():
++            # take existing pipeline
++            # NOTE: no more needed. test storage is wiped fully when test starts
++            # p = dlt.pipeline()
++            # p._wipe_working_folder()
++            # deactivate context
++            container[PipelineContext].deactivate()
+ 
+ 
+ @pytest.fixture(autouse=True)
+diff --git a/tests/workspace/cli/utils.py b/tests/workspace/cli/utils.py
+index 15569f8d8..e2adbfa90 100644
+--- a/tests/workspace/cli/utils.py
++++ b/tests/workspace/cli/utils.py
+@@ -23,8 +23,10 @@ WORKSPACE_CLI_CASES_DIR = os.path.abspath(os.path.join("tests", "workspace", "cl
+ def auto_echo_default_choice() -> Iterator[None]:
+     """Always answer default in CLI interactions"""
+     echo.ALWAYS_CHOOSE_DEFAULT = True
+-    yield
+-    echo.ALWAYS_CHOOSE_DEFAULT = False
++    try:
++        yield
++    finally:
++        echo.ALWAYS_CHOOSE_DEFAULT = False
+ 
+ 
+ @pytest.fixture(scope="session")
+
+
+===== COMMIT 8041e25c =====
+
+
+commit 8041e25c4
+Author: rudolfix
+Date: 2026-02-14
+
+    (bugfix) (chores) cleans up query lifecycle (#3627)
+
+diff --git a/dlt/common/libs/sqlglot.py b/dlt/common/libs/sqlglot.py
+index 537595a44..7de8aa7ee 100644
+--- a/dlt/common/libs/sqlglot.py
++++ b/dlt/common/libs/sqlglot.py
+@@ -1,4 +1,4 @@
+-from typing import Callable, List, Optional, Tuple, Union, Set, Any, Iterable, Literal
++from typing import Callable, Dict, List, Optional, Tuple, Union, Set, Any, Iterable, Literal
+ import sqlglot
+ import sqlglot.expressions as sge
+ from sqlglot.expressions import DataType, DATA_TYPE
+@@ -892,3 +892,131 @@ def reorder_or_adjust_outer_select(
+                 raise exc
+ 
+     outer_parsed_select.set("expressions", new_selects)
++
++
++def normalize_query_identifiers(
++    query: sge.Query,
++    naming_convention: Any,
++) -> sge.Query:
++    """Normalize all logical identifiers in a query to match the naming convention.
++
++    Normalizes table names, column names, and aliases. Does not modify database
++    or catalog names. Call before bind_query to ensure identifiers match the
++    dlt schema naming.
++
++    Args:
++        query: Query with logical (possibly unnormalized) identifiers
++        naming_convention: Naming convention to apply
++
++    Returns:
++        Query with all identifiers normalized
++    """
++    query = query.copy()
++
++    for node in query.walk():
++        # normalize table names
++        if isinstance(node, sge.Table):
++            normalized = naming_convention.normalize_tables_path(node.name)
++            if node.name != normalized:
++                node.this.set("this", normalized)
++
++        # normalize column and other identifiers (but not table/db/catalog)
++        elif isinstance(node, sge.Identifier):
++            # skip identifiers that are part of Table nodes (table/db/catalog names)
++            if isinstance(node.parent, sge.Table):
++                continue
++
++            # table qualifiers in column references must use normalize_tables_path
++            # to stay consistent with table names in FROM/JOIN
++            if isinstance(node.parent, sge.Column) and node.arg_key == "table":
++                normalized = naming_convention.normalize_tables_path(node.this)
++            else:
++                normalized = naming_convention.normalize_path(node.this)
++            if node.this != normalized:
++                node.set("this", normalized)
++
++        # normalize aliases
++        elif isinstance(node, sge.Alias) and node.alias:
++            normalized = naming_convention.normalize_path(node.alias)
++            if node.alias != normalized:
++                node.set("alias", sqlglot.to_identifier(normalized, quoted=False))
++
++    return query
++
++
++def bind_query(
++    qualified_query: sge.Query,
++    sqlglot_schema: Any,  # SQLGlotSchema
++    *,
++    expand_table_name: Callable[[str], List[str]],
++    casefold_identifier: Callable[[str], str],
++) -> sge.Query:
++    """Binds a logical query (compliant with dlt schema) to physical tables in the destination dataset.
++
++    This function performs name resolution/binding - a standard query processing step that maps
++    logical identifiers to actual database objects. It takes a query using dlt's logical naming
++    convention and adapts it for execution on the destination database.
++    Note that outer select list after binding preserve select list in `qualified_query`.
++
++    Binding steps performed:
++    1. **Table name expansion**: Resolves table references to fully qualified physical paths
++       (e.g., for ClickHouse: `dataset.table` → `dataset___table`)
++    2. **Identifier case-folding**: Applies destination-specific case transformation
++       (`str.upper` for Snowflake, `str.lower` for most databases, `str` for case-sensitive)
++    3. **Identifier quoting**: Quotes all identifiers for safe execution and to preserve
++       exact casing (e.g., `column_name` → `"column_name"`)
++    4. **Alias preservation**: For case-folding destinations, adds aliases to SELECT columns
++       to maintain compatibility with dlt schema naming (e.g., `SELECT "VALUE" AS "value"`)
++
++    Args:
++        qualified_query: SQLGlot query expression with qualified table/column references
++        sqlglot_schema: Schema mapping for name validation and column resolution
++        expand_table_name: Function that expands table name to fully qualified path [catalog, schema, table]
++        casefold_identifier: Case transformation function (`str`, `str.upper`, or `str.lower`)
++
++    Returns:
++        Bound query expression ready for execution on the destination database
++    """
++    qualified_query = qualified_query.copy()
++    is_casefolding = casefold_identifier is not str
++
++    # preserve "column" names in original selects which are done in dlt schema namespace
++    orig_selects: Dict[int, str] = None
++    if is_casefolding:
++        orig_selects = {}
++        for i, proj in enumerate(qualified_query.selects):
++            orig_selects[i] = proj.name or proj.args["alias"].name
++
++    # case fold all identifiers and quote
++    for node in qualified_query.walk():
++        if isinstance(node, sge.Table):
++            # expand named of known tables. this is currently clickhouse things where
++            # we use dataset.table in queries but render those as dataset___table
++            if sqlglot_schema.column_names(node):
++                expanded_path = expand_table_name(node.name)
++                # set the table name
++                if node.name != expanded_path[-1]:
++                    node.this.set("this", expanded_path[-1])
++                # set the dataset/schema name
++                if node.db != expanded_path[-2]:
++                    node.set("db", sqlglot.to_identifier(expanded_path[-2], quoted=False))
++                # set the catalog name
++                if len(expanded_path) == 3:
++                    if node.db != expanded_path[0]:
++                        node.set("catalog", sqlglot.to_identifier(expanded_path[0], quoted=False))
++        # quote and case-fold identifiers, TODO: maybe we could be more intelligent, but then we need to unquote ibis
++        if isinstance(node, sge.Identifier):
++            if is_casefolding:
++                node.set("this", casefold_identifier(node.this))
++            node.set("quoted", True)
++
++    # add aliases to output selects to stay compatible with dlt schema after the query
++    if orig_selects:
++        for i, orig in orig_selects.items():
++            case_folded_orig = casefold_identifier(orig)
++            if case_folded_orig != orig:
++                # somehow we need to alias just top select in UNION (tested on Snowflake)
++                sel_expr = qualified_query.selects[i]
++                qualified_query.selects[i] = sge.alias_(sel_expr, orig, quoted=True)
++
++    return qualified_query
+diff --git a/dlt/dataset/relation.py b/dlt/dataset/relation.py
+index 122481bb9..c720f443f 100644
+--- a/dlt/dataset/relation.py
++++ b/dlt/dataset/relation.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ from collections.abc import Collection
+ 
++from functools import partial
+ from typing import overload, Union, Any, Generator, Optional, Sequence, Type, TYPE_CHECKING
+ from textwrap import indent
+ from contextlib import contextmanager
+@@ -30,7 +31,7 @@ from dlt.common.typing import Self, TSortOrder
+ from dlt.common.exceptions import ValueErrorWithKnownValues
+ from dlt.dataset import lineage
+ from dlt.destinations.sql_client import SqlClientBase, WithSqlClient
+-from dlt.destinations.queries import _normalize_query, build_select_expr
++from dlt.destinations.queries import bind_query, build_select_expr
+ from dlt.common.exceptions import MissingDependencyException
+ from dlt.common.destination.dataset import SupportsDataAccess
+ 
+@@ -245,10 +246,14 @@ class Relation(WithSqlClient):
+             query = self.sqlglot_expression
+         else:
+             _, _qualified_query = _get_relation_output_columns_schema(self)
+-            query = _normalize_query(
++            query = bind_query(
+                 qualified_query=_qualified_query,
+                 sqlglot_schema=self._dataset.sqlglot_schema,
+-                sql_client=self.sql_client,
++                expand_table_name=partial(
++                    self.sql_client.make_qualified_table_name_path,
++                    quote=False,
++                    casefold=False,
++                ),
+                 casefold_identifier=self.sql_client.capabilities.casefold_identifier,
+             )
+ 
+diff --git a/dlt/destinations/queries.py b/dlt/destinations/queries.py
+index e616e630b..e171e2a5e 100644
+--- a/dlt/destinations/queries.py
++++ b/dlt/destinations/queries.py
+@@ -1,10 +1,11 @@
+-from typing import Dict, Any, List
++from functools import partial
++from typing import Any, List
+ 
+-import sqlglot
+ import sqlglot.expressions as sge
+ from sqlglot.schema import Schema as SQLGlotSchema
+ 
+ from dlt.common.destination.capabilities import TCasefoldIdentifier
++from dlt.common.libs.sqlglot import bind_query
+ from dlt.destinations.sql_client import SqlClientBase
+ 
+ 
+@@ -12,57 +13,21 @@ def _normalize_query(
+     qualified_query: sge.Query,
+     sqlglot_schema: SQLGlotSchema,
+     *,
+-    # TODO ideally, we don't have to pass an SQLClient around just to get `.make_qualified_table_name_path()`
+     sql_client: SqlClientBase[Any],
+     casefold_identifier: TCasefoldIdentifier,
+ ) -> sge.Query:
+-    """Normalizes a qualified query compliant with the dlt schema into the namespace of the source dataset"""
+-
+-    qualified_query = qualified_query.copy()
+-    is_casefolding = casefold_identifier is not str
+-
+-    # preserve "column" names in original selects which are done in dlt schema namespace
+-    orig_selects: Dict[int, str] = None
+-    if is_casefolding:
+-        orig_selects = {}
+-        for i, proj in enumerate(qualified_query.selects):
+-            orig_selects[i] = proj.name or proj.args["alias"].name
+-
+-    # case fold all identifiers and quote
+-    for node in qualified_query.walk():
+-        if isinstance(node, sge.Table):
+-            # expand named of known tables. this is currently clickhouse things where
+-            # we use dataset.table in queries but render those as dataset___table
+-            if sqlglot_schema.column_names(node):
+-                expanded_path = sql_client.make_qualified_table_name_path(
+-                    node.name, quote=False, casefold=False
+-                )
+-                # set the table name
+-                if node.name != expanded_path[-1]:
+-                    node.this.set("this", expanded_path[-1])
+-                # set the dataset/schema name
+-                if node.db != expanded_path[-2]:
+-                    node.set("db", sqlglot.to_identifier(expanded_path[-2], quoted=False))
+-                # set the catalog name
+-                if len(expanded_path) == 3:
+-                    if node.db != expanded_path[0]:
+-                        node.set("catalog", sqlglot.to_identifier(expanded_path[0], quoted=False))
+-        # quote and case-fold identifiers, TODO: maybe we could be more intelligent, but then we need to unquote ibis
+-        if isinstance(node, sge.Identifier):
+-            if is_casefolding:
+-                node.set("this", casefold_identifier(node.this))
+-            node.set("quoted", True)
+-
+-    # add aliases to output selects to stay compatible with dlt schema after the query
+-    if orig_selects:
+-        for i, orig in orig_selects.items():
+-            case_folded_orig = casefold_identifier(orig)
+-            if case_folded_orig != orig:
+-                # somehow we need to alias just top select in UNION (tested on Snowflake)
+-                sel_expr = qualified_query.selects[i]
+-                qualified_query.selects[i] = sge.alias_(sel_expr, orig, quoted=True)
+-
+-    return qualified_query
++    """Backward compatibility wrapper for bind_query.
++
++    TODO: remove after next dlthub release
++    """
++    return bind_query(
++        qualified_query,
++        sqlglot_schema,
++        expand_table_name=partial(
++            sql_client.make_qualified_table_name_path, quote=False, casefold=False
++        ),
++        casefold_identifier=casefold_identifier,
++    )
+ 
+ 
+ def build_row_counts_expr(
+diff --git a/dlt/normalize/items_normalizers.py b/dlt/normalize/items_normalizers.py
+index 0611c5405..3114e66d6 100644
+--- a/dlt/normalize/items_normalizers.py
++++ b/dlt/normalize/items_normalizers.py
+@@ -92,10 +92,10 @@ class ItemsNormalizer:
+ 
+ 
+ class ModelItemsNormalizer(ItemsNormalizer):
+-    def _normalize_casefold(self, ident: str) -> str:
+-        return self.config.destination_capabilities.casefold_identifier(
+-            self.schema.naming.normalize_identifier(ident)
+-        )
++    def _normalize_casefold(self, identifier: str) -> str:
++        # use normalize_path() to preserve __ separators in already-normalized names
++        normalized = self.schema.naming.normalize_path(identifier)
++        return self.config.destination_capabilities.casefold_identifier(normalized)
+ 
+     def _adjust_outer_select_with_dlt_columns(
+         self,
+diff --git a/tests/destinations/test_queries.py b/tests/destinations/test_queries.py
+index 39fa2838a..a41c65e88 100644
+--- a/tests/destinations/test_queries.py
++++ b/tests/destinations/test_queries.py
+@@ -1,3 +1,4 @@
++from functools import partial
+ from typing import cast
+ 
+ import duckdb
+@@ -9,7 +10,7 @@ from sqlglot.schema import MappingSchema as SQLGlotSchema
+ import dlt
+ from dlt.common.schema.typing import C_DLT_LOAD_ID
+ from dlt.dataset.lineage import compute_columns_schema
+-from dlt.destinations.queries import build_row_counts_expr, build_select_expr, _normalize_query
++from dlt.destinations.queries import build_row_counts_expr, build_select_expr, bind_query
+ from dlt.destinations.impl.duckdb.configuration import DuckDbClientConfiguration
+ 
+ 
+@@ -129,10 +130,12 @@ ORDER BY i.id ASC
+     )
+ 
+     with duckdb_destination_client.sql_client as sql_client:
+-        normalized_query_expr = _normalize_query(
++        normalized_query_expr = bind_query(
+             qualified_query=cast(sge.Query, qualified_query_expr),
+             sqlglot_schema=sqlglot_schema,
+-            sql_client=sql_client,
++            expand_table_name=partial(
++                sql_client.make_qualified_table_name_path, quote=False, casefold=False
++            ),
+             casefold_identifier=sql_client.capabilities.casefold_identifier,
+         )
+         normalized_query = normalized_query_expr.sql()
+diff --git a/tests/libs/test_sqlglot.py b/tests/libs/test_sqlglot.py
+index 799a5ef42..1fe088249 100644
+--- a/tests/libs/test_sqlglot.py
++++ b/tests/libs/test_sqlglot.py
+@@ -1,5 +1,5 @@
+-from typing import List, Optional, Set
+-
++from typing import List, Optional, Set, cast
++import importlib
+ import pytest
+ import sqlglot
+ import sqlglot.expressions as sge
+@@ -15,7 +15,9 @@ from dlt.common.libs.sqlglot import (
+     validate_no_star_select,
+     build_outer_select_statement,
+     reorder_or_adjust_outer_select,
++    normalize_query_identifiers,
+ )
++from dlt.common.normalizers.naming.snake_case import NamingConvention as SnakeCaseNaming
+ from dlt.common.schema.typing import TDataType, TColumnType, TTableSchemaColumns
+ from dlt.common.schema.exceptions import CannotCoerceNullException
+ 
+@@ -556,3 +558,109 @@ def test_reorder_or_adjust_outer_select(dialect: TSqlGlotDialect) -> None:
+     reorder_or_adjust_outer_select(outer4, columns_only_ab, casefold, "test_schema", "test_table")
+     aliases4 = [sel.alias for sel in outer4.selects]
+     assert aliases4 == ["a", "b"]
++
++
++@pytest.mark.parametrize(
++    "naming_convention",
++    [
++        "snake_case",
++        "tests.common.cases.normalizers.sql_upper",
++        "tests.common.cases.normalizers.title_case",
++    ],
++)
++def test_normalize_query_identifiers(naming_convention: str) -> None:
++    # import the naming convention module
++    if naming_convention == "snake_case":
++        naming_module_path = "dlt.common.normalizers.naming.snake_case"
++    else:
++        naming_module_path = naming_convention
++    naming_module = importlib.import_module(naming_module_path)
++    naming = naming_module.NamingConvention()
++
++    # test query with mixed case, paths, and aliases (including __ in table/alias names)
++    query = cast(
++        sge.Query,
++        sqlglot.parse_one("""
++            SELECT
++                MyColumn AS MyAlias,
++                nested__column,
++                user__comments__id AS User__Comments__Id,
++                value__v_double AS value__v__alias,
++                t.col1
++            FROM my_schema.MyTable
++            JOIN my_schema.User__Comments AS User__Table__Alias ON MyTable.id = User__Table__Alias.user_id
++            WHERE AnotherColumn > 10
++        """),
++    )
++
++    normalized = normalize_query_identifiers(query, naming)
++    normalized_sql = normalized.sql()
++
++    # verify table name normalized but schema name unchanged
++    assert "my_schema" in normalized_sql  # schema name should be unchanged
++    expected_table = naming.normalize_table_identifier("MyTable")
++    assert expected_table in normalized_sql
++
++    # verify simple column names normalized
++    expected_col1 = naming.normalize_identifier("MyColumn")
++    expected_col2 = naming.normalize_identifier("AnotherColumn")
++    assert expected_col1 in normalized_sql
++    assert expected_col2 in normalized_sql
++
++    # verify aliases normalized
++    expected_alias = naming.normalize_identifier("MyAlias")
++    assert expected_alias in normalized_sql
++
++    # verify paths preserved (using normalize_path, not normalize_identifier)
++    expected_nested = naming.normalize_path("nested__column")
++    expected_user_path = naming.normalize_path("user__comments__id")
++    expected_variant = naming.normalize_path("value__v_double")
++    assert expected_nested in normalized_sql
++    assert expected_user_path in normalized_sql
++    assert expected_variant in normalized_sql
++
++    # verify nested table name preserved
++    expected_nested_table = naming.normalize_tables_path("User__Comments")
++    assert expected_nested_table in normalized_sql
++
++    # verify aliases with __ preserved (using normalize_path for aliases)
++    expected_col_alias_with_path = naming.normalize_path("User__Comments__Id")
++    expected_variant_alias = naming.normalize_path("value__v__alias")
++    expected_table_alias_with_path = naming.normalize_path("User__Table__Alias")
++    assert expected_col_alias_with_path in normalized_sql
++    assert expected_variant_alias in normalized_sql
++    assert expected_table_alias_with_path in normalized_sql
++
++
++def test_normalize_query_identifiers_table_qualified_columns() -> None:
++    """Table qualifiers in column references must use normalize_tables_path,
++    consistent with the FROM clause table name normalization."""
++
++    class _TablePrefixNaming(SnakeCaseNaming):
++        """Naming convention where normalize_table_identifier diverges from
++        normalize_identifier — table names get a 'tbl_' prefix."""
++
++        def normalize_table_identifier(self, identifier: str) -> str:
++            return "tbl_" + super().normalize_table_identifier(identifier)
++
++    naming = _TablePrefixNaming()
++
++    query = cast(
++        sge.Query,
++        sqlglot.parse_one(
++            "SELECT MyTable.my_col, MyTable.other_col FROM MyTable WHERE MyTable.id > 10"
++        ),
++    )
++
++    normalized = normalize_query_identifiers(query, naming)
++    normalized_sql = normalized.sql()
++
++    # table name in FROM and table qualifiers in column references must both
++    # go through normalize_tables_path → "tbl_my_table"
++    expected_table = naming.normalize_tables_path("MyTable")
++    assert expected_table == "tbl_my_table"
++
++    assert f"FROM {expected_table}" in normalized_sql
++    assert f"{expected_table}.my_col" in normalized_sql
++    assert f"{expected_table}.other_col" in normalized_sql
++    assert f"{expected_table}.id" in normalized_sql
+diff --git a/tests/normalize/test_model_item_normalizer.py b/tests/normalize/test_model_item_normalizer.py
+index d171bcc70..e596ed612 100644
+--- a/tests/normalize/test_model_item_normalizer.py
++++ b/tests/normalize/test_model_item_normalizer.py
+@@ -3,7 +3,8 @@ import pytest
+ import os
+ from concurrent.futures import ThreadPoolExecutor
+ import sqlglot
+-from typing import Iterator, List, Tuple, NamedTuple, Union, Optional
++import sqlglot.expressions
++from typing import Iterator, List, Tuple, NamedTuple, Union, Optional, cast
+ from packaging.version import Version
+ 
+ from dlt.common.destination import DestinationCapabilitiesContext, merge_caps_file_formats
+@@ -659,3 +660,54 @@ def test_model_normalizer_edge_cases_on_duckdb(
+             _, _, _ = extract_normalize_retrieve(
+                 model_normalize, model, schema, "my_table", dialect
+             )
++
++
++@pytest.mark.parametrize("caps", [get_caps("duckdb")], indirect=True, ids=["duckdb"])
++def test_variant_column_names_preserved(
++    caps: DestinationCapabilitiesContext,
++) -> None:
++    """
++    Test that variant column names (with __v_ pattern) are preserved during normalization.
++
++    Regression test for issue #3625: variant columns like value__v_double were being
++    incorrectly normalized to value_v_double (losing the double underscore path separator).
++    """
++    os.environ["NORMALIZE__MODEL_NORMALIZER__ADD_DLT_LOAD_ID"] = "False"
++    os.environ["NORMALIZE__MODEL_NORMALIZER__ADD_DLT_ID"] = "False"
++    model_normalize = next(init_normalize())
++    dialect = caps.sqlglot_dialect
++
++    # Create a query that selects variant columns
++    model_query = "SELECT value__v_double, confidence__v_text, nested__col__v_bool FROM my_table"
++    model = SqlModel.from_query_string(query=model_query, dialect=dialect)
++
++    # Create schema with variant columns
++    variant_cols = ["value__v_double", "confidence__v_text", "nested__col__v_bool"]
++    schema = create_schema_with_complete_columns("my_table", "double", variant_cols)
++
++    # Mark columns as variants in the schema
++    for col in variant_cols:
++        schema.tables["my_table"]["columns"][col]["variant"] = True
++
++    _, normalized_query, _ = extract_normalize_retrieve(
++        model_normalize, model, schema, "my_table", dialect
++    )
++
++    # Parse the normalized query to check column names
++    parsed_query = cast(
++        sqlglot.expressions.Select, sqlglot.parse_one(normalized_query, read=dialect)
++    )
++
++    # Get the aliases from the outer SELECT
++    aliases = [select.alias for select in parsed_query.selects]
++
++    # verify that variant column names are preserved (double underscores intact)
++    assert (
++        "value__v_double" in aliases
++    ), f"Variant column 'value__v_double' was not preserved. Got aliases: {aliases}"
++    assert (
++        "confidence__v_text" in aliases
++    ), f"Variant column 'confidence__v_text' was not preserved. Got aliases: {aliases}"
++    assert (
++        "nested__col__v_bool" in aliases
++    ), f"Variant column 'nested__col__v_bool' was not preserved. Got aliases: {aliases}"
+
+
+===== COMMIT 7eeb8e9f =====
+
+
+commit 7eeb8e9f0
+Author: thecaptain789
+Date: 2026-02-14
+
+    fix: correct typo 'occurences' to 'occurrences' (#3616)
+
+diff --git a/docs/docs_tools/grammar/fix_grammar_gpt.py b/docs/docs_tools/grammar/fix_grammar_gpt.py
+index 86945d73d..eda51fc28 100644
+--- a/docs/docs_tools/grammar/fix_grammar_gpt.py
++++ b/docs/docs_tools/grammar/fix_grammar_gpt.py
+@@ -24,7 +24,7 @@ MAX_CHUNK_SIZE = 4000  # make sure that this is below the context window size of
+ SYSTEM_PROMPT = """\
+ You are a grammar checker. Every message you get will be a document that is to be grammarchecked and returned as such.
+ You will not change the markdown syntax. You will only fix the grammar. You will not change the code snippets except for the comments therein.
+-You will not modify the header section which is enclosed by two occurences of "---".
++You will not modify the header section which is enclosed by two occurrences of "---".
+ Make sure all headings use the Sentence case.
+ Never insert any codeblock start or end statements such as "```"
+ Do not change the spelling or casing of these words: dlt, sdf, dbt
+
+
+===== COMMIT 3db22ee5 =====
+
+
+commit 3db22ee56
+Author: Thierry Jean
+Date: 2026-02-13
+
+    repo: ignore `.zed/` directory (#3633)
+
+diff --git a/.gitignore b/.gitignore
+index cec73cb2c..4ce32693f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,7 +25,7 @@ logs/
+ # playwright dumps
+ test-results/
+ # temporary directory used by marimo for layout, caching, HTML snapshots; see marimo docs
+-**/__marimo__  
++**/__marimo__
+ **.lancedb
+ *.lance
+ 
+@@ -143,6 +143,9 @@ test-results/
+ # VS Code
+ **/.vscode
+ 
++# Zed IDE
++**/.zed
++
+ # MAC OS X
+ **/.DS_Store
+ .DS_Store
+
+
+===== COMMIT f9929438 =====
+
+
+commit f99294386
+Author: Travior
+Date: 2026-02-12
+
+    chore: 3618 upgrade `ibis-framework` and remove `sqlglot` constraint (#3621)
+
+diff --git a/dlt/destinations/impl/sqlalchemy/alter_table.py b/dlt/destinations/impl/sqlalchemy/alter_table.py
+index 9c7255cd7..fbcdae958 100644
+--- a/dlt/destinations/impl/sqlalchemy/alter_table.py
++++ b/dlt/destinations/impl/sqlalchemy/alter_table.py
+@@ -1,12 +1,13 @@
+-from typing import List
++from typing import List, TYPE_CHECKING, Optional
+ 
+ import sqlalchemy as sa
+-from alembic.runtime.migration import MigrationContext
+-from alembic.operations import Operations
+ from sqlalchemy.schema import CreateColumn
+ 
+ from dlt.common import logger
+ 
++if TYPE_CHECKING:
++    from alembic.operations import Operations
++
+ 
+ class ListBuffer:
+     """A partial implementation of string IO to use with alembic.
+@@ -31,7 +32,20 @@ class MigrationMaker:
+         self._buf = ListBuffer()
+         self.dialect = dialect
+ 
+-        # Try to create MigrationContext, fallback to None if dialect not supported
++        # Try to create MigrationContext, fallback to None if alembic not available or dialect not supported
++        self.ctx = None
++        self.ops: Optional["Operations"] = None
++
++        try:
++            from alembic.runtime.migration import MigrationContext
++            from alembic.operations import Operations
++        except ModuleNotFoundError:
++            logger.warning(
++                f"Alembic not installed, falling back to direct SQL generation for {dialect.name}. "
++                "Install the sqlalchemy extra (dlt[sqlalchemy]) for full ALTER TABLE support."
++            )
++            return
++
+         try:
+             self.ctx = MigrationContext(
+                 dialect,
+@@ -45,12 +59,11 @@ class MigrationMaker:
+             )
+             self.ops = Operations(self.ctx)
+         except KeyError:
+-            # dialect was not found
++            # dialect is not supported by alembic
+             logger.warning(
+-                f"Alembic migrations not available for {dialect}, falling back to SQL generation."
++                f"Alembic does not support dialect {dialect.name}, falling back to direct SQL"
++                " generation."
+             )
+-            self.ctx = None
+-            self.ops = None
+ 
+     def add_column(self, table_name: str, column: sa.Column, schema: str) -> None:
+         if self.ops:
+diff --git a/pyproject.toml b/pyproject.toml
+index 534c9b52b..1cf50e785 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -56,7 +56,7 @@ dependencies = [
+     "packaging>=21.1",
+     "pluggy>=1.3.0",
+     "win-precise-time>=1.4.2 ; os_name == 'nt' and python_version < '3.13'",
+-    "sqlglot>=25.4.0,!=28.1",
++    "sqlglot>=25.4.0",
+     "pywin32>=306 ; sys_platform == 'win32'",
+     "rich-argparse>=1.6.0",
+ ]
+@@ -174,7 +174,7 @@ lancedb = [
+     "pyarrow>=16.0.0",
+     "duckdb>=1.4.3",
+     # duckdb >= 1.4.0 doesn't work with ibis < 11.0.0
+-    "ibis-framework>=11.0.0"
++    "ibis-framework>=12.0.0 ; python_version >= '3.10'"
+ ]
+ deltalake = [
+     "deltalake>=0.25.1",
+@@ -196,7 +196,7 @@ postgis = [
+ ]
+ workspace = [
+     "duckdb>=0.9",
+-    "ibis-framework>=10.5.0 ; python_version >= '3.10'",
++    "ibis-framework>=12.0.0 ; python_version >= '3.10'",
+     "pyarrow>=16.0.0",
+     "marimo>=0.14.5",
+     "mcp>=1.2.1 ; python_version >= '3.10'",
+@@ -259,8 +259,6 @@ dev = [
+     "pydoclint>=0.6.5,<0.7",
+     "types-paramiko>=3.5.0.20250708",
+     "graphviz>=0.21",
+-    # limits sqlglot - remove when #3489 is fixed
+-    "sqlglot<28.1",
+ ]
+ 
+ # NOTE: those dependencies are used to test built in sources
+@@ -291,8 +289,8 @@ pipeline = [
+ ]
+ airflow = ["apache-airflow>=2.8.0,<3 ; python_version < '3.12'"]
+ ibis = [
+-    "ibis-framework[duckdb, postgres, bigquery, snowflake, mssql, clickhouse, databricks]>=10.5.0 ; python_version >= '3.10' and python_version < '3.13'",
+-    "ibis-framework[duckdb, postgres, bigquery, snowflake, clickhouse, databricks]>=10.5.0 ; python_version >= '3.13'"
++    "ibis-framework[duckdb, postgres, bigquery, snowflake, mssql, clickhouse, databricks]>=12.0.0 ; python_version >= '3.10' and python_version < '3.13'",
++    "ibis-framework[duckdb, postgres, bigquery, snowflake, clickhouse, databricks]>=12.0.0 ; python_version >= '3.13'"
+ ]
+ streamlit = ["streamlit>=1.40.0,<2 ; python_version >= '3.9' and python_version != '3.9.7' and python_version < '3.14'"]
+ dashboard-tests = [
+@@ -355,6 +353,7 @@ include = [
+     "docs/**/*.py",
+ ]
+ exclude = [
++    ".venv",
+     "docs/website/.dlt-repo",
+     "tests/reflection/module_cases/syntax_error.py",
+     "docs/website/docs/general-usage/transformations/transformation-snippets.py",
+diff --git a/uv.lock b/uv.lock
+index 49117f30f..dc0e5cf89 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1727,25 +1727,6 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/c6/15/a674e16ebbe36190cf79cbf2c25e5dc3b5f0203b471d9e9e98b7c8e70381/databricks_sql_connector-4.1.4-py3-none-any.whl", hash = "sha256:cabe1640412c240b328291d7155c280570892961ce56d0529593f354e9958727", size = 202303, upload-time = "2025-10-15T17:45:33.078Z" },
+ ]
+ 
+-[[package]]
+-name = "databricks-sql-connector-core"
+-version = "4.0.1"
+-source = { registry = "https://pypi.org/simple" }
+-dependencies = [
+-    { name = "alembic", marker = "python_full_version >= '3.10'" },
+-    { name = "lz4", marker = "python_full_version >= '3.10'" },
+-    { name = "oauthlib", marker = "python_full_version >= '3.10'" },
+-    { name = "openpyxl", marker = "python_full_version >= '3.10'" },
+-    { name = "pandas", marker = "python_full_version >= '3.10'" },
+-    { name = "requests", marker = "python_full_version >= '3.10'" },
+-    { name = "thrift", marker = "python_full_version >= '3.10'" },
+-    { name = "urllib3", marker = "python_full_version >= '3.10'" },
+-]
+-sdist = { url = "https://files.pythonhosted.org/packages/97/b5/71761c9baa913ecea180f3f16a6836087011e2cae73c013e009e2af4c2a2/databricks_sql_connector_core-4.0.1.tar.gz", hash = "sha256:98b41686afb683d8f0771cb755a63b6e9061fb7396feca6528f7d9253c40d5f1", size = 303315, upload-time = "2024-10-10T11:15:17.283Z" }
+-wheels = [
+-    { url = "https://files.pythonhosted.org/packages/2a/5e/506bf3a397f0c08eeb0311352f98719307eb66c32f73242e1fb06d0d26cf/databricks_sql_connector_core-4.0.1-py3-none-any.whl", hash = "sha256:d989dc902b1bc6ec453dfa894c29ada3f58c674323fdd9121e7caa3da1507be3", size = 311445, upload-time = "2024-10-10T11:15:14.707Z" },
+-]
+-
+ [[package]]
+ name = "db-dtypes"
+ version = "1.4.3"
+@@ -2171,7 +2152,7 @@ hub = [
+ ]
+ lancedb = [
+     { name = "duckdb" },
+-    { name = "ibis-framework" },
++    { name = "ibis-framework", marker = "python_full_version >= '3.10'" },
+     { name = "lancedb" },
+     { name = "pyarrow" },
+ ]
+@@ -2291,7 +2272,6 @@ dev = [
+     { name = "requests-mock" },
+     { name = "ruff" },
+     { name = "sqlfluff" },
+-    { name = "sqlglot" },
+     { name = "types-cachetools" },
+     { name = "types-click" },
+     { name = "types-deprecated" },
+@@ -2385,8 +2365,8 @@ requires-dist = [
+     { name = "grpcio", marker = "extra == 'bigquery'", specifier = ">=1.50.0" },
+     { name = "grpcio", marker = "extra == 'gcp'", specifier = ">=1.50.0" },
+     { name = "humanize", specifier = ">=4.4.0" },
+-    { name = "ibis-framework", marker = "python_full_version >= '3.10' and extra == 'workspace'", specifier = ">=10.5.0" },
+-    { name = "ibis-framework", marker = "extra == 'lancedb'", specifier = ">=11.0.0" },
++    { name = "ibis-framework", marker = "python_full_version >= '3.10' and extra == 'lancedb'", specifier = ">=12.0.0" },
++    { name = "ibis-framework", marker = "python_full_version >= '3.10' and extra == 'workspace'", specifier = ">=12.0.0" },
+     { name = "jsonpath-ng", specifier = ">=1.5.3" },
+     { name = "lancedb", marker = "extra == 'lancedb'", specifier = ">=0.22.0" },
+     { name = "marimo", marker = "extra == 'workspace'", specifier = ">=0.14.5" },
+@@ -2445,7 +2425,7 @@ requires-dist = [
+     { name = "sqlalchemy", marker = "extra == 'pyiceberg'", specifier = ">=1.4" },
+     { name = "sqlalchemy", marker = "extra == 'sql-database'", specifier = ">=1.4" },
+     { name = "sqlalchemy", marker = "extra == 'sqlalchemy'", specifier = ">=1.4" },
+-    { name = "sqlglot", specifier = ">=25.4.0,!=28.1" },
++    { name = "sqlglot", specifier = ">=25.4.0" },
+     { name = "tenacity", specifier = ">=8.0.2" },
+     { name = "tomlkit", specifier = ">=0.11.3" },
+     { name = "typing-extensions", specifier = ">=4.8.0" },
+@@ -2501,7 +2481,6 @@ dev = [
+     { name = "requests-mock", specifier = ">=1.10.0,<2" },
+     { name = "ruff", specifier = ">=0.3.2,<0.4" },
+     { name = "sqlfluff", specifier = ">=2.3.2,<3" },
+-    { name = "sqlglot", specifier = "<28.1" },
+     { name = "types-cachetools", specifier = ">=4.2.9" },
+     { name = "types-click", specifier = ">=7.1.8,<8" },
+     { name = "types-deprecated", specifier = ">=1.2.9.2,<2" },
+@@ -2519,8 +2498,8 @@ dev = [
+     { name = "types-tqdm", specifier = ">=4.66.0.2,<5" },
+ ]
+ ibis = [
+-    { name = "ibis-framework", extras = ["duckdb", "postgres", "bigquery", "snowflake", "clickhouse", "databricks"], marker = "python_full_version >= '3.13'", specifier = ">=10.5.0" },
+-    { name = "ibis-framework", extras = ["duckdb", "postgres", "bigquery", "snowflake", "mssql", "clickhouse", "databricks"], marker = "python_full_version >= '3.10' and python_full_version < '3.13'", specifier = ">=10.5.0" },
++    { name = "ibis-framework", extras = ["duckdb", "postgres", "bigquery", "snowflake", "clickhouse", "databricks"], marker = "python_full_version >= '3.13'", specifier = ">=12.0.0" },
++    { name = "ibis-framework", extras = ["duckdb", "postgres", "bigquery", "snowflake", "mssql", "clickhouse", "databricks"], marker = "python_full_version >= '3.10' and python_full_version < '3.13'", specifier = ">=12.0.0" },
+ ]
+ pipeline = [
+     { name = "alive-progress", specifier = ">=3.1.1,<4" },
+@@ -3833,20 +3812,20 @@ wheels = [
+ 
+ [[package]]
+ name = "ibis-framework"
+-version = "11.0.0"
++version = "12.0.0"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+-    { name = "atpublic" },
+-    { name = "parsy" },
+-    { name = "python-dateutil" },
+-    { name = "sqlglot" },
+-    { name = "toolz" },
+-    { name = "typing-extensions" },
+-    { name = "tzdata" },
++    { name = "atpublic", marker = "python_full_version >= '3.10'" },
++    { name = "parsy", marker = "python_full_version >= '3.10'" },
++    { name = "python-dateutil", marker = "python_full_version >= '3.10'" },
++    { name = "sqlglot", marker = "python_full_version >= '3.10'" },
++    { name = "toolz", marker = "python_full_version >= '3.10'" },
++    { name = "typing-extensions", marker = "python_full_version >= '3.10'" },
++    { name = "tzdata", marker = "python_full_version >= '3.10'" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/93/c8/f03c7c6e8ab96e5efd67ea5ce6eaf575bde78b4bfb9115f283d5e6e19ea2/ibis_framework-11.0.0.tar.gz", hash = "sha256:0249185eaabb800e224f448cc06ce8ba168df00b269e132d62629f462eca8842", size = 1237767, upload-time = "2025-10-15T13:12:10.01Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/f2/8e/2e7ad9bdeaf45350da7beeb67a0d4317d400dac882825eb7c3bd4d3c6ae1/ibis_framework-12.0.0.tar.gz", hash = "sha256:238624f2c14fdab8382ca2f4f667c3cdb81e29844cd5f8db8a325d0743767c61", size = 1351369, upload-time = "2026-02-07T14:31:13.171Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/86/c0/2851a8a55d0fea03b80fd45815069b686e032938fc68fa9d91ac776c148c/ibis_framework-11.0.0-py3-none-any.whl", hash = "sha256:92ff82a96f4eac7f86fa9b6a315e04b5a8f9ed3d186539d88f48e628363f2e72", size = 1935652, upload-time = "2025-10-15T13:12:07.954Z" },
++    { url = "https://files.pythonhosted.org/packages/9d/b3/11d406849715b47c9d69bb22f50874f80caee96bd1cbe7b61abbebbf5a05/ibis_framework-12.0.0-py3-none-any.whl", hash = "sha256:0bbd790f268da9cb87926d5eaad2b827a573927113c4ed3be5095efa89b9e512", size = 2079219, upload-time = "2026-02-07T14:31:10.646Z" },
+ ]
+ 
+ [package.optional-dependencies]
+@@ -3873,7 +3852,7 @@ clickhouse = [
+     { name = "rich", marker = "python_full_version >= '3.10'" },
+ ]
+ databricks = [
+-    { name = "databricks-sql-connector-core", marker = "python_full_version >= '3.10'" },
++    { name = "databricks-sql-connector", marker = "python_full_version >= '3.10'" },
+     { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
+     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*' or python_full_version >= '3.13'" },
+     { name = "pandas", marker = "python_full_version >= '3.10'" },
+@@ -8795,11 +8774,11 @@ wheels = [
+ 
+ [[package]]
+ name = "sqlglot"
+-version = "27.29.0"
++version = "28.10.0"
+ source = { registry = "https://pypi.org/simple" }
+-sdist = { url = "https://files.pythonhosted.org/packages/d1/50/766692a83468adb1bde9e09ea524a01719912f6bc4fdb47ec18368320f6e/sqlglot-27.29.0.tar.gz", hash = "sha256:2270899694663acef94fa93497971837e6fadd712f4a98b32aee1e980bc82722", size = 5503507, upload-time = "2025-10-29T13:50:24.594Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/69/7d/1479ac3543caada917c3781893d3f846c810aec6355eb7b2f58df68f999b/sqlglot-28.10.0.tar.gz", hash = "sha256:f3d4759164ad854176980b3a47eb0c7ef699118dfa80beeb93e010885637b211", size = 5739594, upload-time = "2026-02-04T14:22:18.26Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/9b/70/20c1912bc0bfebf516d59d618209443b136c58a7cff141afa7cf30969988/sqlglot-27.29.0-py3-none-any.whl", hash = "sha256:9a5ea8ac61826a7763de10cad45a35f0aa9bfcf7b96ee74afb2314de9089e1cb", size = 526060, upload-time = "2025-10-29T13:50:22.061Z" },
++    { url = "https://files.pythonhosted.org/packages/a7/34/c5de8f3c110bd066ebfa31b2d948dd33b691c7ccea39065e37f97f3f30a1/sqlglot-28.10.0-py3-none-any.whl", hash = "sha256:d442473bfd2340776dfc88382de3df456b9c5b66974623e554c6ad6426ba365e", size = 597042, upload-time = "2026-02-04T14:22:16.534Z" },
+ ]
+ 
+ [[package]]
+
+
+===== COMMIT e4816962 =====
+
+
+commit e48169622
+Author: rudolfix
+Date: 2026-02-10
+
+    (fix) suppress spurious psutil warning during dlt init (#3615)
+
+diff --git a/dlt/_workspace/cli/_init_command.py b/dlt/_workspace/cli/_init_command.py
+index 5e6f2e703..77914dd58 100644
+--- a/dlt/_workspace/cli/_init_command.py
++++ b/dlt/_workspace/cli/_init_command.py
+@@ -1,11 +1,9 @@
+ import os
+ import ast
+ import shutil
++import warnings
+ from typing import Dict, Sequence, Tuple, Optional
+-from pathlib import Path
+ 
+-
+-import dlt.destinations
+ from dlt.common.libs import git
+ from dlt.common.configuration.specs import known_sections
+ from dlt.common.configuration.providers import (
+@@ -22,8 +20,8 @@ from dlt.common.schema.utils import is_valid_schema_name
+ from dlt.common.schema.exceptions import InvalidSchemaName
+ from dlt.common.storages.file_storage import FileStorage
+ 
++import dlt.destinations
+ from dlt.sources import SourceReference
+-
+ import dlt.reflection.names as n
+ from dlt.reflection.script_inspector import import_pipeline_script
+ 
+@@ -343,19 +341,25 @@ def init_pipeline_at_destination(
+     )
+ 
+     # inspect the script to populate source references
+-    if source_configuration.source_type != "core":
+-        import_pipeline_script(
+-            source_configuration.storage.storage_path,
+-            source_configuration.storage.to_relative_path(source_configuration.src_pipeline_script),
+-            ignore_missing_imports=True,
+-        )
+-    else:
+-        # core sources are imported directly from the pipeline script which is in the _workspace module
+-        import_pipeline_script(
+-            os.path.dirname(source_configuration.src_pipeline_script),
+-            os.path.basename(source_configuration.src_pipeline_script),
+-            ignore_missing_imports=True,
+-        )
++    # suppress warnings emitted during import (e.g. psutil missing from LogCollector)
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore")
++        if source_configuration.source_type != "core":
++            import_pipeline_script(
++                source_configuration.storage.storage_path,
++                source_configuration.storage.to_relative_path(
++                    source_configuration.src_pipeline_script
++                ),
++                ignore_missing_imports=True,
++            )
++        else:
++            # core sources are imported directly from the pipeline script
++            # which is in the _workspace module
++            import_pipeline_script(
++                os.path.dirname(source_configuration.src_pipeline_script),
++                os.path.basename(source_configuration.src_pipeline_script),
++                ignore_missing_imports=True,
++            )
+ 
+     # detect all the required secrets and configs that should go into tomls files
+     if source_configuration.source_type == "template":
+diff --git a/dlt/common/destination/reference.py b/dlt/common/destination/reference.py
+index 525ab83e2..b418670c4 100644
+--- a/dlt/common/destination/reference.py
++++ b/dlt/common/destination/reference.py
+@@ -297,7 +297,7 @@ class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
+         except UnknownDestinationModule as e:
+             e.destination_type = destination_type
+             e.named_dest_attempted = True
+-            raise e
++            raise
+ 
+ 
+ class DestinationReference:
+diff --git a/dlt/common/libs/pyarrow.py b/dlt/common/libs/pyarrow.py
+index 76ddcccdb..11ed80682 100644
+--- a/dlt/common/libs/pyarrow.py
++++ b/dlt/common/libs/pyarrow.py
+@@ -1346,7 +1346,7 @@ def row_tuples_to_arrow(
+         # TODO if converting to arrow fail, should we raise or skip column?
+         except PyToArrowConversionException as e:
+             e.field_name = column_name
+-            raise e
++            raise
+ 
+         field = pa.field(
+             name=column_name, type=arrow_array.type, nullable=column_schema.get("nullable", True)
+diff --git a/dlt/common/runtime/collector.py b/dlt/common/runtime/collector.py
+index 98a828726..e42ad69f4 100644
+--- a/dlt/common/runtime/collector.py
++++ b/dlt/common/runtime/collector.py
+@@ -2,11 +2,14 @@ import os
+ import sys
+ import logging
+ import time
++import warnings
++
+ from collections import defaultdict
+ from typing import (
+     Any,
+     ContextManager,
+     Dict,
++    Literal,
+     TYPE_CHECKING,
+     DefaultDict,
+     NamedTuple,
+@@ -25,7 +28,8 @@ else:
+ 
+ from dlt.common import logger as dlt_logger
+ from dlt.common.exceptions import MissingDependencyException
+-from dlt.common.runtime.collector_base import Collector, TCollector
++from dlt.common.runtime.collector_base import Collector
++from dlt.common.warnings import DltDeprecationWarning
+ 
+ 
+ class NullCollector(Collector):
+@@ -78,7 +82,7 @@ class DictCollector(Collector):
+ class LogCollector(Collector):
+     """A Collector that shows progress by writing to a Python logger or a console"""
+ 
+-    logger: Union[logging.Logger, TextIO]
++    logger: Union[logging.Logger, TextIO, Literal["stdout", "dlt_logger"]]
+     log_level: int
+ 
+     class CounterInfo(NamedTuple):
+@@ -89,21 +93,33 @@ class LogCollector(Collector):
+     def __init__(
+         self,
+         log_period: float = 1.0,
+-        logger: Union[logging.Logger, TextIO] = sys.stdout,
++        logger: Union[logging.Logger, TextIO, Literal["stdout", "dlt_logger"]] = "stdout",
+         log_level: int = logging.INFO,
+         dump_system_stats: bool = True,
+     ) -> None:
+         """
+-        Collector writing to a `logger` every `log_period` seconds. The logger can be a Python logger instance, text stream, or None that will attach `dlt` logger
++        Collector writing to a `logger` every `log_period` seconds.
+ 
+         Args:
+             log_period (float, optional): Time period in seconds between log updates. Defaults to 1.0.
+-            logger (logging.Logger | TextIO, optional): Logger or text stream to write log messages to. Defaults to stdio.
++            logger: Logger or text stream to write log messages to. Use ``"stdout"`` (default) to
++                write to the current ``sys.stdout`` at call time, ``"dlt_logger"`` to use the
++                internal dlt logger, a ``logging.Logger`` instance, or any ``TextIO`` stream.
+             log_level (str, optional): Log level for the logger. Defaults to INFO level
+             dump_system_stats (bool, optional): Log memory and cpu usage. Defaults to True
+         """
+         self.step = None
+         self.log_period = log_period
++        if logger is None:
++            warnings.warn(
++                DltDeprecationWarning(
++                    "Passing logger=None to LogCollector is deprecated."
++                    " Use logger='dlt_logger' instead",
++                    since="1.22.0",
++                ),
++                stacklevel=2,
++            )
++            logger = "dlt_logger"
+         self.logger = logger
+         self.log_level = log_level
+         self.counters: DefaultDict[str, int] = None
+@@ -111,13 +127,13 @@ class LogCollector(Collector):
+         self.messages: Dict[str, Optional[str]] = None
+         if dump_system_stats:
+             try:
+-                import psutil
++                import psutil  # noqa: F401
+             except ImportError:
+-                self._log(
+-                    logging.WARNING,
+-                    "psutil dependency is not installed and mem stats will not be available. add"
+-                    " psutil to your environment or pass dump_system_stats argument as False to"
+-                    " disable warning.",
++                warnings.warn(
++                    "psutil dependency is not installed and memory stats will not be available."
++                    " Add psutil to your environment or pass dump_system_stats=False to disable"
++                    " this warning.",
++                    stacklevel=2,
+                 )
+                 dump_system_stats = False
+         self.dump_system_stats = dump_system_stats
+@@ -222,16 +238,16 @@ class LogCollector(Collector):
+ 
+         log_lines.append("")
+         log_message = "\n".join(log_lines)
+-        if not self.logger:
+-            # try to attach dlt logger
+-            self.logger = dlt_logger.LOGGER
++        if self.logger == "dlt_logger":
++            self.logger = dlt_logger.LOGGER or "stdout"
+         self._log(self.log_level, log_message)
+ 
+     def _log(self, log_level: int, log_message: str) -> None:
+         if isinstance(self.logger, (logging.Logger, logging.LoggerAdapter)):
+             self.logger.log(log_level, log_message)
+         else:
+-            print(log_message, file=self.logger or sys.stdout)  # noqa
++            dest = sys.stdout if isinstance(self.logger, str) else self.logger
++            dest.write(log_message + "\n")
+ 
+     def _start(self, step: str) -> None:
+         self.counters = defaultdict(int)
+diff --git a/dlt/destinations/impl/athena/athena.py b/dlt/destinations/impl/athena/athena.py
+index 8c16ec03a..4aade928e 100644
+--- a/dlt/destinations/impl/athena/athena.py
++++ b/dlt/destinations/impl/athena/athena.py
+@@ -321,7 +321,7 @@ class AthenaClient(SqlJobClientWithStagingDataset, SupportsStagingDestination):
+             manager.process_lf_tags_database()
+         except Exception as e:
+             logger.error(f"Failed to manage lakeformation tags: {e}")
+-            raise e
++            raise
+ 
+     def _get_table_update_sql(
+         self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
+diff --git a/dlt/destinations/impl/duckdb/sql_client.py b/dlt/destinations/impl/duckdb/sql_client.py
+index 75c6c3f54..f07fa75a5 100644
+--- a/dlt/destinations/impl/duckdb/sql_client.py
++++ b/dlt/destinations/impl/duckdb/sql_client.py
+@@ -187,12 +187,12 @@ class DuckDbSqlClient(SqlClientBase[duckdb.DuckDBPyConnection], DBTransaction):
+         cur = self._conn
+         try:
+             yield self.cursor_impl(cur.execute(query, db_args))  # type: ignore
+-        except duckdb.Error as outer:
++        except duckdb.Error:
+             try:
+                 cur.rollback()
+             except Exception:
+                 pass
+-            raise outer
++            raise
+         finally:
+             # we should somehow cleanup result set if present but no suitable method on connection
+             pass
+diff --git a/dlt/destinations/impl/lancedb/exceptions.py b/dlt/destinations/impl/lancedb/exceptions.py
+index daf8b408f..cc1acc848 100644
+--- a/dlt/destinations/impl/lancedb/exceptions.py
++++ b/dlt/destinations/impl/lancedb/exceptions.py
+@@ -31,7 +31,7 @@ def lancedb_error(f: TFun) -> TFun:
+         except ValueError as e:
+             if is_lancedb_not_found_error(str(e)):
+                 raise DestinationUndefinedEntity(e) from e
+-            raise e
++            raise
+         except (
+             MissingValueError,
+             MissingColumnError,
+diff --git a/dlt/destinations/impl/mssql/sql_client.py b/dlt/destinations/impl/mssql/sql_client.py
+index e8016201f..c06122a80 100644
+--- a/dlt/destinations/impl/mssql/sql_client.py
++++ b/dlt/destinations/impl/mssql/sql_client.py
+@@ -166,7 +166,7 @@ class PyOdbcMsSqlClient(SqlClientBase[pyodbc.Connection], DBTransaction):
+                     pass
+             except pyodbc.Error:
+                 pass
+-        except pyodbc.Error as outer:
++        except pyodbc.Error:
+             # clear all pending result sets
+             try:
+                 while curr.nextset():
+@@ -178,7 +178,7 @@ class PyOdbcMsSqlClient(SqlClientBase[pyodbc.Connection], DBTransaction):
+                 self._conn.rollback()
+             except pyodbc.Error:
+                 pass
+-            raise outer
++            raise
+         finally:
+             # clear all pending result sets
+             while curr.nextset():
+diff --git a/dlt/destinations/impl/postgres/sql_client.py b/dlt/destinations/impl/postgres/sql_client.py
+index 1544416a5..4a572a8d3 100644
+--- a/dlt/destinations/impl/postgres/sql_client.py
++++ b/dlt/destinations/impl/postgres/sql_client.py
+@@ -104,13 +104,13 @@ class Psycopg2SqlClient(SqlClientBase["psycopg2.connection"], DBTransaction):
+             try:
+                 curr.execute(query, db_args)
+                 yield DBApiCursorImpl(curr)
+-            except psycopg2.Error as outer:
++            except psycopg2.Error:
+                 try:
+                     self._reset_connection()
+                 except psycopg2.Error:
+                     self.close_connection()
+                     self.open_connection()
+-                raise outer
++                raise
+ 
+     def execute_fragments(
+         self, fragments: Sequence[AnyStr], *args: Any, **kwargs: Any
+diff --git a/dlt/destinations/impl/qdrant/qdrant_job_client.py b/dlt/destinations/impl/qdrant/qdrant_job_client.py
+index a2c3d3a6f..445555b2a 100644
+--- a/dlt/destinations/impl/qdrant/qdrant_job_client.py
++++ b/dlt/destinations/impl/qdrant/qdrant_job_client.py
+@@ -531,8 +531,8 @@ class QdrantClient(JobClientBase, WithStateSync):
+         except ValueError as e:
+             if "not found" in str(e):
+                 return False
+-            raise e
++            raise
+         except UnexpectedResponse as e:
+             if e.status_code == 404:
+                 return False
+-            raise e
++            raise
+diff --git a/dlt/destinations/impl/snowflake/sql_client.py b/dlt/destinations/impl/snowflake/sql_client.py
+index 8818615df..eab5c7838 100644
+--- a/dlt/destinations/impl/snowflake/sql_client.py
++++ b/dlt/destinations/impl/snowflake/sql_client.py
+@@ -129,13 +129,13 @@ class SnowflakeSqlClient(SqlClientBase[snowflake_lib.SnowflakeConnection], DBTra
+             try:
+                 curr.execute(query, db_args, num_statements=0)
+                 yield SnowflakeCursorImpl(curr)
+-            except snowflake_lib.Error as outer:
++            except snowflake_lib.Error:
+                 try:
+                     self._reset_connection()
+                 except snowflake_lib.Error:
+                     self.close_connection()
+                     self.open_connection()
+-                raise outer
++                raise
+ 
+     def _reset_connection(self) -> None:
+         self._conn.rollback()
+diff --git a/tests/pipeline/test_dlt_versions.py b/tests/pipeline/test_dlt_versions.py
+index 0eab3f6cf..a79376be2 100644
+--- a/tests/pipeline/test_dlt_versions.py
++++ b/tests/pipeline/test_dlt_versions.py
+@@ -105,7 +105,7 @@ def test_pipeline_with_dlt_update(test_storage: FileStorage) -> None:
+     ):
+         # create virtual env with (0.3.0) before the current schema upgrade
+         with Venv.create(
+-            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0"]
++            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0", "setuptools<80"]
+         ) as venv:
+             # NOTE: we force a newer duckdb into the 0.3.0 dlt version to get compatible duckdb storage
+             venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+@@ -334,7 +334,7 @@ def test_filesystem_pipeline_with_dlt_update(test_storage: FileStorage) -> None:
+ 
+     # execute in test storage
+     with test_workspace():
+-        with Venv.create(tempfile.mkdtemp(), ["dlt==0.4.9"]) as venv:
++        with Venv.create(tempfile.mkdtemp(), ["dlt==0.4.9", "setuptools<80"]) as venv:
+             try:
+                 print(venv.run_script("github_pipeline.py", "filesystem", "20"))
+             except CalledProcessError as cpe:
+@@ -407,7 +407,7 @@ def test_load_package_with_dlt_update(test_storage: FileStorage) -> None:
+     with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_github_3.duckdb"}):
+         # create virtual env with (0.3.0) before the current schema upgrade
+         with Venv.create(
+-            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0"]
++            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0", "setuptools<80"]
+         ) as venv:
+             venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+             # extract and normalize on old version but DO NOT LOAD
+@@ -470,7 +470,7 @@ def test_normalize_package_with_dlt_update(test_storage: FileStorage) -> None:
+     with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_github_3.duckdb"}):
+         # create virtual env with (0.3.0) before the current schema upgrade
+         with Venv.create(
+-            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0"]
++            tempfile.mkdtemp(), ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0", "setuptools<80"]
+         ) as venv:
+             venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+             # extract only
+@@ -501,7 +501,7 @@ def test_scd2_pipeline_update(test_storage: FileStorage) -> None:
+         # run scd2 pipeline on 0.4.10
+         venv_dir = tempfile.mkdtemp()
+         # venv_dir == "tmp/dlt0410"
+-        with Venv.create(venv_dir, ["dlt[duckdb]==0.4.10"]) as venv:
++        with Venv.create(venv_dir, ["dlt[duckdb]==0.4.10", "setuptools<80"]) as venv:
+             venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+ 
+             print(venv.run_script("../tests/pipeline/cases/github_pipeline/github_scd2.py"))
+@@ -581,7 +581,9 @@ def test_normalize_path_separator_legacy_behavior(test_storage: FileStorage) ->
+     with test_workspace({"DESTINATION__DUCKDB__CREDENTIALS": "duckdb:///test_github_3.duckdb"}):
+         venv_dir = tempfile.mkdtemp()
+         # create virtual env with (0.3.0) before the current schema upgrade
+-        with Venv.create(venv_dir, ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0"]) as venv:
++        with Venv.create(
++            venv_dir, ["dlt[duckdb]==0.3.0", "json-logging==1.4.1rc0", "setuptools<80"]
++        ) as venv:
+             venv.install_deps(venv.context, ["duckdb" + "==" + pkg_version("duckdb")])
+             try:
+                 print(venv.run_script("../tests/pipeline/cases/github_pipeline/github_rev.py"))
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index e4045f2df..3d7372316 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -1,4 +1,6 @@
+ import asyncio
++import contextlib
++import io
+ from multiprocessing.dummy import DummyProcess
+ import pathlib
+ import pickle
+@@ -44,6 +46,7 @@ from dlt.common.schema.typing import TColumnSchema
+ from dlt.common.schema.utils import get_first_column_name_with_prop, new_column, new_table
+ from dlt.common.typing import DictStrAny, TDataItems
+ from dlt.common.utils import uniq_id
++from dlt.common.warnings import DltDeprecationWarning
+ from dlt.common.schema import Schema
+ 
+ from dlt.destinations import filesystem, redshift, dummy, duckdb
+@@ -1848,14 +1851,24 @@ def test_preserve_fields_order_incomplete_columns() -> None:
+ def test_pipeline_log_progress() -> None:
+     os.environ["TIMEOUT"] = "3.0"
+ 
+-    # will attach dlt logger
++    # "dlt_logger" attaches dlt logger lazily on first dump
+     p = dlt.pipeline(
+-        destination="dummy", progress=dlt.progress.log(0.5, logger=None, log_level=logging.WARNING)
++        destination="dummy",
++        progress=dlt.progress.log(0.5, logger="dlt_logger", log_level=logging.WARNING),
+     )
+-    # collector was created before pipeline so logger is not attached
+-    assert cast(LogCollector, p.collector).logger is None
++    assert cast(LogCollector, p.collector).logger == "dlt_logger"
++    p.extract(many_delayed(2, 10))
++    # dlt logger attached after first extract
++    assert isinstance(
++        cast(LogCollector, p.collector).logger, (logging.Logger, logging.LoggerAdapter)
++    )
++
++    # deprecated logger=None still works and maps to "dlt_logger"
++    with pytest.warns(DltDeprecationWarning, match="logger=None"):
++        collector = dlt.progress.log(0.5, logger=None, log_level=logging.WARNING)
++    assert collector.logger == "dlt_logger"
++    p = dlt.pipeline(destination="dummy", progress=collector)
+     p.extract(many_delayed(2, 10))
+-    # dlt logger attached
+     assert cast(LogCollector, p.collector).logger is not None
+ 
+     # pass explicit root logger
+@@ -1864,6 +1877,27 @@ def test_pipeline_log_progress() -> None:
+     p.extract(many_delayed(2, 10))
+ 
+ 
++def test_log_collector_respects_stdout_redirect() -> None:
++    collector = LogCollector(dump_system_stats=False)
++    assert collector.logger == "stdout"
++
++    # default logger resolves to current sys.stdout at call time
++    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
++        collector._log(logging.WARNING, "redirected message")
++        assert "redirected message" in buf.getvalue()
++
++    # explicit TextIO stream is used directly
++    with io.StringIO() as buf:
++        collector2 = LogCollector(logger=buf, dump_system_stats=False)
++        collector2._log(logging.WARNING, "stream message")
++        assert "stream message" in buf.getvalue()
++
++    # logger=None is deprecated and maps to "dlt_logger"
++    with pytest.warns(DltDeprecationWarning, match="logger=None"):
++        collector3 = LogCollector(logger=None, dump_system_stats=False)
++    assert collector3.logger == "dlt_logger"
++
++
+ def test_progress_collector_callbacks() -> None:
+     collector = dlt.progress.log()
+ 
+
+
+===== COMMIT 660f238b =====
+
+
+commit 660f238b4
+Author: Alberto
+Date: 2026-02-06
+
+    Fix failing testsdue parallelism (#3593)
+

@@ -1,0 +1,3247 @@
+diff --git a/dlt/_workspace/helpers/dashboard/utils/pipeline.py b/dlt/_workspace/helpers/dashboard/utils/pipeline.py
+index 7b934f692..986107467 100644
+--- a/dlt/_workspace/helpers/dashboard/utils/pipeline.py
++++ b/dlt/_workspace/helpers/dashboard/utils/pipeline.py
+@@ -15,7 +15,10 @@ from dlt.common.configuration import resolve_configuration
+ from dlt.common.configuration.specs import known_sections
+ from dlt.common.destination.client import DestinationClientConfiguration
+ from dlt.common.storages.configuration import WithLocalFiles
+-from dlt.common.configuration.exceptions import ConfigFieldMissingException
++from dlt.common.configuration.exceptions import (
++    ConfigFieldMissingException,
++    ConfigurationValueError,
++)
+ from dlt.common.utils import map_nested_keys_in_place
+ 
+ from dlt._workspace.cli import utils as cli_utils
+@@ -136,7 +139,7 @@ def get_local_data_path(pipeline: dlt.Pipeline) -> str:
+         config = pipeline._get_destination_clients(dlt.Schema("temp"))[0].config
+         if isinstance(config, WithLocalFiles):
+             return config.local_dir
+-    except (PipelineConfigMissing, ConfigFieldMissingException):
++    except (PipelineConfigMissing, ConfigFieldMissingException, ConfigurationValueError):
+         pass
+     return None
+ 
+diff --git a/dlt/destinations/impl/destination/configuration.py b/dlt/destinations/impl/destination/configuration.py
+index 84c399bc2..e78bc8bbb 100644
+--- a/dlt/destinations/impl/destination/configuration.py
++++ b/dlt/destinations/impl/destination/configuration.py
+@@ -35,6 +35,9 @@ class CustomDestinationClientConfiguration(DestinationClientConfiguration):
+             or self.destination_callable is dummy_custom_destination
+         ):
+             raise ConfigurationValueError(
+-                f"A valid callable was not provided to `{self.__class__.__name__}`. Did you"
+-                " properly decorate the function with `@dlt.destination`?"
++                f"A valid callable was not provided to `{self.__class__.__name__}`. Note that"
++                " custom destination callables cannot be resolved from a process different than"
++                " the one that originally ran the pipeline, such as processes started by CLI"
++                " commands. If you are running in the same process, make sure a valid callable"
++                " is provided."
+             )
+diff --git a/dlt/destinations/impl/destination/factory.py b/dlt/destinations/impl/destination/factory.py
+index 6264b7646..59a37e1c9 100644
+--- a/dlt/destinations/impl/destination/factory.py
++++ b/dlt/destinations/impl/destination/factory.py
+@@ -8,7 +8,12 @@ from dlt.common.normalizers.naming.naming import NamingConvention
+ from dlt.common.reflection.exceptions import ReferenceImportError
+ from dlt.common.reflection.ref import ImportTrace, callable_typechecker, object_from_ref
+ from dlt.common.typing import AnyFun
+-from dlt.common.destination import Destination, DestinationCapabilitiesContext, TLoaderFileFormat
++from dlt.common.destination import (
++    Destination,
++    DestinationCapabilitiesContext,
++    DestinationReference,
++    TLoaderFileFormat,
++)
+ from dlt.common.configuration import known_sections, with_config, get_fun_spec
+ from dlt.common.configuration.exceptions import ConfigurationValueError
+ from dlt.common.utils import get_callable_name, is_inner_callable
+@@ -59,6 +64,16 @@ class destination(Destination[CustomDestinationClientConfiguration, "Destination
+         caps.loader_parallelism_strategy = None
+         return caps
+ 
++    @property
++    def destination_type(self) -> str:
++        cls = self.__class__
++        # synthesized classes from @dlt.destination in __main__ have non-importable paths;
++        # fall back to __orig_base__ (the factory class) for a portable destination_type
++        if cls.__module__ == "__main__" and (orig := getattr(cls, "__orig_base__", None)):
++            cls = orig
++        full_path = cls.__module__ + "." + cls.__qualname__
++        return DestinationReference.normalize_type(full_path)
++
+     @property
+     def spec(self) -> Type[CustomDestinationClientConfiguration]:
+         """A spec of destination configuration resolved from the sink function signature"""
+@@ -117,8 +132,10 @@ class destination(Destination[CustomDestinationClientConfiguration, "Destination
+         # this is needed for cli commands to work
+         if not destination_callable:
+             logger.warning(
+-                "No destination callable provided, providing dummy callable which will fail on"
+-                " load."
++                "Custom destination callable not provided. Note that custom destination"
++                " callables cannot be resolved from a process different than the one that"
++                " originally ran the pipeline, such as processes started by CLI commands."
++                " Providing a dummy callable that doesn't allow loading for this process."
+             )
+             destination_callable = dummy_custom_destination
+         elif not callable(destination_callable):
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/destination.md b/docs/website/docs/dlt-ecosystem/destinations/destination.md
+index 836a3537a..3a3abb7f1 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/destination.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/destination.md
+@@ -184,6 +184,10 @@ For performance reasons, we recommend keeping the multithreaded approach and mak
+ 
+ `@dlt.destination` will forward all normalized `DataItems` encountered during a pipeline run to the custom destination function, so there is no notion of "write dispositions."
+ 
++## CLI and dashboard limitations
++
++Custom destination callables cannot be resolved from a process different than the one that originally ran the pipeline. This means that CLI commands like `dlt pipeline info` and `dlt pipeline show` will work only partially for custom destinations.
++
+ ## Staging support
+ 
+ `@dlt.destination` does not support staging files in remote locations before being called at this time. If you need this feature, please let us know.
+diff --git a/tests/destinations/test_custom_destination.py b/tests/destinations/test_custom_destination.py
+index 81b18ae84..6ab8c9a4f 100644
+--- a/tests/destinations/test_custom_destination.py
++++ b/tests/destinations/test_custom_destination.py
+@@ -1,5 +1,7 @@
+ from typing import List, Tuple, Dict
+ 
++import contextlib
++import io
+ import dlt
+ import pytest
+ import os
+@@ -17,6 +19,7 @@ from dlt.common.configuration.specs import ConnectionStringCredentials
+ from dlt.common.configuration.inject import get_fun_spec
+ from dlt.common.configuration.specs import BaseConfiguration
+ 
++from dlt._workspace.cli import _pipeline_command
+ from dlt.destinations.impl.destination.configuration import CustomDestinationClientConfiguration
+ from dlt.destinations.impl.destination.factory import UnknownCustomDestinationCallable, destination
+ from dlt.pipeline.exceptions import PipelineStepFailed
+@@ -313,6 +316,75 @@ def test_instantiation() -> None:
+     assert len(calls) == 1
+ 
+ 
++def test_destination_type_main_module_fallback() -> None:
++    """destination_type falls back to __orig_base__ for @dlt.destination classes
++    defined in __main__, but keeps the original module path for importable modules."""
++
++    @dlt.destination
++    def my_sink(items, table):
++        pass
++
++    dest = my_sink()
++    cls = dest.__class__
++
++    # test module is importable — keeps synthesized class path
++    assert hasattr(cls, "__orig_base__")
++    assert "test_custom_destination" in dest.destination_type
++
++    # simulate __main__ module — falls back to base factory path
++    original_module = cls.__module__
++    try:
++        cls.__module__ = "__main__"
++        assert dest.destination_type == "dlt.destinations.destination"
++    finally:
++        cls.__module__ = original_module
++
++    # built-in destinations are unaffected
++    builtin = Destination.from_reference("duckdb")
++    assert getattr(builtin.__class__, "__orig_base__", None) is None
++    assert builtin.destination_type == "dlt.destinations.duckdb"
++
++
++def test_custom_destination_cli_info() -> None:
++    """Test that `dlt pipeline <name> info` works for all custom destination patterns."""
++    # pattern 1: @dlt.destination decorator
++    @dlt.destination
++    def my_sink(items, table):
++        pass
++
++    p = dlt.pipeline("cli_info_decorator", destination=my_sink, dev_mode=True)
++    p.run([1, 2, 3], table_name="items")
++
++    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
++        _pipeline_command.pipeline_command("info", "cli_info_decorator", p.pipelines_dir, 0)
++        info_output = buf.getvalue()
++    assert "Found pipeline cli_info_decorator" in info_output
++
++    # pattern 2: plain callable via destination_callable=func
++    dest_func = dlt.destination("func_sink", destination_callable=global_sink_func)
++    p2 = dlt.pipeline("cli_info_func", destination=dest_func, dev_mode=True)
++    global global_calls
++    global_calls = []
++    p2.run([1, 2, 3], table_name="items")
++
++    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
++        _pipeline_command.pipeline_command("info", "cli_info_func", p2.pipelines_dir, 0)
++        info_output = buf.getvalue()
++    assert "Found pipeline cli_info_func" in info_output
++
++    # pattern 3: string ref via destination_callable="mod.func"
++    ref = "tests.destinations.test_custom_destination.global_sink_func"
++    dest_str = dlt.destination("str_sink", destination_callable=ref)
++    p3 = dlt.pipeline("cli_info_str", destination=dest_str, dev_mode=True)
++    global_calls = []
++    p3.run([1, 2, 3], table_name="items")
++
++    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
++        _pipeline_command.pipeline_command("info", "cli_info_str", p3.pipelines_dir, 0)
++        info_output = buf.getvalue()
++    assert "Found pipeline cli_info_str" in info_output
++
++
+ @pytest.mark.parametrize("loader_file_format", SUPPORTED_LOADER_FORMATS)
+ @pytest.mark.parametrize("batch_size", [1, 10, 23])
+ def test_batched_transactions(loader_file_format: TLoaderFileFormat, batch_size: int) -> None:
+diff --git a/tests/workspace/helpers/dashboard/conftest.py b/tests/workspace/helpers/dashboard/conftest.py
+index e75d173e2..ad8893ef3 100644
+--- a/tests/workspace/helpers/dashboard/conftest.py
++++ b/tests/workspace/helpers/dashboard/conftest.py
+@@ -13,6 +13,9 @@ from tests.workspace.helpers.dashboard.example_pipelines import (
+     create_load_exception_pipeline,
+     create_no_destination_pipeline,
+     create_sync_exception_pipeline,
++    create_custom_destination_pipeline,
++    create_custom_dest_callable_pipeline,
++    create_custom_dest_string_ref_pipeline,
+ )
+ 
+ 
+@@ -104,3 +107,21 @@ def temp_pipelines_dir():
+ def sync_exception_pipeline():
+     with tempfile.TemporaryDirectory() as temp_dir:
+         yield create_sync_exception_pipeline(temp_dir)
++
++
++@pytest.fixture
++def custom_destination_pipeline():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        yield create_custom_destination_pipeline(temp_dir)
++
++
++@pytest.fixture
++def custom_dest_callable_pipeline():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        yield create_custom_dest_callable_pipeline(temp_dir)
++
++
++@pytest.fixture
++def custom_dest_string_ref_pipeline():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        yield create_custom_dest_string_ref_pipeline(temp_dir)
+diff --git a/tests/workspace/helpers/dashboard/example_pipelines.py b/tests/workspace/helpers/dashboard/example_pipelines.py
+index 4f13215d7..ec11aae46 100644
+--- a/tests/workspace/helpers/dashboard/example_pipelines.py
++++ b/tests/workspace/helpers/dashboard/example_pipelines.py
+@@ -30,6 +30,9 @@ NEVER_RAN_PIPELINE = "never_ran_pipline"
+ LOAD_EXCEPTION_PIPELINE = "load_exception_pipeline"
+ NO_DESTINATION_PIPELINE = "no_destination_pipeline"
+ SYNC_EXCEPTION_PIPELINE = "sync_exception_pipeline"
++CUSTOM_DESTINATION_PIPELINE = "custom_destination_pipeline"
++CUSTOM_DEST_CALLABLE_PIPELINE = "custom_dest_callable_pipeline"
++CUSTOM_DEST_STRING_REF_PIPELINE = "custom_dest_string_ref_pipeline"
+ 
+ ALL_PIPELINES = [
+     SUCCESS_PIPELINE_DUCKDB,
+@@ -40,6 +43,15 @@ ALL_PIPELINES = [
+     NO_DESTINATION_PIPELINE,
+     SUCCESS_PIPELINE_FILESYSTEM,
+     SYNC_EXCEPTION_PIPELINE,
++    CUSTOM_DESTINATION_PIPELINE,
++    CUSTOM_DEST_CALLABLE_PIPELINE,
++    CUSTOM_DEST_STRING_REF_PIPELINE,
++]
++
++CUSTOM_DESTINATION_PIPELINES = [
++    CUSTOM_DESTINATION_PIPELINE,
++    CUSTOM_DEST_CALLABLE_PIPELINE,
++    CUSTOM_DEST_STRING_REF_PIPELINE,
+ ]
+ 
+ PIPELINES_WITH_EXCEPTIONS = [
+@@ -281,6 +293,59 @@ def create_sync_exception_pipeline(pipelines_dir: str = None):
+     return pipeline
+ 
+ 
++def _dashboard_sink_func(items, table):
++    """Module-level sink used by plain callable and string ref dashboard pipelines."""
++    pass
++
++
++@dlt.destination
++def _dashboard_decorator_sink(items, table):
++    """Module-level decorated sink used by the decorator dashboard pipeline."""
++    pass
++
++
++def create_custom_destination_pipeline(pipelines_dir: str = None):
++    """Create a test pipeline with a @dlt.destination custom sink"""
++    pipeline = dlt.pipeline(
++        pipeline_name=CUSTOM_DESTINATION_PIPELINE,
++        pipelines_dir=pipelines_dir,
++        destination=_dashboard_decorator_sink,
++    )
++
++    pipeline.run([1, 2, 3], table_name="items", schema=dlt.Schema("fruitshop"))
++
++    return pipeline
++
++
++def create_custom_dest_callable_pipeline(pipelines_dir: str = None):
++    """Create a test pipeline with a plain callable passed via destination_callable=func"""
++    dest = dlt.destination("callable_sink", destination_callable=_dashboard_sink_func)
++    pipeline = dlt.pipeline(
++        pipeline_name=CUSTOM_DEST_CALLABLE_PIPELINE,
++        pipelines_dir=pipelines_dir,
++        destination=dest,
++    )
++
++    pipeline.run([1, 2, 3], table_name="items", schema=dlt.Schema("fruitshop"))
++
++    return pipeline
++
++
++def create_custom_dest_string_ref_pipeline(pipelines_dir: str = None):
++    """Create a test pipeline with a string ref passed via destination_callable='mod.func'"""
++    ref = "tests.workspace.helpers.dashboard.example_pipelines._dashboard_sink_func"
++    dest = dlt.destination("string_ref_sink", destination_callable=ref)
++    pipeline = dlt.pipeline(
++        pipeline_name=CUSTOM_DEST_STRING_REF_PIPELINE,
++        pipelines_dir=pipelines_dir,
++        destination=dest,
++    )
++
++    pipeline.run([1, 2, 3], table_name="items", schema=dlt.Schema("fruitshop"))
++
++    return pipeline
++
++
+ # NOTE: this script can be run to create the test pipelines globally for manual testing of the dashboard app and cli
+ if __name__ == "__main__":
+     create_success_pipeline_duckdb()
+diff --git a/tests/workspace/helpers/dashboard/test_pipeline_operations.py b/tests/workspace/helpers/dashboard/test_pipeline_operations.py
+index 252474697..eae296ef4 100644
+--- a/tests/workspace/helpers/dashboard/test_pipeline_operations.py
++++ b/tests/workspace/helpers/dashboard/test_pipeline_operations.py
+@@ -19,6 +19,10 @@ from dlt._workspace.helpers.dashboard.utils.visualization import get_steps_data_
+ from dlt._workspace.helpers.dashboard.const import TPipelineRunStatus, TVisualPipelineStep
+ from tests.workspace.helpers.dashboard.example_pipelines import (
+     ALL_PIPELINES,
++    CUSTOM_DESTINATION_PIPELINES,
++    CUSTOM_DESTINATION_PIPELINE,
++    CUSTOM_DEST_CALLABLE_PIPELINE,
++    CUSTOM_DEST_STRING_REF_PIPELINE,
+     EXTRACT_EXCEPTION_PIPELINE,
+     LOAD_EXCEPTION_PIPELINE,
+     NO_DESTINATION_PIPELINE,
+@@ -40,7 +44,11 @@ def test_exception_section(pipeline: dlt.Pipeline):
+ 
+ @pytest.mark.parametrize("pipeline", ALL_PIPELINES, indirect=True)
+ def test_get_local_data_path(pipeline: dlt.Pipeline):
+-    if pipeline.pipeline_name in [LOAD_EXCEPTION_PIPELINE, NO_DESTINATION_PIPELINE]:
++    if pipeline.pipeline_name in [
++        LOAD_EXCEPTION_PIPELINE,
++        NO_DESTINATION_PIPELINE,
++        *CUSTOM_DESTINATION_PIPELINES,
++    ]:
+         # custom destination does not support local data path
+         assert get_local_data_path(pipeline) is None
+     else:
+@@ -83,7 +91,11 @@ def test_pipeline_details(pipeline, temp_pipelines_dir):
+     assert isinstance(result, list)
+     if pipeline.pipeline_name in PIPELINES_WITH_LOAD:
+         assert len(result) == 9
+-    elif pipeline.pipeline_name in [LOAD_EXCEPTION_PIPELINE, "normalize_exception_pipeline"]:
++    elif pipeline.pipeline_name in [
++        LOAD_EXCEPTION_PIPELINE,
++        "normalize_exception_pipeline",
++        *CUSTOM_DESTINATION_PIPELINES,
++    ]:
+         # custom destination does not support remote data info
+         assert len(result) == 8
+     else:
+@@ -100,6 +112,15 @@ def test_pipeline_details(pipeline, temp_pipelines_dir):
+         assert details_dict["destination"] == "filesystem (dlt.destinations.filesystem)"
+     elif pipeline.pipeline_name == LOAD_EXCEPTION_PIPELINE:
+         assert details_dict["destination"] == "dummy (dlt.destinations.dummy)"
++    elif pipeline.pipeline_name == CUSTOM_DESTINATION_PIPELINE:
++        assert details_dict["destination"] == (
++            "_dashboard_decorator_sink (tests.workspace.helpers.dashboard"
++            ".example_pipelines.DashboardDecoratorSinkDestination)"
++        )
++    elif pipeline.pipeline_name == CUSTOM_DEST_CALLABLE_PIPELINE:
++        assert details_dict["destination"] == "callable_sink (dlt.destinations.destination)"
++    elif pipeline.pipeline_name == CUSTOM_DEST_STRING_REF_PIPELINE:
++        assert details_dict["destination"] == "string_ref_sink (dlt.destinations.destination)"
+     else:
+         assert details_dict["destination"] == "duckdb (dlt.destinations.duckdb)"
+     assert details_dict["dataset_name"] == pipeline.dataset_name
+
+
+===== COMMIT b99d78d6 =====
+
+
+commit b99d78d6f
+Author: prevostc
+Date: 2026-03-13
+
+    Add clickhouse ReplacingMergeTree (#3366)
+
+diff --git a/dlt/destinations/impl/clickhouse/clickhouse.py b/dlt/destinations/impl/clickhouse/clickhouse.py
+index 9419ca655..4920bcac6 100644
+--- a/dlt/destinations/impl/clickhouse/clickhouse.py
++++ b/dlt/destinations/impl/clickhouse/clickhouse.py
+@@ -22,7 +22,13 @@ from dlt.common.destination.client import (
+ from dlt.common.schema import Schema, TColumnSchema
+ from dlt.common.schema.exceptions import SchemaCorruptedException
+ from dlt.common.schema.typing import TColumnType
+-from dlt.common.schema.utils import get_columns_names_with_prop, is_nullable_column
++from dlt.common import logger
++from dlt.common.schema.utils import (
++    get_columns_names_with_prop,
++    get_dedup_sort_tuple,
++    get_first_column_name_with_prop,
++    is_nullable_column,
++)
+ from dlt.common.storages import FileStorage
+ from dlt.common.storages.configuration import FilesystemConfiguration, ensure_canonical_az_url
+ from dlt.common.storages.fsspec_filesystem import AZURE_BLOB_STORAGE_PROTOCOLS
+@@ -388,7 +394,39 @@ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
+                 self.config.table_engine_type,
+             ),
+         )
+-        sql[0] = f"{sql[0]}\nENGINE = {TABLE_ENGINE_TYPE_TO_CLICKHOUSE_ATTR.get(table_type)}"
++        # for ReplacingMergeTree, wire dedup_sort and hard_delete hints as engine params
++        engine_params = ""
++        if table_type == "replacing_merge_tree":
++            if table.get("write_disposition") == "append":
++                dedup_sort = get_dedup_sort_tuple(table)
++                hard_delete_col = get_first_column_name_with_prop(table, "hard_delete")
++                if dedup_sort is not None:
++                    ver_col = self.sql_client.escape_column_name(dedup_sort[0])
++                    if hard_delete_col is not None:
++                        is_deleted = self.sql_client.escape_column_name(hard_delete_col)
++                        engine_params = f"({ver_col}, {is_deleted})"
++                    else:
++                        engine_params = f"({ver_col})"
++                elif hard_delete_col is not None:
++                    logger.warning(
++                        "Table '%s' has hard_delete hint but no dedup_sort column."
++                        " hard_delete requires dedup_sort (ClickHouse requires a"
++                        " version column when is_deleted is used). hard_delete"
++                        " hint will be ignored.",
++                        table_name,
++                    )
++            else:
++                logger.warning(
++                    "Table '%s' uses replacing_merge_tree with '%s' write"
++                    " disposition. ReplacingMergeTree is only supported for"
++                    " append. Falling back to MergeTree.",
++                    table_name,
++                    table.get("write_disposition"),
++                )
++                table_type = "merge_tree"
++
++        engine_name = TABLE_ENGINE_TYPE_TO_CLICKHOUSE_ATTR.get(table_type)
++        sql[0] = f"{sql[0]}\nENGINE = {engine_name}{engine_params}"
+ 
+         # PRIMARY KEY
+         if primary_key_list := [
+diff --git a/dlt/destinations/impl/clickhouse/typing.py b/dlt/destinations/impl/clickhouse/typing.py
+index 9d9001695..2900cbf20 100644
+--- a/dlt/destinations/impl/clickhouse/typing.py
++++ b/dlt/destinations/impl/clickhouse/typing.py
+@@ -7,6 +7,7 @@ from dlt.common.typing import get_args
+ TSecureConnection = Literal[0, 1]
+ TTableEngineType = Literal[
+     "merge_tree",
++    "replacing_merge_tree",
+     "shared_merge_tree",
+     "replicated_merge_tree",
+ ]
+@@ -24,6 +25,7 @@ HINT_TO_CLICKHOUSE_ATTR: Dict[TColumnHint, str] = {
+ 
+ TABLE_ENGINE_TYPE_TO_CLICKHOUSE_ATTR: Dict[TTableEngineType, str] = {
+     "merge_tree": "MergeTree",
++    "replacing_merge_tree": "ReplacingMergeTree",
+     "shared_merge_tree": "SharedMergeTree",
+     "replicated_merge_tree": "ReplicatedMergeTree",
+ }
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+index 24bea21f8..a586a6605 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+@@ -201,10 +201,77 @@ Supported values for `table_engine_type` are:
+ - `merge_tree` (default) - creates tables using the `MergeTree` engine, suitable for most use cases. [Learn more about MergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree).
+ - `shared_merge_tree` - creates tables using the `SharedMergeTree` engine, optimized for cloud-native environments with shared storage. This table is **only** available on ClickHouse Cloud, and it is the default selection if `merge_tree` is selected. [Learn more about SharedMergeTree](https://clickhouse.com/docs/en/cloud/reference/shared-merge-tree).
+ - `replicated_merge_tree` - creates tables using the `ReplicatedMergeTree` engine, which supports data replication across multiple nodes for high availability. [Learn more about ReplicatedMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replication). This defaults to `shared_merge_tree` on ClickHouse Cloud.
++- `replacing_merge_tree` - creates tables using the `ReplacingMergeTree` engine, which deduplicates rows with the same sorting key during background merges. See [native deduplication with ReplacingMergeTree](#native-deduplication-with-replacingmergetree) below. [Learn more about ReplacingMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replacingmergetree).
+ - Experimental support for the `Log` engine family with `stripe_log` and `tiny_log`.
+ 
+ For local development and testing with ClickHouse running locally, the `MergeTree` engine is recommended.
+ 
++### Native deduplication with ReplacingMergeTree
++
++When loading data with `append` write disposition, you can use ClickHouse's `ReplacingMergeTree` engine to handle deduplication and deletes at the storage engine level — without using dlt's `merge` write disposition. This is useful when you want ClickHouse to manage upserts natively, for example when appending CDC events or syncing data from an external source where rows may repeat.
++
++To enable this, combine `replacing_merge_tree` with dlt column hints:
++
++- **`primary_key`** — defines the dedup key. Rows with the same key are considered duplicates.
++- **`dedup_sort`** (optional) — specifies the version column. ClickHouse keeps the row with the **highest** value in this column. Must be a non-nullable `UInt*`, `Date`, or `DateTime` type. If omitted, ClickHouse uses last-write-wins semantics (the most recently inserted row survives).
++- **`hard_delete`** (optional) — specifies a `UInt8` deletion marker column. Rows where this column is `1` are filtered out when querying with `FINAL`. To physically remove deleted rows during background merges, set the `clean_deleted_rows` table setting (see example below). Requires `dedup_sort` to be set (ClickHouse constraint: `is_deleted` requires a version column).
++
++dlt automatically wires these hints into the `ReplacingMergeTree` engine parameters.
++
++:::note Dedup key and sorting key
++In ClickHouse, `ReplacingMergeTree` deduplicates based on the `ORDER BY` columns, not `PRIMARY KEY`. When no explicit sorting key is set via `clickhouse_adapter(sort=...)`, ClickHouse defaults `ORDER BY` to `PRIMARY KEY`, so `primary_key` effectively controls deduplication. However, if you set a custom sorting key with `clickhouse_adapter(sort=...)`, that sorting key becomes the dedup key and may override your `primary_key` intent. Avoid combining `sort` with `replacing_merge_tree` unless you want the sorting key to define which rows are duplicates.
++:::
++
++```py
++import dlt
++from dlt.destinations.adapters import clickhouse_adapter
++
++@dlt.resource(
++    write_disposition="append",
++    primary_key="id",
++    columns={
++        "version": {"dedup_sort": "desc", "nullable": False},
++        "is_deleted": {"hard_delete": True, "nullable": False},
++    },
++)
++def events(data):
++    yield from data
++
++clickhouse_adapter(
++    events,
++    table_engine_type="replacing_merge_tree",
++    settings={"clean_deleted_rows": "Always"},
++)
++
++pipeline = dlt.pipeline("my_pipeline", destination="clickhouse")
++
++# first load
++pipeline.run(events([
++    {"id": 1, "name": "Alice", "version": 1, "is_deleted": False},
++    {"id": 2, "name": "Bob", "version": 1, "is_deleted": False},
++]))
++
++# second load: update Alice, delete Bob
++pipeline.run(events([
++    {"id": 1, "name": "Alice Updated", "version": 2, "is_deleted": False},
++    {"id": 2, "name": "Bob", "version": 2, "is_deleted": True},
++]))
++```
++
++This generates `ENGINE = ReplacingMergeTree(version, is_deleted)`, so ClickHouse keeps only the row with the highest `version` per `id`. The `clean_deleted_rows` setting tells ClickHouse to physically remove rows marked as deleted during background merges.
++
++:::caution Data consistency
++`ReplacingMergeTree` deduplicates during **background merges**, which happen asynchronously. Until a merge runs, duplicate rows may be visible in queries. To get consistent (deduplicated) results, use the `FINAL` modifier:
++
++```sql
++SELECT * FROM my_table FINAL
++```
++
++Without `clean_deleted_rows`, rows with `is_deleted=1` are only filtered out by `FINAL` queries but remain physically stored. With `clean_deleted_rows='Always'`, ClickHouse removes them during merges.
++
++This is different from dlt's `merge` write disposition, which deduplicates immediately during loading via explicit SQL statements. Choose `ReplacingMergeTree` when eventual consistency is acceptable and you want ClickHouse to manage deduplication natively.
++:::
++
+ ## Sorting and partitioning
+ You can use the `clickhouse_adapter` to specify a [sorting](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree#order_by) and/or [partition](https://clickhouse.com/docs/engines/table-engines/mergetree-family/custom-partitioning-key) key:
+ 
+diff --git a/tests/load/clickhouse/test_clickhouse_adapter.py b/tests/load/clickhouse/test_clickhouse_adapter.py
+index 21d4ecd18..c49e85b10 100644
+--- a/tests/load/clickhouse/test_clickhouse_adapter.py
++++ b/tests/load/clickhouse/test_clickhouse_adapter.py
+@@ -1,6 +1,6 @@
+ import pytest
+ 
+-from typing import Generator, Dict, Literal, cast
++from typing import Generator, Dict, List, Literal, cast
+ 
+ import dlt
+ from dlt.common.schema.exceptions import UnboundColumnException
+@@ -567,3 +567,93 @@ def test_set_column_hints_from_table_hint(table_hint: TSQLExprOrColumnSeq) -> No
+     assert c1.get("nullable") is True  # retained (rule 4)
+     assert c2.get("nullable") is False  # set (rule 2)
+     assert c3.get("nullable") is True  # retained, despite being part of table hint (rule 4)
++
++
++def test_clickhouse_replacing_merge_tree() -> None:
++    """Test that ReplacingMergeTree is created with dedup_sort and hard_delete params
++    and that ClickHouse deduplicates rows on append."""
++
++    @dlt.resource(
++        write_disposition="append",
++        primary_key="id",
++        columns={
++            "version": {"dedup_sort": "desc", "nullable": False},
++            "is_deleted": {"hard_delete": True, "nullable": False},
++        },
++    )
++    def rmt_resource(data: List[Dict[str, object]]) -> Generator[Dict[str, object], None, None]:
++        yield from data
++
++    clickhouse_adapter(
++        rmt_resource,
++        table_engine_type="replacing_merge_tree",
++        settings={"clean_deleted_rows": "Always"},
++    )
++
++    pipe = dlt.pipeline(
++        pipeline_name="rmt_test",
++        destination="clickhouse",
++        dev_mode=True,
++        dataset_name="rmt_test_ds",
++    )
++
++    # first load: initial data
++    info = pipe.run(
++        rmt_resource(
++            [
++                {"id": 1, "name": "Alice", "version": 1, "is_deleted": False},
++                {"id": 2, "name": "Bob", "version": 1, "is_deleted": False},
++                {"id": 3, "name": "Charlie", "version": 1, "is_deleted": False},
++            ]
++        )
++    )
++    assert_load_info(info)
++
++    # verify engine type and clean_deleted_rows setting
++    with pipe.sql_client() as client:
++        qualified = client.make_qualified_table_name("rmt_resource")
++        table_parts = qualified.replace("`", "").split(".")
++        with client.execute_query(
++            "SELECT engine, engine_full, create_table_query FROM system.tables "
++            f"WHERE database = '{table_parts[0]}' AND name = '{table_parts[1]}';"
++        ) as cursor:
++            row = cursor.fetchone()
++            engine_full = str(row[1])
++            create_query = str(row[2])
++            # CH Cloud may remap to SharedMergeTree, but engine_full should
++            # contain the version column reference
++            assert "ReplacingMergeTree" in engine_full or "SharedMergeTree" in str(row[0])
++            # verify clean_deleted_rows setting propagated
++            assert "clean_deleted_rows" in create_query.lower()
++
++    # use dataset() to verify initial data via FINAL query
++    ds = pipe.dataset()
++    rows = ds(
++        f"SELECT id, name, version FROM {qualified} FINAL ORDER BY id",
++        _execute_raw_query=True,
++    ).fetchall()
++    assert len(rows) == 3
++    assert rows[0] == (1, "Alice", 1)
++    assert rows[1] == (2, "Bob", 1)
++    assert rows[2] == (3, "Charlie", 1)
++
++    # second load: update id=1 (higher version), delete id=3 via hard_delete
++    info = pipe.run(
++        rmt_resource(
++            [
++                {"id": 1, "name": "Alice Updated", "version": 2, "is_deleted": False},
++                {"id": 3, "name": "Charlie", "version": 2, "is_deleted": True},
++            ]
++        )
++    )
++    assert_load_info(info)
++
++    # verify dedup and hard delete via FINAL query
++    rows = ds(
++        f"SELECT id, name, version FROM {qualified} FINAL ORDER BY id",
++        _execute_raw_query=True,
++    ).fetchall()
++    # id=1 updated to version 2, id=2 unchanged, id=3 hard-deleted
++    assert len(rows) == 2
++    assert rows[0] == (1, "Alice Updated", 2)
++    assert rows[1] == (2, "Bob", 1)
+diff --git a/tests/load/clickhouse/test_clickhouse_table_builder.py b/tests/load/clickhouse/test_clickhouse_table_builder.py
+index 6d745c999..88b47a946 100644
+--- a/tests/load/clickhouse/test_clickhouse_table_builder.py
++++ b/tests/load/clickhouse/test_clickhouse_table_builder.py
+@@ -10,6 +10,7 @@ from dlt.destinations.impl.clickhouse.configuration import (
+     ClickHouseCredentials,
+     ClickHouseClientConfiguration,
+ )
++from dlt.common.schema.utils import new_table
+ from tests.load.clickhouse.utils import clickhouse_client
+ from tests.load.utils import TABLE_UPDATE, empty_schema
+ 
+@@ -190,3 +191,64 @@ def test_clickhouse_table_engine_configuration() -> None:
+             ClickHouseClientConfiguration(), sections=("destination", "clickhouse")
+         )
+         assert config.table_engine_type == "replicated_merge_tree"
++
++
++@pytest.mark.parametrize(
++    "has_dedup_sort,hard_delete,expected_engine",
++    [
++        (False, False, "ENGINE = ReplacingMergeTree"),
++        (False, True, "ENGINE = ReplacingMergeTree"),
++        (True, False, "ENGINE = ReplacingMergeTree(`col2`)"),
++        (True, True, "ENGINE = ReplacingMergeTree(`col2`, `col3`)"),
++    ],
++    ids=[
++        "no_version",
++        "hard_delete_without_version",
++        "dedup_sort_only",
++        "dedup_sort_and_hard_delete",
++    ],
++)
++def test_clickhouse_replacing_merge_tree(
++    clickhouse_client: ClickHouseClient,
++    has_dedup_sort: bool,
++    hard_delete: bool,
++    expected_engine: str,
++) -> None:
++    columns = deepcopy(TABLE_UPDATE[:3])
++    columns[0]["primary_key"] = True
++    if has_dedup_sort:
++        columns[1]["dedup_sort"] = "desc"
++    if hard_delete:
++        columns[2]["hard_delete"] = True
++
++    table_name = "rmt_table"
++    clickhouse_client.schema.update_table(
++        new_table(table_name, write_disposition="append", columns=columns)
++    )
++    clickhouse_client.schema.tables[table_name]["x-table-engine-type"] = (  # type: ignore[typeddict-unknown-key]
++        "replacing_merge_tree"
++    )
++
++    sql = clickhouse_client._get_table_update_sql(table_name, columns, False)[0]
++    assert expected_engine in sql
++    assert "PRIMARY KEY (`col1`)" in sql
++
++
++def test_clickhouse_replacing_merge_tree_fallback_non_append(
++    clickhouse_client: ClickHouseClient,
++) -> None:
++    columns = deepcopy(TABLE_UPDATE[:3])
++    columns[0]["primary_key"] = True
++    columns[1]["dedup_sort"] = "desc"
++
++    table_name = "rmt_fallback_table"
++    clickhouse_client.schema.update_table(
++        new_table(table_name, write_disposition="replace", columns=columns)
++    )
++    clickhouse_client.schema.tables[table_name]["x-table-engine-type"] = (  # type: ignore[typeddict-unknown-key]
++        "replacing_merge_tree"
++    )
++
++    sql = clickhouse_client._get_table_update_sql(table_name, columns, False)[0]
++    assert "ENGINE = MergeTree" in sql
++    assert "ReplacingMergeTree" not in sql
+
+
+===== COMMIT 8e4c4486 =====
+
+
+commit 8e4c44861
+Author: rudolfix
+Date: 2026-03-13
+
+    (chore) moves render cli docs command to a separate tool (#3740)
+
+diff --git a/.github/workflows/test_docs.yml b/.github/workflows/test_docs.yml
+index 46ffacaf4..156a78bcd 100644
+--- a/.github/workflows/test_docs.yml
++++ b/.github/workflows/test_docs.yml
+@@ -80,7 +80,7 @@ jobs:
+ 
+ 
+       - name: Install root project for CLI docs check
+-        run: uv sync --extra cli
++        run: uv sync --extra cli --extra workspace
+ 
+       - name: Check that CLI docs are up to date
+         run: make check-cli-docs
+diff --git a/Makefile b/Makefile
+index 493e87aa8..adc9ae68a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -419,10 +419,10 @@ start-test-containers: ## Starts docker containers for local testing (postgres,
+ 	docker compose -f "tests/load/clickhouse/docker-compose.yml" up -d
+ 
+ update-cli-docs: ## Regenerates CLI reference docs
+-	uv run dlt --debug render-docs docs/website/docs/reference/command-line-interface.md
++	uv run python docs/tools/check_cli_docs.py docs/website/docs/reference/command-line-interface.md
+ 
+ check-cli-docs: ## Checks CLI reference docs are up to date (CI)
+-	uv run dlt --debug render-docs docs/website/docs/reference/command-line-interface.md --compare
++	uv run python docs/tools/check_cli_docs.py docs/website/docs/reference/command-line-interface.md --compare
+ 
+ test-e2e-dashboard: ## Runs dashboard e2e tests with headless chromium
+ 	uv run pytest --browser chromium tests/e2e
+diff --git a/dlt/_workspace/cli/_plugins.py b/dlt/_workspace/cli/_plugins.py
+index 6cdcda801..2e84fa495 100644
+--- a/dlt/_workspace/cli/_plugins.py
++++ b/dlt/_workspace/cli/_plugins.py
+@@ -20,7 +20,6 @@ __all__ = [
+     "plug_cli_dashboard",
+     "plug_cli_telemetry",
+     "plug_cli_deploy",
+-    "plug_cli_docs",
+     "plug_cli_ai",
+     "plug_cli_profile",
+     "plug_cli_workspace",
+@@ -76,13 +75,6 @@ def plug_cli_deploy() -> Type[plugins.SupportsCliCommand]:
+     return DeployCommand
+ 
+ 
+-@plugins.hookimpl(specname="plug_cli")
+-def plug_cli_docs() -> Type[plugins.SupportsCliCommand]:
+-    from dlt._workspace.cli.commands import CliDocsCommand
+-
+-    return CliDocsCommand
+-
+-
+ @plugins.hookimpl(specname="plug_cli")
+ def plug_cli_ai() -> Type[plugins.SupportsCliCommand]:
+     from dlt._workspace.cli.commands import AiCommand
+diff --git a/dlt/_workspace/cli/commands.py b/dlt/_workspace/cli/commands.py
+index 6cad6a1b5..b8b765239 100644
+--- a/dlt/_workspace/cli/commands.py
++++ b/dlt/_workspace/cli/commands.py
+@@ -685,58 +685,6 @@ the `dlt` Airflow wrapper (https://github.com/dlt-hub/dlt/blob/devel/dlt/helpers
+             )
+ 
+ 
+-# NOTE: we should port this as a command or as a tool to the core repo
+-class CliDocsCommand(SupportsCliCommand):
+-    command = "render-docs"
+-    help_string = "Renders markdown version of cli docs"
+-    description = """
+-The `dlt render-docs` command renders markdown version of cli docs by parsing the argparse help output and generating a markdown file.
+-If you are reading this on the docs website, you are looking at the rendered version of the cli docs generated by this command.
+-    """
+-
+-    def configure_parser(self, parser: argparse.ArgumentParser) -> None:
+-        self.parser = parser
+-
+-        self.parser.add_argument("file_name", nargs=1, help="Output file name")
+-
+-        self.parser.add_argument(
+-            "--commands",
+-            nargs="*",
+-            help="List of command names to render (optional)",
+-            default=None,
+-        )
+-
+-        self.parser.add_argument(
+-            "--compare",
+-            default=False,
+-            action="store_true",
+-            help="Compare the changes and raise if output would be updated",
+-        )
+-
+-    def execute(self, args: argparse.Namespace) -> None:
+-        from dlt._workspace.cli._dlt import _create_parser
+-        from dlt._workspace.cli._docs_command import render_argparse_markdown
+-
+-        parser, _ = _create_parser()
+-
+-        result = render_argparse_markdown("dlt", parser, commands=args.commands)
+-
+-        if args.compare:
+-            with open(args.file_name[0], "r", encoding="utf-8") as f:
+-                if result != f.read():
+-                    fmt.error(
+-                        "Cli Docs out of date, please update, please run "
+-                        "update-cli-docs from the main Makefile and commit your changes. "
+-                    )
+-                    raise CliCommandException()
+-
+-            fmt.note("Docs page up to date.")
+-        else:
+-            with open(args.file_name[0], "w", encoding="utf-8") as f:
+-                f.write(result)
+-            fmt.note("Docs page updated.")
+-
+-
+ class AiCommand(SupportsCliCommand):
+     command = "ai"
+     help_string = "Use AI-powered development tools and utilities"
+@@ -798,7 +746,7 @@ class AiCommand(SupportsCliCommand):
+             description="List, view (redacted), or update secret files used by dlt providers.",
+         )
+         secrets_subparsers = secrets_cmd.add_subparsers(
+-            title="Secrets subcommands", dest="secrets_operation", required=False
++            title="Available subcommands", dest="secrets_operation", required=False
+         )
+         secrets_subparsers.add_parser(
+             "list",
+diff --git a/dlt/_workspace/cli/_docs_command.py b/docs/tools/check_cli_docs.py
+similarity index 69%
+rename from dlt/_workspace/cli/_docs_command.py
+rename to docs/tools/check_cli_docs.py
+index 37b233e21..8d689e1c9 100644
+--- a/dlt/_workspace/cli/_docs_command.py
++++ b/docs/tools/check_cli_docs.py
+@@ -1,12 +1,18 @@
+-"""Cli for rendering markdown docs"""
++# ruff: noqa: T201
++# flake8: noqa: T201
++"""Standalone tool for generating and checking CLI reference docs.
++
++Usage:
++    uv run python tools/check_cli_docs.py <file_name> [--commands CMD ...] [--compare]
++"""
+ 
+ import argparse
+-import textwrap
++import difflib
+ import os
+ import re
+-from typing import List
+-
+-import dlt._workspace.cli.echo as fmt
++import sys
++import textwrap
++from typing import List, Optional
+ 
+ HEADER = """---
+ title: Command Line Interface
+@@ -46,25 +52,36 @@ class _WidthFormatter(argparse.RawTextHelpFormatter):
+         super().__init__(prog, width=99999, max_help_position=99999)
+ 
+ 
++def _set_prog_recursive(
++    parser: argparse.ArgumentParser, old_prog: str, new_prog: str
++) -> None:
++    """Propagates prog to a parser and all nested subparsers."""
++    parser.prog = parser.prog.replace(old_prog, new_prog, 1)
++    for action in parser._actions:
++        if isinstance(action, argparse._SubParsersAction):
++            for subparser in action._name_parser_map.values():
++                _set_prog_recursive(subparser, old_prog, new_prog)
++
++
+ def render_argparse_markdown(
+     name: str,
+     parser: argparse.ArgumentParser,
+     /,
+     *,
+     header: str = HEADER,
+-    commands: List[str] = None,
++    commands: Optional[List[str]] = None,
+ ) -> str:
+     def get_parser_help_recursive(
+         parser: argparse.ArgumentParser,
+         cmd: str = "",
+         parent: str = "",
+         nesting: int = 0,
+-        help_string: str = None,
+-        commands: List[str] = None,
++        help_string: Optional[str] = None,
++        commands: Optional[List[str]] = None,
+     ) -> str:
+         markdown = ""
+ 
+-        # Prevent wrapping in help output for better parseability
++        # prevent wrapping in help output for better parseability
+         parser.formatter_class = _WidthFormatter
+         if parser.description:
+             # remove markdown from description
+@@ -99,7 +116,10 @@ def render_argparse_markdown(
+             description = None
+ 
+         if not parser.description:
+-            fmt.warning(f"No description found for {cmd}, please consider providing one.")
++            print(
++                f"WARNING: No description found for {cmd}, please consider providing one.",
++                file=sys.stderr,
++            )
+ 
+         inherits_from = ""
+         if parent:
+@@ -124,7 +144,10 @@ def render_argparse_markdown(
+             header = section_lines[0].replace(":", "")
+ 
+             if header.lower() not in ["available subcommands", "positional arguments", "options"]:
+-                fmt.warning(f"Skipping unknown section {header} of {cmd}.")
++                print(
++                    f"WARNING: Skipping unknown section {header} of {cmd}.",
++                    file=sys.stderr,
++                )
+                 continue
+ 
+             section_lines = section_lines[1:]
+@@ -146,9 +169,10 @@ def render_argparse_markdown(
+                 arg_title = line_elements[0]
+                 arg_help = line_elements[1] if len(line_elements) > 1 else ""
+                 if not arg_help:
+-                    fmt.warning(
+-                        f"Missing helpstring for argument '{arg_title}' in section '{header}' of"
+-                        f" command '{cmd}'."
++                    print(
++                        f"WARNING: Missing helpstring for argument '{arg_title}' in section"
++                        f" '{header}' of command '{cmd}'.",
++                        file=sys.stderr,
+                     )
+ 
+                 quoted_title = ""
+@@ -223,3 +247,60 @@ def render_argparse_markdown(
+     markdown = get_parser_help_recursive(parser, name, commands=commands)
+ 
+     return header + markdown
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Generate or check CLI reference docs.")
++    parser.add_argument("file_name", help="Output file name")
++    parser.add_argument(
++        "--commands",
++        nargs="*",
++        help="List of command names to render (optional)",
++        default=None,
++    )
++    parser.add_argument(
++        "--compare",
++        default=False,
++        action="store_true",
++        help="Compare and raise if output would be updated",
++    )
++    parser.add_argument(
++        "--executable-name",
++        default="dlt",
++        help="Name of the executable shown in generated docs (default: dlt)",
++    )
++    args = parser.parse_args()
++
++    from dlt._workspace.cli._dlt import _create_parser
++
++    cli_parser, _ = _create_parser()
++    _set_prog_recursive(cli_parser, cli_parser.prog, args.executable_name)
++    result = render_argparse_markdown(args.executable_name, cli_parser, commands=args.commands)
++
++    if args.compare:
++        with open(args.file_name, "r", encoding="utf-8") as f:
++            existing = f.read()
++            if result != existing:
++                diff = difflib.unified_diff(
++                    existing.splitlines(keepends=True),
++                    result.splitlines(keepends=True),
++                    fromfile=args.file_name,
++                    tofile=args.file_name + " (generated)",
++                )
++                print(
++                    "ERROR: CLI docs out of date, please run"
++                    " update-cli-docs from the main Makefile and commit your changes.\n"
++                    "Diff:\n" + "".join(diff),
++                    file=sys.stderr,
++                )
++                sys.exit(1)
++
++        print("Docs page up to date.")
++    else:
++        with open(args.file_name, "w", encoding="utf-8") as f:
++            f.write(result)
++        print("Docs page updated.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/tools/dlthub_cli/Makefile b/docs/tools/dlthub_cli/Makefile
+index 64545f8e2..ffc654e38 100644
+--- a/docs/tools/dlthub_cli/Makefile
++++ b/docs/tools/dlthub_cli/Makefile
+@@ -7,8 +7,8 @@ dev:
+ 
+ update-cli-docs: dev
+ 	# generate as there's no license
+-	RUNTIME__LICENSE="" uv run dlt --debug render-docs ../../website/docs/hub/command-line-interface.md --commands license workspace profile runtime
++	RUNTIME__LICENSE="" uv run python ../check_cli_docs.py ../../website/docs/hub/command-line-interface.md --commands license workspace profile runtime
+ 
+ check-cli-docs: dev
+ 	# generate as there's no license
+-	RUNTIME__LICENSE="" uv run dlt --debug render-docs ../../website/docs/hub/command-line-interface.md --compare --commands license workspace profile runtime
++	RUNTIME__LICENSE="" uv run python ../check_cli_docs.py ../../website/docs/hub/command-line-interface.md --compare --commands license workspace profile runtime
+diff --git a/docs/uv.lock b/docs/uv.lock
+index 8b55a8bc8..53199731d 100644
+--- a/docs/uv.lock
++++ b/docs/uv.lock
+@@ -1053,7 +1053,7 @@ dev = [
+     { name = "graphviz", specifier = ">=0.21" },
+     { name = "griffe", specifier = ">=1.10.0" },
+     { name = "isort", specifier = ">=5.12.0,<6" },
+-    { name = "mypy", specifier = ">=1.11.0,<1.13.0" },
++    { name = "mypy", specifier = ">=1.11.0" },
+     { name = "pip", specifier = ">=24.0.0" },
+     { name = "pydoclint", specifier = ">=0.6.5,<0.7" },
+     { name = "pyjwt", specifier = ">=2.8.0,<3" },
+diff --git a/docs/website/docs/hub/command-line-interface.md b/docs/website/docs/hub/command-line-interface.md
+index 4f962d098..363c22626 100644
+--- a/docs/website/docs/hub/command-line-interface.md
++++ b/docs/website/docs/hub/command-line-interface.md
+@@ -31,7 +31,7 @@ Creates, adds, inspects and deploys dlt pipelines. Further help is available at
+ ```sh
+ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+     [--non-interactive] [--debug] [--no-pwd]
+-    {workspace,telemetry,schema,profile,pipeline,init,render-docs,deploy,dashboard,ai,license,runtime}
++    {workspace,telemetry,schema,profile,pipeline,init,deploy,dashboard,ai,runtime,license}
+     ...
+ ```
+ 
+@@ -51,8 +51,8 @@ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+ **Available subcommands**
+ * [`workspace`](#dlt-workspace) - Manage current workspace
+ * [`profile`](#dlt-profile) - Manage workspace built-in profiles
+-* [`license`](#dlt-license) - View dlthub license status
+ * [`runtime`](#dlt-runtime) - Connect to dlthub runtime and run your code remotely
++* [`license`](#dlt-license) - View dlthub license status
+ 
+ </details>
+ 
+@@ -62,7 +62,7 @@ Manage current Workspace.
+ 
+ **Usage**
+ ```sh
+-dlt workspace [-h] [--verbose] {clean,info,mcp,show} ...
++dlt workspace [-h] [--verbose] {clean,info,show} ...
+ ```
+ 
+ **Description**
+@@ -83,7 +83,6 @@ Inherits arguments from [`dlt`](#dlt).
+ **Available subcommands**
+ * [`clean`](#dlt-workspace-clean) - Cleans local data for the selected profile. locally loaded data will be deleted. pipelines working directories are also deleted by default. data in remote destinations is not affected.
+ * [`info`](#dlt-workspace-info) - Displays workspace info.
+-* [`mcp`](#dlt-workspace-mcp) - Launch dlt mcp server in current python environment and workspace in sse transport mode by default.
+ * [`show`](#dlt-workspace-show) - Shows workspace dashboard for the pipelines and data in this workspace.
+ 
+ </details>
+@@ -137,32 +136,6 @@ Inherits arguments from [`dlt workspace`](#dlt-workspace).
+ 
+ </details>
+ 
+-### `dlt workspace mcp`
+-
+-Launch dlt MCP server in current Python environment and Workspace in SSE transport mode by default.
+-
+-**Usage**
+-```sh
+-dlt workspace mcp [-h] [--stdio] [--port PORT]
+-```
+-
+-**Description**
+-
+-This MCP allows you to attach to any pipeline that was previously run in this workspace and then facilitates schema and data exploration in the pipeline's dataset.
+-
+-<details>
+-
+-<summary>Show Arguments and Options</summary>
+-
+-Inherits arguments from [`dlt workspace`](#dlt-workspace).
+-
+-**Options**
+-* `-h, --help` - Show this help message and exit
+-* `--stdio` - Use stdio transport mode
+-* `--port PORT` - Sse port to use (default: 43654)
+-
+-</details>
+-
+ ### `dlt workspace show`
+ 
+ Shows Workspace Dashboard for the pipelines and data in this workspace.
+@@ -294,110 +267,6 @@ Inherits arguments from [`dlt profile`](#dlt-profile).
+ 
+ </details>
+ 
+-## `dlt license`
+-
+-View dlthub license status.
+-
+-**Usage**
+-```sh
+-dlt license [-h] {info,scopes,issue} ...
+-```
+-
+-**Description**
+-
+-View dlthub license status.
+-
+-<details>
+-
+-<summary>Show Arguments and Options</summary>
+-
+-Inherits arguments from [`dlt`](#dlt).
+-
+-**Options**
+-* `-h, --help` - Show this help message and exit
+-
+-**Available subcommands**
+-* [`info`](#dlt-license-info) - Show the installed license
+-* [`scopes`](#dlt-license-scopes) - Show available scopes
+-* [`issue`](#dlt-license-issue) - Issues a self-signed trial license that may be used for development, testing and for ci ops.
+-
+-</details>
+-
+-### `dlt license info`
+-
+-Show the installed license.
+-
+-**Usage**
+-```sh
+-dlt license info [-h]
+-```
+-
+-**Description**
+-
+-Show the installed license.
+-
+-<details>
+-
+-<summary>Show Arguments and Options</summary>
+-
+-Inherits arguments from [`dlt license`](#dlt-license).
+-
+-**Options**
+-* `-h, --help` - Show this help message and exit
+-
+-</details>
+-
+-### `dlt license scopes`
+-
+-Show available scopes.
+-
+-**Usage**
+-```sh
+-dlt license scopes [-h]
+-```
+-
+-**Description**
+-
+-Show available scopes.
+-
+-<details>
+-
+-<summary>Show Arguments and Options</summary>
+-
+-Inherits arguments from [`dlt license`](#dlt-license).
+-
+-**Options**
+-* `-h, --help` - Show this help message and exit
+-
+-</details>
+-
+-### `dlt license issue`
+-
+-Issues a self-signed trial license that may be used for development, testing and for ci ops.
+-
+-**Usage**
+-```sh
+-dlt license issue [-h] scope
+-```
+-
+-**Description**
+-
+-Issue a new self-signed trial license.
+-
+-<details>
+-
+-<summary>Show Arguments and Options</summary>
+-
+-Inherits arguments from [`dlt license`](#dlt-license).
+-
+-**Positional arguments**
+-* `scope` - Scope of the license, a comma separated list of the scopes: ['dlthub.dbt_generator', 'dlthub.sources.mssql', 'dlthub.project', 'dlthub.transformation', 'dlthub.data_quality', 'dlthub.destinations.iceberg', 'dlthub.destinations.snowflake_plus', 'dlthub.runner']
+-
+-**Options**
+-* `-h, --help` - Show this help message and exit
+-
+-</details>
+-
+ ## `dlt runtime`
+ 
+ Connect to dltHub Runtime and run your code remotely.
+@@ -411,7 +280,7 @@ dlt runtime [-h]
+ 
+ **Description**
+ 
+-Allows to connect to the dltHub Runtime, deploy and run local workspaces there. Requires dltHub license.
++Allows you to connect to the dltHub Runtime, deploy and run local workspaces there. Requires dltHub license.
+ 
+ <details>
+ 
+@@ -423,8 +292,8 @@ Inherits arguments from [`dlt`](#dlt).
+ * `-h, --help` - Show this help message and exit
+ 
+ **Available subcommands**
+-* [`login`](#dlt-runtime-login) - Login to dlthub runtime using github oauth and connect current workspace to the remote one
+-* [`logout`](#dlt-runtime-logout) - Logout from dlthub runtime
++* [`login`](#dlt-runtime-login) - Log in to dlthub runtime and connect the current workspace to the remote one
++* [`logout`](#dlt-runtime-logout) - Log out from dlthub runtime
+ * [`launch`](#dlt-runtime-launch) - Deploy code/config and run a script (follow status and logs by default)
+ * [`serve`](#dlt-runtime-serve) - Deploy and serve an interactive notebook/app (read-only) and follow until ready
+ * [`publish`](#dlt-runtime-publish) - Generate or revoke a public link for an interactive notebook/app
+@@ -434,18 +303,18 @@ Inherits arguments from [`dlt`](#dlt).
+ * [`dashboard`](#dlt-runtime-dashboard) - Open the runtime dashboard for this workspace
+ * [`deploy`](#dlt-runtime-deploy) - Sync code and configuration to runtime without running anything
+ * [`info`](#dlt-runtime-info) - Show overview of current runtime workspace
+-* [`deployment`](#dlt-runtime-deployment) - Manipulate deployments in workspace
++* [`deployment`](#dlt-runtime-deployment) - Manipulate deployments in the workspace
+ * [`job`](#dlt-runtime-job) - List, create and inspect jobs
+ * [`jobs`](#dlt-runtime-jobs) - List, create and inspect jobs
+ * [`job-run`](#dlt-runtime-job-run) - List, create and inspect job runs
+ * [`job-runs`](#dlt-runtime-job-runs) - List, create and inspect job runs
+-* [`configuration`](#dlt-runtime-configuration) - Manipulate configurations in workspace
++* [`configuration`](#dlt-runtime-configuration) - Manipulate configurations in the workspace
+ 
+ </details>
+ 
+ ### `dlt runtime login`
+ 
+-Login to dltHub Runtime using Github OAuth and connect current workspace to the remote one.
++Log in to dltHub Runtime and connect the current workspace to the remote one.
+ 
+ **Usage**
+ ```sh
+@@ -454,7 +323,7 @@ dlt runtime login [-h]
+ 
+ **Description**
+ 
+-Login to dltHub Runtime using Github OAuth.
++Log in to dltHub Runtime.
+ 
+ <details>
+ 
+@@ -469,7 +338,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
+ 
+ ### `dlt runtime logout`
+ 
+-Logout from dltHub Runtime.
++Log out from dltHub Runtime.
+ 
+ **Usage**
+ ```sh
+@@ -478,7 +347,7 @@ dlt runtime logout [-h]
+ 
+ **Description**
+ 
+-Logout from dltHub Runtime.
++Log out from dltHub Runtime.
+ 
+ <details>
+ 
+@@ -525,7 +394,7 @@ Deploy and serve an interactive notebook/app (read-only) and follow until ready.
+ 
+ **Usage**
+ ```sh
+-dlt runtime serve [-h] script_path
++dlt runtime serve [-h] [--app-type {marimo,mcp,streamlit}] script_path
+ ```
+ 
+ **Description**
+@@ -543,6 +412,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
+ 
+ **Options**
+ * `-h, --help` - Show this help message and exit
++* `--app-type {marimo,mcp,streamlit}` - Specify if the interactive job is a marimo notebook, streamlit app, or mcp server
+ 
+ </details>
+ 
+@@ -609,7 +479,7 @@ Show logs for latest or selected job run.
+ 
+ **Usage**
+ ```sh
+-dlt runtime logs [-h] [-f] script_path_or_job_name [run_number]
++dlt runtime logs [-h] script_path_or_job_name [run_number]
+ ```
+ 
+ **Description**
+@@ -628,7 +498,6 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
+ 
+ **Options**
+ * `-h, --help` - Show this help message and exit
+-* `-f, --follow` - Follow the logs of the run in tailing mode
+ 
+ </details>
+ 
+@@ -719,7 +588,7 @@ dlt runtime info [-h]
+ 
+ **Description**
+ 
+-Show workspace id and summary of deployments, configurations and jobs.
++Show workspace ID and summary of deployments, configurations and jobs.
+ 
+ <details>
+ 
+@@ -734,7 +603,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
+ 
+ ### `dlt runtime deployment`
+ 
+-Manipulate deployments in workspace.
++Manipulate deployments in the workspace.
+ 
+ **Usage**
+ ```sh
+@@ -743,7 +612,7 @@ dlt runtime deployment [-h] [deployment_version_no] {list,info,sync} ...
+ 
+ **Description**
+ 
+-Manipulate deployments in workspace.
++Manipulate deployments in the workspace.
+ 
+ <details>
+ 
+@@ -923,7 +792,8 @@ Create a job without running it.
+ **Usage**
+ ```sh
+ dlt runtime job [script_path_or_job_name] create [-h] [--name [NAME]]
+-    [--schedule [SCHEDULE]] [--interactive] [--description [DESCRIPTION]]
++    [--schedule [SCHEDULE]] [--interactive] [--app-type {marimo,mcp,streamlit}]
++    [--description [DESCRIPTION]]
+ ```
+ 
+ **Description**
+@@ -941,6 +811,7 @@ Inherits arguments from [`dlt runtime job`](#dlt-runtime-job).
+ * `--name [NAME]` - Job name to create
+ * `--schedule [SCHEDULE]` - Cron schedule for the job if it's a scheduled one
+ * `--interactive` - Run the job interactively, e.g. for a notebook
++* `--app-type {marimo,mcp,streamlit}` - Specify if the interactive app is a marimo notebook, streamlit app, or mcp server.
+ * `--description [DESCRIPTION]` - Job description
+ 
+ </details>
+@@ -1032,7 +903,8 @@ Create a job without running it.
+ **Usage**
+ ```sh
+ dlt runtime jobs [script_path_or_job_name] create [-h] [--name [NAME]]
+-    [--schedule [SCHEDULE]] [--interactive] [--description [DESCRIPTION]]
++    [--schedule [SCHEDULE]] [--interactive] [--app-type {marimo,mcp,streamlit}]
++    [--description [DESCRIPTION]]
+ ```
+ 
+ **Description**
+@@ -1050,6 +922,7 @@ Inherits arguments from [`dlt runtime jobs`](#dlt-runtime-jobs).
+ * `--name [NAME]` - Job name to create
+ * `--schedule [SCHEDULE]` - Cron schedule for the job if it's a scheduled one
+ * `--interactive` - Run the job interactively, e.g. for a notebook
++* `--app-type {marimo,mcp,streamlit}` - Specify if the interactive app is a marimo notebook, streamlit app, or mcp server.
+ * `--description [DESCRIPTION]` - Job description
+ 
+ </details>
+@@ -1076,7 +949,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
+ 
+ **Positional arguments**
+ * `script_path_or_job_name` - Local script path or job name. required for all commands except `list`
+-* `run_number` - Run number. used in all commands except `list` and `create` as optional argument. if not specified, the latest run of given script be used.
++* `run_number` - Run number. used in all commands except `list` and `create` as optional argument. if not specified, the latest run of the given script will be used.
+ 
+ **Options**
+ * `-h, --help` - Show this help message and exit
+@@ -1168,12 +1041,12 @@ Show logs for the latest or selected job run.
+ 
+ **Usage**
+ ```sh
+-dlt runtime job-run [script_path_or_job_name] [run_number] logs [-h] [-f]
++dlt runtime job-run [script_path_or_job_name] [run_number] logs [-h]
+ ```
+ 
+ **Description**
+ 
+-Show logs for the latest or selected job run. Use --follow to follow the logs in tailing mode.
++Show logs for the latest or selected job run. Will follow logs if the run is not in a terminal state.
+ 
+ <details>
+ 
+@@ -1183,7 +1056,6 @@ Inherits arguments from [`dlt runtime job-run`](#dlt-runtime-job-run).
+ 
+ **Options**
+ * `-h, --help` - Show this help message and exit
+-* `-f, --follow` - Follow the logs of the run in tailing mode
+ 
+ </details>
+ 
+@@ -1233,7 +1105,7 @@ Inherits arguments from [`dlt runtime`](#dlt-runtime).
+ 
+ **Positional arguments**
+ * `script_path_or_job_name` - Local script path or job name. required for all commands except `list`
+-* `run_number` - Run number. used in all commands except `list` and `create` as optional argument. if not specified, the latest run of given script be used.
++* `run_number` - Run number. used in all commands except `list` and `create` as optional argument. if not specified, the latest run of the given script will be used.
+ 
+ **Options**
+ * `-h, --help` - Show this help message and exit
+@@ -1325,12 +1197,12 @@ Show logs for the latest or selected job run.
+ 
+ **Usage**
+ ```sh
+-dlt runtime job-runs [script_path_or_job_name] [run_number] logs [-h] [-f]
++dlt runtime job-runs [script_path_or_job_name] [run_number] logs [-h]
+ ```
+ 
+ **Description**
+ 
+-Show logs for the latest or selected job run. Use --follow to follow the logs in tailing mode.
++Show logs for the latest or selected job run. Will follow logs if the run is not in a terminal state.
+ 
+ <details>
+ 
+@@ -1340,7 +1212,6 @@ Inherits arguments from [`dlt runtime job-runs`](#dlt-runtime-job-runs).
+ 
+ **Options**
+ * `-h, --help` - Show this help message and exit
+-* `-f, --follow` - Follow the logs of the run in tailing mode
+ 
+ </details>
+ 
+@@ -1370,7 +1241,7 @@ Inherits arguments from [`dlt runtime job-runs`](#dlt-runtime-job-runs).
+ 
+ ### `dlt runtime configuration`
+ 
+-Manipulate configurations in workspace.
++Manipulate configurations in the workspace.
+ 
+ **Usage**
+ ```sh
+@@ -1379,7 +1250,7 @@ dlt runtime configuration [-h] [configuration_version_no] {list,info,sync} ...
+ 
+ **Description**
+ 
+-Manipulate configurations in workspace.
++Manipulate configurations in the workspace.
+ 
+ <details>
+ 
+@@ -1472,3 +1343,107 @@ Inherits arguments from [`dlt runtime configuration`](#dlt-runtime-configuration
+ 
+ </details>
+ 
++## `dlt license`
++
++View dlthub license status.
++
++**Usage**
++```sh
++dlt license [-h] {info,scopes,issue} ...
++```
++
++**Description**
++
++View dlthub license status.
++
++<details>
++
++<summary>Show Arguments and Options</summary>
++
++Inherits arguments from [`dlt`](#dlt).
++
++**Options**
++* `-h, --help` - Show this help message and exit
++
++**Available subcommands**
++* [`info`](#dlt-license-info) - Show the installed license
++* [`scopes`](#dlt-license-scopes) - Show available scopes
++* [`issue`](#dlt-license-issue) - Issues a self-signed trial license that may be used for development, testing and for ci ops.
++
++</details>
++
++### `dlt license info`
++
++Show the installed license.
++
++**Usage**
++```sh
++dlt license info [-h]
++```
++
++**Description**
++
++Show the installed license.
++
++<details>
++
++<summary>Show Arguments and Options</summary>
++
++Inherits arguments from [`dlt license`](#dlt-license).
++
++**Options**
++* `-h, --help` - Show this help message and exit
++
++</details>
++
++### `dlt license scopes`
++
++Show available scopes.
++
++**Usage**
++```sh
++dlt license scopes [-h]
++```
++
++**Description**
++
++Show available scopes.
++
++<details>
++
++<summary>Show Arguments and Options</summary>
++
++Inherits arguments from [`dlt license`](#dlt-license).
++
++**Options**
++* `-h, --help` - Show this help message and exit
++
++</details>
++
++### `dlt license issue`
++
++Issues a self-signed trial license that may be used for development, testing and for ci ops.
++
++**Usage**
++```sh
++dlt license issue [-h] scope
++```
++
++**Description**
++
++Issue a new self-signed trial license.
++
++<details>
++
++<summary>Show Arguments and Options</summary>
++
++Inherits arguments from [`dlt license`](#dlt-license).
++
++**Positional arguments**
++* `scope` - Scope of the license, a comma separated list of the scopes: ['dlthub.dbt_generator', 'dlthub.sources.mssql', 'dlthub.project', 'dlthub.transformation', 'dlthub.data_quality', 'dlthub.destinations.iceberg', 'dlthub.destinations.snowflake_plus', 'dlthub.runner']
++
++**Options**
++* `-h, --help` - Show this help message and exit
++
++</details>
++
+diff --git a/docs/website/docs/reference/command-line-interface.md b/docs/website/docs/reference/command-line-interface.md
+index d47a97949..837499135 100644
+--- a/docs/website/docs/reference/command-line-interface.md
++++ b/docs/website/docs/reference/command-line-interface.md
+@@ -31,7 +31,7 @@ Creates, adds, inspects and deploys dlt pipelines. Further help is available at
+ ```sh
+ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+     [--non-interactive] [--debug] [--no-pwd]
+-    {telemetry,schema,pipeline,init,render-docs,deploy,dashboard,ai} ...
++    {telemetry,schema,pipeline,init,deploy,dashboard,ai} ...
+ ```
+ 
+ <details>
+@@ -52,7 +52,6 @@ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+ * [`schema`](#dlt-schema) - Shows, converts and upgrades schemas
+ * [`pipeline`](#dlt-pipeline) - Operations on pipelines that were ran locally
+ * [`init`](#dlt-init) - Creates a pipeline project in the current folder by adding existing verified source or creating a new one from template.
+-* [`render-docs`](#dlt-render-docs) - Renders markdown version of cli docs
+ * [`deploy`](#dlt-deploy) - Creates a deployment package for a selected pipeline script
+ * [`dashboard`](#dlt-dashboard) - Starts the dlt workspace dashboard
+ * [`ai`](#dlt-ai) - Use ai-powered development tools and utilities
+@@ -564,36 +563,6 @@ Inherits arguments from [`dlt`](#dlt).
+ 
+ </details>
+ 
+-## `dlt render-docs`
+-
+-Renders markdown version of cli docs.
+-
+-**Usage**
+-```sh
+-dlt render-docs [-h] [--commands [COMMANDS ...]] [--compare] file_name
+-```
+-
+-**Description**
+-
+-The `dlt render-docs` command renders markdown version of cli docs by parsing the argparse help output and generating a markdown file.
+-If you are reading this on the docs website, you are looking at the rendered version of the cli docs generated by this command.
+-
+-<details>
+-
+-<summary>Show Arguments and Options</summary>
+-
+-Inherits arguments from [`dlt`](#dlt).
+-
+-**Positional arguments**
+-* `file_name` - Output file name
+-
+-**Options**
+-* `-h, --help` - Show this help message and exit
+-* `--commands [COMMANDS ...]` - List of command names to render (optional)
+-* `--compare` - Compare the changes and raise if output would be updated
+-
+-</details>
+-
+ ## `dlt deploy`
+ 
+ Creates a deployment package for a selected pipeline script.
+@@ -838,6 +807,11 @@ Inherits arguments from [`dlt ai`](#dlt-ai).
+ **Options**
+ * `-h, --help` - Show this help message and exit
+ 
++**Available subcommands**
++* [`list`](#dlt-ai-secrets-list) - List secret file locations from providers
++* [`view-redacted`](#dlt-ai-secrets-view-redacted) - Print secrets toml with all values replaced by '***'
++* [`update-fragment`](#dlt-ai-secrets-update-fragment) - Merge a toml fragment into the secrets file
++
+ </details>
+ 
+ ### `dlt ai secrets list`
+
+
+===== COMMIT 2e1cf969 =====
+
+
+commit 2e1cf9694
+Author: YuF-9468
+Date: 2026-03-13
+
+    fix: validate missing MotherDuck catalog (#3723)
+
+diff --git a/dlt/destinations/impl/motherduck/configuration.py b/dlt/destinations/impl/motherduck/configuration.py
+index b659e75d2..cf91483c1 100644
+--- a/dlt/destinations/impl/motherduck/configuration.py
++++ b/dlt/destinations/impl/motherduck/configuration.py
+@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Dict, Final, List, TYPE_CHECKING
+ from dlt.common.configuration.specs.connection_string_credentials import ConnectionStringCredentials
+ from dlt.version import __version__
+ from dlt.common.configuration import configspec
++from dlt.common.configuration.specs.exceptions import NativeValueError
+ from dlt.common.destination.client import DestinationClientDwhWithStagingConfiguration
+ from dlt.common.destination.exceptions import DestinationTerminalException
+ from dlt.common.typing import TSecretStrValue
+@@ -91,6 +92,13 @@ class MotherDuckCredentials(DuckDbBaseCredentials, ConnectionStringCredentials):
+ 
+     def on_resolved(self) -> None:
+         """Adds custom agent to global config"""
++        if self.database == "":
++            raise MotherDuckCatalogMissing(
++                self.__class__,
++                "md:",
++                "MotherDuck connection string must include a catalog/database name, for example"
++                " `md:my_db`.",
++            )
+         if self.global_config is None:
+             self.global_config = {}
+         self.global_config["custom_user_agent"] = self.custom_user_agent or MOTHERDUCK_USER_AGENT
+@@ -122,6 +130,10 @@ class MotherDuckClientConfiguration(DestinationClientDwhWithStagingConfiguration
+         return ""
+ 
+ 
++class MotherDuckCatalogMissing(NativeValueError):
++    pass
++
++
+ class MotherduckLocalVersionNotSupported(DestinationTerminalException):
+     def __init__(self, duckdb_version: str) -> None:
+         self.duckdb_version = duckdb_version
+diff --git a/tests/load/motherduck/test_motherduck_client.py b/tests/load/motherduck/test_motherduck_client.py
+index eacaa88aa..946a13185 100644
+--- a/tests/load/motherduck/test_motherduck_client.py
++++ b/tests/load/motherduck/test_motherduck_client.py
+@@ -10,6 +10,7 @@ from dlt.destinations.impl.motherduck.configuration import (
+     MOTHERDUCK_USER_AGENT,
+     MotherDuckCredentials,
+     MotherDuckClientConfiguration,
++    MotherDuckCatalogMissing,
+ )
+ 
+ # mark all tests as essential, do not remove
+@@ -31,6 +32,9 @@ def test_motherduck_configuration() -> None:
+     assert cred.is_partial() is False
+     assert cred.is_resolved() is False
+ 
++    with pytest.raises(MotherDuckCatalogMissing):
++        resolve_configuration(MotherDuckCredentials("md:?motherduck_token=TOKEN"))
++
+     cred = MotherDuckCredentials()
+     cred.parse_native_representation("md:xdb?motherduck_token=TOKEN2")
+     assert cred.password == "TOKEN2"
+
+
+===== COMMIT 4b1cc416 =====
+
+
+commit 4b1cc4166
+Author: djudjuu
+Date: 2026-03-13
+
+    docs: redirects for removed pages (#3688)
+
+diff --git a/docs/website/package.json b/docs/website/package.json
+index dbfd0409c..0158bc300 100644
+--- a/docs/website/package.json
++++ b/docs/website/package.json
+@@ -4,7 +4,7 @@
+   "private": true,
+   "scripts": {
+     "start": "cd .. && make preprocess-docs && concurrently --kill-others \"make preprocess-docs-watch \" \"cd website && docusaurus start\"",
+-    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js",
++    "build": "uv run npm run update-versions && cd .. && make preprocess-docs && cd website && docusaurus build --out-dir build/docs && node scripts/verify-llms-txt.js && node scripts/verify-redirects.js",
+     "clear": "docusaurus clear",
+     "serve": "docusaurus serve --dir build/docs",
+     "clear-versions": "node tools/clear_versions.js",
+@@ -13,7 +13,8 @@
+     "serve:cloudflare": "wrangler dev --port 3001 --local",
+     "preview:cloudflare": "npm run build && npm run serve:cloudflare",
+     "deploy:cloudflare": "npm run build && wrangler deploy",
+-    "verify-llms": "node scripts/verify-llms-txt.js"
++    "verify-llms": "node scripts/verify-llms-txt.js",
++    "verify-redirects": "node scripts/verify-redirects.js"
+   },
+   "dependencies": {
+     "@docusaurus/core": "^3.9.2",
+diff --git a/docs/website/redirects.js b/docs/website/redirects.js
+new file mode 100644
+index 000000000..8bea66368
+--- /dev/null
++++ b/docs/website/redirects.js
+@@ -0,0 +1,154 @@
++// Redirect rules shared between the Cloudflare worker (worker.ts) and the
++// post-build verification script (scripts/verify-redirects.js).
++
++/** @type {Array<{from: string, to: string}>} */
++const REDIRECTS = [
++    // basic root redirects
++    {
++        // NOTE: We only ever hit the root path on dev previews, so we can redirect to the devel version
++        from: "/",
++        to: "/docs/devel/intro"
++    },
++    {
++        from: "/docs",
++        to: "/docs/intro"
++    },
++    {
++        from: "/docs/",
++        to: "/docs/intro"
++    },
++    {
++        from: "/docs/hub",
++        to: "/docs/hub/intro"
++    },
++
++    // docs section redirects
++    {
++        from: "/docs/getting-started",
++        to: "/docs/intro/"
++    },
++    {
++        from: "/docs/dlt-ecosystem",
++        to: "/docs/dlt-ecosystem/verified-sources/"
++    },
++    {
++        from: "/docs/general-usage/credentials/config_providers",
++        to: "/docs/general-usage/credentials/setup/"
++    },
++    {
++        from: "/docs/general-usage/credentials/configuration",
++        to: "/docs/general-usage/credentials/setup/"
++    },
++    {
++        from: "/docs/general-usage/credentials/config_specs",
++        to: "/docs/general-usage/credentials/complex_types/"
++    },
++
++    // tutorial redirects
++    {
++        from: "/docs/tutorial/intro",
++        to: "/docs/tutorial/load-data-from-an-api/"
++    },
++    {
++        from: "/docs/tutorial/grouping-resources",
++        to: "/docs/tutorial/load-data-from-an-api/"
++    },
++
++    // reference + misc redirects
++    {
++        from: "/docs/telemetry",
++        to: "/docs/reference/telemetry/"
++    },
++    {
++        from: "/docs/walkthroughs",
++        to: "/docs/intro/"
++    },
++    {
++        from: "/docs/visualizations",
++        to: "/docs/general-usage/dataset-access/"
++    },
++
++    // top-404 redirects
++    {
++        from: "/docs/dlt-ecosystem/llm-tooling/cursor-restapi",
++        to: "/docs/dlt-ecosystem/llm-tooling/llm-native-workflow"
++    },
++    {
++        from: "/docs/general-usage/filesystem",
++        to: "/docs/dlt-ecosystem/verified-sources/filesystem/"
++    },
++    {
++        from: "/docs/walkthroughs/",
++        to: "/docs/intro/"
++    },
++    {
++        from: "/docs/dlt-ecosystem/verified-sources/rest_api/reference",
++        to: "/docs/dlt-ecosystem/verified-sources/rest_api"
++    },
++
++    // renamed / relocated pages
++    {
++        from: "/docs/walkthroughs/load-data-from-an-api",
++        to: "/docs/tutorial/load-data-from-an-api"
++    },
++    {
++        from: "/docs/load-data-from-an-api",
++        to: "/docs/tutorial/load-data-from-an-api"
++    },
++    {
++        from: "/docs/destinations/snowflake",
++        to: "/docs/dlt-ecosystem/destinations/snowflake"
++    },
++    {
++        from: "/docs/destinations/duckdb",
++        to: "/docs/dlt-ecosystem/destinations/duckdb"
++    },
++    {
++        from: "/docs/pipelines/salesforce",
++        to: "/docs/dlt-ecosystem/verified-sources/salesforce"
++    },
++    {
++        from: "/docs/dlt-ecosystem/verified-sources/stripe_analytics",
++        to: "/docs/dlt-ecosystem/verified-sources/stripe"
++    },
++    {
++        from: "/docs/dlt-ecosystem/transformations/pandas",
++        to: "/docs/dlt-ecosystem/transformations/python"
++    },
++    {
++        from: "/docs/getting-started/build-a-data-pipeline",
++        to: "/docs/build-a-pipeline-tutorial"
++    },
++
++    // api_reference paths gained a /dlt/ prefix
++    {
++        from: "/docs/api_reference/extract/resource",
++        to: "/docs/api_reference/dlt/extract/resource"
++    },
++    {
++        from: "/docs/api_reference/common/configuration/specs/base_configuration",
++        to: "/docs/api_reference/dlt/common/configuration/specs/base_configuration"
++    },
++    {
++        from: "/docs/hub/reference",
++        to: "/docs/hub/intro"
++    },
++    {
++        from: "/docs/general-usage/connectors",
++        to: "/docs/dlt-ecosystem/verified-sources/"
++    },
++    {
++        from: "/docs/api_reference/pipeline/configuration",
++        to: "/docs/general-usage/credentials/"
++    },
++    {
++        from: "/docs/walkthroughs/grouping-resources",
++        to: "/docs/general-usage/source"
++    },
++    {
++        from: "/docs/general-usage/dlt",
++        to: "/docs/intro"
++    },
++];
++
++module.exports = REDIRECTS;
+diff --git a/docs/website/scripts/verify-redirects.js b/docs/website/scripts/verify-redirects.js
+new file mode 100644
+index 000000000..663802d2f
+--- /dev/null
++++ b/docs/website/scripts/verify-redirects.js
+@@ -0,0 +1,112 @@
++#!/usr/bin/env node
++/**
++ * Post-build verification for redirect targets.
++ *
++ * Imports the shared REDIRECTS array from redirects.js and checks that every
++ * `to` target resolves to an existing HTML page in the build output. Run after
++ * `docusaurus build`:
++ *
++ *   node scripts/verify-redirects.js
++ *
++ * Exits with code 1 if any errors are found.
++ */
++const fs = require('fs');
++const path = require('path');
++
++const BUILD_DIR = path.resolve(__dirname, '..', 'build', 'docs');
++const redirects = require('../redirects.js');
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++let errors = 0;
++let warnings = 0;
++
++function error(msg) {
++  console.error(`  ERROR: ${msg}`);
++  errors++;
++}
++
++function warn(msg) {
++  console.warn(`  WARN:  ${msg}`);
++  warnings++;
++}
++
++function ok(msg) {
++  console.log(`  OK:    ${msg}`);
++}
++
++function targetExists(rel) {
++  const candidates = [
++    path.join(BUILD_DIR, rel + '.html'),
++    path.join(BUILD_DIR, rel, 'index.html'),
++  ];
++  return candidates.some((c) => fs.existsSync(c));
++}
++
++// ---------------------------------------------------------------------------
++// Main
++// ---------------------------------------------------------------------------
++
++console.log('\n--- redirect targets (redirects.js) ---');
++
++if (!fs.existsSync(BUILD_DIR)) {
++  console.error(`Build directory not found: ${BUILD_DIR}`);
++  console.error('Run "npm run build" first.');
++  process.exit(1);
++}
++
++ok(`${redirects.length} redirects loaded from redirects.js`);
++
++// Check for duplicate `from` entries
++const fromCounts = {};
++for (const r of redirects) {
++  fromCounts[r.from] = (fromCounts[r.from] || 0) + 1;
++}
++const dupFroms = Object.entries(fromCounts).filter(([, c]) => c > 1);
++if (dupFroms.length > 0) {
++  for (const [from, count] of dupFroms) {
++    error(`duplicate "from" path: ${from} (appears ${count} times)`);
++  }
++} else {
++  ok('no duplicate "from" paths');
++}
++
++// Check for redirect chains (to → from)
++const fromSet = new Set(redirects.map((r) => r.from));
++for (const r of redirects) {
++  if (fromSet.has(r.to)) {
++    warn(`redirect chain: ${r.from} → ${r.to} → ... (target is itself a redirect source)`);
++  }
++}
++
++// Verify each target resolves to an existing page
++let checked = 0;
++let skipped = 0;
++
++for (const r of redirects) {
++  if (!r.to.startsWith('/docs/')) {
++    skipped++;
++    continue;
++  }
++
++  checked++;
++  const rel = r.to.replace(/^\/docs\//, '').replace(/\/$/, '');
++  if (!targetExists(rel)) {
++    error(`redirect target ${r.to} has no HTML page (from: ${r.from}, checked ${rel}.html and ${rel}/index.html)`);
++  }
++}
++
++if (skipped > 0) {
++  ok(`skipped ${skipped} non-/docs/ targets`);
++}
++
++if (errors === 0) {
++  ok(`all ${checked} checked redirect targets resolve to existing pages`);
++}
++
++// Summary
++console.log(`\n=== Redirects: ${errors} errors, ${warnings} warnings ===`);
++if (errors > 0) {
++  process.exit(1);
++}
+diff --git a/docs/website/worker.ts b/docs/website/worker.ts
+index 4c40fba36..4192aa2c9 100644
+--- a/docs/website/worker.ts
++++ b/docs/website/worker.ts
+@@ -1,80 +1,7 @@
+ // cloudflare worker implementation to serve the website docs
+ import { instrument, ResolveConfigFn } from '@microlabs/otel-cf-workers';
+ import type { ReadableSpan } from '@opentelemetry/sdk-trace-base'
+-
+-const REDIRECTS = [
+-    // basic root redirects
+-    {
+-        // NOTE: We only ever hit the root path on dev previews, so we can redirect to the devel version
+-        from: "/",
+-        to: "/docs/devel/intro"
+-    },
+-    {
+-        from: "/docs",
+-        to: "/docs/intro"
+-    },
+-    {
+-        from: "/docs/",
+-        to: "/docs/intro"
+-    },
+-    {
+-        from: "/docs/hub",
+-        to: "/docs/hub/intro"
+-    },
+-
+-    // docs section redirects
+-    {
+-        from: "/docs/getting-started",
+-        to: "/docs/intro/"
+-    },
+-    {
+-        from: "/docs/dlt-ecosystem",
+-        to: "/docs/dlt-ecosystem/verified-sources/"
+-    },
+-    {
+-        from: "/docs/general-usage/credentials/config_providers",
+-        to: "/docs/general-usage/credentials/setup/"
+-    },
+-    {
+-        from: "/docs/general-usage/credentials/configuration",
+-        to: "/docs/general-usage/credentials/setup/"
+-    },
+-    {
+-        from: "/docs/general-usage/credentials/config_specs",
+-        to: "/docs/general-usage/credentials/complex_types/"
+-    },
+-
+-    // tutorial redirects
+-    {
+-        from: "/docs/tutorial/intro",
+-        to: "/docs/tutorial/load-data-from-an-api/"
+-    },
+-    {
+-        from: "/docs/tutorial/grouping-resources",
+-        to: "/docs/tutorial/load-data-from-an-api/"
+-    },
+-
+-    // reference + misc redirects
+-    {
+-        from: "/docs/telemetry",
+-        to: "/docs/reference/telemetry/"
+-    },
+-    {
+-        from: "/docs/walkthroughs",
+-        to: "/docs/intro/"
+-    },
+-    {
+-        from: "/docs/visualizations",
+-        to: "/docs/general-usage/dataset-access/"
+-    },
+-
+-    // dlt+ redirect
+-    {
+-        from: "/docs/hub",
+-        to: "/docs/hub/intro"
+-    },
+-
+-]
++import REDIRECTS from './redirects.js';
+ 
+ const ROUTE_404 = "/docs/404";
+ 
+
+
+===== COMMIT a607a80d =====
+
+
+commit a607a80d0
+Author: Aditya Panda
+Date: 2026-03-13
+
+    Fix for infinite loop for bigquery job with internal error (#3732)
+
+diff --git a/dlt/destinations/impl/bigquery/bigquery.py b/dlt/destinations/impl/bigquery/bigquery.py
+index ed9858a93..77741a7c5 100644
+--- a/dlt/destinations/impl/bigquery/bigquery.py
++++ b/dlt/destinations/impl/bigquery/bigquery.py
+@@ -115,17 +115,12 @@ class BigQueryLoadJob(RunnableLoadJob, HasFollowupJobs):
+                         f"Bigquery Load Job failed, reason reported from bigquery: `{reason}`"
+                     )
+                 )
+-            elif reason in ["internalError"]:
+-                logger.warning(
+-                    f"Got reason `{reason}` for job `{self._file_name}`, job considered still"
+-                    f" running. ({self._bq_load_job.error_result})"
+-                )
+-                continue
+             else:
+                 raise DatabaseTransientException(
+                     Exception(
+                         "Bigquery Job needs to be retried, reason reported from bigquery"
+-                        f" `{reason}`"
++                        f" `{reason}`, for job `{self._file_name}`."
++                        f" Error details: {self._bq_load_job.error_result}"
+                     )
+                 )
+ 
+diff --git a/tests/load/bigquery/test_bigquery_client.py b/tests/load/bigquery/test_bigquery_client.py
+index 089676960..0e5b218b4 100644
+--- a/tests/load/bigquery/test_bigquery_client.py
++++ b/tests/load/bigquery/test_bigquery_client.py
+@@ -1,7 +1,8 @@
+ import os
+ import base64
+ from copy import copy
+-from typing import Any, Iterator, Tuple, cast, Dict
++from typing import Any, Iterator, Tuple, Type, cast, Dict
++from unittest.mock import MagicMock
+ import pytest
+ 
+ from dlt.common import json, pendulum, Decimal
+@@ -20,7 +21,15 @@ from dlt.common.schema.utils import new_table
+ from dlt.common.storages import FileStorage
+ from dlt.common.utils import digest128, uniq_id, custom_environ
+ from dlt.common.destination.client import RunnableLoadJob
+-from dlt.destinations.impl.bigquery.bigquery import BigQueryClient, BigQueryClientConfiguration
++from dlt.destinations.impl.bigquery.bigquery import (
++    BigQueryClient,
++    BigQueryClientConfiguration,
++    BigQueryLoadJob,
++)
++from dlt.destinations.exceptions import (
++    DatabaseTransientException,
++    DatabaseTerminalException,
++)
+ 
+ from dlt.destinations.impl.bigquery.bigquery_adapter import (
+     AUTODETECT_SCHEMA_HINT,
+@@ -40,6 +49,8 @@ from tests.load.utils import (
+ # mark all tests as essential, do not remove
+ pytestmark = pytest.mark.essential
+ 
++TEST_FILE_PATH = "/tmp/test_table.abc123.0.jsonl"
++
+ 
+ @pytest.fixture(scope="module")
+ def client() -> Iterator[BigQueryClient]:
+@@ -504,3 +515,71 @@ def test_bigquery_configuration_accepts_base_gcp_credentials() -> None:
+     assert config.credentials == wrapper_creds
+     assert config.credentials.project_id == "test-project"
+     assert config.credentials.has_default_credentials()
++
++
++@pytest.mark.parametrize(
++    "error_reason,message,expected_exception",
++    [
++        ("internalError", "Internal error occurred", DatabaseTransientException),
++        ("backendError", "Backend error", DatabaseTransientException),
++        ("rateLimitExceeded", "Rate limit exceeded", DatabaseTransientException),
++        ("invalidQuery", "Invalid query", DatabaseTransientException),
++        ("notFound", "Table not found", DatabaseTerminalException),
++        ("invalid", "Invalid request", DatabaseTerminalException),
++    ],
++)
++def test_error_raises_appropriate_exception(
++    error_reason: str, message: str, expected_exception: Type[Exception]
++) -> None:
++    """Test that different BigQuery error reasons raise the appropriate exception type."""
++    job = BigQueryLoadJob(
++        file_path=TEST_FILE_PATH,
++        http_timeout=15.0,
++        retry_deadline=60.0,
++    )
++
++    error_result = {"reason": error_reason, "message": message}
++    mock_bq_job = MagicMock()
++    mock_bq_job.done.return_value = True
++    mock_bq_job.output_rows = None
++    mock_bq_job.error_result = error_result
++
++    job._bq_load_job = mock_bq_job
++    mock_client = MagicMock()
++    mock_client._create_load_job.return_value = mock_bq_job
++    job._job_client = mock_client
++    job._load_table = {"name": "test_table"}
++
++    with pytest.raises(expected_exception) as exc_info:
++        job.run()
++    exception_str = str(exc_info.value)
++    assert error_reason in exception_str
++    # transient exceptions include error details in the message
++    if expected_exception is DatabaseTransientException:
++        assert "Error details:" in exception_str
++
++
++def test_internal_error_does_not_loop() -> None:
++    """Regression: internalError must raise, not loop forever polling a done job."""
++    job = BigQueryLoadJob(
++        file_path=TEST_FILE_PATH,
++        http_timeout=15.0,
++        retry_deadline=60.0,
++    )
++
++    mock_bq_job = MagicMock()
++    # done() returns True every time — job is finished on BQ side
++    mock_bq_job.done.return_value = True
++    mock_bq_job.output_rows = None
++    mock_bq_job.error_result = {"reason": "internalError", "message": "transient"}
++
++    job._bq_load_job = mock_bq_job
++    mock_client = MagicMock()
++    mock_client._create_load_job.return_value = mock_bq_job
++    job._job_client = mock_client
++    job._load_table = {"name": "test_table"}
++
++    with pytest.raises(DatabaseTransientException):
++        job.run()
++    # done() should be called exactly once — no infinite polling
++    assert mock_bq_job.done.call_count == 1
+
+
+===== COMMIT a8b0ad63 =====
+
+
+commit a8b0ad631
+Author: Aditya Panda
+Date: 2026-03-13
+
+    Fixed the mapping of timezone in sql timestamp datatype (#3735)
+
+diff --git a/dlt/sources/sql_database/schema_types.py b/dlt/sources/sql_database/schema_types.py
+index 3964d3844..20081b929 100644
+--- a/dlt/sources/sql_database/schema_types.py
++++ b/dlt/sources/sql_database/schema_types.py
+@@ -164,7 +164,7 @@ def sqla_col_to_column_schema(
+     elif isinstance(sql_t, sqltypes.DateTime):
+         col["data_type"] = "timestamp"
+         # special handling for MSSQL
+-        col["timezone"] = sql_t.timezone or sql_t.__visit_name__ in ("DATETIMEOFFSET")
++        col["timezone"] = sql_t.timezone or sql_t.__visit_name__ in ("DATETIMEOFFSET",)
+     elif isinstance(sql_t, sqltypes.Date):
+         col["data_type"] = "date"
+     elif isinstance(sql_t, sqltypes.Time):
+diff --git a/tests/sources/sql_database/test_schema_types.py b/tests/sources/sql_database/test_schema_types.py
+index 94c8197fa..717c840a6 100644
+--- a/tests/sources/sql_database/test_schema_types.py
++++ b/tests/sources/sql_database/test_schema_types.py
+@@ -1,6 +1,7 @@
+ import pytest
+ import sqlalchemy as sa
+-from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
++from sqlalchemy.dialects.mssql import DATETIMEOFFSET, UNIQUEIDENTIFIER
++from sqlalchemy.dialects.oracle import DATE as OracleDATE
+ from sqlalchemy.dialects.postgresql import UUID
+ 
+ from dlt.sources.sql_database.schema_types import (
+@@ -85,6 +86,25 @@ def test_default_table_adapter_sa2_generic_uuid() -> None:
+     assert table.c.col.type.as_uuid is False
+ 
+ 
++@pytest.mark.parametrize(
++    "sql_type,expected_tz",
++    [
++        (sa.DateTime(timezone=False), False),
++        (sa.DateTime(timezone=True), True),
++        (OracleDATE(), False),
++        (DATETIMEOFFSET(), True),
++    ],
++    ids=["datetime_no_tz", "datetime_tz", "oracle_date", "mssql_datetimeoffset"],
++)
++def test_datetime_timezone_mapping(sql_type: sa.types.TypeEngine, expected_tz: bool) -> None:
++    """sqla_col_to_column_schema maps timezone correctly for DateTime types."""
++    metadata = sa.MetaData()
++    table = sa.Table("t", metadata, sa.Column("col", sql_type))
++    col_schema = sqla_col_to_column_schema(table.c.col, "full")
++    assert col_schema is not None
++    assert col_schema["timezone"] is expected_tz
++
++
+ def test_get_table_references() -> None:
+     # Test converting foreign keys to reference hints
+     metadata = sa.MetaData()
+
+
+===== COMMIT 173d81d7 =====
+
+
+commit 173d81d73
+Author: rudolfix
+Date: 2026-03-13
+
+    (feat) allows to emit custom resource metrics as tables (#3718)
+
+diff --git a/dlt/common/metrics.py b/dlt/common/metrics.py
+index 2d0ece2e6..5cfe9dc3e 100644
+--- a/dlt/common/metrics.py
++++ b/dlt/common/metrics.py
+@@ -42,9 +42,19 @@ class DataWriterAndCustomMetrics(DataWriterMetrics):
+         return self
+ 
+     def _asdict(self) -> Dict[str, Any]:
+-        """Override _asdict to include custom_metrics in serialization"""
++        """Includes custom_metrics in serialization, promoting list-valued
++        metrics to top-level keys for cleaner child table names."""
+         result = super()._asdict()
+-        result["custom_metrics"] = self.custom_metrics
++        standard_keys = set(result)
++        nested: Dict[str, Any] = {}
++        for key, value in self.custom_metrics.items():
++            # skip list metrics that collide with standard NamedTuple fields
++            if isinstance(value, list) and key not in standard_keys:
++                result[key] = value
++            else:
++                nested[key] = value
++        if nested:
++            result["custom_metrics"] = nested
+         return result
+ 
+ 
+diff --git a/dlt/extract/incremental/__init__.py b/dlt/extract/incremental/__init__.py
+index 6c785a0a5..2f119df22 100644
+--- a/dlt/extract/incremental/__init__.py
++++ b/dlt/extract/incremental/__init__.py
+@@ -4,6 +4,7 @@ from typing import (
+     Generic,
+     ClassVar,
+     Any,
++    List,
+     Optional,
+     Type,
+     Dict,
+@@ -75,13 +76,17 @@ except MissingDependencyException:
+     pandas = None
+ 
+ 
+-class IncrementalCustomMetrics(TypedDict, total=False):
++class IncrementalMetricsRow(TypedDict, total=False):
+     unfiltered_items_count: int
+     unfiltered_batches_count: int
+     initial_unique_hashes_count: int
+     final_unique_hashes_count: int
+ 
+ 
++class IncrementalCustomMetrics(TypedDict, total=False):
++    incremental: List[IncrementalMetricsRow]
++
++
+ @configspec
+ class Incremental(
+     ItemTransform[TDataItem, IncrementalCustomMetrics], BaseConfiguration, Generic[TCursorValue]
+@@ -212,12 +217,15 @@ class Incremental(
+         """Bound pipe"""
+         self.range_start = range_start
+         self.range_end = range_end
+-        self._custom_metrics: IncrementalCustomMetrics = {
++        self._incremental_metrics: IncrementalMetricsRow = {
+             "unfiltered_items_count": 0,
+             "unfiltered_batches_count": 0,
+             "initial_unique_hashes_count": 0,
+             "final_unique_hashes_count": 0,
+         }
++        self._custom_metrics: IncrementalCustomMetrics = {
++            "incremental": [self._incremental_metrics],
++        }
+         self._dedup_key_from_hints: Optional[bool] = False if primary_key is not None else None
+         """Tells if dedup key was set from resource hints, to prevent overrides of directly set values"""
+ 
+@@ -615,8 +623,8 @@ class Incremental(
+             return rows
+ 
+         # collect metrics
+-        self.custom_metrics["unfiltered_items_count"] += count_rows_in_items(rows)
+-        self.custom_metrics["unfiltered_batches_count"] += 1
++        self._incremental_metrics["unfiltered_items_count"] += count_rows_in_items(rows)
++        self._incremental_metrics["unfiltered_batches_count"] += 1
+ 
+         transformer = self._get_transform(rows)
+         if isinstance(rows, list):
+@@ -649,13 +657,13 @@ class Incremental(
+             )
+             initial_hash_list = self._cached_state.get("unique_hashes")
+             initial_hash_count = len(initial_hash_list) if initial_hash_list else 0
+-            self.custom_metrics["initial_unique_hashes_count"] = initial_hash_count
++            self._incremental_metrics["initial_unique_hashes_count"] = initial_hash_count
+ 
+             # add directly computed hashes
+             unique_hashes.update(transformer.unique_hashes)
+             self._cached_state["unique_hashes"] = list(unique_hashes)
+             final_hash_count = len(self._cached_state["unique_hashes"])
+-            self.custom_metrics["final_unique_hashes_count"] = final_hash_count
++            self._incremental_metrics["final_unique_hashes_count"] = final_hash_count
+ 
+             self._check_duplicate_cursor_threshold(initial_hash_count, final_hash_count)
+         else:
+diff --git a/docs/website/docs/general-usage/resource.md b/docs/website/docs/general-usage/resource.md
+index acf334d40..3e48f6f5a 100644
+--- a/docs/website/docs/general-usage/resource.md
++++ b/docs/website/docs/general-usage/resource.md
+@@ -799,6 +799,22 @@ print(f"Custom metrics: {resource_metrics.custom_metrics}")
+ 
+ As shown above, custom metrics are included in pipeline traces. Refer to [pipeline trace loading](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) for more details.
+ 
++#### Trace table layout for custom metrics
++
++When a pipeline trace is [loaded into a destination](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace),
++custom metrics are stored in the `resource_metrics` table. Scalar and dict-valued metrics become
++columns prefixed with `custom_metrics__` (e.g. `custom_metrics__page_count`). List-valued metrics
++become separate child tables, giving each resource a deterministic schema for its metrics. For example:
++
++```py
++custom_metrics = dlt.current.resource_metrics()
++custom_metrics["page_count"] = 0          # becomes column: custom_metrics__page_count
++custom_metrics["errors"] = []             # becomes child table: resource_metrics__errors
++```
++
++This lets you query per-resource metrics tables directly at the destination, rather than
++parsing a single JSON column.
++
+ ### Using `add_metrics` as a transformation step
+ 
+ Alternatively, you can collect metrics using `add_metrics`, which works as a transformation step in the pipeline.
+diff --git a/tests/extract/test_extract.py b/tests/extract/test_extract.py
+index 882590a4d..0f29b2e09 100644
+--- a/tests/extract/test_extract.py
++++ b/tests/extract/test_extract.py
+@@ -627,6 +627,7 @@ def test_resource_custom_metrics(extract_step: Extract, with_custom_metrics: boo
+                 "random_constant": 1.5,
+                 "random_nested": {"value": 100, "unit": "items"},
+                 "items_count": 90,
++                "events": [{"ts": 1}, {"ts": 2}],
+             },
+             "resource_with_other_metrics": {
+                 "custom_count": 3,
+@@ -684,6 +685,58 @@ def test_resource_custom_metrics(extract_step: Extract, with_custom_metrics: boo
+         == all_resource_metrics["resource_with_other_metrics"].custom_metrics
+     )
+ 
++    # verify _asdict() promotes list-valued metrics to top-level keys
++    if with_custom_metrics:
++        d = all_resource_metrics["resource_with_metrics"]._asdict()
++        assert d["events"] == [{"ts": 1}, {"ts": 2}]
++        assert "events" not in d.get("custom_metrics", {})
++        assert d["custom_metrics"]["custom_count"] == 42
++
++
++def test_asdict_all_list_metrics(extract_step: Extract) -> None:
++    """When all custom metrics are list-valued, no custom_metrics key appears in _asdict()."""
++
++    @dlt.resource
++    def only_lists():
++        m = dlt.current.resource_metrics()
++        m["rows"] = [{"a": 1}]
++        m["errors"] = [{"msg": "oops"}]
++        yield [{"id": 1}]
++
++    source = DltSource(dlt.Schema("all_list"), "module", [only_lists()])
++    load_id = extract_step.extract(source, 20, 1)
++    step_info = extract_step.get_step_info(MockPipeline("buba", first_run=False))  # type: ignore[abstract]
++    d = step_info.metrics[load_id][0]["resource_metrics"]["only_lists"]._asdict()
++    assert "custom_metrics" not in d
++    assert d["rows"] == [{"a": 1}]
++    assert d["errors"] == [{"msg": "oops"}]
++
++
++def test_asdict_list_metric_collision_with_standard_field(extract_step: Extract) -> None:
++    """List-valued custom metric whose key collides with a standard NamedTuple field
++    stays nested under custom_metrics so it cannot overwrite standard metrics."""
++
++    @dlt.resource
++    def collision():
++        m = dlt.current.resource_metrics()
++        # items_count is a standard DataWriterMetrics field
++        m["items_count"] = [{"v": 99}]
++        m["safe_list"] = [{"v": 1}]
++        yield [{"id": 1}]
++
++    source = DltSource(dlt.Schema("collision"), "module", [collision()])
++    load_id = extract_step.extract(source, 20, 1)
++    step_info = extract_step.get_step_info(MockPipeline("buba", first_run=False))  # type: ignore[abstract]
++    metrics = step_info.metrics[load_id][0]["resource_metrics"]["collision"]
++    d = metrics._asdict()
++    # standard field preserved
++    assert isinstance(d["items_count"], int)
++    # colliding list metric stays in custom_metrics
++    assert d["custom_metrics"]["items_count"] == [{"v": 99}]
++    # non-colliding list metric promoted
++    assert d["safe_list"] == [{"v": 1}]
++    assert "safe_list" not in d.get("custom_metrics", {})
++
+ 
+ @pytest.mark.parametrize(
+     "with_custom_metrics", [True, False], ids=["with_custom_metrics", "without_custom_metrics"]
+@@ -786,6 +839,8 @@ def test_add_metrics(extract_step: Extract, as_single_batch: bool) -> None:
+             priority = meta["priority"]
+             key = f"{priority}_priority_count"
+             metrics[key] = metrics.get(key, 0) + 1
++            # collect list-valued metric for child table promotion
++            metrics.setdefault("seen_priorities", []).append({"priority": priority})
+ 
+     data_with_priority.add_metrics(count_by_priority)
+ 
+@@ -805,6 +860,13 @@ def test_add_metrics(extract_step: Extract, as_single_batch: bool) -> None:
+     assert source.resources["data_with_priority"].custom_metrics == {
+         "high_priority_count": 2,
+         "low_priority_count": 3,
++        "seen_priorities": [
++            {"priority": "high"},
++            {"priority": "high"},
++            {"priority": "low"},
++            {"priority": "low"},
++            {"priority": "low"},
++        ],
+     }
+ 
+     step_info = extract_step.get_step_info(MockPipeline("buba", first_run=False))  # type: ignore[abstract]
+@@ -823,8 +885,27 @@ def test_add_metrics(extract_step: Extract, as_single_batch: bool) -> None:
+     assert all_resource_metrics["data_with_priority"].custom_metrics == {
+         "high_priority_count": 2,
+         "low_priority_count": 3,
++        "seen_priorities": [
++            {"priority": "high"},
++            {"priority": "high"},
++            {"priority": "low"},
++            {"priority": "low"},
++            {"priority": "low"},
++        ],
+     }
+ 
++    # verify _asdict() promotes list-valued metrics to top-level keys
++    d = all_resource_metrics["data_with_priority"]._asdict()
++    assert d["seen_priorities"] == [
++        {"priority": "high"},
++        {"priority": "high"},
++        {"priority": "low"},
++        {"priority": "low"},
++        {"priority": "low"},
++    ]
++    assert "seen_priorities" not in d.get("custom_metrics", {})
++    assert d["custom_metrics"]["high_priority_count"] == 2
++
+ 
+ def test_object_mixed_case_columns_normalized(extract_step: Extract) -> None:
+     """Column hints with PascalCase names are normalized to snake_case in the schema.
+diff --git a/tests/extract/test_incremental.py b/tests/extract/test_incremental.py
+index f657196b9..fbc5b522f 100644
+--- a/tests/extract/test_incremental.py
++++ b/tests/extract/test_incremental.py
+@@ -4632,20 +4632,13 @@ def test_custom_metrics_in_incremental() -> None:
+             "resource_with_metrics"
+         ]
+         assert resource_metrics.custom_metrics["from_resource"] == "hey"
+-        assert resource_metrics.custom_metrics["unfiltered_items_count"] == unfiltered_items_count
+-        assert (
+-            resource_metrics.custom_metrics["unfiltered_batches_count"] == unfiltered_batches_count
+-        )
++        inc = resource_metrics.custom_metrics["incremental"][0]
++        assert inc["unfiltered_items_count"] == unfiltered_items_count
++        assert inc["unfiltered_batches_count"] == unfiltered_batches_count
+         # NOTE: initial_unique_hashes_count is always last value in pipeline state,
+         # so it persists across different incremental instances
+-        assert (
+-            resource_metrics.custom_metrics["initial_unique_hashes_count"]
+-            == initial_unique_hashes_count
+-        )
+-        assert (
+-            resource_metrics.custom_metrics["final_unique_hashes_count"]
+-            == final_unique_hashes_count
+-        )
++        assert inc["initial_unique_hashes_count"] == initial_unique_hashes_count
++        assert inc["final_unique_hashes_count"] == final_unique_hashes_count
+         assert p.last_trace.last_normalize_info.row_counts.get("items") == last_normalized_count
+ 
+     def _run_with_items(items: TDataItems, as_batch: bool) -> str:
+@@ -4703,3 +4696,89 @@ def test_custom_metrics_in_incremental() -> None:
+     # None items should increment unfiltered_items_count
+     load_id = _run_with_items([None, None, {"id": 9, "value": "9"}], True)
+     _assert_custom_metrics(load_id, 12, 6, 1, 1, 1)
++
++
++def test_incremental_hints_in_extract_trace() -> None:
++    """Verify that incremental configuration is correctly stored in extract
++    trace hints for first run, subsequent run, run with end_value, and
++    resource refresh run."""
++    call_no = 0
++
++    @dlt.resource(table_name="items", primary_key="id")
++    def some_data(
++        updated_at=dlt.sources.incremental("updated_at", initial_value=1),
++    ):
++        nonlocal call_no
++        call_no += 1
++        yield [
++            {"id": call_no * 10 + 1, "updated_at": call_no * 10 + 2},
++            {"id": call_no * 10 + 2, "updated_at": call_no * 10 + 3},
++        ]
++
++    # yields static data so all items get filtered on second run
++    @dlt.resource(table_name="items", primary_key="id")
++    def static_data(
++        updated_at=dlt.sources.incremental("updated_at", initial_value=1),
++    ):
++        yield [{"id": 1, "updated_at": 2}, {"id": 2, "updated_at": 3}]
++
++    p = dlt.pipeline(pipeline_name="p_hints_" + uniq_id(), destination="duckdb")
++
++    def _get_incremental_hint(resource_name: str = "some_data") -> Dict[str, Any]:
++        extract_info = p.last_trace.last_extract_info
++        load_id = list(extract_info.metrics.keys())[0]
++        return extract_info.metrics[load_id][0]["hints"][resource_name]["incremental"]
++
++    # 1. first run: initial_value=1, no end_value, no prior state
++    p.run(some_data)
++    inc_hint = _get_incremental_hint()
++    assert inc_hint["cursor_path"] == "updated_at"
++    assert inc_hint["initial_value"] == 1
++    assert inc_hint["end_value"] is None
++    assert inc_hint["range_start"] == "closed"
++    assert inc_hint["range_end"] == "open"
++    assert inc_hint["lag"] is None
++    assert inc_hint["allow_external_schedulers"] is False
++
++    # 2. subsequent run: initial_value stays as configured (state is separate)
++    p.run(some_data)
++    inc_hint = _get_incremental_hint()
++    assert inc_hint["cursor_path"] == "updated_at"
++    assert inc_hint["initial_value"] == 1
++    assert inc_hint["end_value"] is None
++
++    # 3. run with end_value set
++    some_data_with_end = some_data()
++    some_data_with_end.apply_hints(
++        incremental=dlt.sources.incremental("updated_at", initial_value=1, end_value=100)
++    )
++    p.run(some_data_with_end)
++    inc_hint = _get_incremental_hint()
++    assert inc_hint["cursor_path"] == "updated_at"
++    assert inc_hint["initial_value"] == 1
++    assert inc_hint["end_value"] == 100
++    assert inc_hint["range_start"] == "closed"
++    assert inc_hint["range_end"] == "open"
++
++    # 4. resource refresh run (drop_resources resets state)
++    p.run(some_data, refresh="drop_resources")
++    inc_hint = _get_incremental_hint()
++    assert inc_hint["cursor_path"] == "updated_at"
++    assert inc_hint["initial_value"] == 1
++    assert inc_hint["end_value"] is None
++
++    # 5. no new data: all items filtered by incremental, nothing loaded
++    #    but hints are still present in extract metrics
++    p.run(static_data)
++    assert p.last_trace.last_extract_info.metrics
++    # second run yields same items — all filtered out
++    load_info = p.run(static_data)
++    assert load_info.loads_ids == []
++    inc_hint = _get_incremental_hint("static_data")
++    assert inc_hint["cursor_path"] == "updated_at"
++    assert inc_hint["initial_value"] == 1
++    assert inc_hint["end_value"] is None
++    # resource_metrics should be empty when no items pass the filter
++    extract_info = p.last_trace.last_extract_info
++    load_id = list(extract_info.metrics.keys())[0]
++    assert extract_info.metrics[load_id][0]["resource_metrics"] == {}
+diff --git a/tests/pipeline/cases/contracts/trace.schema.yaml b/tests/pipeline/cases/contracts/trace.schema.yaml
+index ee7d73b13..6644fe4dd 100644
+--- a/tests/pipeline/cases/contracts/trace.schema.yaml
++++ b/tests/pipeline/cases/contracts/trace.schema.yaml
+@@ -1,6 +1,6 @@
+-version: 5
+-version_hash: zsNXwXS2tlD1Or0sGgLOMI7clOz978WoyDuzVx+KU1s=
+-engine_version: 10
++version: 9
++version_hash: P8E7cjYovKZVIFpXOcuizgzCVXmUriPYEZ1FxBt63Tc=
++engine_version: 11
+ name: trace
+ tables:
+   _dlt_version:
+@@ -47,7 +47,8 @@ tables:
+     description: Created by DLT. Tracks completed loads
+     resource: _dlt_loads
+   trace:
+-    description: Top-level pipeline run trace with execution context, timing and environment info
++    description: Top-level pipeline run trace with execution context, timing and environment
++      info
+     columns:
+       transaction_id:
+         description: Unique identifier for this pipeline run
+@@ -73,23 +74,23 @@ tables:
+         data_type: text
+         nullable: true
+       execution_context__library__name:
+-        description: "dlt library name"
++        description: dlt library name
+         data_type: text
+         nullable: true
+       execution_context__library__version:
+-        description: "dlt library version"
++        description: dlt library version
+         data_type: text
+         nullable: true
+       execution_context__plus__name:
+-        description: "dlthub plus library name (if installed)"
++        description: dlthub plus library name (if installed)
+         data_type: text
+         nullable: true
+       execution_context__plus__version:
+-        description: "dlthub plus library version (if installed)"
++        description: dlthub plus library version (if installed)
+         data_type: text
+         nullable: true
+       execution_context__run_context:
+-        description: "Run context class name (e.g. PluggableRunContext)"
++        description: Run context class name (e.g. PluggableRunContext)
+         data_type: text
+         nullable: true
+       started_at:
+@@ -132,14 +133,15 @@ tables:
+         nullable: false
+     parent: trace
+   trace__steps:
+-    description: Individual pipeline steps (extract, normalize, load) with timing and outcome info
++    description: Individual pipeline steps (extract, normalize, load) with timing
++      and outcome info
+     columns:
+       span_id:
+         description: Unique span identifier for this step
+         data_type: text
+         nullable: true
+       step:
+-        description: "Step type: extract, normalize, or load"
++        description: 'Step type: extract, normalize, or load'
+         data_type: text
+         nullable: true
+       started_at:
+@@ -202,7 +204,8 @@ tables:
+         data_type: text
+         nullable: true
+       exception_traces:
+-        description: JSON-serialized exception chain (compact form, see child table for structured)
++        description: JSON-serialized exception chain (compact form, see child table
++          for structured)
+         data_type: text
+         nullable: true
+       load_info__environment:
+@@ -214,7 +217,8 @@ tables:
+         nullable: true
+     parent: trace
+   trace__steps__extract_info__job_metrics:
+-    description: Per-job file metrics from the extract step (file path, item count, size)
++    description: Per-job file metrics from the extract step (file path, item count,
++      size)
+     columns:
+       file_path:
+         data_type: text
+@@ -303,7 +307,8 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__extract_info__resource_metrics:
+-    description: Extract job metrics aggregated by resource name, including custom resource metrics
++    description: Extract job metrics aggregated by resource name, including custom
++      resource metrics
+     columns:
+       file_path:
+         data_type: text
+@@ -350,7 +355,8 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__extract_info__dag:
+-    description: Resource dependency graph edges (parent_name -> resource_name) from extract step
++    description: Resource dependency graph edges (parent_name -> resource_name) from
++      extract step
+     columns:
+       load_id:
+         data_type: text
+@@ -381,7 +387,8 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__extract_info__hints:
+-    description: Resource hints applied during extract (write_disposition, schema_contract, columns, etc.)
++    description: Resource hints applied during extract (write_disposition, schema_contract,
++      columns, etc.)
+     columns:
+       load_id:
+         data_type: text
+@@ -428,6 +435,21 @@ tables:
+         nullable: false
+         unique: true
+         row_key: true
++      incremental__cursor_path:
++        data_type: text
++        nullable: true
++      incremental__allow_external_schedulers:
++        data_type: bool
++        nullable: true
++      incremental__on_cursor_value_missing:
++        data_type: text
++        nullable: true
++      incremental__range_start:
++        data_type: text
++        nullable: true
++      incremental__range_end:
++        data_type: text
++        nullable: true
+     parent: trace__steps
+   trace__steps__step_info__loads_ids:
+     description: List of load package IDs processed in a pipeline step
+@@ -449,7 +471,8 @@ tables:
+         nullable: false
+     parent: trace__steps
+   trace__steps__step_info__load_packages:
+-    description: Load package metadata (state, schema, completion time) for each processed package
++    description: Load package metadata (state, schema, completion time) for each processed
++      package
+     columns:
+       load_id:
+         data_type: text
+@@ -459,7 +482,7 @@ tables:
+         data_type: text
+         nullable: true
+       state:
+-        description: "Package state: new, extracted, normalized, loaded"
++        description: 'Package state: new, extracted, normalized, loaded'
+         data_type: text
+         nullable: true
+       schema_hash:
+@@ -485,10 +508,11 @@ tables:
+         nullable: true
+     parent: trace__steps
+   trace__steps__step_info__load_packages__jobs:
+-    description: Individual load jobs within a package (file path, state, size, retry count, errors)
++    description: Individual load jobs within a package (file path, state, size, retry
++      count, errors)
+     columns:
+       state:
+-        description: "Job state: new_jobs, started_jobs, failed_jobs, completed_jobs"
++        description: 'Job state: new_jobs, started_jobs, failed_jobs, completed_jobs'
+         data_type: text
+         nullable: true
+       file_path:
+@@ -540,7 +564,8 @@ tables:
+         nullable: true
+     parent: trace__steps__step_info__load_packages
+   trace__steps__normalize_info__job_metrics:
+-    description: Per-job file metrics from the normalize step (file path, item count, size)
++    description: Per-job file metrics from the normalize step (file path, item count,
++      size)
+     columns:
+       file_path:
+         data_type: text
+@@ -629,7 +654,8 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__load_info__job_metrics:
+-    description: Per-job metrics from the load step (timing, state, remote URL, retry count)
++    description: Per-job metrics from the load step (timing, state, remote URL, retry
++      count)
+     columns:
+       load_id:
+         data_type: text
+@@ -673,7 +699,8 @@ tables:
+         nullable: true
+     parent: trace__steps
+   trace__steps__step_info__load_packages__tables:
+-    description: Schema update tables within a load package (write disposition, format, contract)
++    description: Schema update tables within a load package (write disposition, format,
++      contract)
+     columns:
+       write_disposition:
+         data_type: text
+@@ -721,7 +748,8 @@ tables:
+         nullable: true
+     parent: trace__steps__step_info__load_packages
+   trace__steps__step_info__load_packages__tables__columns:
+-    description: Column definitions from schema update tables (data type, constraints, hints)
++    description: Column definitions from schema update tables (data type, constraints,
++      hints)
+     columns:
+       name:
+         data_type: text
+@@ -797,9 +825,13 @@ tables:
+         description: Whether the normalizer first saw a null value for this column
+         data_type: bool
+         nullable: true
++      incremental:
++        data_type: bool
++        nullable: true
+     parent: trace__steps__step_info__load_packages__tables
+   trace__resolved_config_values:
+-    description: Config and secret values resolved during the pipeline run (key, provider, type)
++    description: Config and secret values resolved during the pipeline run (key, provider,
++      type)
+     columns:
+       key:
+         data_type: text
+@@ -849,7 +881,8 @@ tables:
+         nullable: false
+     parent: trace__resolved_config_values
+   trace__steps__exception_traces:
+-    description: Structured exception chain for failed steps (type, message, terminality, source)
++    description: Structured exception chain for failed steps (type, message, terminality,
++      source)
+     columns:
+       message:
+         data_type: text
+@@ -913,6 +946,33 @@ tables:
+         data_type: bigint
+         nullable: false
+     parent: trace__steps__exception_traces
++  trace__steps__extract_info__resource_metrics__incremental:
++    columns:
++      unfiltered_items_count:
++        data_type: bigint
++        nullable: true
++      unfiltered_batches_count:
++        data_type: bigint
++        nullable: true
++      initial_unique_hashes_count:
++        data_type: bigint
++        nullable: true
++      final_unique_hashes_count:
++        data_type: bigint
++        nullable: true
++      _dlt_parent_id:
++        data_type: text
++        nullable: false
++        parent_key: true
++      _dlt_list_idx:
++        data_type: bigint
++        nullable: false
++      _dlt_id:
++        data_type: text
++        nullable: false
++        unique: true
++        row_key: true
++    parent: trace__steps__extract_info__resource_metrics
+ settings:
+   detections:
+   - iso_timestamp
+@@ -935,9 +995,13 @@ normalizers:
+   names: snake_case
+   json:
+     module: dlt.common.normalizers.json.relational
++  use_break_path_on_normalize: false
+ previous_hashes:
++- lZ/04BwFLOm7fouDWZwxKImlCEdyHBO+SUUgIVLGm1k=
++- nNzjL9RAoVnFRkAEXVSu6FPXKDHlW1gQ5pJN0o12msk=
++- z//eAZyEIH4IFhc95OmWN6Uv4QBb8o4o9puK23yw9Ww=
++- zsNXwXS2tlD1Or0sGgLOMI7clOz978WoyDuzVx+KU1s=
+ - JE62zVwqT2T/qHTi2Qdnn2d1A/JzCzyGtDwc+qUmbTs=
+ - 9Ysjq/W0xpxkI/vBiYm8Qbr2nDP3JMt6KvGKUS/FCyI=
+ - NYeAxJ2r+T+dKFnXFhBEPzBP6SO+ORdhOfgQRo/XqBU=
+ - RV9jvZSD5dM+ZGjEL3HqokLvtf22K4zMNc3zWRahEw4=
+-
+diff --git a/tests/pipeline/test_pipeline_trace.py b/tests/pipeline/test_pipeline_trace.py
+index 57421d3e4..1691728b2 100644
+--- a/tests/pipeline/test_pipeline_trace.py
++++ b/tests/pipeline/test_pipeline_trace.py
+@@ -258,7 +258,6 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
+     assert isinstance(pipeline.last_trace.last_extract_info, ExtractInfo)
+ 
+ 
+-@pytest.mark.forked
+ def test_trace_schema() -> None:
+     os.environ["DATA_WRITER__DISABLE_COMPRESSION"] = "True"
+     os.environ["RESTORE_FROM_DESTINATION"] = "False"
+@@ -296,7 +295,7 @@ def test_trace_schema() -> None:
+                 }
+             ],
+         )
+-        def data():
++        def data(id_=dlt.sources.incremental("id")):
+             yield [{"id": 1, "multi": "1.2"}, {"id": 2}, {"id": 3}]
+ 
+         return data()
+@@ -353,11 +352,15 @@ def test_trace_schema() -> None:
+     trace = pipeline.last_trace
+     pipeline._schema_storage.storage.save("trace.json", json.dumps(trace, pretty=True))
+ 
+-    schema = dlt.Schema("trace")
++    # load existing contract as schema and let it evolve with new columns/tables
++    with open(f"{PIPELINE_TEST_CASES_PATH}/contracts/trace.schema.yaml", encoding="utf-8") as f:
++        imported_schema = yaml.safe_load(f)
++    evolving_schema = Schema.from_dict(imported_schema, remove_processing_hints=True)
++
+     trace_pipeline = dlt.pipeline(
+         pipeline_name="test_trace_schema_traces", destination=dummy(completed_prob=1.0)
+     )
+-    trace_pipeline.run([trace], table_name="trace", schema=schema)
++    trace_pipeline.run([trace], table_name="trace", schema=evolving_schema)
+ 
+     # add exception trace
+     with pytest.raises(PipelineStepFailed):
+@@ -378,10 +381,10 @@ def test_trace_schema() -> None:
+     pipeline._schema_storage.storage.save("trace.schema.yaml", inferred_contract_str)
+     # print(pipeline._schema_storage.storage.storage_path)
+ 
+-    # load the schema and use it as contract
++    # reload the original contract and use it with freeze to verify no breaking changes
+     with open(f"{PIPELINE_TEST_CASES_PATH}/contracts/trace.schema.yaml", encoding="utf-8") as f:
+-        imported_schema = yaml.safe_load(f)
+-    trace_contract = Schema.from_dict(imported_schema, remove_processing_hints=True)
++        contract_schema = yaml.safe_load(f)
++    trace_contract = Schema.from_dict(contract_schema, remove_processing_hints=True)
+     # compare pretty forms of the schemas, they must be identical
+     # NOTE: if this fails you can comment this out and use contract run below to find first offending difference
+     # assert trace_contract.to_pretty_yaml() == inferred_contract_str
+@@ -782,10 +785,7 @@ def test_trace_custom_metrics_schema() -> None:
+     assert "custom_metrics__random_constant" in resource_metrics_table_cols
+     assert "custom_metrics__random_nested__value" in resource_metrics_table_cols
+     assert "custom_metrics__random_nested__unit" in resource_metrics_table_cols
+-    assert (
+-        "trace__steps__extract_info__resource_metrics__custom_metrics__list_metric"
+-        in inferred_schema.tables
+-    )
++    assert "trace__steps__extract_info__resource_metrics__list_metric" in inferred_schema.tables
+ 
+ 
+ @pytest.mark.skipif(
+
+
+===== COMMIT 853cafee =====
+
+
+commit 853cafeeb
+Author: Anuun Chinbat
+Date: 2026-03-12
+
+    Initial commit (#3733)
+
+diff --git a/dlt/destinations/impl/sqlalchemy/merge_job.py b/dlt/destinations/impl/sqlalchemy/merge_job.py
+index b12d49f7f..583341a95 100644
+--- a/dlt/destinations/impl/sqlalchemy/merge_job.py
++++ b/dlt/destinations/impl/sqlalchemy/merge_job.py
+@@ -417,15 +417,26 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
+ 
+         sqla_statements.append(update_statement)
+ 
++        # Build SELECT columns in the same order as the destination table columns
++        # to ensure the INSERT ... SELECT column positions match.
++        select_cols = []
++        for col in root_table_obj.columns:
++            if col.name == from_:
++                select_cols.append(sa.literal(boundary_literal.strip("'")).label(from_))
++            elif col.name == to:
++                select_cols.append(
++                    sa.literal(
++                        active_record_literal.strip("'")
++                        if active_record_literal is not None
++                        else None
++                    ).label(to)
++                )
++            else:
++                select_cols.append(staging_root_table_obj.c[col.name])
++
+         insert_statement = root_table_obj.insert().from_select(
+             [col.name for col in root_table_obj.columns],
+-            sa.select(
+-                sa.literal(boundary_literal.strip("'")).label(from_),
+-                sa.literal(
+-                    active_record_literal.strip("'") if active_record_literal is not None else None
+-                ).label(to),
+-                *[c for c in staging_root_table_obj.columns if c.name not in [from_, to]],
+-            ).where(
++            sa.select(*select_cols).where(
+                 staging_root_table_obj.c[hash_].notin_(
+                     sa.select(root_table_obj.c[hash_]).where(root_is_active_clause)
+                 )
+diff --git a/tests/load/pipeline/test_scd2.py b/tests/load/pipeline/test_scd2.py
+index 3651d7d6d..5693a6a2a 100644
+--- a/tests/load/pipeline/test_scd2.py
++++ b/tests/load/pipeline/test_scd2.py
+@@ -1093,3 +1093,81 @@ def test_user_provided_row_hash(destination_config: DestinationTestConfiguration
+         {"value": 2},
+         {"value": 3},
+     ]
++
++
++@pytest.mark.essential
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(default_sql_configs=True, supports_merge=True),
++    ids=lambda x: x.name,
++)
++def test_scd2_validity_column_position(
++    destination_config: DestinationTestConfiguration,
++) -> None:
++    """SCD2 merge must work when validity columns are not first in the table.
++
++    Regression test for #3692: the merge INSERT...SELECT must align column
++    positions with the destination table. We use an append-then-scd2 switch
++    to produce a table where _dlt_valid_from/_dlt_valid_to are at the end.
++    """
++    p = destination_config.setup_pipeline("test_scd2_col_order", dev_mode=True)
++
++    # step 1: create table with append (no validity columns)
++    @dlt.resource(table_name="dim_test", write_disposition="append")
++    def r_append(data):
++        yield data
++
++    info = p.run(
++        r_append([{"nk": 1, "c1": "foo"}, {"nk": 2, "c1": "bar"}]),
++        **destination_config.run_kwargs,
++    )
++    assert_load_info(info)
++
++    # step 2: switch to scd2 (validity columns appended at end)
++    @dlt.resource(
++        table_name="dim_test",
++        merge_key="nk",
++        write_disposition={"disposition": "merge", "strategy": "scd2"},
++    )
++    def r_scd2(data):
++        yield data
++
++    info = p.run(
++        r_scd2([{"nk": 1, "c1": "foo"}, {"nk": 2, "c1": "bar"}]),
++        **destination_config.run_kwargs,
++    )
++    assert_load_info(info)
++
++    # step 3: load changed data (triggers the merge INSERT)
++    info = p.run(
++        r_scd2([{"nk": 1, "c1": "foo_updated"}, {"nk": 3, "c1": "baz"}]),
++        **destination_config.run_kwargs,
++    )
++    assert_load_info(info)
++
++    table = get_table(p, "dim_test", "nk")
++
++    def rows_for(nk: int):
++        return [r for r in table if r["nk"] == nk]
++
++    def active(rows):
++        return [r for r in rows if r[TO] is None]
++
++    def initial(rows):
++        """Rows from the append phase have FROM set to None."""
++        return [r for r in rows if r[FROM] is None]
++
++    # nk=1: initial (append) + retired (scd2 switch) + active (updated)
++    assert len(rows_for(1)) == 3
++    assert len(initial(rows_for(1))) == 1
++    assert len(active(rows_for(1))) == 1
++    assert active(rows_for(1))[0]["c1"] == "foo_updated"
++
++    # nk=2: initial (append) + active (scd2 switch, unchanged)
++    assert len(rows_for(2)) == 2
++    assert len(initial(rows_for(2))) == 1
++    assert len(active(rows_for(2))) == 1
++
++    # nk=3: new active only
++    assert len(rows_for(3)) == 1
++    assert len(active(rows_for(3))) == 1
+
+
+===== COMMIT 08b867d6 =====
+
+
+commit 08b867d60
+Author: AyushPatel101
+Date: 2026-03-12
+
+    feat: make promote_options configurable for Arrow table concatenation… (#3701)
+

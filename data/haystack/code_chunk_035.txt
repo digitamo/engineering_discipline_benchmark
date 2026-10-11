@@ -1,0 +1,3398 @@
+diff --git a/dlt/pipeline/pipeline.py b/dlt/pipeline/pipeline.py
+index ec5c501f8..764e9b315 100644
+--- a/dlt/pipeline/pipeline.py
++++ b/dlt/pipeline/pipeline.py
+@@ -133,6 +133,7 @@ from dlt.pipeline.trace import (
+     end_trace_step,
+     end_trace,
+ )
++from dlt.pipeline.track import on_first_dataset_access
+ from dlt.pipeline.typing import TPipelineStep
+ from dlt.pipeline.state_sync import (
+     PIPELINE_STATE_ENGINE_VERSION,
+@@ -355,6 +356,7 @@ class Pipeline(SupportsPipeline):
+         self._trace: PipelineTrace = None
+         self._last_trace: PipelineTrace = None
+         self._state_restored: bool = False
++        self._dataset_access_tracked: bool = False
+ 
+         # initialize pipeline working dir
+         self._init_working_dir(pipeline_name, pipelines_dir)
+@@ -1826,12 +1828,15 @@ class Pipeline(SupportsPipeline):
+                 " directly or via .dlt config.toml file or environment variable.",
+             )
+ 
++        schema_name = None
+         if isinstance(schema, Schema):
++            schema_name = schema.name
+             logger.info(
+-                f"Make sure that tables declared in explicit schema {schema.name} are present on"
++                f"Make sure that tables declared in explicit schema {schema_name} are present on"
+                 f" dataset {self.dataset_name}"
+             )
+         elif isinstance(schema, str):
++            schema_name = schema
+             if schema not in self.schemas:
+                 logger.info(
+                     f"Schema {schema} not found in the pipeline, deferring to destination, this"
+@@ -1843,9 +1848,20 @@ class Pipeline(SupportsPipeline):
+ 
+         elif self.default_schema_name:
+             schema = self.default_schema
++            schema_name = self.default_schema_name
+ 
+-        return dlt.dataset(
+-            self._destination,
+-            self.dataset_name,
+-            schema=schema,
+-        )
++        try:
++            dataset = dlt.dataset(
++                self._destination,
++                self.dataset_name,
++                schema=schema,
++            )
++            success = True
++            return dataset
++        except Exception:
++            success = False
++            raise
++        finally:
++            if not self._dataset_access_tracked:
++                on_first_dataset_access(pipeline=self, schema_name=schema_name, success=success)
++                self._dataset_access_tracked = True
+diff --git a/dlt/pipeline/track.py b/dlt/pipeline/track.py
+index f855de6df..2a3577ac1 100644
+--- a/dlt/pipeline/track.py
++++ b/dlt/pipeline/track.py
+@@ -1,6 +1,6 @@
+ """Implements SupportsTracking"""
+ import contextlib
+-from typing import Any, List
++from typing import Any, Union, Dict, Optional
+ import humanize
+ 
+ from dlt.common import logger
+@@ -78,6 +78,35 @@ def on_start_trace_step(
+         span.__enter__()
+ 
+ 
++def _build_base_props(
++    pipeline: SupportsPipeline,
++) -> Dict[str, Union[str, None]]:
++    return {
++        "destination_name": pipeline.destination.destination_name if pipeline.destination else None,
++        "destination_type": pipeline.destination.destination_type if pipeline.destination else None,
++        "pipeline_name_hash": digest128(pipeline.pipeline_name),
++        "dataset_name_hash": digest128(pipeline.dataset_name) if pipeline.dataset_name else None,
++        "default_schema_name_hash": (
++            digest128(pipeline.default_schema_name) if pipeline.default_schema_name else None
++        ),
++    }
++
++
++def on_first_dataset_access(
++    pipeline: SupportsPipeline,
++    success: bool,
++    schema_name: Optional[str] = None,
++) -> None:
++    """Track the first dataset access telemetry event for the given pipeline instance."""
++    props = {
++        "success": success,
++        **_build_base_props(pipeline=pipeline),
++        # The schema may differ from the default pipeline schema
++        "requested_schema_name_hash": digest128(schema_name) if schema_name else None,
++    }
++    dlthub_telemetry_track("pipeline", "access_dataset", props)
++
++
+ def on_end_trace_step(
+     trace: PipelineTrace,
+     step: PipelineStepTrace,
+@@ -95,13 +124,7 @@ def on_end_trace_step(
+     props = {
+         "elapsed": (step.finished_at - trace.started_at).total_seconds(),
+         "success": step.step_exception is None,
+-        "destination_name": pipeline.destination.destination_name if pipeline.destination else None,
+-        "destination_type": pipeline.destination.destination_type if pipeline.destination else None,
+-        "pipeline_name_hash": digest128(pipeline.pipeline_name),
+-        "dataset_name_hash": digest128(pipeline.dataset_name) if pipeline.dataset_name else None,
+-        "default_schema_name_hash": (
+-            digest128(pipeline.default_schema_name) if pipeline.default_schema_name else None
+-        ),
++        **_build_base_props(pipeline=pipeline),
+         "transaction_id": trace.transaction_id,
+     }
+     if step.step == "extract" and step_info:
+diff --git a/docs/website/docs/reference/telemetry.md b/docs/website/docs/reference/telemetry.md
+index ff10f53af..4c19f0eae 100644
+--- a/docs/website/docs/reference/telemetry.md
++++ b/docs/website/docs/reference/telemetry.md
+@@ -44,6 +44,7 @@ Anonymous telemetry is sent when:
+ 
+ - Any `dlt` command is executed from the command line. The data contains the command name. In the case of the `dlt init` command, we also send the requested destination and data source names.
+ - When `pipeline.run` is called, we send information when the [extract, normalize, and load](explainers/how-dlt-works.md) steps are completed. The data contains the destination name (e.g., `duckdb`), hashes of the dataset name, pipeline name, default schema name, destination fingerprint (which is a hash of selected destination configuration fields), elapsed time, and whether the step succeeded or not.
++- When `pipeline.dataset` is called, we send information about dataset access attempts. The data contains the destination name and type (e.g., `duckdb`), hashes of the dataset name, default and requested schema names, as well as whether the access attempt succeeded.
+ - When `dbt` and `airflow` helpers are used
+ 
+ Here is an example `dlt init` telemetry message:
+@@ -112,6 +113,39 @@ Example for `load` pipeline run step:
+ }
+ ```
+ 
++Example for data access telemetry:
++
++```json
++{
++  "anonymousId": "570816b273a41d16caacc26a797204d9",
++  "context": {
++    "ci_run": false,
++    "cpu": 3,
++    "exec_info": [],
++    "library": {
++      "name": "dlt",
++      "version": "1.15.0"
++    },
++    "os": {
++      "name": "Darwin",
++      "version": "21.6.0"
++    },
++    "python": "3.10.10"
++  },
++  "event": "data_access_connect",
++  "properties": {
++    "destination_name": "duckdb",
++    "destination_type": "duckdb",
++    "dataset_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
++    "default_schema_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
++    "requested_schema_name_hash": "49ShjWp8x9h+rmyqjP6G",
++    "event_category": "data_access",
++    "event_name": "connect",
++    "success": true
++  }
++}
++```
++
+ ## The message `context`
+ 
+ The message `context` contains the following information:
+diff --git a/tests/common/runtime/test_telemetry.py b/tests/common/runtime/test_telemetry.py
+index 95b34baf1..0cce2fa6f 100644
+--- a/tests/common/runtime/test_telemetry.py
++++ b/tests/common/runtime/test_telemetry.py
+@@ -1,17 +1,20 @@
+-from typing import Any
++from typing import Any, Union
+ from contextlib import nullcontext as does_not_raise
+ import os
+ import pytest
+ import logging
+ import base64
+-from unittest.mock import patch
++from unittest.mock import patch, Mock
+ 
+ from pytest_mock import MockerFixture
+ 
++import dlt
+ from dlt.common import logger
+ from dlt.common.runtime.anon_tracker import get_anonymous_id, track, disable_anon_tracker
+ from dlt.common.runtime.exec_info import get_execution_context
+ from dlt.common.typing import DictStrAny, DictStrStr
++from dlt.common.schema import Schema
++from dlt.common.utils import digest128
+ from dlt.common.configuration import configspec
+ from dlt.common.configuration.specs import RuntimeConfiguration
+ from dlt.version import DLT_PKG_NAME, __version__
+@@ -25,6 +28,7 @@ from tests.utils import (
+     disable_temporary_telemetry,
+     init_test_logging,
+     start_test_telemetry,
++    wipe_pipeline,
+ )
+ 
+ 
+@@ -194,6 +198,61 @@ def test_execution_context_with_plugin() -> None:
+         sys.path.remove(plus_path)
+ 
+ 
++@pytest.mark.parametrize(
++    "schema",
++    [Schema("my_schema"), "str_schema", None],
++)
++@pytest.mark.parametrize(
++    "success",
++    [True, False],
++)
++def test_on_first_dataset_access(
++    schema: Union[Schema, str, None], success: bool, monkeypatch
++) -> None:
++    pipeline = dlt.pipeline("test_on_first_dataset_access", destination="duckdb")
++
++    if not success:
++        monkeypatch.setattr(dlt, "dataset", Mock(side_effect=RuntimeError("fake_error")))
++
++    mock_github_env(os.environ)
++    mock_pod_env(os.environ)
++    SENT_ITEMS.clear()
++    config = SentryLoggerConfiguration()
++
++    with patch("dlt.common.runtime.anon_tracker.before_send", _mock_before_send):
++        start_test_telemetry(config)
++        # first access should always trigger telemetry
++        # second access should NOT trigger telemetry
++        if not success:
++            with pytest.raises(RuntimeError):
++                pipeline.dataset(schema)
++            with pytest.raises(RuntimeError):
++                pipeline.dataset(schema)
++        else:
++            pipeline.dataset(schema)
++            pipeline.dataset(schema)
++        disable_anon_tracker()
++
++    # should have exactly 1 event despite two dataset method calls
++    assert len(SENT_ITEMS) == 1
++    event = SENT_ITEMS[0]
++
++    assert event["event"] == "pipeline_access_dataset"
++    assert event["properties"]["event_category"] == "pipeline"
++    assert event["properties"]["event_name"] == "access_dataset"
++    assert event["properties"]["success"] == success
++    assert event["properties"]["destination_name"] == pipeline.destination.destination_name
++    assert event["properties"]["destination_type"] == pipeline.destination.destination_type
++    assert event["properties"]["dataset_name_hash"] == digest128(pipeline.dataset_name)
++    assert event["properties"]["default_schema_name_hash"] is None
++    requested_schema_name_hash = None
++    if isinstance(schema, Schema):
++        requested_schema_name_hash = digest128(schema.name)
++    elif isinstance(schema, str):
++        requested_schema_name_hash = digest128(schema)
++    assert event["properties"]["requested_schema_name_hash"] == requested_schema_name_hash
++
++
+ def test_cleanup(environment: DictStrStr) -> None:
+     # this must happen after all forked tests (problems with tests teardowns in other tests)
+     pass
+
+
+===== COMMIT 5442f207 =====
+
+
+commit 5442f2078
+Author: Alena Astrakhantseva
+Date: 2025-09-03
+
+    Release notes 1.15 (#3038)
+
+diff --git a/docs/website/docs/release-notes/1.15.md b/docs/website/docs/release-notes/1.15.md
+new file mode 100644
+index 000000000..875883d4b
+--- /dev/null
++++ b/docs/website/docs/release-notes/1.15.md
+@@ -0,0 +1,217 @@
++---
++title: "Release highlights: 1.15"
++description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
++keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
++---
++
++# Release highlights: 1.15
++
++
++## ⚠️ Breaking changes: `.gz` extensions now added to compressed files
++
++**PR: #2835**
++
++Starting with v1.15, all compressed files will include the `.gz` extension by default. This applies to:
++
++- Filesystem destinations
++- Internal working directories
++- Staging locations (feeding downstream destinations like Redshift, BigQuery)
++
++**Notes**
++
++- Does **not apply** to `.parquet` files
++- Existing filesystem destination will keep the old behavior (no `.gz`) for backward compatibility
++- Compressed files uploaded to staging destinations will now have the `.gz` extension, also if `dlt` is configured to keep data in stage.
++
++[More details → File Compression in Filesystem Destination](../dlt-ecosystem/destinations/filesystem#file-compression)
++
++---
++
++## Export schemas in DBML format
++
++**PR: #2929**
++
++You can now export your pipeline schema in **DBML format**, ready for visualization in DBML frontends.
++
++```py
++# Generate a string that can be rendered in a DBML frontend
++dbml_str = pipeline.default_schema.to_dbml()
++```
++
++This includes:
++
++- Data and dlt tables
++- Table/column metadata
++- User-defined/root-child/parent-child references
++- Grouping by resources
++- etc.
++
++![schema-diagram](https://storage.googleapis.com/dlt-blog-images/release-highlights/470492597-cc6882ec-d08a-46a0-b268-cda8a6c6bf70.png)
++
++---
++
++## REST API Client Enhancements
++
++### 1. `has_more` flag in paginators
++
++**PR: #2817**
++
++Some APIs provide a `has_more` boolean instead of `total` or `offset` limits.
++
++You can now configure paginators to use that flag.
++
++```py
++from dlt.sources.helpers.rest_client.paginators import OffsetPaginator, PageNumberPaginator
++
++# Paginator starts at offset=0, increments by `limit`
++# Stops automatically when response["has_more"] == False
++offset_paginator = OffsetPaginator(
++    offset=0,
++    limit=2,
++    has_more_path="has_more"   # JSONPath to the boolean flag
++)
++
++# Paginator starts at page=1, increments by page
++# Stops automatically when response["has_more"] == False
++pn_paginator = PageNumberPaginator(
++    page=1,
++    has_more_path="has_more"  # JSONPath to the boolean in response
++)
++```
++
++### 2. JSON body pagination support
++
++**PR: #2917**
++
++Pagination parameters can now be placed in the **request body** (e.g., for `POST` requests).
++
++```py
++from dlt.sources.helpers.rest_client.paginators import OffsetPaginator, PageNumberPaginator
++
++# We tell dlt to place pagination values INSIDE the request JSON body
++offset_paginator = OffsetPaginator(
++    offset=0,
++    limit=3,
++    offset_body_path="offset",     # put 'offset' in request.json["offset"]
++    limit_body_path="limit",       # put 'limit'  in request.json["limit"]
++)
++
++pn_paginator = PageNumberPaginator(
++    page=1,
++    page_body_path="page",           # put 'page'      in request.json["page"]
++)
++```
++
++---
++
++## Databricks + Unity Catalog enhancement
++
++**PR: #2674**
++
++New support for **comments, tags, and constraints** in Databricks Unity Catalog tables.
++
++- Add **table comments** and **tags**
++- Add **column comments** and **tags**
++- Apply **primary/foreign key constraints**
++
++```toml
++[destination.databricks]
++# Add PRIMARY KEY and FOREIGN KEY constraints to tables
++create_indexes = true
++```
++
++Use the adapter for column- and table-level hints:
++
++```py
++from dlt.destinations.adapters import databricks_adapter
++
++databricks_adapter(
++    my_resource,
++    table_comment="Event data",
++    table_tags=["pii", {"cost_center": "12345"}],
++    column_hints={
++        "user_id": {
++            "column_comment": "User ID",
++            "column_tags": ["pii"]
++        }
++    },
++)
++```
++
++---
++
++## SQLAlchemy destination: MSSQL + Trino support
++
++**PR: #2951**
++
++- **MSSQL** fully supported (including JSON fields)
++- **Trino** partially supported (with limitations: no merge/SCD2, JSON casted to string)
++- Fixes for ClickHouse temp tables and BigQuery numeric handling
++
++[Example of customizing a type mapper for Trino →](../dlt-ecosystem/destinations/sqlalchemy#adapting-destination-for-a-dialect)
++
++---
++
++## Delta Lake: control over streamed execution
++
++**PR: #2961**
++
++By default, dlt runs **Delta Lake upserts in *streamed mode***.
++
++- Streamed execution = the source table is read **row by row**, which **reduces memory pressure** and works well for large datasets.
++- But in streamed mode, **table statistics and pruning predicates are not used** — meaning Delta can’t skip irrelevant partitions efficiently.
++
++**New option: `deltalake_streamed_exec`**
++
++Now you can explicitly choose whether to run Delta merge operations in streamed mode or not.
++
++- **`true` (default):** safe for very large datasets, lower memory usage.
++- **`false`:** enables Delta to use table statistics and pruning (better performance when partitions and stats exist).
++
++```toml
++[destination.filesystem]
++deltalake_streamed_exec = false
++```
++
++---
++
++## Python 3.14 support
++
++**PR: #2789**
++
++Python `3.14` is currently in `beta4`. We now provide experimental support for Python `3.14` to make it easier for projects depending on dlt to prepare for the upgrade.
++
++---
++
++## Switched ConnectorX backend from `arrow2` to `arrow`
++
++**PR: #2933**
++
++ConnectorX dropped the `arrow2` backend in v0.4.2, which was dlt’s default.
++
++dlt now defaults to the `arrow` backend, with minor adjustments for behavioral differences, and relaxed ConnectorX version constraints.
++
++---
++
++## AI Command IDE integration: now works with all major IDEs (Cursor, Copilot, Windsurf, etc.)
++
++**PR: #2937**
++
++[The AI command](../reference/command-line-interface#dlt-ai) now supports all major IDEs, automatically creating the correct rule files for each AI editor/agent. This ensures seamless integration whether you’re using Cursor, Copilot, Windsurf, Claude, or other supported editors.
++
++---
++
++## Shout-out to new contributors
++
++Big thanks to our newest contributors:
++
++- [@bayees](https://github.com/bayees) — #2674
++- [@7amza79](https://github.com/7amza79) — #2783
++- [@michaelconan](https://github.com/michaelconan) — #2817
++- [@Giackgamba](https://github.com/Giackgamba) — #2917
++
++---
++
++**Full release notes**
++
++[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
+\ No newline at end of file
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index cf3db2262..c7143f55b 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -56,6 +56,7 @@ const sidebars = {
+       items: [
+         'release-notes/1.12.1',
+         'release-notes/1.13-1.14',
++        'release-notes/1.15'
+       ]
+     },
+     {
+
+
+===== COMMIT 9e42cbd6 =====
+
+
+commit 9e42cbd62
+Author: Jinso-o
+Date: 2025-09-01
+
+    Jinso o fix/cors playground (#2995)
+
+diff --git a/docs/notebooks/playground/playground.py b/docs/notebooks/playground/playground.py
+index a85a8b4f9..81f5f2e55 100644
+--- a/docs/notebooks/playground/playground.py
++++ b/docs/notebooks/playground/playground.py
+@@ -7,7 +7,6 @@ app = marimo.App()
+ @app.cell(hide_code=True)
+ async def initialize():
+     import sys
+-    import marimo as mo
+ 
+     # NOTE: this installs the dependencies for the notebook if run on pyodide
+     if sys.platform == "emscripten":
+@@ -28,24 +27,26 @@ def run():
+     import dlt
+     import requests
+ 
+-    @dlt.resource(table_name="users")
+-    def users():
+-        yield requests.get("https://jsonplaceholder.typicode.com/users").json()
++    @dlt.resource(name="customers")
++    def fetch_customers():
++        response = requests.get("https://jaffle-shop.dlthub.com/api/v1/customers?limit=100")
++        yield response.json()
+ 
+     pipeline = dlt.pipeline(
+-        pipeline_name="users_pipeline",
++        pipeline_name="customers_pipeline",
+         destination="duckdb",
+         dataset_name="raw_data",
+         dev_mode=True,
+     )
+-    print(pipeline.run(users()))
++    load_info = pipeline.run(fetch_customers())
++    print(load_info)
+     return (pipeline,)
+ 
+ 
+ @app.cell
+ def view(pipeline):
+-    # NOTE: This line displays the data of the users table in a marimo table
+-    pipeline.dataset().users.df()
++    # NOTE: This line displays the data of the customers table in a marimo table
++    pipeline.dataset().customers.df()
+     return
+ 
+ 
+@@ -53,13 +54,13 @@ def view(pipeline):
+ def connect(pipeline):
+     # NOTE: This line allows your data to be explored in the marimo datasources which is the third item from the top in the left sidebar
+     con = pipeline.dataset().ibis()
+-    return
++    return (con,)
+ 
+ 
+ @app.cell(hide_code=True)
+ def tests(pipeline):
+     # NOTE: this cell is only needed for testing this notebook on ci
+-    assert pipeline.dataset().users.df().shape[0] == 10
++    assert pipeline.dataset().customers.df().shape[0] == 100
+     return
+ 
+ 
+
+
+===== COMMIT 4af60c80 =====
+
+
+commit 4af60c80e
+Author: David Scharf
+Date: 2025-09-01
+
+    fix grammar on timezone specific docs sections (#3044)
+
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/configuration.md b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/configuration.md
+index 80a1d2950..ca344325f 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/configuration.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/configuration.md
+@@ -160,14 +160,12 @@ Incremental loading uses a cursor column (e.g., timestamp or auto-incrementing I
+ If your cursor column name contains special characters (e.g., `$`) you need to escape it when passing it to the `incremental` function. For example, if your cursor column is `example_$column`, you should pass it as `"'example_$column'"` or `'"example_$column"'` to the `incremental` function: `incremental("'example_$column'", initial_value=...)`.
+ :::
+ 
+-### Configure timezone aware and naive timestamp cursors
+-If your cursor is on timestamp/datetime column, make sure you set up your initial and end values correctly. You will avoid implicit
+-type conversions, invalid date time literals or column comparisons in database queries. Note that if implicit conversions may
+-result in data loss ie. if naive datetime has different local timezone on the machine where Python is executing vs. your dbms.
+-
+-* If your datetime columns is naive, use naive Python datetime. Note that `pendulum` datetime is tz-aware by default and standard `datetime` is naive.
+-* Use `full` reflection level or above to reflect `timezone` (awareness hint) on the datetime columns.
+-* read about the [timestamp handling](../../../general-usage/schema.md#handling-of-timestamp-and-time-zones) in `dlt`
++### Configure timezone-aware and naive timestamp cursors
++If your cursor is on a timestamp/datetime column, make sure you set up your initial and end values correctly. This will help you avoid implicit type conversions, invalid datetime literals, or column comparisons in database queries. Note that implicit conversions may result in data loss, for example if a naive datetime has a different local timezone on the machine where Python is executing versus your DBMS.
++
++* If your datetime column is naive, use naive Python datetime. Note that `pendulum` datetime is timezone-aware by default while standard `datetime` is naive.
++* Use `full` reflection level or above to reflect the `timezone` (awareness hint) on datetime columns.
++* Read about [timestamp handling](../../../general-usage/schema.md#handling-of-timestamp-and-time-zones) in `dlt`
+ 
+ 
+ ### Examples
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md
+index ccbf85628..39115af47 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md
+@@ -10,18 +10,18 @@ import Header from '../_source-info-header.md';
+ 
+ <Header/>
+ 
+-## Timezone aware and non-aware data types
++## Timezone-aware and Non-aware Data Types
+ 
+-### I see UTC datetime column in my destination, but my data source has naive datetime column
+-Use `full` or `full_with_precision` reflection level to get explicit `timezone` hint in reflected table schemas. Without that
+-hint, `dlt` will coerce all timestamps into tz-aware UTC ones.
++### I see a UTC datetime column in my destination, but my data source has a naive datetime column
++Use `full` or `full_with_precision` reflection level to get an explicit `timezone` hint in reflected table schemas. Without that
++hint, `dlt` will coerce all timestamps into timezone-aware UTC ones.
+ 
+-### I have incremental cursor on datetime column and I see query errors
+-Queries used to query data in the `sql_database` are created from `Incremental` instance attached to table resource. [Initial end and last values
+-must match tz-awareness of the cursor column](setup.md) because they will be used as parameters to the `WHERE` clause. 
++### I have an incremental cursor on a datetime column and I see query errors
++Queries used to query data in the `sql_database` are created from an `Incremental` instance attached to the table resource. [Initial end and last values
++must match timezone-awareness of the cursor column](setup.md) because they will be used as parameters in the `WHERE` clause.
+ 
+-In rare cases where last value is already stored in pipeline state and has wrong tz-awareness you may not be able to recover your pipeline automatically. You may 
+-modify local pipeline state (after syncing with destination) to add/remove timezone.
++In rare cases where the last value is already stored in the pipeline state and has incorrect timezone-awareness, you may not be able to recover your pipeline automatically. You can
++modify the local pipeline state (after syncing with destination) to add/remove timezone information.
+ 
+ ## Troubleshooting connection
+ 
+diff --git a/docs/website/docs/general-usage/schema.md b/docs/website/docs/general-usage/schema.md
+index c86d3f7cd..be3a92d36 100644
+--- a/docs/website/docs/general-usage/schema.md
++++ b/docs/website/docs/general-usage/schema.md
+@@ -197,7 +197,7 @@ Now go ahead and try to add a new record where `id` is a float number; you shoul
+ 
+ 
+ ### Handling of timestamp and time zones
+-By default `dlt` normalizes timestamps (tz-aware an naive) into time zone aware type in UTC timezone. Since `1.16.0` it fully honors `timezone` boolean hint if set
++By default, `dlt` normalizes timestamps (tz-aware and naive) into time zone aware types in UTC timezone. Since `1.16.0`, it fully honors the `timezone` boolean hint if set 
+ explicitly on a column or by a source/resource. Normalizers do not infer this hint from data. The same rules apply for tabular data (arrow/pandas) and Python objects:
+ 
+ | input timestamp | `timezone` hint | normalized timestamp  |
+@@ -212,12 +212,12 @@ explicitly on a column or by a source/resource. Normalizers do not infer this hi
+ naive timestamps will **always be considered as UTC**, system timezone settings are ignored by `dlt`
+ :::
+ 
+-Ultimately destination will interpret the timestamp values. Some destinations:
+-- do not support naive timestamps (ie. BigQuery) and will interpret them as naive UTC by attaching UTC timezone
+-- do not support tz-aware timestamps (ie. Dremio, Athena) and will strip timezones from timestamps being loaded
++Ultimately, the destination will interpret the timestamp values. Some destinations:
++- do not support naive timestamps (i.e. BigQuery) and will interpret them as naive UTC by attaching UTC timezone
++- do not support tz-aware timestamps (i.e. Dremio, Athena) and will strip timezones from timestamps being loaded
+ - do not store timezone at all and all timestamps are converted to UTC
+-- store timezone as column level property and internally convert timestamps to UTC. (ie. postgres)
+-- store timezone and offset (ie. MSSQL). however we could not find any destination that can read back the original timezones
++- store timezone as column level property and internally convert timestamps to UTC (i.e. postgres)
++- store timezone and offset (i.e. MSSQL). However, we could not find any destination that can read back the original timezones
+ 
+ `dlt` sets sessions to UTC timezone to minimize chances of erroneous conversion.
+ 
+@@ -226,20 +226,20 @@ The precision and scale are interpreted by the particular destination and are va
+ 
+ The precision for **bigint** is mapped to available integer types, i.e., TINYINT, INT, BIGINT. The default is 64 bits (8 bytes) precision (BIGINT).
+ 
+-Selected destinations honor precision hint on **timestamp**. Precisions is numeric value in range of 0 (seconds) to 9 (nanoseconds) and set the fractional
+-number of seconds stored in a column. The default value is 6 (microseconds) which is Python `datetime` precision. `postgres`, `duckdb`, `snowflake`, `synapse` and `mssql` allow to set precision. Additionally `duckdb` and `filesystem` (via. parquet) allow for nanosecond precision if:
++Selected destinations honor precision hint on **timestamp**. Precision is a numeric value in range of 0 (seconds) to 9 (nanoseconds) and sets the fractional
++number of seconds stored in a column. The default value is 6 (microseconds) which is Python `datetime` precision. `postgres`, `duckdb`, `snowflake`, `synapse` and `mssql` allow setting precision. Additionally, `duckdb` and `filesystem` (via parquet) allow for nanosecond precision if:
+ * you configure [parquet version](../dlt-ecosystem/file-formats/parquet.md#writer-settings) to **2.6**
+ * you yield tabular data (arrow tables/pandas). `dlt` coerces all Python datetime objects into `pendulum` with microsecond precision.
+ 
+ ### Handling nulls
+ In general, destinations are responsible for NULL enforcement. `dlt` does not verify nullability of data in arrow tables and Python objects. Note that:
+ 
+-* there's an exception to that rule if Python object (`dict`) contains explicit `None` for non-nullable key. This check will be eliminated. Note that if value
++* there's an exception to that rule if a Python object (`dict`) contains explicit `None` for a non-nullable key. This check will be eliminated. Note that if a value
+ for a key is not present at all, nullability check is not done
+ * nullability is checked by Arrow when saving parquet files. This is a new behavior and `dlt` normalizes it for older arrow versions.
+ 
+ ### Structured types
+-`dlt` has experimental support for structured types that currently piggyback on `json` data type and may be set only by yielding arrow tables. `dlt`` does not
++`dlt` has experimental support for structured types that currently piggyback on `json` data type and may be set only by yielding arrow tables. `dlt` does not
+ evolve nested types and will not migrate destination schemas to match. Nested types are enabled for `filesystem`, `iceberg`, `delta` and `lancedb` destinations.
+ 
+ 
+
+
+===== COMMIT 0d90a83b =====
+
+
+commit 0d90a83b8
+Author: Thierry Jean
+Date: 2025-08-29
+
+    repo: add `ruff check` for linting (#2967)
+
+diff --git a/Makefile b/Makefile
+index 60951737f..c4c138078 100644
+--- a/Makefile
++++ b/Makefile
+@@ -54,11 +54,11 @@ lint:
+ 	# NOTE: we need to make sure docstring_parser_fork is the only version of docstring_parser installed
+ 	uv pip uninstall docstring_parser
+ 	uv pip install docstring_parser_fork --reinstall
++	uv run ruff check
+ 	# NOTE: we exclude all D lint errors (docstrings)
+ 	uv run flake8 --extend-ignore=D --max-line-length=200 dlt
+ 	uv run flake8 --extend-ignore=D --max-line-length=200 tests --exclude tests/reflection/module_cases,tests/common/reflection/cases/modules/
+ 	uv run black dlt docs tests --check --diff --color --extend-exclude=".*syntax_error.py"
+-	# uv run isort ./ --diff
+ 	$(MAKE) lint-security
+ 	$(MAKE) lint-docstrings
+ 
+@@ -72,12 +72,14 @@ lint-and-test-snippets: lint-snippets
+ 	# TODO: re-enable transformation snippets tests
+ 	uv pip install docstring_parser_fork --reinstall
+ 	uv run mypy --config-file mypy.ini docs/website docs/tools --exclude docs/tools/lint_setup --exclude docs/website/docs_processed --exclude docs/website/versioned_docs/ --exclude docs/website/docs/general-usage/transformations/transformation-snippets.py
++	uv run ruff check
+ 	uv run flake8 --max-line-length=200 docs/website docs/tools --exclude docs/website/.dlt-repo --exclude docs/website/docs/general-usage/transformations/transformation-snippets.py
+ 	cd docs/website/docs && uv run pytest --ignore=node_modules --ignore general-usage/transformations/transformation-snippets.py
+ 
+ lint-and-test-examples:
+ 	uv pip install docstring_parser_fork --reinstall
+ 	cd docs/tools && uv run python prepare_examples_tests.py
++	uv run ruff check
+ 	uv run flake8 --max-line-length=200 docs/examples
+ 	uv run mypy --config-file mypy.ini docs/examples
+ 	cd docs/examples && uv run pytest
+diff --git a/dlt/helpers/dashboard/dlt_dashboard.py b/dlt/helpers/dashboard/dlt_dashboard.py
+index fe9d47431..54cd179f0 100644
+--- a/dlt/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/helpers/dashboard/dlt_dashboard.py
+@@ -852,7 +852,7 @@ def ui_controls(mo_cli_arg_with_test_identifiers: bool):
+     """
+ 
+     dlt_refresh_button: mo.ui.run_button = mo.ui.run_button(
+-        label=f"<small>Refresh</small>",
++        label="<small>Refresh</small>",
+     )
+ 
+     # page switches
+diff --git a/pyproject.toml b/pyproject.toml
+index 83b12e073..647cb6bda 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -343,6 +343,46 @@ include = [
+ requires = ["hatchling"]
+ build-backend = "hatchling.build"
+ 
++
++[tool.ruff]
++line-length = 100
++target-version = "py39"
++src = ["dlt"]
++include = [
++    "dlt/**/*.py",
++    "tests/**/*.py",
++    "docs/**/*.py",
++]
++exclude = [
++    "docs/website/.dlt-repo",
++    "tests/reflection/module_cases/syntax_error.py",
++    "docs/website/docs/general-usage/transformations/transformation-snippets.py",
++]
++
++[tool.ruff.lint]
++preview = true
++ignore = [
++    # from tox.ini
++    "E1",
++    "E2",
++    "E3",
++    "E4",
++    "F401",
++    "W391",
++    "W292",
++    "E501",
++    # additional ignores to appease ruff
++    "E713",
++    "E721",
++    "E731",
++    "E741",
++    "E999",
++    "F601",
++    "F821",
++    "F841",
++    "F811",
++]
++
+ [tool.black]
+ line-length = 100
+ preview = true
+
+
+===== COMMIT b29f33c5 =====
+
+
+commit b29f33c5e
+Author: Thierry Jean
+Date: 2025-08-27
+
+    feat: dlt widgets for marimo (#3021)
+
+diff --git a/dlt/helpers/marimo/README.md b/dlt/helpers/marimo/README.md
+new file mode 100644
+index 000000000..d5a4ea398
+--- /dev/null
++++ b/dlt/helpers/marimo/README.md
+@@ -0,0 +1,69 @@
++# How to add a marimo widget
++
++This guide shows how to add the hypothetical `pipeline_browser` widget.
++
++## 1. Create a new widget notebook under `dlt/helpers/marimo/_widgets`
++
++A marimo widget **is** a marimo notebook. We'll call this the *widget notebook*. 
++Create the marimo notebook with: `marimo edit dlt/helpers/marimo/_widgets/_pipeline_browser.py`.
++The widget notebook file name is prefixed with `_` to avoid name collisions.
++
++## 2. edit your widget notebook
++
++Edit the `_pipeline_browser.py` notebook until you're satisfied. Use a [setup cell](https://docs.marimo.io/guides/reusing_functions/#1-create-a-setup-cell) for your import and constants. Set a unique name to be able to [run cells directly](https://docs.marimo.io/api/cell/) in a unit test.
++
++
++## 3. "register" the widget
++
++To make the widget available, you need to modify `dlt/helpers/marimo/_widgets/__init__.py` and `dlt/helpers/marimo/__init__.py`
++
++```python
++# `dlt/helpers/marimo/_widgets/__init__.py`
++# import the `app` variable from the notebook file
++# the alias for `app` will be the widget name imported by users
++from dlt.helpers.marimo._widgets._pipeline_browser import app as pipeline_browser
++```
++
++```python
++# `dlt/helpers/marimo/__init__.py`
++# import the `pipeline_browser` (the aliased `app` variable from the notebook)
++# and add it to the `__all__` public interface
++from dlt.helpers.marimo._widgets import render, pipeline_browser
++
++__all__ = (
++    "render",
++    "pipeline_browser",
++)
++```
++
++## 4. unit tests
++
++Add tests for cells with complex operations. You can retrieve a cell by name and give it inputs.
++
++Source code for the widget
++```python
++# dlt/helpers/marimo/_widgets/_pipeline_browser.py
++@app.cell
++def pipeline_selector(base_path):
++    pipelines = [p.name for p in pathlib.Path(base_path).expanduser().iterdir()]
++    select_pipeline = mo.ui.dropdown(pipelines, value="pokemon")
++    select_pipeline
++    return (select_pipeline,)
++```
++
++Unit test
++```python
++# tests/helpers/marimo/test_pipeline_browser.py
++# import the named cell directly from the widget notebook
++from dlt.helpers.marimo._widgets._pipeline_browser import pipeline_selector
++
++def test_pipeline_selector():
++    base_path = ...
++
++    # output is the HTML to be displayed
++    # definitions is a dictionary of values returned
++    output, definitions = pipeline_selector.run(base_path=base_path)
++
++    assert definitions["select_pipeline"] == ... 
++```
++
+diff --git a/dlt/helpers/marimo/__init__.py b/dlt/helpers/marimo/__init__.py
+new file mode 100644
+index 000000000..64781f44a
+--- /dev/null
++++ b/dlt/helpers/marimo/__init__.py
+@@ -0,0 +1,8 @@
++from dlt.helpers.marimo._widgets import render, load_package_viewer, schema_viewer
++
++
++__all__ = (
++    "render",
++    "load_package_viewer",
++    "schema_viewer",
++)
+diff --git a/dlt/helpers/marimo/_widgets/__init__.py b/dlt/helpers/marimo/_widgets/__init__.py
+new file mode 100644
+index 000000000..cd759b197
+--- /dev/null
++++ b/dlt/helpers/marimo/_widgets/__init__.py
+@@ -0,0 +1,10 @@
++import marimo as mo
++
++# when adding widget, import the `app` variable and rename it to the widget name
++from dlt.helpers.marimo._widgets._load_package_viewer import app as load_package_viewer
++from dlt.helpers.marimo._widgets._schema_viewer import app as schema_viewer
++
++
++async def render(widget: mo.App) -> mo.Html:
++    result = await widget.embed()
++    return result.output
+diff --git a/dlt/helpers/marimo/_widgets/_load_package_viewer.py b/dlt/helpers/marimo/_widgets/_load_package_viewer.py
+new file mode 100644
+index 000000000..5c8140cc9
+--- /dev/null
++++ b/dlt/helpers/marimo/_widgets/_load_package_viewer.py
+@@ -0,0 +1,65 @@
++import marimo
++
++__generated_with = "0.14.17"
++app = marimo.App(width="medium")
++
++with app.setup:
++    import marimo as mo
++    from dlt.common.storages import FileStorage
++    from dlt.common.pipeline import get_dlt_pipelines_dir
++    from dlt.helpers.marimo.utils import _load_file
++
++
++@app.cell
++def _():
++    storage = FileStorage(get_dlt_pipelines_dir())
++
++    try:
++        pipelines = storage.list_folder_dirs(".", to_root=False)
++    except Exception:
++        pipelines = []
++
++    pipelines_options = {p: storage.storage_path + "/" + p for p in sorted(pipelines)}
++    return (pipelines_options,)
++
++
++@app.cell
++def _(pipelines_options):
++    first_key = next(iter(pipelines_options.keys()))
++    select_pipeline = mo.ui.dropdown(
++        pipelines_options,
++        value=first_key,
++        label="Pipeline",
++    )
++    select_pipeline
++    return (select_pipeline,)
++
++
++@app.cell
++def _(select_pipeline):
++    # TODO set `filetypes` args to match implementations
++    # in `file_loader()`
++    pipeline_details = mo.ui.file_browser(
++        select_pipeline.value,
++        selection_mode="file",
++        multiple=False,
++        restrict_navigation=True,
++        label="Select file to load",
++    )
++    pipeline_details
++    return (pipeline_details,)
++
++
++@app.cell
++def _(pipeline_details):
++    if pipeline_details.value:
++        obj = _load_file(pipeline_details.value[0].path)
++    else:
++        obj = None
++
++    obj
++    return
++
++
++if __name__ == "__main__":
++    app.run()
+diff --git a/dlt/helpers/marimo/_widgets/_schema_viewer.py b/dlt/helpers/marimo/_widgets/_schema_viewer.py
+new file mode 100644
+index 000000000..db986478f
+--- /dev/null
++++ b/dlt/helpers/marimo/_widgets/_schema_viewer.py
+@@ -0,0 +1,213 @@
++import marimo
++
++__generated_with = "0.14.17"
++app = marimo.App(width="medium")
++
++with app.setup:
++    import marimo as mo
++
++    import dlt
++    from dlt.common.storages import FileStorage
++    from dlt.common.pipeline import get_dlt_pipelines_dir
++
++
++@app.cell
++def _():
++    _storage = FileStorage(get_dlt_pipelines_dir())
++
++    try:
++        _pipelines = _storage.list_folder_dirs(".", to_root=False)
++    except Exception:
++        _pipelines = []
++
++    _pipelines = sorted(_pipelines)
++
++    select_pipeline = mo.ui.dropdown(
++        _pipelines,
++        value=_pipelines[0],
++        label="Pipeline",
++    )
++    select_pipeline
++    return (select_pipeline,)
++
++
++@app.function
++def pipeline_details(pipeline: dlt.Pipeline) -> list[dict]:
++    """
++    Get the details of a pipeline.
++    """
++    try:
++        credentials = str(pipeline.dataset().destination_client.config.credentials)
++    except Exception:
++        credentials = "Could not resolve credentials"
++
++    details_dict = {
++        "Pipeline name": pipeline.pipeline_name,
++        "Destination": (
++            pipeline.destination.destination_description
++            if pipeline.destination
++            else "No destination set"
++        ),
++        "Credentials": credentials,
++        "Dataset name": pipeline.dataset_name,
++        "Schema name": (
++            pipeline.default_schema_name
++            if pipeline.default_schema_name
++            else "No default schema set"
++        ),
++        "Pipeline working dir": pipeline.working_dir,
++    }
++
++    return [{"Key": k, "Value": v} for k, v in details_dict.items()]
++
++
++@app.cell
++def _():
++    from typing import Any, cast
++    from itertools import chain
++
++    from dlt.common.utils import without_none
++
++    def _align_dict_keys(items: list[dict]) -> list[dict]:
++        """
++        Makes sure all dicts have the same keys, sets "-" as default. Makes for nicer rendering in marimo table
++        """
++        items = cast(list[dict], [without_none(i) for i in items])
++        all_keys = set(chain.from_iterable(i.keys() for i in items))
++        for i in items:
++            i.update({key: "-" for key in all_keys if key not in i})
++        return items
++
++    def style_cell(row_id: str, name: str, __: Any) -> dict[str, str]:
++        """
++        Style a cell in a table.
++
++        Args:
++            row_id (str): The id of the row.
++            name (str): The name of the column.
++            __ (Any): The value of the cell.
++
++        Returns:
++            Dict[str, str]: The css style of the cell.
++        """
++        style = {}  # "background-color": "white" if (int(row_id) % 2 == 0) else "#f4f4f9"}
++        if name.lower() == "name":
++            style["font-weight"] = "bold"
++        return style
++
++    @mo.cache
++    def create_table_list(
++        pipeline: dlt.Pipeline,
++        show_internals: bool = False,
++        show_child_tables: bool = True,
++    ) -> list[dict[str, str]]:
++        """Create a list of tables for the pipeline.
++
++        Args:
++            pipeline_name (str): The name of the pipeline to create the table list for.
++        """
++        FILL_VALUE = "-"
++
++        # get tables and filter as needed
++        tables = list(pipeline.default_schema.tables.values())
++        if not show_child_tables:
++            tables = [t for t in tables if t.get("parent") is None]
++
++        table_list = []
++        keys = ("name", "parent", "resource", "write_disposition", "description")
++        for table in tables:
++            info = {key.capitalize().replace("_", " "): table.get(key, FILL_VALUE) for key in keys}
++            table_list.append(info)
++
++        table_list.sort(key=lambda x: str(x["Name"]))
++        if not show_internals:
++            table_list = [t for t in table_list if not str(t["Name"]).lower().startswith("_dlt")]
++
++        return _align_dict_keys(table_list)
++
++    return create_table_list, style_cell
++
++
++@app.cell
++def _(dlt_schema_table_list, pipeline):
++    schema_dict = pipeline.default_schema.to_dict().copy()
++    schema_dict["tables"] = {
++        col_name: col
++        for col_name, col in schema_dict["tables"].items()
++        if col_name in [table["Name"].lower() for table in dlt_schema_table_list.value]
++    }
++
++    dlt.Schema.from_dict(schema_dict)
++    return
++
++
++@app.cell
++def _(create_table_list, pipeline, style_cell):
++    table_list = create_table_list(
++        pipeline,
++        show_internals=True,
++        show_child_tables=True,
++    )
++
++    dlt_schema_table_list = mo.ui.table(
++        table_list,  # type: ignore[arg-type]
++        style_cell=style_cell,
++        initial_selection=list(range(0, len(table_list))),
++    )
++    dlt_schema_table_list
++    return (dlt_schema_table_list,)
++
++
++@app.cell
++def _(select_pipeline):
++    pipeline = dlt.attach(select_pipeline.value)
++    return (pipeline,)
++
++
++@app.cell
++def _(pipeline):
++    raw_schema = mo.lazy(
++        mo.json(pipeline.default_schema.to_dict(), label=pipeline.default_schema_name)
++    )
++
++    raw_schema_yaml = mo.lazy(
++        mo.ui.code_editor(
++            pipeline.default_schema.to_pretty_yaml(),
++            language="yaml",
++        )
++    )
++
++    raw_schema_json = mo.lazy(
++        mo.ui.code_editor(
++            pipeline.default_schema.to_pretty_json(),
++            language="json",
++        )
++    )
++
++    raw_schema_dbml = mo.lazy(
++        mo.ui.code_editor(
++            value=pipeline.default_schema.to_dbml(),
++        )
++    )
++
++    raw_schema_dot = mo.lazy(
++        mo.ui.code_editor(
++            value=pipeline.default_schema.to_dot(),
++        )
++    )
++
++    raw_schema_format_tabs = mo.ui.tabs(
++        {
++            "dict": raw_schema,
++            "JSON": raw_schema_json,
++            "YAML": raw_schema_yaml,
++            "DBML": raw_schema_dbml,
++            "DOT": raw_schema_dot,
++        },
++    )
++    raw_schema_format_tabs
++    return
++
++
++if __name__ == "__main__":
++    app.run()
+diff --git a/dlt/helpers/marimo/utils.py b/dlt/helpers/marimo/utils.py
+new file mode 100644
+index 000000000..9a999fa53
+--- /dev/null
++++ b/dlt/helpers/marimo/utils.py
+@@ -0,0 +1,116 @@
++from __future__ import annotations
++
++import pathlib
++import textwrap
++from typing import TYPE_CHECKING, Any
++
++from dlt.common.storages import FileStorage
++from dlt.common.pipeline import get_dlt_pipelines_dir
++
++if TYPE_CHECKING:
++    import pyarrow
++
++
++def list_pipelines(pipelines_dir: str = None) -> list[str]:
++    pipelines_dir = pipelines_dir or get_dlt_pipelines_dir()
++    storage = FileStorage(pipelines_dir)
++
++    try:
++        pipelines = storage.list_folder_dirs(".", to_root=False)
++    except Exception:
++        pipelines = []
++
++    return pipelines
++
++
++def _load_pickle(file_path: pathlib.Path) -> Any:
++    import pickle
++
++    return pickle.loads(file_path.read_bytes())
++
++
++def _load_json(file_path: pathlib.Path) -> Any:
++    from dlt.common import json
++
++    return json.loads(file_path.read_text())
++
++
++def _load_jsonl(file_path: pathlib.Path) -> list[Any]:
++    from dlt.common import json
++
++    with file_path.open("r") as f:
++        records = [json.loads(line.strip("\n")) for line in f.readlines()]
++    return records
++
++
++def _load_gzip(file_path: pathlib.Path) -> Any:
++    return FileStorage.open_zipsafe_ro(str(file_path)).read()
++
++
++def _load_parquet(file_path: pathlib.Path) -> pyarrow.Table:
++    import pyarrow.parquet
++
++    return pyarrow.parquet.read_table(file_path)
++
++
++def _load_csv(file_path: pathlib.Path) -> pyarrow.Table:
++    import pyarrow.csv
++
++    return pyarrow.csv.read_csv(file_path)
++
++
++def _load_insert_values_gzip(file_path: pathlib.Path) -> pyarrow.Table:
++    import sqlglot
++    import duckdb
++
++    table_name = file_path.name.partition(".")[0]
++
++    insert_statement = _load_gzip(file_path)
++    # Remove the `E` prefix used by postgres-style quote escapes
++    insert_statement = insert_statement.replace("E'", r"'")
++    # For some reason, the INSERT statement is missing the table name
++    # we can get this info from the file name
++    insert_statement = insert_statement.replace("{}", f"{table_name} ")
++    insert_expr = sqlglot.parse(insert_statement)[0]
++
++    query = textwrap.dedent(f"""\
++        CREATE TABLE {table_name} AS
++        FROM ({insert_expr.expression.sql()})
++        AS {insert_expr.this.sql()}
++        """)
++
++    con = duckdb.connect(":memory:")
++    con.execute(query)
++    arrow_table = con.execute(f"FROM {table_name}").arrow()
++    con.close()  # release the memory
++    return arrow_table
++
++
++def _load_raw_text(file_path: pathlib.Path) -> str:
++    return file_path.read_text()
++
++
++def _load_raw_bytes(file_path: pathlib.Path) -> bytes:
++    return file_path.read_bytes()
++
++
++def _load_file(file_path: pathlib.Path) -> Any:
++    try:
++        if file_path.suffix == ".pickle":
++            return _load_pickle(file_path)
++        elif file_path.suffix == ".json":
++            return _load_json(file_path)
++        elif file_path.suffix == ".jsonl":
++            return _load_jsonl(file_path)
++        elif ".insert_values" in file_path.suffixes and file_path.suffix in (".gzip", ".gz"):
++            return _load_insert_values_gzip(file_path)
++        elif file_path.suffix in (".gzip", ".gz"):
++            return _load_gzip(file_path)
++        elif file_path.suffix == ".parquet":
++            return _load_parquet(file_path)
++        elif file_path.suffix == ".csv":
++            return _load_csv(file_path)
++        else:
++            return _load_raw_text(file_path)
++    except Exception:
++        return _load_raw_bytes(file_path)
+diff --git a/docs/tools/check_embedded_snippets.py b/docs/tools/check_embedded_snippets.py
+index 344f5dd38..9a7ba1c64 100644
+--- a/docs/tools/check_embedded_snippets.py
++++ b/docs/tools/check_embedded_snippets.py
+@@ -223,8 +223,11 @@ def lint_snippets(snippets: List[Snippet], verbose: bool) -> None:
+     """
+     fmt.secho(fmt.bold("Linting Python snippets"))
+ 
++    # TODO replace this by the repo's main formatting and linting
+     prepare_for_linting(snippets)
+-    result = subprocess.run(["ruff", "check", LINT_FOLDER], capture_output=True, text=True)
++    result = subprocess.run(
++        ["ruff", "check", LINT_FOLDER, "--extend-ignore", "F704"], capture_output=True, text=True
++    )
+ 
+     if "error" in result.stdout.lower():
+         fmt.echo(result.stdout.strip())
+@@ -242,7 +245,9 @@ def typecheck_snippets(snippets: List[Snippet], verbose: bool) -> None:
+ 
+     prepare_for_linting(snippets)
+     result = subprocess.run(
+-        ["mypy", LINT_FOLDER, "--check-untyped-defs"], capture_output=True, text=True
++        ["mypy", LINT_FOLDER, "--exclude", ".*/dataset-access/marimo", "--check-untyped-defs"],
++        capture_output=True,
++        text=True,
+     )
+ 
+     if "no issues found" not in result.stdout.lower():
+diff --git a/docs/website/docs/general-usage/dataset-access/marimo.md b/docs/website/docs/general-usage/dataset-access/marimo.md
+index 39078920b..eff37ca73 100644
+--- a/docs/website/docs/general-usage/dataset-access/marimo.md
++++ b/docs/website/docs/general-usage/dataset-access/marimo.md
+@@ -36,6 +36,24 @@ Here's a screenshot of the interface you should see:
+ 
+ ## Features
+ 
++### Use custom dlt widgets
++
++Inside your marimo notebook, you can use widgets built and maintained by the dlt team.
++
++Simply import them from `dlt.helpers.marimo` and pass them to the `render()` function. Note that `render()` is asynchronous and must be awaited with `await`.
++
++```py
++#%% cell 1
++import marimo as mo
++from dlt.helpers.marimo import render, load_package_viewer
++
++#%% cell 2
++await render(load_package_viewer)
++```
++
++![Example marimo widget](https://storage.googleapis.com/dlt-blog-images/marimo-widget-screenshot.png)
++
++
+ ### View dataset tables and columns
+ 
+ After loading data with dlt, you can access it via the [dataset interface](./dataset.md), including a [native ibis connection](./ibis-backend.md).
+diff --git a/mypy.ini b/mypy.ini
+index ecfaeec35..267914837 100644
+--- a/mypy.ini
++++ b/mypy.ini
+@@ -11,7 +11,7 @@ namespace_packages=true
+ warn_unused_ignores=true
+ show_error_codes=true
+ #exclude=reflection/module_cases/*
+-exclude=docs/examples/archive/*|tests/reflection/module_cases/*|tests/common/reflection/cases/modules/*
++exclude=docs/examples/archive/*|tests/reflection/module_cases/*|tests/common/reflection/cases/modules/*|dlt/helpers/marimo/_widgets/*
+ 
+ [mypy-tests.*]
+ disallow_untyped_defs=false
+diff --git a/tests/helpers/marimo_tests/__init__.py b/tests/helpers/marimo_tests/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/helpers/marimo_tests/test_load_package_viewer.py b/tests/helpers/marimo_tests/test_load_package_viewer.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/helpers/marimo_tests/test_utils.py b/tests/helpers/marimo_tests/test_utils.py
+new file mode 100644
+index 000000000..ccb0dd646
+--- /dev/null
++++ b/tests/helpers/marimo_tests/test_utils.py
+@@ -0,0 +1,126 @@
++import pickle
++import json
++import pathlib
++import gzip
++import unittest.mock
++
++import pyarrow
++import pyarrow.parquet
++import pyarrow.csv
++import pytest
++
++import dlt.helpers.marimo.utils as marimo_utils
++
++
++def test_load_pickle(tmp_path):
++    file_path = tmp_path / "file.pickle"
++    obj = ("foo", "bar")
++    pickle.dump(obj, file_path.open("wb"))
++
++    loaded_obj = marimo_utils._load_pickle(file_path)
++
++    assert loaded_obj == obj
++
++
++def test_load_json(tmp_path):
++    file_path = tmp_path / "file.json"
++    obj = {"foo": "bar"}
++    json.dump(obj, file_path.open("w"))
++
++    loaded_obj = marimo_utils._load_json(file_path)
++
++    assert loaded_obj == obj
++
++
++def test_load_jsonl(tmp_path):
++    file_path = tmp_path / "file.jsonl"
++    obj = [{"foo": "bar"}, {"foo": "baz"}]
++    with file_path.open("w") as f:
++        for record in obj:
++            f.write(json.dumps(record) + "\n")
++
++    loaded_obj = marimo_utils._load_jsonl(file_path)
++
++    assert loaded_obj == obj
++
++
++def test_load_parquet(tmp_path):
++    file_path = tmp_path / "file.parquet"
++    obj = pyarrow.table(
++        {"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"], "score": [85.0, 90.5, 88.0]}
++    )
++    pyarrow.parquet.write_table(obj, file_path)
++
++    loaded_obj = marimo_utils._load_parquet(file_path)
++
++    assert loaded_obj == obj
++
++
++def test_load_csv(tmp_path):
++    file_path = tmp_path / "file.csv"
++    obj = pyarrow.table(
++        {"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"], "score": [85.0, 90.5, 88.0]}
++    )
++    pyarrow.csv.write_csv(obj, file_path)
++
++    loaded_obj = marimo_utils._load_csv(file_path)
++
++    assert loaded_obj == obj
++
++
++def test_load_gzip(tmp_path):
++    file_path = tmp_path / "file.gzip"
++    obj = "foobar"
++    with gzip.open(file_path, "w") as f:
++        f.write(obj.encode())
++
++    loaded_obj = marimo_utils._load_gzip(file_path)
++
++    assert loaded_obj == obj
++
++
++def test_load_inser_values_gzip(tmp_path):
++    file_path = tmp_path / "file.gzip"
++    obj = r"""
++INSERT INTO {}("sku","name","type")
++VALUES
++(E'JAF-001',E'nutellaphone who dis?',E'jaffle',),
++(E'JAF-002',E'doctor stew',E'jaffle'),
++"""
++    expected_obj = pyarrow.table(
++        {
++            "sku": ["JAF-001", "JAF-002"],
++            "name": ["nutellaphone who dis?", "doctor stew"],
++            "type": ["jaffle", "jaffle"],
++        }
++    )
++    with gzip.open(file_path, "w") as f:
++        f.write(obj.encode())
++
++    loaded_obj = marimo_utils._load_insert_values_gzip(file_path)
++
++    assert loaded_obj == expected_obj
++
++
++@pytest.mark.parametrize(
++    ("file_name", "expected_triggered_fn"),
++    [
++        ("file.pickle", "_load_pickle"),
++        ("file.json", "_load_json"),
++        ("file.jsonl", "_load_jsonl"),
++        ("file.gzip", "_load_gzip"),
++        ("file.gz", "_load_gzip"),
++        ("file.insert_values.gzip", "_load_insert_values_gzip"),
++        ("file.insert_values.gz", "_load_insert_values_gzip"),
++        ("file.parquet", "_load_parquet"),
++        ("file.csv", "_load_csv"),
++        ("file.sql", "_load_raw_text"),
++        ("file", "_load_raw_text"),
++    ],
++)
++def test_load_file_dispatch(file_name: str, expected_triggered_fn: str):
++    with unittest.mock.patch(f"dlt.helpers.marimo.utils.{expected_triggered_fn}") as mock_fn:
++        SENTINEL = object()
++        mock_fn.return_value = SENTINEL
++
++        assert marimo_utils._load_file(pathlib.Path(file_name)) is SENTINEL
+
+
+===== COMMIT b7c8eee2 =====
+
+
+commit b7c8eee20
+Author: David Scharf
+Date: 2025-08-27
+
+    Small dashboard fixes (#3036)
+
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 13b2be206..3d04b85ec 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -42,6 +42,11 @@ jobs:
+     if: needs.get_docs_changes.outputs.changes_outside_docs == 'true'
+     uses: ./.github/workflows/test_common.yml
+ 
++  test_dashboard:
++    name: run dashboard tests
++    needs: [lint, get_docs_changes]
++    uses: ./.github/workflows/test_tools_dashboard.yml
++
+   #
+   # Destination and Sources local tests, do not provide secrets
+   # Other tests that do not require remote connections
+diff --git a/.github/workflows/test_common.yml b/.github/workflows/test_common.yml
+index bf62b5ca8..6e66cfdfa 100644
+--- a/.github/workflows/test_common.yml
++++ b/.github/workflows/test_common.yml
+@@ -43,9 +43,9 @@ jobs:
+             python-version: "3.13"
+             shell: bash
+ 
+-          - os: ubuntu-latest
+-            python-version: "3.14.0-beta.4"
+-            shell: bash
++          # - os: ubuntu-latest
++          #   python-version: "3.14.0-beta.4"
++          #   shell: bash
+ 
+           # linux test with minimal dependencies
+           - os: ubuntu-latest
+@@ -133,29 +133,6 @@ jobs:
+         run: |
+           pytest tests/sources/sql_database
+         if: matrix.python-version != '3.14.0-beta.4'
+-
+-      # test pipeline dashboard app, does not work with python 3.13
+-      - name: Install dlt with duckdb and dashboard
+-        # note: this also tests the workspace extra installation
+-        run: uv sync ${{ matrix.uv_sync_args }} --extra duckdb --extra workspace --group sentry-sdk --group pipeline --group sources --group dashboard-tests
+-        if: matrix.python-version != '3.14.0-beta.4'
+-
+-      - name: Install playwright
+-        run: playwright install
+-        if: matrix.python-version != '3.14.0-beta.4'
+-
+-
+-      # Run pipeline dashboard unit tests
+-      - name: Run pipeline dashboard unit tests
+-        run: |
+-          pytest tests/helpers/dashboard
+-        if: matrix.python-version != '3.9' && matrix.python-version != '3.14.0-beta.4'
+-
+-      # Run pipeline dashboard e2e tests (does not pass with python 3.9, does not pass on windows (playwright does not work somehow), does not pass on python 3.13 (ibis not available))
+-      - name: Run dashboard e2e
+-        run: |
+-          marimo run --headless dlt/helpers/dashboard/dlt_dashboard.py -- -- --pipelines-dir _storage/.dlt/pipelines/ --with_test_identifiers true & pytest --browser chromium tests/e2e
+-        if: matrix.python-version != '3.9' && matrix.os != 'windows-latest' && matrix.python-version != '3.14.0-beta.4'
+   
+   matrix_job_required_check:
+     name: common | common tests
+diff --git a/.github/workflows/test_tools_dashboard.yml b/.github/workflows/test_tools_dashboard.yml
+new file mode 100644
+index 000000000..9bc439df0
+--- /dev/null
++++ b/.github/workflows/test_tools_dashboard.yml
+@@ -0,0 +1,112 @@
++name: common | common
++
++on:
++  workflow_call:
++
++
++env:
++  RUNTIME__LOG_LEVEL: ERROR
++
++  # we need the secrets only for the rest_api_pipeline tests which are in tests/sources
++  # so we inject them only at the end
++  SOURCES__GITHUB__ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++  # and also for the github_api_pipeline tests
++  SOURCES__GITHUB_API_PIPELINE__ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++
++jobs:
++  run_common:
++    name: test
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++
++          # macos tests
++          - os: macos-latest
++            python-version: "3.11"
++            shell: bash
++
++          # linux tests
++          - os: ubuntu-latest
++            python-version: "3.10"
++            shell: bash
++          - os: ubuntu-latest
++            python-version: "3.11"
++            shell: bash
++          - os: ubuntu-latest
++            python-version: "3.12"
++            shell: bash
++          - os: ubuntu-latest
++            python-version: "3.13"
++            shell: bash
++
++          
++          # windows tests
++          - os: windows-latest
++            python-version: "3.11"
++            shell: cmd
++            pytest_args: '-m "not forked"'
++
++    defaults:
++      run:
++        shell: ${{ matrix.shell }}
++    runs-on: ${{ matrix.os }}
++
++    steps:
++      - name: Check out
++        uses: actions/checkout@master
++      - name: Setup Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: ${{ matrix.python-version }}
++
++      - name: Install tzdata on windows
++        run: |
++          cd %USERPROFILE%
++          curl https://data.iana.org/time-zones/releases/tzdata2021e.tar.gz --output tzdata.tar.gz
++          mkdir tzdata
++          tar --extract --file tzdata.tar.gz --directory tzdata
++          mkdir %USERPROFILE%\Downloads\tzdata
++          copy tzdata %USERPROFILE%\Downloads\tzdata
++          curl https://raw.githubusercontent.com/unicode-org/cldr/master/common/supplemental/windowsZones.xml --output %USERPROFILE%\Downloads\tzdata\windowsZones.xml
++        if: runner.os == 'Windows'
++      - name: Install uv
++        uses: astral-sh/setup-uv@v6
++        with:
++          python-version: ${{ matrix.python-version }}
++          activate-environment: true
++
++      # test pipeline dashboard app, does not work with python 3.13
++      - name: Install dlt with duckdb and dashboard
++        # note: this also tests the workspace extra installation
++        run: uv sync ${{ matrix.uv_sync_args }} --extra duckdb --extra workspace --group sentry-sdk --group pipeline --group sources --group dashboard-tests
++        if: matrix.python-version != '3.14.0-beta.4'
++
++      - name: Install playwright
++        run: playwright install
++        if: matrix.python-version != '3.14.0-beta.4'
++
++      # Run pipeline dashboard unit tests
++      - name: Run pipeline dashboard unit tests
++        run: |
++          pytest tests/helpers/dashboard
++
++      # Run pipeline dashboard e2e tests (does not pass with python 3.9, does not pass on windows (playwright does not work somehow), does not pass on python 3.13 (ibis not available))
++      # Mac is also disabled for the time being
++      - name: Run dashboard e2e
++        run: |
++          marimo run --headless dlt/helpers/dashboard/dlt_dashboard.py -- -- --pipelines-dir _storage/.dlt/pipelines/ --with_test_identifiers true & 
++          sleep 10
++          pytest --browser chromium tests/e2e
++        if: matrix.python-version != '3.9' && matrix.os != 'windows-latest' && matrix.os != 'macos-latest' && matrix.python-version != '3.14.0-beta.4'
++  
++  matrix_job_required_check:
++    name: common | common tests
++    needs: run_common
++    runs-on: ubuntu-latest
++    if: always()
++    steps:
++      - name: Check matrix job results
++        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
++        run: |
++          echo "One or more matrix job tests failed or were cancelled. You may need to re-run them." && exit 1
+diff --git a/dlt/helpers/dashboard/utils.py b/dlt/helpers/dashboard/utils.py
+index f7a4c9254..5856ec37b 100644
+--- a/dlt/helpers/dashboard/utils.py
++++ b/dlt/helpers/dashboard/utils.py
+@@ -19,6 +19,8 @@ from dlt.common.pipeline import get_dlt_pipelines_dir
+ from dlt.common.schema import Schema
+ from dlt.common.storages import FileStorage
+ from dlt.common.destination.client import DestinationClientConfiguration
++from dlt.common.exceptions import DltException
++from dlt.common.configuration.exceptions import ConfigFieldMissingException
+ 
+ from dlt.helpers.dashboard import dlt_dashboard, ui_elements as ui
+ from dlt.helpers.dashboard.config import DashboardConfiguration
+@@ -188,7 +190,7 @@ def remote_state_details(pipeline: dlt.Pipeline) -> List[Dict[str, Any]]:
+     """
+     try:
+         remote_state = pipeline._restore_state_from_destination()
+-    except (DatabaseUndefinedRelation, PipelineConfigMissing):
++    except (DatabaseUndefinedRelation, PipelineConfigMissing, ConfigFieldMissingException):
+         remote_state = None
+ 
+     if not remote_state:
+@@ -294,7 +296,6 @@ def create_column_list(
+ 
+         column_list.append(column_dict)
+ 
+-    column_list.sort(key=lambda x: x["name"])
+     if not show_internals:
+         column_list = [c for c in column_list if not c["name"].lower().startswith("_dlt")]
+     return _align_dict_keys(column_list)
+@@ -517,9 +518,13 @@ def get_local_data_path(pipeline: dlt.Pipeline) -> str:
+     """Get the local data path of a pipeline"""
+     if not pipeline.destination or not pipeline.default_schema_name:
+         return None
+-    config = pipeline._get_destination_clients()[0].config
+-    if isinstance(config, WithLocalFiles):
+-        return config.local_dir
++    try:
++        config = pipeline._get_destination_clients()[0].config
++        if isinstance(config, WithLocalFiles):
++            return config.local_dir
++    except (PipelineConfigMissing, ConfigFieldMissingException):
++        # If configs are missing or anything like that, we can fail silently here
++        pass
+     return None
+ 
+ 
+
+
+===== COMMIT 9da47874 =====
+
+
+commit 9da478740
+Author: Thierry Jean
+Date: 2025-08-27
+
+    improve type hints for dataset and relation (#2997)
+
+diff --git a/dlt/common/destination/dataset.py b/dlt/common/destination/dataset.py
+index 7961c5a1e..7b688a19f 100644
+--- a/dlt/common/destination/dataset.py
++++ b/dlt/common/destination/dataset.py
+@@ -144,12 +144,11 @@ class SupportsRelation(SupportsDataAccess, Protocol):
+         ...
+ 
+     # modifying access parameters
+-    def limit(self, limit: int, **kwargs: Any) -> Self:
++    def limit(self, limit: int) -> Self:
+         """Returns a new relation with the limit applied.
+ 
+         Args:
+             limit (int): The number of rows to fetch.
+-            **kwargs (Any): Additional keyword arguments to pass to the limit implementation of the destination client cursor.
+ 
+         Returns:
+             Self: The relation with the limit applied.
+diff --git a/dlt/dataset/__init__.py b/dlt/dataset/__init__.py
+index 4030e5a39..7ad423b94 100644
+--- a/dlt/dataset/__init__.py
++++ b/dlt/dataset/__init__.py
+@@ -1,4 +1,4 @@
+-from dlt.dataset.factory import dataset
++from dlt.dataset.dataset import dataset
+ from dlt.dataset.dataset import Dataset
+ from dlt.dataset.relation import Relation
+ 
+diff --git a/dlt/dataset/dataset.py b/dlt/dataset/dataset.py
+index b812cb5c4..b2cff6c4d 100644
+--- a/dlt/dataset/dataset.py
++++ b/dlt/dataset/dataset.py
+@@ -1,41 +1,33 @@
++from __future__ import annotations
++
+ from types import TracebackType
+ from typing import Any, Type, Union, TYPE_CHECKING, List, Literal, overload
+ 
+-
+ from sqlglot.schema import Schema as SQLGlotSchema
+ import sqlglot.expressions as sge
+ 
+-from dlt.common.destination.exceptions import (
+-    OpenTableClientNotAvailable,
+-)
++import dlt
++from dlt.common.destination.exceptions import OpenTableClientNotAvailable
+ from dlt.common.libs.sqlglot import TSqlGlotDialect
+ from dlt.common.json import json
+ from dlt.common.destination.reference import TDestinationReferenceArg, Destination
+ from dlt.common.destination.client import JobClientBase, SupportsOpenTables, WithStateSync
+-from dlt.common.destination.dataset import (
+-    SupportsRelation,
+-    SupportsDataset,
+-)
++from dlt.common.destination.dataset import SupportsRelation, SupportsDataset
+ from dlt.common.schema import Schema
+ from dlt.common.typing import Self
+ from dlt.common.schema.typing import C_DLT_LOAD_ID
+ from dlt.common.utils import simple_repr, without_none
+ from dlt.destinations.sql_client import SqlClientBase, WithSqlClient
++from dlt.dataset import lineage
+ from dlt.dataset.relation import Relation
+ from dlt.dataset.utils import get_destination_clients
+ from dlt.destinations.queries import build_row_counts_expr
+ 
+-from dlt.dataset import lineage
+-
+ 
+ if TYPE_CHECKING:
+     from dlt.helpers.ibis import BaseBackend as IbisBackend
+     from dlt.helpers.ibis import Table as IbisTable
+     from dlt.helpers.ibis import Expr as IbisExpr
+-else:
+-    IbisBackend = Any
+-    IbisTable = Any
+-    IbisExpr = Any
+ 
+ 
+ class Dataset(SupportsDataset):
+@@ -45,7 +37,7 @@ class Dataset(SupportsDataset):
+         self,
+         destination: TDestinationReferenceArg,
+         dataset_name: str,
+-        schema: Union[Schema, str, None] = None,
++        schema: Union[dlt.Schema, str, None] = None,
+     ) -> None:
+         # provided properties
+         self._destination = Destination.from_reference(destination)
+@@ -53,7 +45,7 @@ class Dataset(SupportsDataset):
+         self._dataset_name = dataset_name
+ 
+         # derived / cached properties
+-        self._schema: Schema = None
++        self._schema: dlt.Schema = None
+         # self._sqlglot_schema: SQLGlotSchema = None
+         self._sql_client: SqlClientBase[Any] = None
+         self._opened_sql_client: SqlClientBase[Any] = None
+@@ -70,7 +62,7 @@ class Dataset(SupportsDataset):
+         )
+ 
+     @property
+-    def schema(self) -> Schema:
++    def schema(self) -> dlt.Schema:
+         # NOTE: if this property raises AttributeError, __getattr__ will get called 🤯
+         #   this leads to infinite recursion as __getattr_ calls this property
+         if not self._schema:
+@@ -130,19 +122,19 @@ class Dataset(SupportsDataset):
+                 )
+         return self._table_client
+ 
+-    def is_same_physical_destination(self, other: "Dataset") -> bool:
++    def is_same_physical_destination(self, other: dlt.Dataset) -> bool:
+         """
+         Returns true if the other dataset is on the same physical destination
+         helpful if we want to run sql queries without extracting the data
+         """
+         return str(self.destination_client.config) == str(other.destination_client.config)
+ 
+-    def _get_destination_client(self, schema: Schema) -> JobClientBase:
++    def _get_destination_client(self, schema: dlt.Schema) -> JobClientBase:
+         return get_destination_clients(
+             schema, destination=self._destination, destination_dataset_name=self._dataset_name
+         )[0]
+ 
+-    def _get_sql_client(self, schema: Schema) -> SqlClientBase[Any]:
++    def _get_sql_client(self, schema: dlt.Schema) -> SqlClientBase[Any]:
+         client = self._get_destination_client(self.schema)
+         if isinstance(client, WithSqlClient):
+             return client.sql_client
+@@ -155,30 +147,34 @@ class Dataset(SupportsDataset):
+         """Lazy load the schema on request"""
+ 
+         # full schema given, nothing to do
+-        if not self._schema and isinstance(self._provided_schema, Schema):
++        if not self._schema and isinstance(self._provided_schema, dlt.Schema):
+             self._schema = self._provided_schema
+ 
+         # schema name given, resolve it from destination by name
+         elif not self._schema and isinstance(self._provided_schema, str):
+-            with self._get_destination_client(Schema(self._provided_schema)) as client:
++            with self._get_destination_client(dlt.Schema(self._provided_schema)) as client:
+                 if isinstance(client, WithStateSync):
+                     stored_schema = client.get_stored_schema(self._provided_schema)
+                     if stored_schema:
+-                        self._schema = Schema.from_stored_schema(json.loads(stored_schema.schema))
++                        self._schema = dlt.Schema.from_stored_schema(
++                            json.loads(stored_schema.schema)
++                        )
+                     else:
+-                        self._schema = Schema(self._provided_schema)
++                        self._schema = dlt.Schema(self._provided_schema)
+ 
+         # no schema name given, load newest schema from destination
+         elif not self._schema:
+-            with self._get_destination_client(Schema(self._dataset_name)) as client:
++            with self._get_destination_client(dlt.Schema(self._dataset_name)) as client:
+                 if isinstance(client, WithStateSync):
+                     stored_schema = client.get_stored_schema()
+                     if stored_schema:
+-                        self._schema = Schema.from_stored_schema(json.loads(stored_schema.schema))
++                        self._schema = dlt.Schema.from_stored_schema(
++                            json.loads(stored_schema.schema)
++                        )
+ 
+         # default to empty schema with dataset name
+         if not self._schema:
+-            self._schema = Schema(self._dataset_name)
++            self._schema = dlt.Schema(self._dataset_name)
+ 
+     def query(
+         self,
+@@ -358,3 +354,11 @@ class Dataset(SupportsDataset):
+             else:
+                 msg += "No data tables found in schema."
+         return msg
++
++
++def dataset(
++    destination: TDestinationReferenceArg,
++    dataset_name: str,
++    schema: Union[Schema, str, None] = None,
++) -> Dataset:
++    return Dataset(destination, dataset_name, schema)
+diff --git a/dlt/dataset/factory.py b/dlt/dataset/factory.py
+deleted file mode 100644
+index 43e90c1c6..000000000
+--- a/dlt/dataset/factory.py
++++ /dev/null
+@@ -1,19 +0,0 @@
+-from typing import Union, TYPE_CHECKING, Any
+-
+-from dlt.common.destination import TDestinationReferenceArg
+-from dlt.common.schema import Schema
+-
+-from dlt.dataset.dataset import Dataset
+-
+-if TYPE_CHECKING:
+-    from dlt import SupportsDataset
+-else:
+-    SupportsDataset = Any
+-
+-
+-def dataset(
+-    destination: TDestinationReferenceArg,
+-    dataset_name: str,
+-    schema: Union[Schema, str, None] = None,
+-) -> SupportsDataset:
+-    return Dataset(destination, dataset_name, schema)
+diff --git a/dlt/dataset/lineage.py b/dlt/dataset/lineage.py
+index 66b30241d..b7e99fc3b 100644
+--- a/dlt/dataset/lineage.py
++++ b/dlt/dataset/lineage.py
+@@ -8,6 +8,7 @@ from sqlglot.schema import Schema as SQLGlotSchema, ensure_schema
+ from sqlglot.optimizer.annotate_types import annotate_types
+ from sqlglot.optimizer.qualify import qualify
+ 
++import dlt
+ from dlt.common.libs.sqlglot import (
+     to_sqlglot_type,
+     from_sqlglot_type,
+@@ -15,7 +16,6 @@ from dlt.common.libs.sqlglot import (
+     get_metadata,
+     TSqlGlotDialect,
+ )
+-from dlt.common.schema import Schema
+ from dlt.common.schema.typing import (
+     TTableSchemaColumns,
+     TColumnSchema,
+@@ -27,7 +27,7 @@ logger = logging.getLogger(__file__)
+ 
+ 
+ def create_sqlglot_schema(
+-    schema: Schema,
++    schema: dlt.Schema,
+     dataset_name: str,
+     dialect: TSqlGlotDialect,
+ ) -> SQLGlotSchema:
+diff --git a/dlt/dataset/relation.py b/dlt/dataset/relation.py
+index 31c9c6d71..3c62790bc 100644
+--- a/dlt/dataset/relation.py
++++ b/dlt/dataset/relation.py
+@@ -1,3 +1,5 @@
++from __future__ import annotations
++
+ from typing import overload, Union, Any, Generator, Optional, Sequence, Tuple, Type, TYPE_CHECKING
+ from textwrap import indent
+ from contextlib import contextmanager
+@@ -9,8 +11,8 @@ from sqlglot.expressions import ExpOrStr as SqlglotExprOrStr
+ 
+ import sqlglot.expressions as sge
+ 
++import dlt
+ from dlt.common.destination.dataset import SupportsRelation, TFilterOperation
+-
+ from dlt.common.libs.sqlglot import to_sqlglot_type, build_typed_literal, TSqlGlotDialect
+ from dlt.common.schema.typing import TTableSchemaColumns, TTableSchema
+ from dlt.common.typing import Self, TSortOrder
+@@ -28,12 +30,7 @@ except (ImportError, MissingDependencyException):
+     IbisExpr = None
+ 
+ if TYPE_CHECKING:
+-    from dlt.dataset.dataset import Dataset
+     from dlt.helpers.ibis import Expr as IbisExpr
+-else:
+-    Dataset = Any
+-    IbisTable = Any
+-    BaseReadableDBAPIDataset = Any
+ 
+ 
+ _FILTER_OP_MAP = {
+@@ -53,7 +50,7 @@ class Relation(SupportsRelation, WithSqlClient):
+     def __init__(
+         self,
+         *,
+-        readable_dataset: "Dataset",
++        readable_dataset: dlt.Dataset,
+         query: Union[str, sge.Query],
+         query_dialect: Optional[str] = None,
+         _execute_raw_query: bool = False,
+@@ -63,14 +60,14 @@ class Relation(SupportsRelation, WithSqlClient):
+     def __init__(
+         self,
+         *,
+-        readable_dataset: "Dataset",
++        readable_dataset: dlt.Dataset,
+         table_name: str,
+     ) -> None: ...
+ 
+     def __init__(
+         self,
+         *,
+-        readable_dataset: "Dataset",
++        readable_dataset: dlt.Dataset,
+         query: Optional[Union[str, sge.Query, IbisExpr]] = None,
+         query_dialect: Optional[str] = None,
+         table_name: Optional[str] = None,
+@@ -298,7 +295,7 @@ class Relation(SupportsRelation, WithSqlClient):
+     # Relation protocol methods
+     #
+ 
+-    def limit(self, limit: int, **kwargs: Any) -> Self:
++    def limit(self, limit: int) -> Self:
+         rel = self.__copy__()
+         rel._sqlglot_expression = rel._sqlglot_expression.limit(limit)
+         return rel
+diff --git a/dlt/destinations/dataset/__init__.py b/dlt/destinations/dataset/__init__.py
+index 4c0de6d75..6facfe736 100644
+--- a/dlt/destinations/dataset/__init__.py
++++ b/dlt/destinations/dataset/__init__.py
+@@ -19,7 +19,7 @@ if not TYPE_CHECKING:
+         expected_due="2.0.0",
+     )
+ 
+-from dlt.destinations.dataset.factory import dataset
++from dlt.dataset.dataset import dataset
+ from dlt.destinations.dataset.dataset import ReadableDBAPIDataset
+ from dlt.destinations.dataset.relation import ReadableDBAPIRelation
+ 
+diff --git a/dlt/destinations/dataset/factory.py b/dlt/destinations/dataset/factory.py
+index 91cc44e13..c7c3b6bdc 100644
+--- a/dlt/destinations/dataset/factory.py
++++ b/dlt/destinations/dataset/factory.py
+@@ -12,4 +12,4 @@ if not TYPE_CHECKING:
+         expected_due="2.0.0",
+     )
+ 
+-from dlt.dataset import dataset  # noqa: F401
++from dlt.dataset.dataset import dataset  # noqa: F401
+diff --git a/tests/destinations/test_readable_dbapi_dataset.py b/tests/destinations/test_readable_dbapi_dataset.py
+index 732f59b13..cd91f0a9e 100644
+--- a/tests/destinations/test_readable_dbapi_dataset.py
++++ b/tests/destinations/test_readable_dbapi_dataset.py
+@@ -23,13 +23,10 @@ def mock_dataset() -> ReadableDBAPIDataset:
+         ],
+     )
+     s.update_table(t)
+-    dataset = cast(
+-        ReadableDBAPIDataset,
+-        dlt.dataset(
+-            dlt.destinations.duckdb(destination_name="duck_db"),
+-            "pipeline_dataset",
+-            schema=s,
+-        ),
++    dataset = dlt.dataset(
++        dlt.destinations.duckdb(destination_name="duck_db"),
++        "pipeline_dataset",
++        schema=s,
+     )
+     return dataset
+ 
+@@ -90,12 +87,9 @@ def test_query_builder(mock_dataset: ReadableDBAPIDataset) -> None:
+ 
+ 
+ def test_copy_and_chaining() -> None:
+-    dataset = cast(
+-        ReadableDBAPIDataset,
+-        dlt.dataset(
+-            dlt.destinations.duckdb(destination_name="duck_db"),
+-            "pipeline_dataset",
+-        ),
++    dataset = dlt.dataset(
++        dlt.destinations.duckdb(destination_name="duck_db"),
++        "pipeline_dataset",
+     )
+ 
+     dataset.schema.tables["items"] = new_table(
+@@ -177,13 +171,10 @@ def test_changing_relation_with_query() -> None:
+     )
+ 
+     s.update_table(t)
+-    dataset = cast(
+-        ReadableDBAPIDataset,
+-        dlt.dataset(
+-            dlt.destinations.duckdb(destination_name="duck_db"),
+-            "pipeline_dataset",
+-            schema=s,
+-        ),
++    dataset = dlt.dataset(
++        dlt.destinations.duckdb(destination_name="duck_db"),
++        "pipeline_dataset",
++        schema=s,
+     )
+ 
+     relation = cast(ReadableDBAPIRelation, dataset("SELECT * FROM something"))
+diff --git a/tests/load/test_read_interfaces.py b/tests/load/test_read_interfaces.py
+index e786b74b4..05c87187a 100644
+--- a/tests/load/test_read_interfaces.py
++++ b/tests/load/test_read_interfaces.py
+@@ -1358,14 +1358,11 @@ def test_standalone_dataset(populated_pipeline: Pipeline) -> None:
+     total_records = _total_records(populated_pipeline.destination.destination_type)
+ 
+     # check dataset factory
+-    dataset = cast(
+-        ReadableDBAPIDataset,
+-        dlt.dataset(
+-            destination=populated_pipeline.destination,
+-            dataset_name=populated_pipeline.dataset_name,
+-            # use name otherwise aleph schema is loaded
+-            schema=populated_pipeline.default_schema_name,
+-        ),
++    dataset = dlt.dataset(
++        destination=populated_pipeline.destination,
++        dataset_name=populated_pipeline.dataset_name,
++        # use name otherwise aleph schema is loaded
++        schema=populated_pipeline.default_schema_name,
+     )
+     # verify that sql client and schema are lazy loaded
+     assert not dataset._schema
+@@ -1376,24 +1373,18 @@ def test_standalone_dataset(populated_pipeline: Pipeline) -> None:
+     assert dataset.schema.tables["items"]["write_disposition"] == "replace"
+ 
+     # check that schema is not loaded when wrong name given
+-    dataset = cast(
+-        ReadableDBAPIDataset,
+-        dlt.dataset(
+-            destination=populated_pipeline.destination,
+-            dataset_name=populated_pipeline.dataset_name,
+-            schema="wrong_schema_name",
+-        ),
++    dataset = dlt.dataset(
++        destination=populated_pipeline.destination,
++        dataset_name=populated_pipeline.dataset_name,
++        schema="wrong_schema_name",
+     )
+     assert "items" not in dataset.schema.tables
+     assert dataset.schema.name == "wrong_schema_name"
+ 
+     # check that schema is loaded if no schema name given
+-    dataset = cast(
+-        ReadableDBAPIDataset,
+-        dlt.dataset(
+-            destination=populated_pipeline.destination,
+-            dataset_name=populated_pipeline.dataset_name,
+-        ),
++    dataset = dlt.dataset(
++        destination=populated_pipeline.destination,
++        dataset_name=populated_pipeline.dataset_name,
+     )
+     # aleph is a secondary schema in the pipeline but because it was stored second
+     # will be retrieved by default
+@@ -1401,12 +1392,9 @@ def test_standalone_dataset(populated_pipeline: Pipeline) -> None:
+     assert dataset.schema.tables["digits"]["write_disposition"] == "append"
+ 
+     # check that there is no error when creating dataset without schema table
+-    dataset = cast(
+-        ReadableDBAPIDataset,
+-        dlt.dataset(
+-            destination=populated_pipeline.destination,
+-            dataset_name="unknown_dataset",
+-        ),
++    dataset = dlt.dataset(
++        destination=populated_pipeline.destination,
++        dataset_name="unknown_dataset",
+     )
+     assert dataset.schema.name == "unknown_dataset"
+     assert "items" not in dataset.schema.tables
+@@ -1424,12 +1412,9 @@ def test_standalone_dataset(populated_pipeline: Pipeline) -> None:
+     with populated_pipeline.destination_client() as client:
+         client.update_stored_schema()
+ 
+-    dataset = cast(
+-        ReadableDBAPIDataset,
+-        dlt.dataset(
+-            destination=populated_pipeline.destination,
+-            dataset_name=populated_pipeline.dataset_name,
+-        ),
++    dataset = dlt.dataset(
++        destination=populated_pipeline.destination,
++        dataset_name=populated_pipeline.dataset_name,
+     )
+     assert dataset.schema.name == "some_other_schema"
+     assert "other_table" in dataset.schema.tables
+
+
+===== COMMIT a81aed62 =====
+
+
+commit a81aed622
+Author: djudjuu
+Date: 2025-08-26
+
+    docs: dlt_plus.runner docs (#2886)
+
+diff --git a/docs/website/docs/plus/features/projects.md b/docs/website/docs/plus/features/projects.md
+index 4b9c99adb..fe84442fa 100644
+--- a/docs/website/docs/plus/features/projects.md
++++ b/docs/website/docs/plus/features/projects.md
+@@ -182,6 +182,28 @@ profiles:
+         bucket_url: s3://dlt-ci-test-bucket/dlt_example_project/
+ ```
+ 
++### Run Configurations
++
++For each pipeline, you can use the `run_config` section to define what happens when the pipeline is run from
++the command line with `dlt pipeline <pipeline_name> run`.
++
++```yaml
++pipelines:
++  my_pipeline:
++    source: my_source
++    destination: duckdb
++    dataset_name: my_dataset
++    run_config:
++      run_from_clean_folder: true
++      store_trace_info: true
++      retry_policy:
++        type: fixed
++        max_attempts: 3
++      retry_pipeline_steps: ["load"]
++```
++
++Read more about these options [here](../production/pipeline-runner.md).
++
+ ### Project settings and variable substitution
+ 
+ You can override default project settings using the `project` section:
+@@ -364,9 +386,10 @@ transformation = entities.get_transformation("stressed_transformation")
+ ```
+ Here, we access the entities manager, which allows you to create sources, destinations, pipelines, and other objects.
+ 
+-### Running pipelines with the runner
++### Running pipelines
+ 
+-`dlt+` includes a pipeline runner, which is the same one used when you run pipelines from the CLI.
++`dlt+` includes a project runner which will instantiate pipelines from the `dlt.yml` file
++and run them with the [pipeline runner](../production/pipeline-runner.md), which is exactly the same as using the [pipeline run](../reference#dlt-pipeline-run) command of the CLI.
+ You can also use it directly in your code through the project context:
+ 
+ ```py
+diff --git a/docs/website/docs/plus/production/observability.md b/docs/website/docs/plus/production/observability.md
+index fc5756159..4f70b97f0 100644
+--- a/docs/website/docs/plus/production/observability.md
++++ b/docs/website/docs/plus/production/observability.md
+@@ -1,12 +1,70 @@
+ ---
+ title: Observability
+ description: Observability tooling
+-keywords: [observability, monitoring, alerting]
++keywords: [observability, monitoring, alerting, callbacks]
+ ---
+ 
+-# Observability
++# Custom callbacks
+ 
+-There are several features under development in dlt+ to enhance your observability workflows. These include:
++dlt+ includes a `PlusLogCollector` interface that can be used to implement custom callbacks.
++It is an extension of the dlt [LogCollector](https://github.com/dlt-hub/dlt/blob/273420b2574a518a7488443253ab1e0971b136e8/dlt/common/runtime/collector.py#L77) which accumulates pipeline and system stats and outputs to a python logger or the console. 
++
++You have several options to implement your own logic:
++- Five different methods related to the different stages of the pipeline, all having the pipeline and the trace as parameters, allowing you, for example, to implement
++`after_extract` or `before_load`
++- Three additional callbacks, `on_before`, `on_after` and `on_retry`, which are available if you are running your pipelines with the [dlt+ runner](../production/pipeline-runner.md)
++- the `on_log` method, which is called at a customizable interval and has context about the progress of the currently active stage and the system resources
++
++For an extended description, we recommend you look at the actual implementation of the `PlusLogCollector` interface.
++Here is a simple example of how to inherit from the `PlusLogCollector` and use the [slack-hook](../../running-in-production/running#using-slack-to-send-messages) to send a message when a schema change is detected.
++
++```py
++from dlt_plus._runner.plus_log_collector import PlusLogCollector
++from dlt.sources.sql_database import sql_database
++from dlt.common.schema.typing import TTableSchema
++from dlt.common.pipeline import SupportsPipeline
++from dlt.pipeline.trace import PipelineTrace
++from typing import Dict
++import dlt
++pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
++
++my_source = sql_database(schema="my_schema")
++
++
++class MyLogCollector(PlusLogCollector):
++    def on_schema_change(
++        self,
++        pipeline: SupportsPipeline,
++        trace: PipelineTrace,
++        schema_name: str,
++        changes: Dict[str, TTableSchema],
++    ) -> None:
++        try:
++            from dlt.common.runtime.slack import send_slack_message
++            # os.environ["RUNTIME__SLACK_INCOMING_HOOK"] = "https://hooks.slack.com/services/..."
++
++            msg = f"schema {schema_name} change in pipeline {pipeline.pipeline_name}**:\n{changes}"
++            send_slack_message(pipeline.runtime_config.slack_incoming_hook, msg)
++        except Exception as e:
++            # fail without interrupting the pipeline
++            print(f"Error trying to send slack message: {e}")
++
++
++    def on_log(self):
++        # override the default behavior if you don't want to see progress log output on stdio
++        # super().on_log()
++        pass
++
++# attach your collector to the pipeline
++pipeline.collector = MyLogCollector()
++
++load_info = pipeline.run(my_source)
++print(load_info)
++```
++
++## Planned features
++
++There are several other features under development in dlt+ to enhance your observability workflows. These include:
+ * A UI to explore and debug your pipeline runs
+ * An AI agent to investigate your traces and logs
+ 
+diff --git a/docs/website/docs/plus/production/pipeline-runner.md b/docs/website/docs/plus/production/pipeline-runner.md
+new file mode 100644
+index 000000000..1d390fee7
+--- /dev/null
++++ b/docs/website/docs/plus/production/pipeline-runner.md
+@@ -0,0 +1,307 @@
++---
++title: "Pipeline runner"
++description: Run pipelines with the dlt+ runner
++keywords: ["runner", "pipeline", "retry", "trace"]
++---
++# Runner
++
++dlt+ provides a production-ready runner for your pipelines. It offers robust error handling, retry mechanisms, and near atomic trace storage to destinations of your choice.
++
++## Usage
++
++The runner will be used automatically if you do `dlt pipeline run` inside a project, or you can use
++`dlt_plus.runner()` directly in your code where you define your pipeline and data.
++
++<Tabs
++  groupId="config-type"
++  defaultValue="cli"
++  values={[
++    {"label": "CLI", "value": "cli"},
++    {"label": "Python", "value": "python"}
++  ]}>
++
++<TabItem value="cli">
++
++```sh
++dlt pipeline my_pipeline run
++```
++
++</TabItem>
++
++<TabItem value="python">
++
++```py
++import dlt
++import dlt_plus
++
++pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
++
++@dlt.resource(table_name="my_table")
++def my_resource():
++    return [1, 2, 3]
++
++load_info = dlt_plus.runner(pipeline).run(my_resource())
++print(load_info)
++```
++
++</TabItem>
++
++</Tabs>
++
++## Configuration
++
++The runner is configured through the `run_config` section of a pipeline in your `dlt.yml` file
++or by passing arguments to the `dlt_plus.runner()` function in your code.
++Configuration via environment variables or `config.toml` is still under development.
++
++### Complete configuration example
++
++<Tabs
++  groupId="config-type"
++  defaultValue="yml"
++  values={[
++    {"label": "dlt.yml", "value": "yml"},
++    {"label": "Python", "value": "python"}
++  ]}>
++
++<TabItem value="yml">
++
++```yaml
++pipelines:
++  my_pipeline:
++    source: my_source
++    destination: duckdb
++    run_config:
++      store_trace_info: true
++      run_from_clean_folder: true
++      retry_policy:
++        type: backoff
++        max_attempts: 5
++        multiplier: 2
++        min: 1
++        max: 10
++      retry_pipeline_steps: ["load"]
++```
++
++</TabItem>
++
++<TabItem value="python">
++
++```py
++import dlt_plus
++from tenacity import Retrying, stop_after_attempt, wait_exponential
++
++pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
++
++@dlt.resource(table_name="my_table")
++def my_resource():
++    return [1, 2, 3]
++
++load_info = dlt_plus.runner(
++    pipeline,
++    store_trace_info=True,
++    run_from_clean_folder=True,
++    retry_policy=Retrying(
++        stop=stop_after_attempt(5),
++        wait=wait_exponential(multiplier=2, min=1, max=10),
++        reraise=True
++    ),
++    retry_pipeline_steps=["load"]
++).run(my_resource())
++```
++
++</TabItem>
++
++</Tabs>
++
++
++
++## Trace storage
++
++The `store_trace_info` parameter enables automatic storage of the pipeline's runtime [trace](https://github.com/dlt-hub/dlt/blob/273420b2574a518a7488443253ab1e0971b136e8/dlt/pipeline/trace.py#L126), which contains detailed information about a run, e.g., timings of each step, schema changes, and load packages (see [here](../../running-in-production/running#inspect-and-save-the-load-info-and-trace)).
++
++The runner will convert the trace into a `dict` and try loading it to the destination using a separate pipeline, which runs directly after each successful or failed attempt of the main pipeline. If any pending data is finalized before running the main pipeline, the trace of that finalization is also stored.
++
++Setting `store_trace_info=True` will derive the configuration of the trace pipeline from the main pipeline.
++That trace pipeline will be named `_trace_<pipeline_name>` and will write to the same destination as the main pipeline.
++
++```yaml
++pipelines:
++  my_pipeline:
++    run_config:
++      store_trace_info: true
++```
++
++Alternatively, you can explicitly define a trace pipeline for example, if you want 
++to use store your traces in a different filesystem than your production data:
++
++<Tabs
++  groupId="config-type"
++  defaultValue="yml"
++  values={[
++    {"label": "dlt.yml", "value": "yml"},
++    {"label": "Python", "value": "python"}
++  ]}>
++
++<TabItem value="yml">
++
++```yaml
++destination:
++  log_filesystem:
++    type: filesystem
++    bucket_url: "s3://my-bucket/logs/dlt_traces"
++
++pipelines:
++  my_pipeline:
++    source: my_source
++    destination: duckdb
++    run_config:
++      store_trace_info: trace_pipeline
++    
++  trace_pipeline:
++    source: my_source # << this will not actually be used but cannot be empty
++    destination: log_filesystem
++```
++
++</TabItem>
++
++<TabItem value="python">
++```py
++import dlt
++import dlt_plus
++from tenacity import Retrying, stop_after_attempt
++
++@dlt.resource(table_name="numbers")
++def my_resource():
++    return [1, 2, 3]
++
++# your main pipeline
++pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
++
++# your trace pipeline
++# os.environ["DESTINATION__FILESYSTEM__BUCKET_URL"] = "s3://my-bucket/logs/dlt_traces"
++trace_pipeline = dlt.pipeline(
++    pipeline_name="my_trace_pipeline",
++    destination="filesystem",
++    dataset_name="my_pipeline_trace_dataset",
++)
++
++load_info = dlt_plus.runner(pipeline, store_trace_info=trace_pipeline).run(my_resource())
++print(load_info)
++```
++</TabItem>
++
++</Tabs>
++
++### Trace table naming
++
++Traces are loaded into a table named `<pipeline_name>_trace`. This means you can use the same trace pipeline for 
++multiple pipelines without conflicts.
++
++## Run from clean folder
++
++When the `run_from_clean_folder` option is enabled, the [pipeline working directory](../../general-usage/pipeline#pipeline-working-directory) is removed before the pipeline runs. The state, schema, and all files from previous runs are deleted, and state and schema are synchronized from the destination (see [dlt pipeline sync](../../reference/command-line-interface.md#dlt-pipeline-sync)).
++
++```yaml
++pipelines:
++  my_pipeline:
++    run_config:
++      run_from_clean_folder: true
++```
++
++:::note
++The dlt+ runner behaves slightly differently from `pipeline.run()` when there exists pending data in the pipeline's working directory: `pipeline.run()` will load only the pending data and needs to be invoked again, whereas the dlt+ runner will run with the pending data, and then automatically run again with the given data.
++:::
++
++## Retry policies
++
++The Runner supports configurable retry policies to handle errors during pipeline execution. Retry policies apply to both finalizing pending data from previous loads and running the pipeline with the given data.
++
++For the python interface you can define any retry policy you want using the [tenacity](https://tenacity.readthedocs.io/en/latest/) library. For the yaml interface you can configure three different retry policies:
++
++| Policy type | Description | Configuration |
++|-------------|-------------|---------------|
++| None | No retry (single attempt) | `type: none` |
++| Fixed | Fixed number of attempts with no backoff | `type: fixed`, `max_attempts: N` |
++| Backoff | Exponential backoff with configurable parameters | `type: backoff`, `max_attempts: N`, `multiplier: N`, `min: N`, `max: N` |
++
++:::note
++When storing the trace, the runner will alternate between trying to load the pipeline and loading the trace. So after the
++first attempt fails, it will try to load the trace of the first attempt. If the trace pipeline also fails, the
++trace file will be kept as `traces/<transaction_id>_attempt_1_trace.json` in the pipeline's
++working directory and the pipeline will be retried. Failures to load the trace will be logged as warnings, but
++do not affect the main pipeline's execution.
++:::
++
++
++### Retry pipeline steps
++
++The runner will automatically apply [a helper method](https://github.com/dlt-hub/dlt/blob/273420b2574a518a7488443253ab1e0971b136e8/dlt/pipeline/helpers.py#L30) to all given policies to define whether or not a retry should be attempted. 
++
++It takes into account the type of the exception and the pipeline step at which it occurred.
++For example, any exceptions inheriting from `TerminalException` such as those related to missing credentials will end the run immediately,
++whereas a `PipelineStepFailed`-exception such as it might occur due to a connection that timed-out could be be retried.
++
++For the latter, the `retry_pipeline_steps` parameter can be used to further control during which pipeline steps a retry will be attempted.
++
++| Configuration | Behavior |
++|---------------|----------|
++| `retry_pipeline_steps: ["load"]` | Only retry the load step (default) |
++| `retry_pipeline_steps: ["normalize", "load"]` | Retry both normalize and load steps |
++| `retry_pipeline_steps: ["extract", "normalize", "load"]` | Retry all main steps |
++
++**Example configuration:**
++This is how you can configure the runner to retry 5 times unless the error is terminal or occurs during the extract step:
++
++<Tabs
++  groupId="config-type"
++  defaultValue="yml"
++  values={[
++    {"label": "dlt.yml", "value": "yml"},
++    {"label": "Python", "value": "python"}
++  ]}>
++
++<TabItem value="yml">
++
++```yaml
++pipelines:
++  my_pipeline:
++    source: github_source
++    run_config:
++      retry_policy:
++        type: fixed
++        max_attempts: 5
++      retry_pipeline_steps: ["normalize", "load"]
++```
++
++</TabItem>
++
++<TabItem value="python">
++
++```py
++import dlt
++import dlt_plus
++from tenacity import Retrying, stop_after_attempt, wait_fixed
++
++pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
++
++@dlt.resource(table_name="my_table")
++def my_resource():
++    return [1, 2, 3]
++
++load_info = dlt_plus.runner(
++  pipeline,
++  retry_policy=Retrying(stop=stop_after_attempt(5), wait=wait_fixed(2), reraise=True),
++  retry_pipeline_steps=["normalize", "load"]
++).run(my_resource())
++print(load_info)
++```
++
++</TabItem>
++
++</Tabs>
++
++## Callbacks
++
++You can implement [custom callbacks](observability.md) by inheriting from dlt+'s `PlusLogCollector` class.
++If such a collector is attached to a pipeline, the runner will detect it and will call its `on_before`, `on_after` and `on_retry` methods.
+diff --git a/docs/website/docs/plus/production/runners.md b/docs/website/docs/plus/production/runners.md
+deleted file mode 100644
+index 1cd8f5406..000000000
+--- a/docs/website/docs/plus/production/runners.md
++++ /dev/null
+@@ -1,22 +0,0 @@
+----
+-title: Runners
+-description: Run pipelines in production
+-keywords: [runners, lambda, airflow]
+----
+-
+-# Runners
+-
+-With dlt+ you can now run pipelines directly from the command line, allowing you to go to production faster:
+-
+-```sh
+-dlt pipeline my_pipeline run
+-```
+-
+-These can also be run in different environments with the use of [profiles](../core-concepts/profiles.md):
+-
+-```sh
+-dlt project --profile prod my_pipeline run
+-```
+-
+-We are working on specialized runners for environments like Airflow, Dagster, Prefect, and more. If you're interested, feel free to [join our early access program](https://info.dlthub.com/waiting-list).
+-
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index cfce2c51e..7ee82fbf6 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -178,7 +178,7 @@ const sidebars = {
+           type: 'category',
+           label: 'Going to production',
+           items: [
+-            'plus/production/runners',
++            'plus/production/pipeline-runner',
+             'plus/production/observability',
+           ]
+         },
+
+
+===== COMMIT ec1f8e48 =====
+
+
+commit ec1f8e485
+Author: djudjuu
+Date: 2025-08-26
+
+    docs: pip install marimo -> dlt[workspace] (#3035)
+
+diff --git a/docs/website/docs/walkthroughs/create-a-pipeline.md b/docs/website/docs/walkthroughs/create-a-pipeline.md
+index d14135eb0..73a417f91 100644
+--- a/docs/website/docs/walkthroughs/create-a-pipeline.md
++++ b/docs/website/docs/walkthroughs/create-a-pipeline.md
+@@ -148,7 +148,7 @@ It also prints the `load_info` object.
+ Let's explore the loaded data with the [command](../reference/command-line-interface#dlt-pipeline-show) `dlt pipeline <pipeline_name> show`.
+ 
+ :::info
+-Make sure you have `marimo` installed: `pip install marimo`
++You will need to install `pip dlt[workspace]`
+ :::
+ 
+ ```sh
+
+
+===== COMMIT ec567ce7 =====
+
+
+commit ec567ce70
+Author: Alena Astrakhantseva
+Date: 2025-08-25
+
+    Update advanced-course.md
+
+diff --git a/docs/website/docs/tutorial/advanced-course.md b/docs/website/docs/tutorial/advanced-course.md
+index e1411dd8d..6b6e2f84e 100644
+--- a/docs/website/docs/tutorial/advanced-course.md
++++ b/docs/website/docs/tutorial/advanced-course.md
+@@ -1,10 +1,10 @@
+ ---
+-title: Advanced dlt Course
++title: dlt Advanced Course
+ description: Master advanced dlt concepts with this comprehensive course covering custom sources, destinations, transformations, data contracts and performance optimization.
+ keywords: [dlt, advanced, tutorial, pipeline, python, data engineering, custom sources, custom destinations, transformations, data contracts, logging, tracing, performance optimization]
+ ---
+ 
+-# Advanced `dlt` Course
++# `dlt` Advanced Course
+ 
+ In this course, you'll go far beyond the basics. You’ll build production-grade data pipelines with custom implementations, advanced patterns, and performance optimizations.
+ 
+
+
+===== COMMIT 39397517 =====
+
+
+commit 393975172
+Author: anuunchin
+Date: 2025-08-25
+
+    Page description fix in llm native workflow (#3033)
+
+diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+index 5f70cf2c4..b78bddf79 100644
+--- a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
++++ b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+@@ -1,6 +1,6 @@
+ ---
+ title: LLM-native workflow
+-description: How to extract and explore data from REST API with Cursor
++description: How to extract and explore data from REST API with AI editors/agents
+ keywords: [cursor, llm, restapi, ai]
+ ---
+ 
+
+
+===== COMMIT 5bf932f6 =====
+
+
+commit 5bf932f69
+Author: David Scharf
+Date: 2025-08-25
+
+    use license command for plus connection test (#3026)
+
+diff --git a/tests/plus/test_cli.py b/tests/plus/test_cli.py
+index a471a4ae1..8c0bb7c0e 100644
+--- a/tests/plus/test_cli.py
++++ b/tests/plus/test_cli.py
+@@ -2,7 +2,7 @@ from pytest_console_scripts import ScriptRunner
+ 
+ 
+ def test_project_command(script_runner: ScriptRunner) -> None:
+-    result = script_runner.run(["dlt", "project", "-h"])
++    result = script_runner.run(["dlt", "license", "-h"])
+     assert result.returncode == 0
+ 
+-    assert "Usage: dlt project" in result.stdout
++    assert "Usage: dlt license" in result.stdout
+
+
+===== COMMIT dc5cfba2 =====
+
+
+commit dc5cfba29
+Author: anuunchin
+Date: 2025-08-22
+
+    llm workflow docs updated with AI editors other than cursor (#3001)
+
+diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+index e55186b26..5f70cf2c4 100644
+--- a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
++++ b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+@@ -8,23 +8,32 @@ keywords: [cursor, llm, restapi, ai]
+ 
+ ## Overview
+ 
+-This guide walks you through a collaborative AI-human workflow for extracting and exploring data from REST API sources using Cursor and dlt. It introduces the first workflow available in dltHub Workspace — an LLM-native development environment for data engineering tasks.
++This guide walks you through a collaborative AI-human workflow for extracting and exploring data from REST API sources using an AI editor/agent of your choice and dlt. It introduces the first workflow available in dltHub workspace — an LLM-native development environment for data engineering tasks.
+ 
+ You will learn:
+-1. How to use dltHub's [LLM-context database](https://dlthub.com/workspace) to init workspace for the source you need.
++1. How to initialize a dltHub workspace for your source using dltHub’s [LLM-context database](https://dlthub.com/workspace).
+ 2. How to build a REST API source in minutes with AI assistance.
+-3. How to debug the pipeline and explore data using the pipeline dashboard.
+-4. How to start a new notebook and use the pipeline's dataset in it.
++3. How to debug a pipeline and explore data using the pipeline dashboard.
++4. How to start a new notebook and work with the pipeline’s dataset in it.
+ 
+ ## Prerequisites
+ 
+-- [Cursor IDE](https://cursor.com/) installed
++Have one of the following AI editors/agents installed:
++- [Cursor IDE](https://cursor.com/)
++- [Continue](https://www.continue.dev/)
++- [Cody](https://sourcegraph.com/cody)
++- [Claude](https://docs.anthropic.com/en/docs/claude-code/ide-integrations)
++- [Cline](https://cline.bot/)
++- [Codex](https://openai.com/codex/)
++- [Copilot](https://github.com/features/copilot)
++- [Amp](https://ampcode.com/)
++- [Windsurf](https://windsurf.com/)
+ 
+ ## Concepts used in this guide
+ 
+ Before diving into the workflow, here’s a quick overview of key terms you’ll encounter:
+ 
+-1. **dltHub Workspace** - An environment where all data engineering tasks, from writing code to maintenance in production, can be executed by single developer:
++1. **dlt workspace** - An environment where all data engineering tasks, from writing code to maintenance in production, can be executed by a single developer:
+    - Develop and test data pipelines locally
+    - Run dlt pipelines, transformations, and notebooks with one command
+    - Deliver live, production-ready reports with streamlined access to the dataset
+@@ -32,28 +41,34 @@ Before diving into the workflow, here’s a quick overview of key terms you’ll
+    We plan to support more functionality in the future, such as:
+    - Deploy and run your data workflows in the cloud without any changes to code and schemas
+    - Maintain pipelines with a Runtime Agent, customizable dashboards, and validation tests
+-   - Deploy live, reports without worrying about schema drift or silent failures
++   - Deploy live reports without worrying about schema drift or silent failures
+ 
+-2. **[Cursor](https://cursor.com/)** - An AI-powered code editor that lets you express tasks in natural language for an LLM agent to implement. This LLM-native workflow isn’t exclusive to Cursor, but it’s the first AI code editor we’ve integrated with.
++2. **[Cursor](https://cursor.com/)** - An AI-powered code editor that lets you express tasks in natural language for an LLM agent to implement. Cursor is the first AI code editor we’ve integrated with, so the examples use Cursor, but the same workflow applies to Continue, Copilot, Cody, Windsurf, Cline, Claude, Amp, and Codex (only the UI/shortcuts differ).
+ 
+-3. **LLM-context** - A curated collection of prompts, rules, docs, and examples provided to an LLM for specific tasks. A rich context leads to more accurate, bug-free code generation. dltHub provides tailored [LLM-context for 1,000+ REST API sources](https://dlthub.com/workspace), so you can go from idea to working pipeline in under 10 minutes.
++3. **LLM-context** - A curated collection of prompts, rules, docs, and examples provided to an LLM for specific tasks. A rich context leads to more accurate, bug-free code generation. dltHub provides tailored [LLM-contexts for 1,000+ REST API sources](https://dlthub.com/workspace), so you can go from idea to working pipeline in under 10 minutes.
+ 
+ ## Setup
+ 
+-### Setup Cursor
++### Setup your AI editor/agent
+ 
+-1. Use the right model
+-For best results, use Claude 3.7-sonnet, Gemini 2.5+ or higher models. Weaker models struggle with context comprehension and workflow consistency.
+-We've observed the best results with Claude 3.7-sonnet (which requires the paid version of Cursor).
++#### 1. Use the right model
+ 
+-2. Add documentation
+-AI code editors let you upload documentation and code examples to provide additional context. [Here](https://docs.cursor.com/context/@-symbols/@-docs) you can learn how to do it with Cursor.
+-Go to `Cursor Settings > Indexing & Docs` to see all your added documentation. You can edit, delete, or add new docs here. We recommend adding documentation scoped for a specific task. Add the following documentation links:
++For best results, use newer models. For example, in Cursor we’ve found that Claude-4-sonnet performs best (available in the paid version). Older or weaker models often struggle with context comprehension and workflows.
+ 
+-    * [REST API Source](../verified-sources/rest_api/) as `@dlt rest api`
+-    * [Core dlt concepts & usage](../../general-usage/resource) as `@dlt docs`
++#### 2. Add documentation
+ 
+-### Install dlt Workspace
++AI code editors let you upload documentation and code examples to provide additional context. The exact steps vary by tool, but here are two examples:
++
++1. Cursor ([guide](https://docs.cursor.com/context/@-symbols/@-docs)): Go to `Settings > Indexing & Docs` to add documentation.
++2. Continue ([guide](https://docs.continue.dev/customize/context/documentation)): In chat, type `@Docs` and press `Enter`, then click `Add Docs`.
++
++For any editor or agent, we recommend adding documentation scoped to a specific task.
++At minimum, include:
++
++* [REST API source](../verified-sources/rest_api/) as `@dlt_rest_api`
++* [Core dlt concepts & usage](../../general-usage/) as `@dlt_docs`
++
++### Install dlt workspace
+ 
+ ```sh
+ pip install "dlt[workspace]"
+@@ -67,20 +82,22 @@ dltHub provides prepared contexts for 1000+ sources, available at [https://dlthu
+ ![search for your source](https://storage.googleapis.com/dlt-blog-images/llm_workflows_search.png)
+ </div>
+ 
+-To initialize dltHub Workspace, execute the following:
++To initialize a dltHub workspace, execute the following:
+ 
+ ```sh
+ dlt init dlthub:{source_name} duckdb
+ ```
+ 
+-This command will initialize the dltHub Workspace with:
++This command will first prompt you to choose an AI editor/agent. If you pick the wrong one, no problem. After initializing the workspace, you can delete the incorrect editor rules and run `dlt ai setup` to select the editor again. This time it will only load the rules.
++
++The dltHub workspace will be initialized with:
+ - Files and folder structure you know from [dlt init](../../walkthroughs/create-a-pipeline.md)
+ - Documentation scaffold for the specific source (typically a `yaml` file) optimized for LLMs
+-- Cursor rules tailored for `dlt`
+-- Pipeline script and REST API Source (`{source_name}_pipeline.py`) definition that you'll customize in next step
++- Rules for `dlt`, configured for your selected AI editor/agent
++- Pipeline script and REST API source (`{source_name}_pipeline.py`) definition that you'll customize in the next step
+ 
+ :::tip
+-If you can't find the source you need, start with a generic REST API Source template. Choose source name you need i.e.
++If you can't find the source you need, start with a generic REST API source template. Choose a source name you need i.e.
+ ```sh
+ dlt init dlthub:my_internal_fast_api duckdb
+ ```
+@@ -98,20 +115,20 @@ Prompts are adjusted per API to provide the most accurate and relevant context.
+ Here's a general prompt template you can adapt:
+ 
+ ```text
+-Please generate a REST API Source for {source} API, as specified in @{source}-docs.yaml
++Please generate a REST API source for {source} API, as specified in @{source}-docs.yaml
+ Start with endpoints {endpoints you want} and skip incremental loading for now.
+ Place the code in {source}_pipeline.py and name the pipeline {source}_pipeline.
+ If the file exists, use it as a starting point.
+ Do not add or modify any other files.
+-Use @dlt rest api as a tutorial.
++Use @dlt_rest_api as a tutorial.
+ After adding the endpoints, allow the user to run the pipeline with python {source}_pipeline.py and await further instructions.
+ ```
+ 
+-YIn this prompt, we use `@` references to link to source specifications and documentation. Make sure Cursor recognizes the referenced docs.
+-You can learn more about [referencing with @ in Cursor](https://docs.cursor.com/context/@-symbols/overview).
++In this prompt, we use `@` references to link source specifications and documentation. Make sure Cursor (or whichevert AI editor/agent you use) recognizes the referenced docs.
++For example, see [Cursor’s guide](https://docs.cursor.com/context/@-symbols/overview) to @ references.
+ 
+-* `@{source}-docs.yaml` contains the source specification. Describes the source with endpoints, parameters, and other details.
+-* `@dlt rest api` contains the documentation for dlt's REST API source.
++* `@{source}-docs.yaml` contains the source specification and describes the source with endpoints, parameters, and other details.
++* `@dlt_rest_api` contains the documentation for dlt's REST API source.
+ 
+ ### Add credentials
+ 
+@@ -137,7 +154,7 @@ Load package 1749667187.541553 is LOADED and contains no failed jobs
+ If the pipeline fails, pass error messages to the LLM. Restart after 4-8 failed attempts.
+ :::
+ 
+-### Validate with Pipeline Dashboard
++### Validate with pipeline dashboard
+ 
+ Launch the dashboard to validate your pipeline:
+ 
+@@ -156,7 +173,7 @@ The dashboard helps detect silent failures due to pagination errors, schema drif
+ ![dashboard](https://storage.googleapis.com/dlt-blog-images/llm-native-dashboard.png)
+ </div>
+ 
+-## Use the data in a Notebook
++## Use the data in a notebook
+ 
+ With the pipeline and data validated, you can continue with custom data explorations and reports. You can use your preferred environment, for example, [Jupyter Notebook](https://jupyter.org/), [Marimo Notebook](https://marimo.io/), or a plain Python file.
+ 
+@@ -174,7 +191,7 @@ my_data = dlt.pipeline("{source}_pipeline").dataset()
+ # my_data.{table_name}.df().head()
+ ```
+ 
+-For more, see [dataset access guide](../../general-usage/dataset-access).
++For more, see the [dataset access guide](../../general-usage/dataset-access).
+ 
+ ## Next steps: production deployment
+ 
+@@ -182,12 +199,12 @@ For more, see [dataset access guide](../../general-usage/dataset-access).
+ - [Deploy a pipeline](../../walkthroughs/deploy-a-pipeline/)
+ 
+ 
+-## Addon: bring your own LLM Scaffold
++## Addon: bring your own LLM scaffold
+ 
+-LLMs can infer a REST API Source definition from various types of input, and in many cases, it’s easy to provide what’s needed.
++LLMs can infer a REST API source definition from various types of input, and in many cases, it’s easy to provide what’s needed.
+ 
+ Here are a few effective ways to scaffold your source:
+ 
+ 1. **FastAPI (Internal APIs)**. If you're using FastAPI, simply add a file with the autogenerated OpenAPI spec to your workspace and reference it in your prompt.
+-2. **Legacy code in any programming language**. Add the relevant code files to your workspace and reference them directly in your prompt. LLM can extract useful structure even from older codebases.
+-3. **Human-readable documentation**. Well-written documentation works too. You can add it to your Cursor docs and reference it in your prompt for context.
+\ No newline at end of file
++2. **Legacy code in any programming language**. Add the relevant code files to your workspace and reference them directly in your prompt. LLMs can extract useful structure even from older codebases.
++3. **Human-readable documentation**. Well-written documentation works too. You can add it to your AI editor docs and reference it in your prompt for context.
+\ No newline at end of file
+
+
+===== COMMIT c2dc9bbc =====
+
+
+commit c2dc9bbc2
+Author: Thierry Jean
+Date: 2025-08-22
+
+    fix: `dlt.Pipeline.__repr__` (#3022)
+
+diff --git a/dlt/pipeline/pipeline.py b/dlt/pipeline/pipeline.py
+index d37a1f894..ec5c501f8 100644
+--- a/dlt/pipeline/pipeline.py
++++ b/dlt/pipeline/pipeline.py
+@@ -952,17 +952,19 @@ class Pipeline(SupportsPipeline):
+     def __repr__(self) -> str:
+         kwargs = {
+             "pipeline_name": self.pipeline_name,
+-            "destination": self._destination.destination_name if self._destination else None,
+-            "staging": self._staging.destination_name if self._staging else None,
++            "destination": (
++                self._destination.destination_name if getattr(self, "_destination", None) else None
++            ),
++            "staging": self._staging.destination_name if getattr(self, "_staging", None) else None,
+             "dataset_name": self.dataset_name,
+             "default_schema_name": self.default_schema_name,
+-            "schema_names": self.schema_names if self.schema_names else None,
+-            "first_run": self.first_run if self.first_run else None,
+-            "dev_mode": self.dev_mode if self.dev_mode else None,
+-            # we check for `not is_active` which is the less common case
+-            "is_active": self.is_active if not self.is_active else None,
+-            "pipelines_dir": self.pipelines_dir,
+-            "working_dir": self.working_dir,
++            "schema_names": getattr(self, "schema_names", None),
++            "first_run": getattr(self, "first_run", None),
++            "dev_mode": getattr(self, "dev_mode", None),
++            # `is_active is True` is the common case
++            "is_active": getattr(self, "is_active", None),
++            "pipelines_dir": getattr(self, "pipelines_dir", None),
++            "working_dir": getattr(self, "working_dir", None),
+         }
+         return simple_repr("dlt.pipeline", **without_none(kwargs))
+ 
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index ce08135aa..246f2457d 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import pathlib
++import pickle
+ from concurrent.futures import ThreadPoolExecutor
+ import itertools
+ import logging
+@@ -3893,6 +3894,17 @@ def test_pipeline_repr() -> None:
+     assert getattr(p, "working_dir", sentinel) is not sentinel
+ 
+ 
++def test_repr_after_loading_trace(tmp_path):
++    pipeline_name = "foo"
++    trace_path = tmp_path / pipeline_name / "trace.pickle"
++    pipeline = dlt.pipeline(pipeline_name, destination="duckdb", pipelines_dir=tmp_path)
++    pipeline.run([{"foo": "bar"}], table_name="temp")
++    trace = pickle.load(trace_path.open("rb"))
++
++    # ensure calling `__repr__()` shouldn't cause any error
++    trace.__repr__()
++
++
+ def test_pipeline_with_null_executors(monkeypatch) -> None:
+     # NOTE: emscripten forces null executor, this is tested in test_runners.py
+     monkeypatch.setattr(sys, "platform", "emscripten")
+
+
+===== COMMIT f6b785ff =====
+
+
+commit f6b785ffc
+Author: Tomas Pulmano
+Date: 2025-08-18
+
+    fix: avoid setting "None" string for aws session token (#2978)
+
+diff --git a/dlt/common/configuration/specs/aws_credentials.py b/dlt/common/configuration/specs/aws_credentials.py
+index 195bcf62c..83781cb79 100644
+--- a/dlt/common/configuration/specs/aws_credentials.py
++++ b/dlt/common/configuration/specs/aws_credentials.py
+@@ -183,7 +183,7 @@ class AwsCredentials(AwsCredentialsWithoutDefaults, CredentialsWithDefault):
+             return None
+         self.aws_access_key_id = default.access_key
+         self.aws_secret_access_key = TSecretStrValue(default.secret_key)
+-        self.aws_session_token = TSecretStrValue(default.token)
++        self.aws_session_token = cast(TSecretStrValue, default.token)
+         return default
+ 
+     def to_native_credentials(self) -> Optional[Any]:
+
+
+===== COMMIT b49edd3c =====
+
+
+commit b49edd3c6
+Author: Thierry Jean
+Date: 2025-08-18
+
+    ignore temporary `__marimo__/` folders (#3008)
+
+diff --git a/.gitignore b/.gitignore
+index 96b9fcee1..ed70e2988 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -17,6 +17,8 @@ secrets.toml
+ *.wal
+ logs/
+ .continuerules
++# temporary directory used by marimo for layout, caching, HTML snapshots; see marimo docs
++**/__marimo__  
+ 
+ # Byte-compiled / optimized / DLL files
+ **/__pycache__/
+
+
+===== COMMIT 684dccad =====
+
+
+commit 684dccad4
+Author: anuunchin
+Date: 2025-08-18
+
+    Fix: Max table nesting is ignored for the first run when import schema path is specified (#2992)
+
+diff --git a/dlt/common/storages/schema_storage.py b/dlt/common/storages/schema_storage.py
+index 77137711c..666c6fd17 100644
+--- a/dlt/common/storages/schema_storage.py
++++ b/dlt/common/storages/schema_storage.py
+@@ -84,11 +84,10 @@ class SchemaStorage(Mapping[str, Schema]):
+                 self._load_import_schema(schema.name)
+             except FileNotFoundError:
+                 # save import schema only if it not exist
+-                self._export_schema(
++                import_schema_hash = self._export_schema(
+                     schema, self.config.import_schema_path, remove_processing_hints=True
+                 )
+-                # if import schema got saved then add own version hash as import version hash
+-                schema._imported_version_hash = schema.version_hash
++                schema._imported_version_hash = import_schema_hash
+                 return True
+ 
+         return False
+@@ -187,7 +186,7 @@ class SchemaStorage(Mapping[str, Schema]):
+ 
+     def _export_schema(
+         self, schema: Schema, export_path: str, remove_processing_hints: bool = False
+-    ) -> None:
++    ) -> str:
+         if self.config.external_schema_format == "json":
+             exported_schema_s = schema.to_pretty_json(
+                 remove_defaults=self.config.external_schema_format_remove_defaults,
+@@ -217,6 +216,7 @@ class SchemaStorage(Mapping[str, Schema]):
+             f" {stored_schema['version']}:{stored_schema['version_hash']} as"
+             f" {self.config.external_schema_format}"
+         )
++        return stored_schema["version_hash"]
+ 
+     def _save_schema(self, schema: Schema) -> str:
+         """Saves schema to schema store and bumps the version"""
+diff --git a/tests/pipeline/test_import_export_schema.py b/tests/pipeline/test_import_export_schema.py
+index 5eb9c664d..490707a2f 100644
+--- a/tests/pipeline/test_import_export_schema.py
++++ b/tests/pipeline/test_import_export_schema.py
+@@ -1,4 +1,5 @@
+ import dlt, os
++import pytest
+ 
+ from dlt.common.utils import uniq_id
+ 
+@@ -219,3 +220,29 @@ def test_only_explicit_hints_in_import_schema() -> None:
+     }
+     import_schema = _get_import_schema("source")
+     assert import_schema.tables["person"]["columns"].keys() == {"id", "age"}
++
++
++@pytest.mark.parametrize(
++    "table_nesting",
++    [0, 1],
++)
++def test_import_schema_preserves_max_nesting(table_nesting: int) -> None:
++    # Add nested field
++    @dlt.resource(max_table_nesting=table_nesting, table_name="my_table")
++    def nested_data():
++        nested_example_data = EXAMPLE_DATA[0]
++        nested_example_data["children"] = [{"id": 2, "name": "Max"}, {"id": 3, "name": "Julia"}]
++        yield nested_example_data
++
++    p = dlt.pipeline(
++        pipeline_name="schema_test" + uniq_id(),
++        destination="duckdb",
++        import_schema_path=IMPORT_SCHEMA_PATH,
++        export_schema_path=EXPORT_SCHEMA_PATH,
++    )
++    p.run(nested_data())
++
++    if table_nesting == 0:
++        assert "my_table__children" not in p.default_schema.tables
++    else:
++        assert "my_table__children" in p.default_schema.tables
+
+
+===== COMMIT 0e19b5f0 =====
+
+
+commit 0e19b5f0d
+Author: Thierry Jean
+Date: 2025-08-13
+
+    docs: added docs page to index (#2994)
+
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index a5f373c7e..470b215f9 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -369,6 +369,7 @@ const sidebars = {
+             'general-usage/dataset-access/dataset',
+             'general-usage/dataset-access/ibis-backend',
+             'general-usage/dataset-access/sql-client',
++            'general-usage/dataset-access/view-dlt-schema',
+             'general-usage/destination-tables',
+           ]
+         },
+
+
+===== COMMIT 6348115c =====
+
+
+commit 6348115c9
+Author: Jinso-o
+Date: 2025-08-11
+
+    Jinso o fix/cors playground (#2986)
+
+diff --git a/docs/notebooks/playground/playground.py b/docs/notebooks/playground/playground.py
+index ccd58f14b..a85a8b4f9 100644
+--- a/docs/notebooks/playground/playground.py
++++ b/docs/notebooks/playground/playground.py
+@@ -1,6 +1,6 @@
+ import marimo
+ 
+-__generated_with = "0.13.15"
++__generated_with = "0.14.10"
+ app = marimo.App()
+ 
+ 
+@@ -17,35 +17,35 @@ async def initialize():
+         await micropip.install("dlt[duckdb]")
+         await micropip.install("pandas")
+         # dependencies needed for ibis
+-        await micropip.install("sqlite3")
++        await micropip.install("requests")
+         await micropip.install("ibis-framework[duckdb]")
+ 
+-    return sys, mo
++    return
+ 
+ 
+ @app.cell
+-def run(dlt):
++def run():
+     import dlt
++    import requests
+ 
+-    @dlt.resource(table_name="items")
+-    def foo():
+-        for i in range(50):
+-            yield {"id": i, "name": f"This is item {i}"}
++    @dlt.resource(table_name="users")
++    def users():
++        yield requests.get("https://jsonplaceholder.typicode.com/users").json()
+ 
+     pipeline = dlt.pipeline(
+-        pipeline_name="python_data_example",
++        pipeline_name="users_pipeline",
+         destination="duckdb",
++        dataset_name="raw_data",
+         dev_mode=True,
+     )
+-
+-    load_info = pipeline.run(foo)
++    print(pipeline.run(users()))
+     return (pipeline,)
+ 
+ 
+ @app.cell
+ def view(pipeline):
+-    # NOTE: This line displays the data of the items table in a marimo table
+-    pipeline.dataset().items.df()
++    # NOTE: This line displays the data of the users table in a marimo table
++    pipeline.dataset().users.df()
+     return
+ 
+ 
+@@ -59,7 +59,7 @@ def connect(pipeline):
+ @app.cell(hide_code=True)
+ def tests(pipeline):
+     # NOTE: this cell is only needed for testing this notebook on ci
+-    assert pipeline.dataset().items.df().shape[0] == 50
++    assert pipeline.dataset().users.df().shape[0] == 10
+     return
+ 
+ 
+
+
+===== COMMIT f17e9812 =====
+
+
+commit f17e98122
+Author: AyushPatel101
+Date: 2025-08-11
+
+    Add remaining paramiko connect params to SFTP filesystem (#2823)
+

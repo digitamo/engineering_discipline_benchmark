@@ -1,0 +1,2966 @@
+diff --git a/dlt/cli/pipeline_command.py b/dlt/cli/pipeline_command.py
+index bab4475e8..872dfb6f3 100644
+--- a/dlt/cli/pipeline_command.py
++++ b/dlt/cli/pipeline_command.py
+@@ -1,3 +1,4 @@
++import os
+ import yaml
+ from typing import Any, Optional, Sequence, Tuple
+ import dlt
+@@ -8,6 +9,7 @@ from dlt.common.pipeline import get_dlt_pipelines_dir, TSourceState
+ from dlt.common.destination.reference import TDestinationReferenceArg
+ from dlt.common.runners import Venv
+ from dlt.common.runners.stdout import iter_stdout
++from dlt.common.runtime import run_context
+ from dlt.common.schema.utils import (
+     group_tables_by_resource,
+     has_table_seen_data,
+@@ -116,8 +118,6 @@ def pipeline_command(
+ 
+     if operation == "show":
+         if command_kwargs.get("marimo"):
+-            import os
+-
+             from dlt.common.utils import custom_environ
+             from dlt.common.known_env import DLT_DATA_DIR
+ 
+@@ -169,7 +169,14 @@ def pipeline_command(
+         fmt.echo()
+         fmt.echo("Local state:")
+         for k, v in state["_local"].items():
+-            if not isinstance(v, dict):
++            if isinstance(v, dict):
++                # show run context id
++                if k == "last_run_context":
++                    k = "last_run_context['uri']"
++                    v = v["uri"]
++                else:
++                    v = None
++            if v is not None:
+                 fmt.echo("%s: %s" % (fmt.style(k, fg="green"), v))
+         fmt.echo()
+         if p.default_schema_name is None:
+@@ -361,6 +368,26 @@ def pipeline_command(
+                     fmt.warning(warning)
+             return
+ 
++        # drop command will fail if first run but that happens later, so we make sure that last_run_context exists
++        if not p.first_run:
++            from dlt.common.runtime import run_context
++
++            active_run_dir = os.path.abspath(run_context.active().run_dir)
++
++            if p.last_run_context["run_dir"] != active_run_dir:
++                fmt.warning(
++                    fmt.style(
++                        "You should run this from the same directory as the pipeline script (%s),"
++                        " where the folder with credentials (%s) is located. Alternatively, you can"
++                        " set the required credentials as environment variables."
++                        % (
++                            p.last_run_context["run_dir"],
++                            p.last_run_context["settings_dir"],
++                        ),
++                        fg="yellow",
++                    )
++                )
++
+         fmt.echo(
+             "About to drop the following data in dataset %s in destination %s:"
+             % (
+diff --git a/dlt/common/configuration/exceptions.py b/dlt/common/configuration/exceptions.py
+index 7bfa992b4..c6554c6a9 100644
+--- a/dlt/common/configuration/exceptions.py
++++ b/dlt/common/configuration/exceptions.py
+@@ -72,30 +72,8 @@ class ConfigFieldMissingException(KeyError, ConfigurationException):
+                     f"WARNING: provider `{provider.name}` is empty. Locations (i.e., files) are"
+                     " missing or empty.\n"
+                 )
+-
+-        # check if entry point is run with path. this is common problem so warn the user
+-        main_path = main_module_file_path()
+-        if main_path and main_path.endswith(".py"):
+-            from dlt.common.runtime import run_context
+-
+-            # check if settings are relative
+-            settings = run_context.active().settings_dir
+-            # settings are relative so check makes sense
+-            if not os.path.isabs(settings):
+-                main_dir = os.path.dirname(main_path)
+-                abs_main_dir = os.path.abspath(main_dir)
+-                if abs_main_dir != os.getcwd():
+-                    # directory was specified
+-                    msg += (
+-                        f"WARNING: dlt looks for {settings} folder in your current working"
+-                        " directory and your cwd (%s) is different from directory of your pipeline"
+-                        " script (%s).\n" % (os.getcwd(), abs_main_dir)
+-                    )
+-                    msg += (
+-                        "If you keep your secret files in the same folder as your pipeline script"
+-                        " but run your script from some other folder, secrets/configs will not be"
+-                        " found\n"
+-                    )
++        # get pipeline context warning
++        msg += get_run_context_warning(main_module_file_path())
+         msg += "Learn more: https://dlthub.com/docs/general-usage/credentials/\n"
+         return msg
+ 
+@@ -109,6 +87,75 @@ class ConfigFieldMissingException(KeyError, ConfigurationException):
+         return attrs_
+ 
+ 
++def get_run_context_warning(main_module_path: str) -> str:
++    """Generates additional warnings when config resolution failed. There are two typical reasons
++    (except genuine missing configurations):
++    * `main_module_path` differs from current run_dir so `dlt` does not find related .dlt folder with settings
++    * command line was used but pipeline script hardcodes config and secrets
++    """
++    from dlt.common.configuration.container import Container
++    from dlt.common.runtime import run_context
++    from dlt.common.pipeline import SupportsPipeline, PipelineContext
++
++    msg = "\n"
++    settings_moved_msg = (
++        "If you keep `.dlt` folder with secret files in the same directory as your pipeline script"
++        " but run your script or a dlt cli command from some other folder,"
++        " secrets/configs will not be found.\n"
++    )
++
++    # find active pipeline
++    context = Container()[PipelineContext]
++    active_pipeline: SupportsPipeline = None
++    # it is not always present
++    if context.is_active():
++        active_pipeline = context.pipeline()
++
++    # use abs path to settings
++    active_context = run_context.active()
++    active_settings = os.path.abspath(active_context.settings_dir)
++
++    if active_pipeline and active_pipeline.last_run_context:
++        # warn if settings are now somewhere else than when pipeline had last successful run
++        last_run_settings = active_pipeline.last_run_context["settings_dir"]
++        if last_run_settings != active_settings:
++            msg += (
++                f"WARNING: Active pipeline `{active_pipeline.pipeline_name}` used"
++                f" `{last_run_settings}` directory to read config and secrets for the last"
++                f" successful run. Different directory `{active_settings}` is used now which may be"
++                " the reason for configuration not resolving.\n"
++                + settings_moved_msg
++            )
++
++        else:
++            # locations didn't change
++            pass
++    else:
++        # there's no active pipeline or it does not contain run context from successful run
++        if main_module_path and main_module_path.endswith(".py"):
++            pipeline_script_dir = os.path.abspath(os.path.dirname(main_module_path))
++            run_dir = os.path.abspath(run_context.active().run_dir)
++            if pipeline_script_dir != run_dir:
++                msg += (
++                    "WARNING: Your run dir (%s) is different from directory of your"
++                    " pipeline script (%s).\n" % (run_dir, pipeline_script_dir)
++                ) + settings_moved_msg
++        else:
++            # if no module path (ie. interactive) or it was not a script (ie. `dlt` cli`)
++            pass
++
++    if main_module_path and main_module_path.endswith("dlt"):
++        msg += (
++            "\nWARNING: When accessing data in the pipeline from the command line `dlt` will not"
++            " execute user code and will just attach to the existing pipeline working dir. If you"
++            " hardcoded your credentials or passed them explicitly ie. with `dlt.secrets` they"
++            " won't be visible. Use environment variables, config files or other providers with"
++            " config injection in order to use cli commands that access data.\n"
++        )
++
++    return msg
++
++
+ class UnmatchedConfigHintResolversException(ConfigurationException):
+     """Raised when using `@resolve_type` on a field that doesn't exist in the spec"""
+ 
+diff --git a/dlt/common/configuration/specs/pluggable_run_context.py b/dlt/common/configuration/specs/pluggable_run_context.py
+index a06ea4ed4..bb4a3ebbd 100644
+--- a/dlt/common/configuration/specs/pluggable_run_context.py
++++ b/dlt/common/configuration/specs/pluggable_run_context.py
+@@ -20,13 +20,19 @@ class SupportsRunContext(Protocol):
+         is active, will be scoped to it. Typically corresponds to Python package name ie. `dlt`.
+         """
+ 
++    @property
++    def uri(self) -> str:
++        """Uniquely identifies the context. By default it is a combination of `run_dir` and `runtime_kwargs`
++        to create file:// uri
++        """
++
+     @property
+     def global_dir(self) -> str:
+         """Directory in which global settings are stored ie ~/.dlt/"""
+ 
+     @property
+     def run_dir(self) -> str:
+-        """Defines the current working directory, defaults to cwd()"""
++        """Defines the context working directory, defaults to cwd()"""
+ 
+     @property
+     def local_dir(self) -> str:
+diff --git a/dlt/common/pipeline.py b/dlt/common/pipeline.py
+index 2cd5b3366..33f9e1952 100644
+--- a/dlt/common/pipeline.py
++++ b/dlt/common/pipeline.py
+@@ -435,6 +435,19 @@ class WithStepInfo(ABC, Generic[TStepMetrics, TStepInfo]):
+         pass
+ 
+ 
++class TLastRunContext(TypedDict, total=False):
++    """Stores context from the last successful pipeline run or sync"""
++
++    run_dir: str
++    """Defines the context working directory, defaults to cwd()"""
++    uri: str
++    """Uniquely identifies the context"""
++    local_dir: str
++    """Defines data dir where local relative dirs and files are created, defaults to run_dir"""
++    settings_dir: str
++    """Defines where the current settings (secrets and configs) are located"""
++
++
+ class TPipelineLocalState(TypedDict, total=False):
+     first_run: bool
+     """Indicates a first run of the pipeline, where run ends with successful loading of data"""
+@@ -444,6 +457,8 @@ class TPipelineLocalState(TypedDict, total=False):
+     """Hash of state that was recently synced with destination"""
+     initial_cwd: str
+     """Run dir when pipeline was instantiated for a first time, defaults to cwd on OSS run context"""
++    last_run_context: Optional[TLastRunContext]
++    """Context from the last successful pipeline run or sync"""
+ 
+ 
+ class TPipelineState(TVersionedState, total=False):
+@@ -490,6 +505,8 @@ class SupportsPipeline(Protocol):
+     """A configurable pipeline secret to be used as a salt or a seed for encryption key"""
+     first_run: bool
+     """Indicates a first run of the pipeline, where run ends with successful loading of the data"""
++    last_run_context: TLastRunContext
++    """Stores last "good" run context, where run ends with successful loading of the data"""
+ 
+     @property
+     def state(self) -> TPipelineState:
+@@ -615,6 +632,9 @@ class PipelineContext(ContainerInjectableContext):
+         if pipeline == self._pipeline:
+             return
+         self.deactivate()
++        # TODO: (1) compare run_context in pipeline with currently active context (via uri) and warn if they differ
++        # TODO: (2) activate the right pipeline context. that requires that we should change pluggable run context
++        #       to thread-affine or even contextvar that works in async pools
+         pipeline._set_context(True)
+         self._pipeline = pipeline
+         # store activated pipelines
+diff --git a/dlt/common/runtime/run_context.py b/dlt/common/runtime/run_context.py
+index e22f06711..9e6d95a78 100644
+--- a/dlt/common/runtime/run_context.py
++++ b/dlt/common/runtime/run_context.py
+@@ -3,6 +3,7 @@ import tempfile
+ import warnings
+ from types import ModuleType
+ from typing import Any, ClassVar, Dict, List, Optional
++from urllib.parse import urlencode
+ 
+ from dlt.common import known_env
+ from dlt.common.configuration import plugins
+@@ -34,6 +35,19 @@ class RunContext(SupportsRunContext):
+     def global_dir(self) -> str:
+         return self.data_dir
+ 
++    @property
++    def uri(self) -> str:
++        from dlt.common.storages.configuration import FilesystemConfiguration
++
++        uri_no_qs = FilesystemConfiguration.make_file_url(self.run_dir)
++        # add query string from self.runtime_kwargs
++        runtime_kwargs = self.runtime_kwargs
++        if runtime_kwargs:
++            query_string = urlencode(runtime_kwargs)
++            if query_string:
++                return f"{uri_no_qs}?{query_string}"
++        return uri_no_qs
++
+     @property
+     def run_dir(self) -> str:
+         """The default run dir is the current working directory but may be overridden by DLT_PROJECT_DIR env variable."""
+diff --git a/dlt/pipeline/configuration.py b/dlt/pipeline/configuration.py
+index b615fad3d..1f60540a6 100644
+--- a/dlt/pipeline/configuration.py
++++ b/dlt/pipeline/configuration.py
+@@ -1,11 +1,11 @@
+ from typing import Any, Optional
+ 
+-import dlt
+ from dlt.common.configuration import configspec
+ from dlt.common.configuration.specs import RuntimeConfiguration, BaseConfiguration
++from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
+ from dlt.common.typing import AnyFun, TSecretStrValue
+ from dlt.common.utils import digest256
+-from dlt.common.destination import TLoaderFileFormat, TDestinationReferenceArg
++from dlt.common.destination import TDestinationReferenceArg
+ from dlt.common.pipeline import TRefreshMode
+ from dlt.common.configuration.exceptions import ConfigurationValueError
+ 
+@@ -42,6 +42,8 @@ class PipelineConfiguration(BaseConfiguration):
+     runtime: RuntimeConfiguration = None
+     refresh: Optional[TRefreshMode] = None
+     """Refresh mode for the pipeline to fully or partially reset a source during run. See docstring of `dlt.pipeline` for more details."""
++    pluggable_run_context: PluggableRunContext = None
++    """Pluggable run context with current run context"""
+ 
+     def on_resolved(self) -> None:
+         if not self.pipeline_name:
+diff --git a/dlt/pipeline/pipeline.py b/dlt/pipeline/pipeline.py
+index 1f9068570..034b631fd 100644
+--- a/dlt/pipeline/pipeline.py
++++ b/dlt/pipeline/pipeline.py
+@@ -88,6 +88,7 @@ from dlt.common.pipeline import (
+     PipelineContext,
+     TStepInfo,
+     SupportsPipeline,
++    TLastRunContext,
+     TPipelineLocalState,
+     TPipelineState,
+     StateInjectableContext,
+@@ -334,10 +335,12 @@ class Pipeline(SupportsPipeline):
+         self.first_run = False
+         self.dataset_name: str = None
+         self.is_active = False
++        self.last_run_context: TLastRunContext = None
+ 
+         self.pipeline_salt = pipeline_salt
+         self.config = config
+         self.runtime_config = runtime
++        self.run_context = config.pluggable_run_context.context
+         self.dev_mode = dev_mode
+         self.collector = progress or _NULL_COLLECTOR
+         self._destination = None
+@@ -362,6 +365,7 @@ class Pipeline(SupportsPipeline):
+             self._set_destinations(destination=destination, staging=staging, initializing=True)
+             # set the pipeline properties from state, destination and staging will not be set
+             self._state_to_props(state)
++            # TODO: compare run_context with last_run_context restored from props. warn on changed uri
+             # we overwrite the state with the values from init
+             self._set_dataset_name(dataset_name)
+ 
+@@ -593,8 +597,7 @@ class Pipeline(SupportsPipeline):
+             with signals.delayed_signals():
+                 runner.run_pool(load_step.config, load_step)
+             info: LoadInfo = self._get_step_info(load_step)
+-
+-            self.first_run = False
++            self._update_last_run_context()
+             return info
+         except Exception as l_ex:
+             step_info = self._get_step_info(load_step)
+@@ -780,11 +783,9 @@ class Pipeline(SupportsPipeline):
+                 remote_state = self._restore_state_from_destination()
+ 
+                 # if remote state is newer or same
+-                # print(f'REMOTE STATE: {(remote_state or {}).get("_state_version")} >= {state["_state_version"]}')
+                 # TODO: check if remote_state["_state_version"] is not in 10 recent version. then we know remote is newer.
+                 if remote_state and remote_state["_state_version"] >= state["_state_version"]:
+                     state_changed = remote_state["_version_hash"] != state.get("_version_hash")
+-                    # print(f"MERGED STATE: {bool(merged_state)}")
+                     if state_changed:
+                         # see if state didn't change the pipeline name
+                         if state["pipeline_name"] != remote_state["pipeline_name"]:
+@@ -804,7 +805,7 @@ class Pipeline(SupportsPipeline):
+                                 f"Pipeline {self.pipeline_name} got restored from destination"
+                                 " including new version",
+                                 "of pipeline state but it has pending load packages that were not"
+-                                " yet normalized or loaded. If that packages contain extracted"
++                                " yet normalized or loaded. If those packages contain extracted"
+                                 " state or schema migrations - those will not be affected and will"
+                                 " still be loaded to destination.",
+                             )
+@@ -826,9 +827,9 @@ class Pipeline(SupportsPipeline):
+                     self._schema_storage.clear_storage()
+                 for schema in restored_schemas:
+                     self._schema_storage.save_schema(schema)
+-                # if the remote state is present then unset first run
++                # if the remote state is present then unset first run and update last run context
+                 if remote_state is not None:
+-                    self.first_run = False
++                    self._update_last_run_context()
+             except DestinationUndefinedEntity:
+                 # storage not present. wipe the pipeline if pipeline not new
+                 # do it only if pipeline has any data
+@@ -1053,6 +1054,19 @@ class Pipeline(SupportsPipeline):
+             state = self._get_state()
+         return state["_local"][key]  # type: ignore
+ 
++    def _update_last_run_context(self) -> None:
++        """
++        Persist the directory context in local state.
++        Safe-no-op if the pipeline is not active or if run_context cannot be resolved.
++        """
++        self.first_run = False
++        self.last_run_context = {
++            "settings_dir": os.path.abspath(self.run_context.settings_dir),
++            "local_dir": os.path.abspath(self.run_context.local_dir),
++            "run_dir": os.path.abspath(self.run_context.run_dir),
++            "uri": self.run_context.uri,
++        }
++
+     @with_config_section(sections=(), merge_func=ConfigSectionContext.prefer_existing)
+     def sql_client(self, schema_name: str = None) -> SqlClientBase[Any]:
+         """Returns a sql client configured to query/change the destination and dataset that were used to load the data.
+diff --git a/tests/cli/test_pipeline_command.py b/tests/cli/test_pipeline_command.py
+index 3551b7958..5ccedb721 100644
+--- a/tests/cli/test_pipeline_command.py
++++ b/tests/cli/test_pipeline_command.py
+@@ -6,8 +6,11 @@ import logging
+ from subprocess import CalledProcessError
+ 
+ import dlt
++from dlt.common.utils import set_working_dir
+ from dlt.common.runners.venv import Venv
+ from dlt.common.storages.file_storage import FileStorage
++from dlt.common.configuration.exceptions import ConfigFieldMissingException
++from dlt.cli.exceptions import CliCommandInnerException
+ 
+ from dlt.cli import echo, init_command, pipeline_command
+ 
+@@ -131,6 +134,11 @@ def test_pipeline_command_operations(repo_dir: str, project_files: FileStorage)
+ 
+         _out = buf.getvalue()
+         assert "Selected resource(s): ['players_games']" in _out
++        assert (
++            "WARNING: Unless hardcoded, credentials are loaded from environment variables and/or"
++            " configuration files."
++            not in _out
++        )
+ 
+         # Command was executed
+         pipeline = dlt.attach(pipeline_name="chess_pipeline")
+@@ -242,3 +250,42 @@ def test_pipeline_command_drop_partial_loads(repo_dir: str, project_files: FileS
+         _out = buf.getvalue()
+         assert "No pending packages found" in _out
+     print(_out)
++
++
++def test_drop_from_wrong_dir(repo_dir: str, project_files: FileStorage) -> None:
++    init_command.init_command("chess", "duckdb", repo_dir)
++
++    os.environ.pop(
++        "DESTINATION__DUCKDB__CREDENTIALS", None
++    )  # settings from local project (secrets.toml etc.)
++    venv = Venv.restore_current()
++    try:
++        print(venv.run_script("chess_pipeline.py"))
++    except CalledProcessError as cpe:
++        print(cpe.stdout)
++        print(cpe.stderr)
++        raise
++
++    # Running from the correct location should not raise warning
++    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
++        pipeline = dlt.attach(pipeline_name="chess_pipeline")
++        # when testing local_dir is not run_dir! it is pointing to tests/_storage
++        pipeline_dir = pipeline.last_run_context.get("run_dir")
++        with set_working_dir(pipeline_dir):
++            pipeline_command.pipeline_command(
++                "drop", "chess_pipeline", None, 0, resources=["players_games"]
++            )
++        _out = buf.getvalue()
++        assert (
++            "WARNING: You should run this from the same directory as the pipeline script"
++            not in _out
++        )
++
++    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
++        os.makedirs("wrong_dir", exist_ok=True)
++        with set_working_dir("wrong_dir"):
++            pipeline_command.pipeline_command(
++                "drop", "chess_pipeline", None, 0, resources=["players_games"]
++            )
++        _out = buf.getvalue()
++        assert "WARNING: You should run this from the same directory as the pipeline script" in _out
+diff --git a/tests/common/configuration/test_configuration.py b/tests/common/configuration/test_configuration.py
+index 119c351ad..6f35e01dd 100644
+--- a/tests/common/configuration/test_configuration.py
++++ b/tests/common/configuration/test_configuration.py
+@@ -1,4 +1,5 @@
+ from dlt.common import logger
++import os
+ import pytest
+ import datetime  # noqa: I251
+ from unittest.mock import patch
+@@ -25,7 +26,12 @@ from dlt.common.configuration.specs.config_providers_context import ConfigProvid
+ from dlt.common.configuration.specs.gcp_credentials import (
+     GcpServiceAccountCredentialsWithoutDefaults,
+ )
+-from dlt.common.utils import custom_environ, get_exception_trace, get_exception_trace_chain
++from dlt.common.utils import (
++    custom_environ,
++    get_exception_trace,
++    get_exception_trace_chain,
++    set_working_dir,
++)
+ from dlt.common.typing import (
+     AnyType,
+     CallableAny,
+@@ -44,6 +50,7 @@ from dlt.common.configuration.exceptions import (
+     LookupTrace,
+     ValueNotSecretException,
+     UnmatchedConfigHintResolversException,
++    get_run_context_warning,
+ )
+ from dlt.common.configuration import (
+     configspec,
+@@ -58,6 +65,7 @@ from dlt.common.configuration.specs import (
+     RuntimeConfiguration,
+     ConnectionStringCredentials,
+ )
++from dlt.common.configuration.container import Container
+ from dlt.common.configuration.resolve import resolve_single_provider_value
+ from dlt.common.configuration.providers import environ as environ_provider, toml
+ from dlt.common.configuration.utils import (
+@@ -68,11 +76,11 @@ from dlt.common.configuration.utils import (
+     add_config_dict_to_env,
+     add_config_to_env,
+ )
+-from dlt.common.pipeline import TRefreshMode
++from dlt.common.pipeline import TRefreshMode, PipelineContext
+ from dlt.cli.config_toml_writer import TYPE_EXAMPLES
+ 
+ from dlt.destinations.impl.postgres.configuration import PostgresCredentials
+-from tests.utils import preserve_environ
++from tests.utils import preserve_environ, TEST_STORAGE_ROOT
+ from tests.common.configuration.utils import (
+     MockProvider,
+     CoercionTestConfiguration,
+@@ -88,6 +96,8 @@ from tests.common.configuration.utils import (
+     env_provider,
+     reset_resolved_traces,
+ )
++import dlt
++
+ 
+ INVALID_COERCIONS = {
+     # 'STR_VAL': 'test string',  # string always OK
+@@ -1701,3 +1711,95 @@ def test_warn_when_resolving_placeholders(
+             assert str(placeholder_value) in msg
+             assert test_section_name in msg
+             assert provider.name in msg
++
++
++def test_get_run_context_warning_cli() -> None:
++    """Test get_run_context_warning function with CLI command scenarios"""
++    from dlt.common.runtime import run_context
++
++    # Case 1: CLI command with no active pipeline
++    # Expected: Only shows CLI-specific warning (1 WARNING total)
++    result = get_run_context_warning("/dlt")
++    assert "When accessing data in the pipeline from the command line" in result
++    assert 1 == result.count("WARNING")
++
++    # Setup: Create active pipeline with current location context
++    ctx = Container()[PipelineContext]
++    p = dlt.pipeline(pipeline_name="test_get_run_context_warning")
++    p._update_last_run_context()
++    assert ctx.is_active() is True
++
++    initial_run_dir = os.getcwd()
++
++    initial_settings_dir = os.path.join(initial_run_dir, ".dlt")
++    assert initial_settings_dir == p.last_run_context.get("settings_dir")
++    assert initial_settings_dir == os.path.abspath(run_context.active().settings_dir)
++
++    # Case 2: CLI command with active pipeline - same location as pipeline last ran
++    # Expected: Only shows CLI-specific warning (1 WARNING total)
++    result = get_run_context_warning("/dlt")
++    assert "When accessing data in the pipeline from the command line" in result
++    assert 1 == result.count("WARNING")
++
++    # Case 3: CLI command with active pipeline - different location than pipeline last ran
++    # Expected: Shows both CLI warning AND pipeline location mismatch warning (2 WARNINGS total)
++    with set_working_dir(TEST_STORAGE_ROOT):
++        assert initial_settings_dir == p.last_run_context.get("settings_dir")
++        assert initial_settings_dir != os.path.abspath(run_context.active().settings_dir)
++        result = get_run_context_warning("/dlt")
++        assert "Active pipeline `test_get_run_context_warning` used" in result
++        assert "When accessing data in the pipeline from the command line" in result
++        assert 2 == result.count("WARNING")
++
++    ctx.deactivate()
++
++
++def test_get_run_context_warning_script() -> None:
++    """Simple test for get_run_context_warning function with pipeline_script"""
++    from dlt.common.runtime import run_context
++
++    initial_run_dir = os.getcwd()
++
++    # Case 1: Python script with no active pipeline - script in same directory as run
++    # Expected: No warnings (script and run dir match, no pipeline context to check)
++    result = get_run_context_warning(os.path.join(initial_run_dir, "pipeline_script.py"))
++    assert initial_run_dir == os.path.abspath(run_context.active().run_dir)
++    assert "\n" == result
++
++    # Case 2: Python script with no active pipeline - script in different directory than run
++    # Expected: Shows original heuristic warning about script vs run dir mismatch (1 WARNING)
++    result = get_run_context_warning(
++        os.path.join(initial_run_dir, "some_folder", "pipeline_script.py")
++    )
++    assert initial_run_dir == os.path.abspath(run_context.active().run_dir)
++    assert (
++        f"Your run dir ({initial_run_dir}) is different from directory of your pipeline script"
++        f" ({os.path.join(initial_run_dir, 'some_folder')})"
++        in result
++    )
++    assert 1 == result.count("WARNING")
++
++    # Setup: Create active pipeline with current location context
++    ctx = Container()[PipelineContext]
++    p = dlt.pipeline(pipeline_name="test_get_run_context_warning")
++    p._update_last_run_context()
++    assert ctx.is_active() is True
++
++    # Case 3: Python script with active pipeline - same location as pipeline last ran
++    # Expected: No warnings (current location matches where pipeline worked before)
++    initial_settings_dir = os.path.join(initial_run_dir, ".dlt")
++    assert initial_settings_dir == p.last_run_context.get("settings_dir")
++    assert initial_settings_dir == os.path.abspath(run_context.active().settings_dir)
++    result = get_run_context_warning(os.path.join(initial_run_dir, "pipeline_script.py"))
++    assert "\n" == result
++
++    # Case 4: Python script with active pipeline - different location than pipeline last ran
++    # Expected: Shows pipeline-specific location mismatch warning (1 WARNING)
++    with set_working_dir(TEST_STORAGE_ROOT):
++        assert initial_settings_dir == p.last_run_context.get("settings_dir")
++        assert initial_settings_dir != os.path.abspath(run_context.active().settings_dir)
++        result = get_run_context_warning(os.path.join(initial_run_dir, "pipeline_script.py"))
++        assert "Active pipeline `test_get_run_context_warning` used" in result
++        assert 1 == result.count("WARNING")
++
++    ctx.deactivate()
+diff --git a/tests/common/runtime/test_run_context.py b/tests/common/runtime/test_run_context.py
+index 13bd7b0d0..e9200f835 100644
+--- a/tests/common/runtime/test_run_context.py
++++ b/tests/common/runtime/test_run_context.py
+@@ -13,6 +13,7 @@ from dlt.common.runtime.run_context import (
+     get_plugin_modules,
+     is_folder_writable,
+ )
++from dlt.common.storages.configuration import _make_file_url
+ from dlt.common.utils import set_working_dir
+ 
+ import tests
+@@ -47,6 +48,8 @@ def test_run_context() -> None:
+     assert run_context.name == "dlt"
+     assert run_context.global_dir == run_context.data_dir
+     assert run_context.run_dir == run_context.local_dir
++    assert run_context.uri == _make_file_url(None, run_context.run_dir, None)
++    assert run_context.uri.startswith("file://")
+ 
+     # check config providers
+     assert len(run_context.initial_providers()) == 3
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index 9b7bc1333..281ec4a8f 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -1279,6 +1279,13 @@ def test_set_get_local_value() -> None:
+     assert p.state["_local"][new_val] == new_val  # type: ignore[literal-required]
+ 
+ 
++def test_update_last_run_context() -> None:
++    p = dlt.pipeline(destination="dummy", dev_mode=True)
++    p._update_last_run_context()
++    assert p.last_run_context["local_dir"] == os.path.join(os.getcwd(), "_storage")
++    assert p.last_run_context["settings_dir"] == os.path.join(os.getcwd(), ".dlt")
++
++
+ def test_changed_write_disposition() -> None:
+     pipeline_name = "pipe_" + uniq_id()
+     p = dlt.pipeline(pipeline_name=pipeline_name, destination=DUMMY_COMPLETE)
+diff --git a/tests/plugins/dlt_example_plugin/dlt_example_plugin/plugin.py b/tests/plugins/dlt_example_plugin/dlt_example_plugin/plugin.py
+index 7964cd794..9d031f050 100644
+--- a/tests/plugins/dlt_example_plugin/dlt_example_plugin/plugin.py
++++ b/tests/plugins/dlt_example_plugin/dlt_example_plugin/plugin.py
+@@ -1,6 +1,6 @@
+ import os
+ import argparse
+-from typing import Any, ClassVar, Optional, Type
++from typing import Any, ClassVar, Dict, Optional, Type
+ 
+ from dlt.common.configuration import plugins
+ from dlt.common.configuration.specs.pluggable_run_context import SupportsRunContext
+@@ -32,6 +32,10 @@ class RunContextTest(RunContext):
+     def local_dir(self) -> str:
+         return os.path.join(self.data_dir, "tmp")
+ 
++    @property
++    def runtime_kwargs(self) -> Dict[str, Any]:
++        return {"profile": "dev"}
++
+ 
+ @plugins.hookimpl(specname="plug_run_context")
+ def plug_run_context_impl(run_dir: Optional[str], **kwargs: Any) -> SupportsRunContext:
+diff --git a/tests/plugins/test_plugin_discovery.py b/tests/plugins/test_plugin_discovery.py
+index 06451ebd0..e987ed662 100644
+--- a/tests/plugins/test_plugin_discovery.py
++++ b/tests/plugins/test_plugin_discovery.py
+@@ -63,6 +63,8 @@ def plugin_install():
+ def test_example_plugin() -> None:
+     context = run_context.active()
+     assert context.name == "dlt-test"
++    # run_dir is the module file path and we have profile == dev as runtime kwargs
++    assert context.uri.endswith("/dlt_example_plugin?profile=dev")
+     assert context.data_dir == os.path.abspath(TEST_STORAGE_ROOT)
+     # top level module info should be present
+     assert context.module.__name__ == "dlt_example_plugin"
+
+
+===== COMMIT 4f54e644 =====
+
+
+commit 4f54e6446
+Author: Alena Astrakhantseva
+Date: 2025-07-02
+
+    extended release notes 1.12.0 (#2801) (#2830)
+
+diff --git a/docs/website/docs/release-notes/1.12.1.md b/docs/website/docs/release-notes/1.12.1.md
+new file mode 100644
+index 000000000..49f67c2c1
+--- /dev/null
++++ b/docs/website/docs/release-notes/1.12.1.md
+@@ -0,0 +1,228 @@
++---
++title: "Release highlights: 1.12.1"
++description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
++keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
++---
++
++# Release highlights: 1.12.1
++
++This update includes substantial improvements to developer experience and stability, as well as bug fixes. Here's a breakdown of what's new:
++
++---
++
++## Placeholder config & secret warning system
++
++**PR:** [#2636](https://github.com/dlt-hub/dlt/pull/2636)
++
++**Overview**
++
++* dlt now detects placeholder values during **config and secret resolution** (e.g., `"<configure me>"`, or timestamps like `1768-07-21T02:56:00Z`).
++* A **detailed warning** is emitted when placeholders are detected, helping users identify incomplete configuration.
++* Prevents confusing errors during pipeline runs and catches misconfigured values early in the development cycle.
++
++**Example placeholders**
++
++```toml
++[credentials]
++token = "<configure me>"
++started_at = "1768-07-21T02:56:73Z"  # random date
++```
++
++**Example warning**
++
++```text
++Placeholder value encountered when resolving config or secret:
++resolved_key: host, value: <configure me>, section: sources.sql_database.credentials.host
++Most likely, this comes from init-command, which creates basic templates for non-complex configs and secrets. The provider to adjust is secrets.toml at one of these locations:
++- /home/me/project/.dlt/secrets.toml
++- /home/me/.dlt/secrets.toml
++```
++
++---
++
++## Warning for `None`-only columns
++
++**PR:** [#2633](https://github.com/dlt-hub/dlt/pull/2633)
++
++**Overview**
++
++* When normalizing data, if a column contains only `None`, dlt can’t infer its type.
++* This PR adds a **clear warning message** to help users fix this by providing an explicit type hint.
++* If no type hint is given, the column will be **excluded** from the destination table.
++
++**Example warning**
++
++```text
++The column `my_column` in table `my_table` did not receive any data during this load. Therefore, its type couldn't be inferred.
++
++Unless a type hint is provided, the column will not be materialized in the destination.
++```
++
++**Recommended fix**
++
++```py
++@dlt.resource(columns={"my_column": {"data_type": "text"}})
++def my_data():
++    yield {"my_column": None}
++```
++
++---
++
++## Regular and standalone resources are now the same thing
++
++**Before**
++
++* Inner resources could not receive secrets or configs properly.
++* Required the `standalone=True` argument.
++
++```py
++@dlt.resource(standalone=True)
++def foo(access_token=dlt.secrets.value):
++    yield from generate_json_like_data(access_token)
++```
++
++```toml
++[sources.foo]
++access_token = "your_token"
++```
++
++**Now**
++
++* All `@dlt.resource` functions behave identically.
++* `standalone=True` is **ignored** and no longer required.
++* Inner resources adopt the config section from the source they are in: `sources.source_module.resource_name` this is canonical form.
++
++**Cleaner usage**
++
++```py
++@dlt.resource
++def foo(access_token=dlt.secrets.value):
++    yield from generate_json_like_data(access_token)
++```
++
++For inner resources:
++
++```py
++@dlt.source
++def bar():
++    @dlt.resource
++    def foo(access_token=dlt.secrets.value):
++        yield from generate_json_like_data(access_token)
++
++    return foo
++```
++
++```toml
++[sources.bar.foo]
++access_token = "your_token"
++```
++
++---
++
++## Resources can `return` data (instead of `yield`)
++
++**Overview**
++
++* You can now return values instead of yielding.
++* Useful for static data or short lists.
++
++**Example**
++
++```py
++@dlt.resource
++def numbers():
++    return [{"key1": 1, "key2": 2}]
++```
++> `return` is automatically wrapped into a generator internally.
++
++:::warning
++Not recommended for large-scale use due to readability and stream control.
++:::
++
++---
++
++## Performance and stability fixes
++
++**PR:** [#2756](https://github.com/dlt-hub/dlt/pull/2756)
++
++### 1. Snowflake: extremely slow merge query due to `OR` condition (n² complexity)
++
++* In **merge** write disposition with `delete-insert` strategy, the generated SQL used:
++
++```sql
++DELETE FROM main_table WHERE EXISTS (
++  SELECT 1 FROM staging_table
++  WHERE main.pk1 = staging.pk1 AND main.pk2 = staging.pk2
++     OR main.merge_key = staging.merge_key
++);
++```
++
++* This caused **very slow** performance due to `OR` logic in `EXISTS`, especially on large datasets.
++
++**New approach**
++
++* Rewrites the logic to two separate `DELETE` queries, executed in the same transaction:
++
++```sql
++DELETE ... WHERE EXISTS (JOIN ON primary_key);
++DELETE ... WHERE EXISTS (JOIN ON merge_key);
++```
++
++:::info
++⚡ Improves performance from **18 hours → 4 seconds** on large datasets.
++:::
++
++### 2. Skip deduplication option
++
++* New flag allows users to **disable deduplication** during `delete-insert` operations, further reducing merge cost.
++* Useful for **append-heavy** workloads with upstream deduplication.
++* Works for any destination that supports `delete-insert`.
++
++```py
++@dlt.resource(
++    primary_key="id",
++    write_disposition={
++        "disposition": "merge",
++        "strategy": "delete-insert",
++        "deduplicated": False
++    }
++)
++def data_resource():
++    yield from get_data()
++```
++---
++
++## Iceberg: `upsert` merge strategy added
++
++**PR:** [#2671](https://github.com/dlt-hub/dlt/pull/2671)
++
++**Overview**
++
++* Iceberg now supports `merge` with **upsert** semantics, similar to Delta Lake.
++* Enables row-level updates using **primary and merge keys**.
++
++:::warning
++Known limitations due to current pyiceberg behavior:
++
++* Nested fields and struct joins are not fully supported in Arrow joins (required by upsert).
++* Non-unique keys in input data will raise hard errors — Iceberg enforces strict uniqueness.
++* Some failing tests stem from current pyiceberg limitations (e.g., recursion limits, Arrow type mismatches).
++:::
++
++---
++
++## Bonus: Postgres now supports `parquet` via ADBC
++
++**PR:** [#2685](https://github.com/dlt-hub/dlt/pull/2685)
++
++```py
++pipeline = dlt.pipeline(destination="postgres")
++pipeline.run(some_source(), loader_file_format="parquet")
++```
++
++---
++
++## Full release notes
++
++[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
++
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 7efc7cf64..b3f362485 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -43,6 +43,19 @@ const sidebars = {
+         'tutorial/load-data-from-an-api',
+       ]
+     },
++    {
++      type: 'category',
++      label: 'Release highlights',
++      link: {
++        type: 'generated-index',
++        title: 'Release highlights',
++        slug: '/release-highlights',
++        keywords: ['release notes, release highlights'],
++      },
++      items: [
++        'release-notes/1.12.1',
++      ]
++    },
+     {
+       type: 'category',
+       label: 'Core concepts',
+diff --git a/docs/website/src/css/custom.css b/docs/website/src/css/custom.css
+index 7b10051f5..63b6153df 100644
+--- a/docs/website/src/css/custom.css
++++ b/docs/website/src/css/custom.css
+@@ -368,201 +368,221 @@ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(1)>div>a::before {
+   background-image: url(../../static/img/GettingStarted-Active-1.svg);
+ }
+ 
+-
+-/* Core concepts */
++/* Release Highlights */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(2)>div>a::before {
+-  background-image: url(../../static/img/UserGuide-Inactive.svg);
++  background-image: url(../../static/img/ReleaseNotes-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:nth-child(2)>div>a::before,
+ .menu_vPEQ>ul>li:hover:nth-child(2)>div>a::before {
+-  background-image: url(../../static/img/UserGuide-Active.svg);
++  background-image: url(../../static/img/ReleaseNotes-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(2)>div>a::before {
+-  background-image: url(../../static/img/UserGuide-Inactive-1.svg);
++  background-image: url(../../static/img/ReleaseNotes-Inactive-1.svg);
+ }
+ 
+-html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(2)>div>a::before,
+-html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(2)>div>a::before {
+-  background-image: url(../../static/img/UserGuide-Active-1.svg);
++html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(2)>div>a::before,
++html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(2)>div>a::before {
++  background-image: url(../../static/img/ReleaseNotes-Active-1.svg);
+ }
+ 
+-/* dlt+ */
++
++/* Core concepts */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(3)>div>a::before {
+-  background-image: url(../../static/img/Plus-Inactive.svg);
++  background-image: url(../../static/img/UserGuide-Inactive.svg);
+ }
+ 
+-.menu_vPEQ>ul>li:hover:nth-child(3)>div>a::before,
+-.menu_vPEQ>ul>li:nth-child(3)>div>a::before {
+-  background-image: url(../../static/img/Plus-Active.svg);
++.menu_vPEQ>ul>li:nth-child(3)>div>a::before,
++.menu_vPEQ>ul>li:hover:nth-child(3)>div>a::before {
++  background-image: url(../../static/img/UserGuide-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(3)>div>a::before {
+-  background-image: url(../../static/img/Plus-Inactive-1.svg);
++  background-image: url(../../static/img/UserGuide-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(3)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(3)>div>a::before {
+-  background-image: url(../../static/img/Plus-Active-1.svg);
++  background-image: url(../../static/img/UserGuide-Active-1.svg);
+ }
+ 
+-/* Sources */
++/* dlt+ */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(4)>div>a::before {
+-  background-image: url(../../static/img/Sources-Inactive.svg);
++  background-image: url(../../static/img/Plus-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(4)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(4)>div>a::before {
+-  background-image: url(../../static/img/Sources-Active.svg);
++  background-image: url(../../static/img/Plus-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(4)>div>a::before {
+-  background-image: url(../../static/img/Sources-Inactive-1.svg);
++  background-image: url(../../static/img/Plus-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(4)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(4)>div>a::before {
+-  background-image: url(../../static/img/Sources-Active-1.svg);
++  background-image: url(../../static/img/Plus-Active-1.svg);
+ }
+ 
+-/* Destinations */
++/* Sources */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(5)>div>a::before {
+-  background-image: url(../../static/img/Destinations-Inactive.svg);
++  background-image: url(../../static/img/Sources-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(5)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(5)>div>a::before {
+-  background-image: url(../../static/img/Destinations-Active.svg);
++  background-image: url(../../static/img/Sources-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(5)>div>a::before {
+-  background-image: url(../../static/img/Destinations-Inactive-1.svg);
++  background-image: url(../../static/img/Sources-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(5)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(5)>div>a::before {
+-  background-image: url(../../static/img/Destinations-Active-1.svg);
++  background-image: url(../../static/img/Sources-Active-1.svg);
+ }
+ 
+-/* Using dlt */
++/* Destinations */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(6)>div>a::before {
+-  background-image: url(../../static/img/GeneralUsage-Inactive.svg);
++  background-image: url(../../static/img/Destinations-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(6)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(6)>div>a::before {
+-  background-image: url(../../static/img/GeneralUsage-Active.svg);
++  background-image: url(../../static/img/Destinations-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(6)>div>a::before {
+-  background-image: url(../../static/img/GeneralUsage-Inactive-1.svg);
++  background-image: url(../../static/img/Destinations-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(6)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(6)>div>a::before {
+-  background-image: url(../../static/img/GeneralUsage-Active-1.svg);
++  background-image: url(../../static/img/Destinations-Active-1.svg);
+ }
+ 
+-/* Deploying dlt */
++/* Using dlt */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(7)>div>a::before {
+-  background-image: url(../../static/img/UsingLoadedData-Inactive.svg);
++  background-image: url(../../static/img/GeneralUsage-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(7)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(7)>div>a::before {
+-  background-image: url(../../static/img/UsingLoadedData-Active.svg);
++  background-image: url(../../static/img/GeneralUsage-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(7)>div>a::before {
+-  background-image: url(../../static/img/UsingLoadedData-Inactive-1.svg);
++  background-image: url(../../static/img/GeneralUsage-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(7)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(7)>div>a::before {
+-  background-image: url(../../static/img/UsingLoadedData-Active-1.svg);
++  background-image: url(../../static/img/GeneralUsage-Active-1.svg);
+ }
+ 
+-/* Optimizing dlt */
+-
++/* Deploying dlt */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(8)>div>a::before {
+-  background-image: url(../../static/img/Installation-Inactive.svg);
++  background-image: url(../../static/img/UsingLoadedData-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(8)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(8)>div>a::before {
+-  background-image: url(../../static/img/Installation-Active.svg);
++  background-image: url(../../static/img/UsingLoadedData-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(8)>div>a::before {
+-  background-image: url(../../static/img/Installation-Inactive-1.svg);
++  background-image: url(../../static/img/UsingLoadedData-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(8)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(8)>div>a::before {
+-  background-image: url(../../static/img/Installation-Active-1.svg);
++  background-image: url(../../static/img/UsingLoadedData-Active-1.svg);
+ }
+ 
++/* Optimizing dlt */
+ 
+-/* Code Examples */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(9)>div>a::before {
+-  background-image: url(../../static/img/Howdltworks-Inactive.svg);
++  background-image: url(../../static/img/Installation-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(9)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(9)>div>a::before {
+-  background-image: url(../../static/img/Howdltworks-Active.svg);
++  background-image: url(../../static/img/Installation-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(9)>div>a::before {
+-  background-image: url(../../static/img/Howdltworks-Inactive-1.svg);
++  background-image: url(../../static/img/Installation-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(9)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(9)>div>a::before {
+-  background-image: url(../../static/img/Howdltworks-Active-1.svg);
++  background-image: url(../../static/img/Installation-Active-1.svg);
+ }
+ 
+-/* Reference */
++
++/* Code Examples */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(10)>div>a::before {
+-  background-image: url(../../static/img/Reference-Inactive.svg);
++  background-image: url(../../static/img/Howdltworks-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(10)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(10)>div>a::before {
+-  background-image: url(../../static/img/Reference-Active.svg);
++  background-image: url(../../static/img/Howdltworks-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(10)>div>a::before {
+-  background-image: url(../../static/img/Reference-Inactive-1.svg);
++  background-image: url(../../static/img/Howdltworks-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(10)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(10)>div>a::before {
++  background-image: url(../../static/img/Howdltworks-Active-1.svg);
++}
++
++/* Reference */
++
++.menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(11)>div>a::before {
++  background-image: url(../../static/img/Reference-Inactive.svg);
++}
++
++.menu_vPEQ>ul>li:hover:nth-child(11)>div>a::before,
++.menu_vPEQ>ul>li:nth-child(11)>div>a::before {
++  background-image: url(../../static/img/Reference-Active.svg);
++}
++
++html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(11)>div>a::before {
++  background-image: url(../../static/img/Reference-Inactive-1.svg);
++}
++
++html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(11)>div>a::before,
++html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(11)>div>a::before {
+   background-image: url(../../static/img/Reference-Active-1.svg);
+ }
+ 
+ 
+ /* Devel / Stable switch */
+ 
+-.menu_vPEQ>ul>li:nth-child(11)>a svg {
++.menu_vPEQ>ul>li:nth-child(12)>a svg {
+   display: none;
+ }
+ 
+-.menu_vPEQ>ul>li:nth-child(11)>a {
++.menu_vPEQ>ul>li:nth-child(12)>a {
+   flex: none;
+ }
+ 
+-.menu_vPEQ>ul>li:nth-child(11) {
++.menu_vPEQ>ul>li:nth-child(12) {
+   margin-top:30px;
+   padding-top: 10px;
+   justify-content: center;
+diff --git a/docs/website/static/img/ReleaseNotes-Active-1.svg b/docs/website/static/img/ReleaseNotes-Active-1.svg
+new file mode 100644
+index 000000000..35812973a
+--- /dev/null
++++ b/docs/website/static/img/ReleaseNotes-Active-1.svg
+@@ -0,0 +1,15 @@
++<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
++<g clip-path="url(#clip0_8_1360)">
++<mask id="mask0_8_1360" style="mask-type:luminance" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32">
++<path d="M28 0H4C1.79086 0 0 1.79086 0 4V28C0 30.2091 1.79086 32 4 32H28C30.2091 32 32 30.2091 32 28V4C32 1.79086 30.2091 0 28 0Z" fill="white"/>
++</mask>
++<g mask="url(#mask0_8_1360)">
++<path d="M28 0C30.2091 0 32 1.79086 32 4V28C32 30.2091 30.2091 32 28 32H4C1.79086 32 0 30.2091 0 28V4C0 1.79086 1.79086 0 4 0H28ZM8 5C6.34315 5 5 6.34315 5 8V24C5 25.6569 6.34315 27 8 27H24C25.6569 27 27 25.6569 27 24V8C27 6.34315 25.6569 5 24 5H8ZM24 7C24.5523 7 25 7.44771 25 8V24C25 24.5523 24.5523 25 24 25H8C7.44771 25 7 24.5523 7 24V8C7 7.44772 7.44772 7 8 7H24ZM10 19V21H20V19H10ZM10 15V17H19V15H10ZM10 11V13H22V11H10Z" fill="#C6D300"/>
++</g>
++</g>
++<defs>
++<clipPath id="clip0_8_1360">
++<rect width="32" height="32" fill="white"/>
++</clipPath>
++</defs>
++</svg>
+diff --git a/docs/website/static/img/ReleaseNotes-Active.svg b/docs/website/static/img/ReleaseNotes-Active.svg
+new file mode 100644
+index 000000000..a193f9341
+--- /dev/null
++++ b/docs/website/static/img/ReleaseNotes-Active.svg
+@@ -0,0 +1,15 @@
++<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
++<g clip-path="url(#clip0_8_1347)">
++<mask id="mask0_8_1347" style="mask-type:luminance" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32">
++<path d="M28 0H4C1.79086 0 0 1.79086 0 4V28C0 30.2091 1.79086 32 4 32H28C30.2091 32 32 30.2091 32 28V4C32 1.79086 30.2091 0 28 0Z" fill="white"/>
++</mask>
++<g mask="url(#mask0_8_1347)">
++<path d="M28 0C30.2091 0 32 1.79086 32 4V28C32 30.2091 30.2091 32 28 32H4C1.79086 32 0 30.2091 0 28V4C0 1.79086 1.79086 0 4 0H28ZM8 5C6.34315 5 5 6.34315 5 8V24C5 25.6569 6.34315 27 8 27H24C25.6569 27 27 25.6569 27 24V8C27 6.34315 25.6569 5 24 5H8ZM24 7C24.5523 7 25 7.44771 25 8V24C25 24.5523 24.5523 25 24 25H8C7.44771 25 7 24.5523 7 24V8C7 7.44772 7.44772 7 8 7H24ZM10 19V21H20V19H10ZM10 15V17H19V15H10ZM10 11V13H22V11H10Z" fill="#4C4898"/>
++</g>
++</g>
++<defs>
++<clipPath id="clip0_8_1347">
++<rect width="32" height="32" fill="white"/>
++</clipPath>
++</defs>
++</svg>
+diff --git a/docs/website/static/img/ReleaseNotes-Inactive-1.svg b/docs/website/static/img/ReleaseNotes-Inactive-1.svg
+new file mode 100644
+index 000000000..edab10c54
+--- /dev/null
++++ b/docs/website/static/img/ReleaseNotes-Inactive-1.svg
+@@ -0,0 +1,3 @@
++<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path d="M25 8C25 7.44771 24.5523 7 24 7H8C7.44772 7 7 7.44772 7 8V24C7 24.5523 7.44771 25 8 25H24C24.5523 25 25 24.5523 25 24V8ZM20 19V21H10V19H20ZM19 15V17H10V15H19ZM22 11V13H10V11H22ZM27 24C27 25.6569 25.6569 27 24 27H8C6.34315 27 5 25.6569 5 24V8C5 6.34315 6.34315 5 8 5H24C25.6569 5 27 6.34315 27 8V24Z" fill="#C6D300"/>
++</svg>
+diff --git a/docs/website/static/img/ReleaseNotes-Inactive.svg b/docs/website/static/img/ReleaseNotes-Inactive.svg
+new file mode 100644
+index 000000000..370cb2637
+--- /dev/null
++++ b/docs/website/static/img/ReleaseNotes-Inactive.svg
+@@ -0,0 +1,3 @@
++<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path d="M25 8C25 7.44771 24.5523 7 24 7H8C7.44772 7 7 7.44772 7 8V24C7 24.5523 7.44771 25 8 25H24C24.5523 25 25 24.5523 25 24V8ZM20 19V21H10V19H20ZM19 15V17H10V15H19ZM22 11V13H10V11H22ZM27 24C27 25.6569 25.6569 27 24 27H8C6.34315 27 5 25.6569 5 24V8C5 6.34315 6.34315 5 8 5H24C25.6569 5 27 6.34315 27 8V24Z" fill="#4C4898"/>
++</svg>
+
+
+===== COMMIT 61f239fe =====
+
+
+commit 61f239fe6
+Author: Alena Astrakhantseva
+Date: 2025-06-30
+
+    extended release notes 1.12.0 (#2801)
+
+diff --git a/docs/website/docs/release-notes/1.12.1.md b/docs/website/docs/release-notes/1.12.1.md
+new file mode 100644
+index 000000000..49f67c2c1
+--- /dev/null
++++ b/docs/website/docs/release-notes/1.12.1.md
+@@ -0,0 +1,228 @@
++---
++title: "Release highlights: 1.12.1"
++description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
++keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
++---
++
++# Release highlights: 1.12.1
++
++This update includes substantial improvements to developer experience and stability, as well as bug fixes. Here's a breakdown of what's new:
++
++---
++
++## Placeholder config & secret warning system
++
++**PR:** [#2636](https://github.com/dlt-hub/dlt/pull/2636)
++
++**Overview**
++
++* dlt now detects placeholder values during **config and secret resolution** (e.g., `"<configure me>"`, or timestamps like `1768-07-21T02:56:00Z`).
++* A **detailed warning** is emitted when placeholders are detected, helping users identify incomplete configuration.
++* Prevents confusing errors during pipeline runs and catches misconfigured values early in the development cycle.
++
++**Example placeholders**
++
++```toml
++[credentials]
++token = "<configure me>"
++started_at = "1768-07-21T02:56:73Z"  # random date
++```
++
++**Example warning**
++
++```text
++Placeholder value encountered when resolving config or secret:
++resolved_key: host, value: <configure me>, section: sources.sql_database.credentials.host
++Most likely, this comes from init-command, which creates basic templates for non-complex configs and secrets. The provider to adjust is secrets.toml at one of these locations:
++- /home/me/project/.dlt/secrets.toml
++- /home/me/.dlt/secrets.toml
++```
++
++---
++
++## Warning for `None`-only columns
++
++**PR:** [#2633](https://github.com/dlt-hub/dlt/pull/2633)
++
++**Overview**
++
++* When normalizing data, if a column contains only `None`, dlt can’t infer its type.
++* This PR adds a **clear warning message** to help users fix this by providing an explicit type hint.
++* If no type hint is given, the column will be **excluded** from the destination table.
++
++**Example warning**
++
++```text
++The column `my_column` in table `my_table` did not receive any data during this load. Therefore, its type couldn't be inferred.
++
++Unless a type hint is provided, the column will not be materialized in the destination.
++```
++
++**Recommended fix**
++
++```py
++@dlt.resource(columns={"my_column": {"data_type": "text"}})
++def my_data():
++    yield {"my_column": None}
++```
++
++---
++
++## Regular and standalone resources are now the same thing
++
++**Before**
++
++* Inner resources could not receive secrets or configs properly.
++* Required the `standalone=True` argument.
++
++```py
++@dlt.resource(standalone=True)
++def foo(access_token=dlt.secrets.value):
++    yield from generate_json_like_data(access_token)
++```
++
++```toml
++[sources.foo]
++access_token = "your_token"
++```
++
++**Now**
++
++* All `@dlt.resource` functions behave identically.
++* `standalone=True` is **ignored** and no longer required.
++* Inner resources adopt the config section from the source they are in: `sources.source_module.resource_name` this is canonical form.
++
++**Cleaner usage**
++
++```py
++@dlt.resource
++def foo(access_token=dlt.secrets.value):
++    yield from generate_json_like_data(access_token)
++```
++
++For inner resources:
++
++```py
++@dlt.source
++def bar():
++    @dlt.resource
++    def foo(access_token=dlt.secrets.value):
++        yield from generate_json_like_data(access_token)
++
++    return foo
++```
++
++```toml
++[sources.bar.foo]
++access_token = "your_token"
++```
++
++---
++
++## Resources can `return` data (instead of `yield`)
++
++**Overview**
++
++* You can now return values instead of yielding.
++* Useful for static data or short lists.
++
++**Example**
++
++```py
++@dlt.resource
++def numbers():
++    return [{"key1": 1, "key2": 2}]
++```
++> `return` is automatically wrapped into a generator internally.
++
++:::warning
++Not recommended for large-scale use due to readability and stream control.
++:::
++
++---
++
++## Performance and stability fixes
++
++**PR:** [#2756](https://github.com/dlt-hub/dlt/pull/2756)
++
++### 1. Snowflake: extremely slow merge query due to `OR` condition (n² complexity)
++
++* In **merge** write disposition with `delete-insert` strategy, the generated SQL used:
++
++```sql
++DELETE FROM main_table WHERE EXISTS (
++  SELECT 1 FROM staging_table
++  WHERE main.pk1 = staging.pk1 AND main.pk2 = staging.pk2
++     OR main.merge_key = staging.merge_key
++);
++```
++
++* This caused **very slow** performance due to `OR` logic in `EXISTS`, especially on large datasets.
++
++**New approach**
++
++* Rewrites the logic to two separate `DELETE` queries, executed in the same transaction:
++
++```sql
++DELETE ... WHERE EXISTS (JOIN ON primary_key);
++DELETE ... WHERE EXISTS (JOIN ON merge_key);
++```
++
++:::info
++⚡ Improves performance from **18 hours → 4 seconds** on large datasets.
++:::
++
++### 2. Skip deduplication option
++
++* New flag allows users to **disable deduplication** during `delete-insert` operations, further reducing merge cost.
++* Useful for **append-heavy** workloads with upstream deduplication.
++* Works for any destination that supports `delete-insert`.
++
++```py
++@dlt.resource(
++    primary_key="id",
++    write_disposition={
++        "disposition": "merge",
++        "strategy": "delete-insert",
++        "deduplicated": False
++    }
++)
++def data_resource():
++    yield from get_data()
++```
++---
++
++## Iceberg: `upsert` merge strategy added
++
++**PR:** [#2671](https://github.com/dlt-hub/dlt/pull/2671)
++
++**Overview**
++
++* Iceberg now supports `merge` with **upsert** semantics, similar to Delta Lake.
++* Enables row-level updates using **primary and merge keys**.
++
++:::warning
++Known limitations due to current pyiceberg behavior:
++
++* Nested fields and struct joins are not fully supported in Arrow joins (required by upsert).
++* Non-unique keys in input data will raise hard errors — Iceberg enforces strict uniqueness.
++* Some failing tests stem from current pyiceberg limitations (e.g., recursion limits, Arrow type mismatches).
++:::
++
++---
++
++## Bonus: Postgres now supports `parquet` via ADBC
++
++**PR:** [#2685](https://github.com/dlt-hub/dlt/pull/2685)
++
++```py
++pipeline = dlt.pipeline(destination="postgres")
++pipeline.run(some_source(), loader_file_format="parquet")
++```
++
++---
++
++## Full release notes
++
++[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
++
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 7efc7cf64..b3f362485 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -43,6 +43,19 @@ const sidebars = {
+         'tutorial/load-data-from-an-api',
+       ]
+     },
++    {
++      type: 'category',
++      label: 'Release highlights',
++      link: {
++        type: 'generated-index',
++        title: 'Release highlights',
++        slug: '/release-highlights',
++        keywords: ['release notes, release highlights'],
++      },
++      items: [
++        'release-notes/1.12.1',
++      ]
++    },
+     {
+       type: 'category',
+       label: 'Core concepts',
+diff --git a/docs/website/src/css/custom.css b/docs/website/src/css/custom.css
+index 7b10051f5..63b6153df 100644
+--- a/docs/website/src/css/custom.css
++++ b/docs/website/src/css/custom.css
+@@ -368,201 +368,221 @@ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(1)>div>a::before {
+   background-image: url(../../static/img/GettingStarted-Active-1.svg);
+ }
+ 
+-
+-/* Core concepts */
++/* Release Highlights */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(2)>div>a::before {
+-  background-image: url(../../static/img/UserGuide-Inactive.svg);
++  background-image: url(../../static/img/ReleaseNotes-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:nth-child(2)>div>a::before,
+ .menu_vPEQ>ul>li:hover:nth-child(2)>div>a::before {
+-  background-image: url(../../static/img/UserGuide-Active.svg);
++  background-image: url(../../static/img/ReleaseNotes-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(2)>div>a::before {
+-  background-image: url(../../static/img/UserGuide-Inactive-1.svg);
++  background-image: url(../../static/img/ReleaseNotes-Inactive-1.svg);
+ }
+ 
+-html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(2)>div>a::before,
+-html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(2)>div>a::before {
+-  background-image: url(../../static/img/UserGuide-Active-1.svg);
++html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(2)>div>a::before,
++html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(2)>div>a::before {
++  background-image: url(../../static/img/ReleaseNotes-Active-1.svg);
+ }
+ 
+-/* dlt+ */
++
++/* Core concepts */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(3)>div>a::before {
+-  background-image: url(../../static/img/Plus-Inactive.svg);
++  background-image: url(../../static/img/UserGuide-Inactive.svg);
+ }
+ 
+-.menu_vPEQ>ul>li:hover:nth-child(3)>div>a::before,
+-.menu_vPEQ>ul>li:nth-child(3)>div>a::before {
+-  background-image: url(../../static/img/Plus-Active.svg);
++.menu_vPEQ>ul>li:nth-child(3)>div>a::before,
++.menu_vPEQ>ul>li:hover:nth-child(3)>div>a::before {
++  background-image: url(../../static/img/UserGuide-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(3)>div>a::before {
+-  background-image: url(../../static/img/Plus-Inactive-1.svg);
++  background-image: url(../../static/img/UserGuide-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(3)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(3)>div>a::before {
+-  background-image: url(../../static/img/Plus-Active-1.svg);
++  background-image: url(../../static/img/UserGuide-Active-1.svg);
+ }
+ 
+-/* Sources */
++/* dlt+ */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(4)>div>a::before {
+-  background-image: url(../../static/img/Sources-Inactive.svg);
++  background-image: url(../../static/img/Plus-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(4)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(4)>div>a::before {
+-  background-image: url(../../static/img/Sources-Active.svg);
++  background-image: url(../../static/img/Plus-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(4)>div>a::before {
+-  background-image: url(../../static/img/Sources-Inactive-1.svg);
++  background-image: url(../../static/img/Plus-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(4)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(4)>div>a::before {
+-  background-image: url(../../static/img/Sources-Active-1.svg);
++  background-image: url(../../static/img/Plus-Active-1.svg);
+ }
+ 
+-/* Destinations */
++/* Sources */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(5)>div>a::before {
+-  background-image: url(../../static/img/Destinations-Inactive.svg);
++  background-image: url(../../static/img/Sources-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(5)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(5)>div>a::before {
+-  background-image: url(../../static/img/Destinations-Active.svg);
++  background-image: url(../../static/img/Sources-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(5)>div>a::before {
+-  background-image: url(../../static/img/Destinations-Inactive-1.svg);
++  background-image: url(../../static/img/Sources-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(5)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(5)>div>a::before {
+-  background-image: url(../../static/img/Destinations-Active-1.svg);
++  background-image: url(../../static/img/Sources-Active-1.svg);
+ }
+ 
+-/* Using dlt */
++/* Destinations */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(6)>div>a::before {
+-  background-image: url(../../static/img/GeneralUsage-Inactive.svg);
++  background-image: url(../../static/img/Destinations-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(6)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(6)>div>a::before {
+-  background-image: url(../../static/img/GeneralUsage-Active.svg);
++  background-image: url(../../static/img/Destinations-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(6)>div>a::before {
+-  background-image: url(../../static/img/GeneralUsage-Inactive-1.svg);
++  background-image: url(../../static/img/Destinations-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(6)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(6)>div>a::before {
+-  background-image: url(../../static/img/GeneralUsage-Active-1.svg);
++  background-image: url(../../static/img/Destinations-Active-1.svg);
+ }
+ 
+-/* Deploying dlt */
++/* Using dlt */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(7)>div>a::before {
+-  background-image: url(../../static/img/UsingLoadedData-Inactive.svg);
++  background-image: url(../../static/img/GeneralUsage-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(7)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(7)>div>a::before {
+-  background-image: url(../../static/img/UsingLoadedData-Active.svg);
++  background-image: url(../../static/img/GeneralUsage-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(7)>div>a::before {
+-  background-image: url(../../static/img/UsingLoadedData-Inactive-1.svg);
++  background-image: url(../../static/img/GeneralUsage-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(7)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(7)>div>a::before {
+-  background-image: url(../../static/img/UsingLoadedData-Active-1.svg);
++  background-image: url(../../static/img/GeneralUsage-Active-1.svg);
+ }
+ 
+-/* Optimizing dlt */
+-
++/* Deploying dlt */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(8)>div>a::before {
+-  background-image: url(../../static/img/Installation-Inactive.svg);
++  background-image: url(../../static/img/UsingLoadedData-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(8)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(8)>div>a::before {
+-  background-image: url(../../static/img/Installation-Active.svg);
++  background-image: url(../../static/img/UsingLoadedData-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(8)>div>a::before {
+-  background-image: url(../../static/img/Installation-Inactive-1.svg);
++  background-image: url(../../static/img/UsingLoadedData-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(8)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(8)>div>a::before {
+-  background-image: url(../../static/img/Installation-Active-1.svg);
++  background-image: url(../../static/img/UsingLoadedData-Active-1.svg);
+ }
+ 
++/* Optimizing dlt */
+ 
+-/* Code Examples */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(9)>div>a::before {
+-  background-image: url(../../static/img/Howdltworks-Inactive.svg);
++  background-image: url(../../static/img/Installation-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(9)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(9)>div>a::before {
+-  background-image: url(../../static/img/Howdltworks-Active.svg);
++  background-image: url(../../static/img/Installation-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(9)>div>a::before {
+-  background-image: url(../../static/img/Howdltworks-Inactive-1.svg);
++  background-image: url(../../static/img/Installation-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(9)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(9)>div>a::before {
+-  background-image: url(../../static/img/Howdltworks-Active-1.svg);
++  background-image: url(../../static/img/Installation-Active-1.svg);
+ }
+ 
+-/* Reference */
++
++/* Code Examples */
+ 
+ .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(10)>div>a::before {
+-  background-image: url(../../static/img/Reference-Inactive.svg);
++  background-image: url(../../static/img/Howdltworks-Inactive.svg);
+ }
+ 
+ .menu_vPEQ>ul>li:hover:nth-child(10)>div>a::before,
+ .menu_vPEQ>ul>li:nth-child(10)>div>a::before {
+-  background-image: url(../../static/img/Reference-Active.svg);
++  background-image: url(../../static/img/Howdltworks-Active.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(10)>div>a::before {
+-  background-image: url(../../static/img/Reference-Inactive-1.svg);
++  background-image: url(../../static/img/Howdltworks-Inactive-1.svg);
+ }
+ 
+ html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(10)>div>a::before,
+ html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(10)>div>a::before {
++  background-image: url(../../static/img/Howdltworks-Active-1.svg);
++}
++
++/* Reference */
++
++.menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(11)>div>a::before {
++  background-image: url(../../static/img/Reference-Inactive.svg);
++}
++
++.menu_vPEQ>ul>li:hover:nth-child(11)>div>a::before,
++.menu_vPEQ>ul>li:nth-child(11)>div>a::before {
++  background-image: url(../../static/img/Reference-Active.svg);
++}
++
++html[data-theme='dark'] .menu_vPEQ>ul>li.menu__list-item--collapsed:nth-child(11)>div>a::before {
++  background-image: url(../../static/img/Reference-Inactive-1.svg);
++}
++
++html[data-theme='dark'] .menu_vPEQ>ul>li:hover:nth-child(11)>div>a::before,
++html[data-theme='dark'] .menu_vPEQ>ul>li:nth-child(11)>div>a::before {
+   background-image: url(../../static/img/Reference-Active-1.svg);
+ }
+ 
+ 
+ /* Devel / Stable switch */
+ 
+-.menu_vPEQ>ul>li:nth-child(11)>a svg {
++.menu_vPEQ>ul>li:nth-child(12)>a svg {
+   display: none;
+ }
+ 
+-.menu_vPEQ>ul>li:nth-child(11)>a {
++.menu_vPEQ>ul>li:nth-child(12)>a {
+   flex: none;
+ }
+ 
+-.menu_vPEQ>ul>li:nth-child(11) {
++.menu_vPEQ>ul>li:nth-child(12) {
+   margin-top:30px;
+   padding-top: 10px;
+   justify-content: center;
+diff --git a/docs/website/static/img/ReleaseNotes-Active-1.svg b/docs/website/static/img/ReleaseNotes-Active-1.svg
+new file mode 100644
+index 000000000..35812973a
+--- /dev/null
++++ b/docs/website/static/img/ReleaseNotes-Active-1.svg
+@@ -0,0 +1,15 @@
++<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
++<g clip-path="url(#clip0_8_1360)">
++<mask id="mask0_8_1360" style="mask-type:luminance" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32">
++<path d="M28 0H4C1.79086 0 0 1.79086 0 4V28C0 30.2091 1.79086 32 4 32H28C30.2091 32 32 30.2091 32 28V4C32 1.79086 30.2091 0 28 0Z" fill="white"/>
++</mask>
++<g mask="url(#mask0_8_1360)">
++<path d="M28 0C30.2091 0 32 1.79086 32 4V28C32 30.2091 30.2091 32 28 32H4C1.79086 32 0 30.2091 0 28V4C0 1.79086 1.79086 0 4 0H28ZM8 5C6.34315 5 5 6.34315 5 8V24C5 25.6569 6.34315 27 8 27H24C25.6569 27 27 25.6569 27 24V8C27 6.34315 25.6569 5 24 5H8ZM24 7C24.5523 7 25 7.44771 25 8V24C25 24.5523 24.5523 25 24 25H8C7.44771 25 7 24.5523 7 24V8C7 7.44772 7.44772 7 8 7H24ZM10 19V21H20V19H10ZM10 15V17H19V15H10ZM10 11V13H22V11H10Z" fill="#C6D300"/>
++</g>
++</g>
++<defs>
++<clipPath id="clip0_8_1360">
++<rect width="32" height="32" fill="white"/>
++</clipPath>
++</defs>
++</svg>
+diff --git a/docs/website/static/img/ReleaseNotes-Active.svg b/docs/website/static/img/ReleaseNotes-Active.svg
+new file mode 100644
+index 000000000..a193f9341
+--- /dev/null
++++ b/docs/website/static/img/ReleaseNotes-Active.svg
+@@ -0,0 +1,15 @@
++<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
++<g clip-path="url(#clip0_8_1347)">
++<mask id="mask0_8_1347" style="mask-type:luminance" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32">
++<path d="M28 0H4C1.79086 0 0 1.79086 0 4V28C0 30.2091 1.79086 32 4 32H28C30.2091 32 32 30.2091 32 28V4C32 1.79086 30.2091 0 28 0Z" fill="white"/>
++</mask>
++<g mask="url(#mask0_8_1347)">
++<path d="M28 0C30.2091 0 32 1.79086 32 4V28C32 30.2091 30.2091 32 28 32H4C1.79086 32 0 30.2091 0 28V4C0 1.79086 1.79086 0 4 0H28ZM8 5C6.34315 5 5 6.34315 5 8V24C5 25.6569 6.34315 27 8 27H24C25.6569 27 27 25.6569 27 24V8C27 6.34315 25.6569 5 24 5H8ZM24 7C24.5523 7 25 7.44771 25 8V24C25 24.5523 24.5523 25 24 25H8C7.44771 25 7 24.5523 7 24V8C7 7.44772 7.44772 7 8 7H24ZM10 19V21H20V19H10ZM10 15V17H19V15H10ZM10 11V13H22V11H10Z" fill="#4C4898"/>
++</g>
++</g>
++<defs>
++<clipPath id="clip0_8_1347">
++<rect width="32" height="32" fill="white"/>
++</clipPath>
++</defs>
++</svg>
+diff --git a/docs/website/static/img/ReleaseNotes-Inactive-1.svg b/docs/website/static/img/ReleaseNotes-Inactive-1.svg
+new file mode 100644
+index 000000000..edab10c54
+--- /dev/null
++++ b/docs/website/static/img/ReleaseNotes-Inactive-1.svg
+@@ -0,0 +1,3 @@
++<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path d="M25 8C25 7.44771 24.5523 7 24 7H8C7.44772 7 7 7.44772 7 8V24C7 24.5523 7.44771 25 8 25H24C24.5523 25 25 24.5523 25 24V8ZM20 19V21H10V19H20ZM19 15V17H10V15H19ZM22 11V13H10V11H22ZM27 24C27 25.6569 25.6569 27 24 27H8C6.34315 27 5 25.6569 5 24V8C5 6.34315 6.34315 5 8 5H24C25.6569 5 27 6.34315 27 8V24Z" fill="#C6D300"/>
++</svg>
+diff --git a/docs/website/static/img/ReleaseNotes-Inactive.svg b/docs/website/static/img/ReleaseNotes-Inactive.svg
+new file mode 100644
+index 000000000..370cb2637
+--- /dev/null
++++ b/docs/website/static/img/ReleaseNotes-Inactive.svg
+@@ -0,0 +1,3 @@
++<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path d="M25 8C25 7.44771 24.5523 7 24 7H8C7.44772 7 7 7.44772 7 8V24C7 24.5523 7.44771 25 8 25H24C24.5523 25 25 24.5523 25 24V8ZM20 19V21H10V19H20ZM19 15V17H10V15H19ZM22 11V13H10V11H22ZM27 24C27 25.6569 25.6569 27 24 27H8C6.34315 27 5 25.6569 5 24V8C5 6.34315 6.34315 5 8 5H24C25.6569 5 27 6.34315 27 8V24Z" fill="#4C4898"/>
++</svg>
+
+
+===== COMMIT d336c839 =====
+
+
+commit d336c8390
+Author: Nicolas
+Date: 2025-06-30
+
+    Psycopg2SqlClient: accept extra options (#2755)
+
+diff --git a/dlt/destinations/impl/postgres/sql_client.py b/dlt/destinations/impl/postgres/sql_client.py
+index c0350aa19..0f5ea5cc7 100644
+--- a/dlt/destinations/impl/postgres/sql_client.py
++++ b/dlt/destinations/impl/postgres/sql_client.py
+@@ -45,9 +45,10 @@ class Psycopg2SqlClient(SqlClientBase["psycopg2.connection"], DBTransaction):
+         self.credentials = credentials
+ 
+     def open_connection(self) -> "psycopg2.connection":
++        query_options = self.credentials.get_query().get("options", "")
+         self._conn = psycopg2.connect(
+             dsn=self.credentials.to_native_representation(),
+-            options=f"-c search_path={self.fully_qualified_dataset_name()},public",
++            options=f"{query_options} -csearch_path={self.fully_qualified_dataset_name()},public",
+         )
+         # we'll provide explicit transactions see _reset
+         self._reset_connection()
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/postgres.md b/docs/website/docs/dlt-ecosystem/destinations/postgres.md
+index 75030fe5b..05aa2e10c 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/postgres.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/postgres.md
+@@ -57,12 +57,13 @@ password = "<password>" # replace with your password
+ host = "localhost" # or the IP address location of your database
+ port = 5432
+ connect_timeout = 15
++query.options = "-ctimezone=Europe/Paris"
+ ```
+ 
+ You can also pass a database connection string similar to the one used by the `psycopg2` library or [SQLAlchemy](https://docs.sqlalchemy.org/en/20/core/engines.html#postgresql). The credentials above will look like this:
+ ```toml
+ # Keep it at the top of your TOML file, before any section starts
+-destination.postgres.credentials="postgresql://loader:<password>@localhost/dlt_data?connect_timeout=15"
++destination.postgres.credentials="postgresql://loader:<password>@localhost/dlt_data?connect_timeout=15&options=-ctimezone%3DEurope%2FParis"
+ ```
+ 
+ To pass credentials directly, use the [explicit instance of the destination](../../general-usage/destination.md#pass-explicit-credentials)
+diff --git a/tests/load/postgres/test_postgres_client.py b/tests/load/postgres/test_postgres_client.py
+index b4ae6fee9..f6d4bf82d 100644
+--- a/tests/load/postgres/test_postgres_client.py
++++ b/tests/load/postgres/test_postgres_client.py
+@@ -73,11 +73,12 @@ def test_postgres_credentials_native_value(environment) -> None:
+ 
+ def test_postgres_query_params() -> None:
+     # test postgres timeout
+-    dsn = "postgres://loader:pass@localhost:5432/dlt_data?client_encoding=utf-8&connect_timeout=600"
++    dsn = "postgres://loader:pass@localhost:5432/dlt_data?client_encoding=utf-8&connect_timeout=600&options=-ctimezone%3DEurope%2FParis"
+     csc = PostgresCredentials()
+     csc.parse_native_representation(dsn)
+     assert csc.connect_timeout == 600
+     assert csc.client_encoding == "utf-8"
++    assert csc.get_query().get("options") == "-ctimezone=Europe/Paris"
+     assert csc.to_native_representation() == dsn
+ 
+ 
+
+
+===== FILE: docs/README.md =====
+
+# Documentation
+
+## Set Up
+
+You will need [uv](https://docs.astral.sh/uv/) and Node.js on your system. Then, from the `/docs` directory:
+
+```sh
+# Install Python dependencies (tools, linters, dlt itself)
+make dev
+
+# Install Node.js dependencies for the website
+cd website && npm install
+```
+
+Run `make help` to see all available commands.
+
+> Find info about the website build process at: `/docs/website/README`
+
+## Sections
+
+The documentation is composed of several sections:
+
+- Static docs: found at `/docs/website/docs`, they are static `.md` files rendered as-is
+- Dynamic docs: found at `/docs/website/docs`, they are `.md` files that included custom markers. During the build process, these markers are replaced by content. The processed docs land under `/docs/website/docs_processed`
+- Python API reference: found at `/docs/website/docs_processed/api_reference`, these files are generated by `pydoc-markdown` from the Python source code under `/dlt`
+- CLI reference: found at `/docs/website/docs/reference/command-line-interface.md`, this file is dynamically generated from an instantiated CLI instance. Note that the CLI auto-detects plugins, which can alter the available commands.
+- Cookbook / examples: found at `/docs/website/docs/examples`, these `.md` files contain more sizeable code examples meant to be ran. They appear in a separate section of the rendered documentation.
+- Educational notebooks: found at `/docs/education`, these jupyter (`.ipynb`) and marimo (`.py`) notebooks are not directly rendered in the docs, but are automatically listed in a separate docs section of the rendered docs. The marimo notebooks are automatically generated from the `.ipynb` files.
+
+## Tools
+
+The documentation development and build process relies on several tools. This gives a high-level overview of how things work.
+
+- `make`: uses `docs/Makefile` to define simple command entrypoints for the user and other tools. Use `make help` to see all commands.
+- `prek`: uses `.pre-commit-config.yaml` to define checks that are run before `git` commits or pushes. Use `prek list` to see all checks. Generally, `prek` calls the commands defined in `make` for consistency. An exception is made when the checks should run with different flags (e.g., different verbosity). `prek` checks are meant to only run when associated files are changed (e.g., run markdown formatter only if an `.md` file changed). On CI, all `prek` checks run for all files, ensuring consistency between dev and CI. You can do the same locally with `prek run --all-files`
+- custom tools: under `/docs/tools/`, we have several custom Python scripts. Ideally, they use inline Python dependencies (PEP 723) to ensure isolated dependencies and can be ran with `uv run --script tools/TOOL.py`. These tools are primarily called by `make` commands. More complex tools should also have an associated `test_` file that will be verified.
+- `mdsmith`: configured in `.mdsmith.yml`, it defines formatting and linting rules for `.md` files. This ensures consistency in the docs source files.
+- `pytest-examples`: the file `/docs/test_snippets.py` leverages `pytest` with the plugin `pytest-examples` to lint, format, type-check, and run Python code snippets found in `.md` files. The file `/docs/conftest.py` implements the snippet collection logic and handles custom directive like `nolint`, `notype`, `execute`, `noexecute`, to include/exclude snippets for each check. The file `docs_snippets_stub.py` is used to simplify type-checking of snippets. These checks leverage `ruff` and `ty`, which are defined in `/docs/pyproject.toml`.
+
+### `uv run lint-embedded-snippets`
+Finds all embedded snippets in our docs, extracts them and performs the following checks:
+
+* Snippet must have a valid language set, e.g. ```py
+* Snippet must be parseable (works for py, toml, yaml and json snippets)
+* Snippet must pass linting (works for py)
+* Snippet must pass type checking with mypy (works for py)
+
+This script is run on CI to ensure code quality in our docs.
+
+### `uv run --script tools/preprocess_docs.py`
+Copies the markdown files for the website from ./docs to ./docs_processed and performs various tasks underway, such as embedding snippets and inserting destination info into the destination pages. Is called by the npm script that previews and builds the website, and re-run on source changes by the `preprocess-docs` Docusaurus plugin during `npm run start`. Pass `--incremental` to keep the existing ./docs_processed folder and only rewrite files whose content changed.
+
+
+===== FILE: docs/education/README.md =====
+
+# Adding New Notebooks
+
+## Overview
+
+The `.py` files in this directory are **auto-generated** from `.ipynb` files. Only edit the `.ipynb` files.
+
+To regenerate `.py` files:
+```bash
+make build-molabs
+```
+
+Preprocessing logic: [`docs/docs_tools/education/`](../docs_tools/education/)
+
+## Things to consider
+
+To ensure compatibility with both **Google Colab** and **Marimo/Molab**:
+
+### 1. **No inline comments**
+Bad: `x = 5  # comment`  
+Good: Separate line comments
+
+**Why:** `marimo convert` scatters inline comments
+
+## Workflow
+
+1. Create/edit `.ipynb` in the course folder
+2. Follow guidelines above
+3. Run `make build-molabs` to generate `.py` files
+4. Test both versions (Colab and Molab)
+5. Commit both `.ipynb` and `.py` files
+6. Make changes to the processing logic in `docs/docs_tools/education/` if necessary.
+
+===== FILE: docs/website/README.md =====
+
+# Website
+
+The website is a Node.js application.
+
+The documentation is generated using [Docusaurus 2](https://docusaurus.io/), a modern static website generator.
+Docusaurus consumes content from the `./docs` folder (at `./docs/website/docs` in this repo). The content includes:
+
+- markdown files
+- code snippets
+- API documentation, which `docs/tools/generate_api_reference.py` generates into `./docs_processed/api_reference` when the Node package is run.
+
+On the production website the documentation appears at https://dlthub.com/docs and the default documentation page is https://dlthub.com/docs/intro.
+
+## Installation
+
+With `website` as your working directory:
+
+```
+$ npm install
+```
+
+That command installs our Node.js package defined in `package.json`.
+
+### Python Dependencies
+
+The website build process requires Python dependencies. From the `docs/` directory run:
+
+```
+$ make dev
+```
+
+This calls `uv sync` and installs all Python tooling into the docs virtual environment. It also installs `prek` git hooks (`pre-commit` and `pre-push`), so linting/formatting checks may run automatically on commit/push.
+
+### Are you new to Node?
+
+`npm` is a package manager bundled with Node.js. If `npm install` complained that you have an old version, try:
+
+```
+nvm install --lts
+```
+
+That command installs and uses the latest stable version of Node.js (and therefore `npm`).  Then retry the Installation steps above.
+
+`nvm` is the Node Version Manager, and yes, you may need to install that first, using your usual way of installing software on your OS.
+
+You will also need the uv python package manager (https://docs.astral.sh/uv/guides/install-python/), as some of the npm commands call python based pre-preprocessing scripts to prepare the markdown files for docusaurus. We are mixing python and javascript tools in this project.
+
+## Local Development
+
+In this mode, most of your authoring changes will be reflected live in the browser just by saving files, without having to restart the server. Type:
+
+```
+$ npm run start
+```
+
+That command starts a local development web server and opens a browser window. It then takes a few seconds for Docusaurus to generate pages before the website displays.
+
+You edit the sources in `docs/`, but Docusaurus renders `docs_processed/`, which the Python preprocessor generates from them. The `preprocess-docs` Docusaurus plugin (`plugins/preprocess-docs.js`) watches `docs/` and re-runs the preprocessor on change, so there is a single file watcher and saving a source file refreshes the browser as usual.
+You may get a "Page Not Found" error when browsing at `/docs/`. This does not happen on the production website, whose default page is the "Ïntroduction" page at `/docs/intro`.
+
+For most authoring purposes, once you are happy with your changes running locally, you can create a Github PR, without needing to do the following build and deployment steps.
+
+## Local Build
+
+```
+$ npm run build
+```
+
+That command delegates to `cd .. && make build` (see `package.json`), which drives the full pipeline from `docs/Makefile`. It generates static content into the `build` directory, which can be served using `npm run serve`.
+
+### What `npm run build` does
+
+The full build (the `build` target in `docs/Makefile`) runs these steps in order:
+
+1. **`npm run update-versions`** — clones `dlt`, checks out the `master` branch, freezes the content into `versioned_docs/version-master/`. This is the **master snapshot** (served at `/docs/`); your branch is served at `/docs/devel/`. See [Docs versions](#docs-versions) below.
+2. **`npm run compile-redirects`** — merges `redirects.js` (devel) and the per-version snapshots under `versioned_redirects/` into `redirects.compiled.js`. See [Redirects](#redirects) below.
+3. **`make check-orphan-docs`** (from `docs/`) — runs `tools/check_orphan_docs.js`, which fails the build if any page under `docs/` is unreachable from `sidebars.js` (directly, via a category `link`, or as a sidebar item) unless it's marked `unlisted: true` in frontmatter.
+4. **`make preprocess-docs`** (from `docs/`) — Python preprocessor (`docs/tools/preprocess_docs.py`): copies `docs/` to `docs_processed/`, expands `@@@DLT_*` markers, generates the API reference, etc.
+5. **`docusaurus build --out-dir build/docs`** — the static site build itself. Fails on broken internal markdown links.
+6. **`npm run verify-redirects`** — loads `redirects.compiled.js`, recompiles it in memory to check it isn't stale, and checks each `to` target resolves to an existing page in `build/docs`.
+7. **`node scripts/verify-llms-txt.js`** — checks the generated `llms.txt` index against the sidebar.
+
+CI (`.github/workflows/docs_build.yml`) simply runs `make build` from `docs/`, so it exercises the exact same 7 steps — there is no separate "verify redirects" CI step.
+
+### Running individual checks
+
+You can re-run these checks standalone — useful when iterating on one concern without rebuilding everything:
+
+```
+$ npm run check-orphan-docs      # orphan-page check (fails on non-unlisted orphans)
+$ npm run check-orphan-docs:all  # same, but also fails on unlisted orphans (lists everything)
+$ npm run compile-redirects      # regenerate redirects.compiled.js from sources
+$ npm run verify-llms            # llms.txt index check
+$ npm run verify-redirects       # redirect targets check (requires a prior `npm run build`)
+```
+
+Run `verify-redirects` (or a full `npm run build`) whenever you add or change entries in `redirects.js`. See [Redirects](#redirects) below for the source-of-truth and how to add new entries.
+
+## Deployment
+
+The site is deployed using `cloudflare workers`. There are several commands specific to cloudflare to deploy the docs or test them locally. 
+
+```
+npm run preview:cloudflare
+```
+
+This will build the project fully and serve via a local wrangler webserver which simulates a cloudflare worker. This way you can also test tracking and redirects. 
+
+## Redirects
+
+The docs site builds two snapshots: `master` (frozen at the last `dlt` release, mounted at `/docs/`) and `devel` (your current branch, mounted at `/docs/devel/`). Each version owns its own redirect rules, scoped to that version's URL space. A build-time step merges them into a single, version-prefixed list that the Cloudflare worker and the verifier both consume.
+
+### How to add or change a redirect
+
+Edit [`redirects.js`](redirects.js) — that file is the **devel** version's redirect source. Write entries with bare `/docs/...` paths, **without any `/devel/` prefix**:
+
+```js
+{ from: "/docs/old/path",   to: "/docs/new/path" },
+```
+
+The compile step (see below) prefixes both fields with `/docs/devel/` when emitting the version-scoped output. So the entry above ends up matching the URL `/docs/devel/old/path` in production — exactly where the page lives in this version.
+
+A `from` path may only appear **once**. The worker resolves paths through a map where the first rule wins, so a second rule for the same `from` would never fire; `compile-redirects` fails the build on duplicates. To change where a path goes, edit the existing entry.
+
+Pre-snapshotted versions (currently just `master`) have their own redirect files under `versioned_redirects/version-<v>.js`. Those are populated by `tools/update_versions.js`, which clones each tag and snapshots its `docs/website/redirects.js`. You don't edit those files by hand — to change `master`'s redirects, edit `redirects.js` on the `master` branch and push.
+
+The lone catchall `{ from: "/", to: "/docs/devel/intro" }` is the exception: its `from` doesn't start with `/docs/`, so the compiler treats it as version-independent and passes it through unchanged.
+
+### Compile step
+
+`tools/compile_redirects.js` reads:
+
+1. `./redirects.js` (the devel source).
+2. Every `./versioned_redirects/version-*.js` (snapshotted by `update_versions.js`).
+
+It rewrites each entry's leading `/docs/` to `/docs/<version-path>/` (devel → `/docs/devel/`, master → `/docs/`, any future tag → `/docs/<tag>/`) and writes the merged list to `redirects.compiled.js`. That file is a **build artifact** — gitignored and regenerated on every build.
+
+### Where the compiled file is used
+
+- **Cloudflare worker (`worker.ts`)** — imports `redirects.compiled.js`. Wrangler bundles the import into the deployed worker. Exact pathname match per entry; no version-routing logic in the worker. Rules, trailing slashes and the legacy `/plus/` → `/hub/` forward are followed to the final target (see `worker-routing.mjs`), so a moved page answers with a single `301` instead of a chain. A chain that does not settle within 10 hops is left to the assets binding rather than redirected to a half-resolved path.
+- **`scripts/verify-redirects.js`** — loads `redirects.compiled.js`, checks each `to` resolves to an HTML page in `build/docs/<rel>`, and **also recompiles in memory** from the per-version sources and diffs the result against the on-disk compiled file to guard against a stale compiled file.
+
+
+### Lifecycle: what happens after merge to `master`
+
+The build runs the same way on every branch: `update_versions.js` always clones `origin/master` and snapshots its `redirects.js` into `versioned_redirects/version-master.js`. The local `./redirects.js` is always treated as the `current` (devel-prefixed) version.
+
+When a devel→master merge ships the next release, the only thing that changes is what `origin/master` points to. The next build on master snapshots the just-merged `redirects.js` as the master version's source, so the same authored rules that previously compiled with the `/devel/` prefix now also compile with **no** prefix — they catch the bare `/docs/...` URLs on the freshly released master.
+
+## Docs versions
+
+We keep a few additional versions of our docs for the users to be able read about how former and future versions of dlt work. We use docusaurus versions for this but we do not check the historical versions into the repo but rather use a script to build the former versions on deployment. To locally build the versions run:
+
+```
+npm run update-versions
+```
+
+This will execute the script at tools/update_versions.js. This tool will do the following:
+
+* Find all the highest minor versions the tags of the repo (e.g. 0.4.13, 0.5.22, 1.1.3)
+* It will create a version for all of these tags that are larger than the minimum version defined in MINIMUM_SEMVER_VERSION in the script.
+* It will NOT create a version for the highest version, we assume the most up to date docs for the highest versions are the tip of master
+* It will NOT create any docs versions for pre-releases.
+* It will create a future version called "devel" from the current commit of this repo.
+* It will set up docusaurus to display all of these versions correctly.
+
+You can clear these versions with
+
+```
+npm run clear-versions
+```
+
+The cloudflare deployment of these docs needs to happen from the master branch so that the current version gets properly selected.
+
+## LLM-friendly documentation
+
+The docs build generates LLM-optimized output following the [llms.txt specification](https://llmstxt.org/). This is implemented by a custom Docusaurus plugin at `plugins/llms-txt.js` that runs as a `postBuild` hook.
+
+### What the plugin produces
+
+- **`/docs/llms.txt`** — Index of all master-version doc pages (excluding hub) with titles and descriptions, grouped by sidebar category (e.g. "Getting started", "Sources > REST APIs"). This is the primary entry point for LLM agents.
+- **`/docs/hub/llms.txt`** — Separate index for dltHub pages, grouped by `hubSidebar` categories. Configured via `separateIndexes` in the plugin options.
+- **`.md` files next to each HTML page** — For every doc page like `/docs/general-usage/schema`, a clean markdown version is available at `/docs/general-usage/schema.md`. These are copied from the preprocessed source files (with snippets already resolved), not reverse-converted from HTML.
+
+### How it works
+
+1. **Discovers pages** from the HTML build output (all `*.html` files).
+2. **Maps each HTML path** back to its source `.md` file in `versioned_docs/version-{name}/` or `docs_processed/`, handling custom `slug:` frontmatter.
+3. **Copies source `.md` files** with cleanup: strips MDX `import` lines and self-closing React component tags (`<Header/>`, `<DocCardList/>`, etc.) that are UI-only widgets.
+4. **Generates `llms.txt`** from the master version pages, reading `title` and `description` from YAML frontmatter. Pages are grouped by sidebar categories from `sidebars.js` (up to `groupDepth` levels, joined with " > "); pages not in any sidebar fall back to directory-based grouping. Pages matching a `separateIndexes` prefix (e.g. `hub/`) are split into their own `llms.txt` at that prefix path and removed from the main index.
+
+### What gets excluded or separated
+
+- **`api_reference/`** pages — auto-generated, no source `.md` files. Excluded from both `.md` generation and `llms.txt`.
+- **`devel/`** pages — get `.md` files (so "View Markdown" links work) but are excluded from `llms.txt`.
+- **`hub/`** pages — get `.md` files and their own `/docs/hub/llms.txt` index (via `separateIndexes`), but are excluded from the main `/docs/llms.txt`.
+- **Underscore-prefixed files** (`_source-info-header.md`, etc.) — MDX partials imported by other pages, not standalone content.
+
+### Theme components
+
+Two swizzled Docusaurus theme components support the "View Markdown" badge:
+
+- **`src/theme/DocMarkdownLink`** — Renders the "View Markdown" badge and injects a `<link rel="alternate" type="text/markdown">` tag into the page head. Used on regular doc pages only.
+- **`src/theme/DocItem/Layout`** — Swizzled to include `DocMarkdownLink` next to `DocVersionBadge`.
+
+
+## Hub pages and sidebars
+
+The site has two sidebars defined in `sidebars.js`:
+
+- **`docsSidebar`** — The primary sidebar for all open-source dlt documentation. Items are manually curated and do not mirror the file-system layout (e.g., "Core concepts" pulls docs from `reference/`, `general-usage/`, etc.). Two sections are injected dynamically at build time:
+  - **Code examples** — all `.md`/`.mdx` files under `docs_processed/examples/` are auto-appended.
+  - **API reference** — if `docs_processed/api_reference/sidebar.json` exists (generated by `make generate-api-ref`), it is spliced into the "Reference" category.
+
+- **`hubSidebar`** — A secondary sidebar for dltHub-specific pages (under `docs/hub/`). It cross-references open-source docs using `{ type: 'ref', id: '...' }` items, so users can navigate between the two sidebars seamlessly.
+
+Hub pages receive special treatment in swizzled theme components:
+
+- **`src/theme/DocBreadcrumbs`** — When the current URL contains `/hub/`, a dltHub logo is rendered next to the breadcrumb trail (via the `breadcrumbsContainerPlus` CSS class and an `<img>` tag).
+- **`src/components/DltHubFeatureAdmonition.js`** — A reusable admonition component imported by hub pages to display licensing/feature notices.
+
+In production, the Cloudflare worker (`worker.ts`) redirects the legacy `/plus/` URL prefix to `/hub/`.
+
+## Page overlays (Root.js)
+
+`src/theme/Root.js` wraps the entire Docusaurus app to inject page-specific modal overlays, e.g. a floating button that opens a Loom video walkthrough for the page. The overlay configuration is a simple object mapping URL paths to `{buttonTitle, title, loomId, text}` (currently empty).
+
+
+===== FILE: docs/website/docs/_book-onboarding-call.md =====
+
+<span><a href="https://dlthub.com/contact">Get in touch</a> with the dltHub Customer Success team</span>
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/athena.md =====
+
+---
+title: Athena
+description: AWS Athena `dlt` destination
+keywords: [aws, athena, glue catalog]
+---
+# AWS Athena
+
+The Athena destination stores data as Parquet files in S3 buckets and creates [external tables in AWS Athena](https://docs.aws.amazon.com/athena/latest/ug/creating-tables.html). You can then query those tables with Athena SQL commands, which will scan the entire folder of Parquet files and return the results. This destination works very similarly to other SQL-based destinations, with the exception that the merge write disposition is not supported at this time. The `dlt` metadata will be stored in the same bucket as the Parquet files, but as iceberg tables. Athena also supports writing individual data tables as Iceberg tables, so they may be manipulated later. A common use case would be to strip GDPR data from them.
+
+<!--@@@DLT_DESTINATION_CAPABILITIES athena-->
+
+## Install dlt with Athena
+
+To install the dlt library with Athena dependencies:
+
+```sh
+pip install "dlt[athena]"
+```
+
+## Setup guide
+
+### 1. Initialize the dlt project
+
+Let's start by initializing a new `dlt` project as follows:
+
+   ```sh
+   dlt init chess athena
+   ```
+
+   :::info
+   This command will initialize your pipeline with chess as the source and AWS Athena as the destination using the filesystem staging destination.
+   :::
+
+### 2. Setup bucket storage and Athena credentials
+
+First, install dependencies by running:
+
+```sh
+pip install -r requirements.txt
+```
+
+or with `pip install "dlt[athena]"`, which will install `s3fs`, `pyarrow`, `pyathena`, and `botocore` packages.
+
+:::warning
+
+You may also install the dependencies independently. Try
+
+```sh
+pip install dlt
+pip install s3fs
+pip install pyarrow
+pip install pyathena
+```
+
+so pip does not fail on backtracking.
+:::
+
+To edit the `dlt` credentials file with your secret info, open `.dlt/secrets.toml`. You will need to provide a `bucket_url`, which holds the uploaded parquet files, and credentials that have write and read access to the bucket as well as the full Athena access AWS role. You should also provide a `query_result_bucket`, which Athena uses to write query results to. If your Athena workgroup has [Managed Query Results](https://docs.aws.amazon.com/athena/latest/ug/querying-athena-managed-query-results.html) enabled, omit `query_result_bucket` (or leave it unset) — Athena will manage the results storage automatically.
+
+The TOML file looks like this:
+
+```toml
+[destination.filesystem]
+bucket_url = "s3://[your_bucket_name]" # replace with your bucket name,
+
+[destination.filesystem.credentials]
+aws_access_key_id = "please set me up!" # copy the access key here
+aws_secret_access_key = "please set me up!" # copy the secret access key here
+
+[destination.athena]
+query_result_bucket="s3://[results_bucket_name]" # replace with your query results bucket name
+
+[destination.athena.credentials]
+aws_access_key_id="please set me up!" # same as credentials for filesystem
+aws_secret_access_key="please set me up!" # same as credentials for filesystem
+region_name="please set me up!" # set your AWS region, for example "eu-central-1" for Frankfurt
+```
+
+If you have your credentials stored in `~/.aws/credentials`, just remove the **[destination.filesystem.credentials]** and **[destination.athena.credentials]** sections above and `dlt` will fall back to your **default** profile in local credentials. If you want to switch the profile, pass the profile name as follows (here: `dlt-ci-user`):
+
+```toml
+[destination.filesystem.credentials]
+profile_name="dlt-ci-user"
+
+[destination.athena.credentials]
+profile_name="dlt-ci-user"
+```
+
+## Additional destination configuration
+
+You can provide an Athena workgroup like so:
+
+```toml
+[destination.athena]
+athena_work_group="my_workgroup"
+```
+
+You can force all tables to be in iceberg format and control Iceberg tables layout in the bucket:
+
+```toml
+[destination.athena]
+force_iceberg=true
+table_location_layout="{dataset_name}/{table_name}"
+```
+
+where `dataset_name` and `table_name` will be replaced by actual names.
+
+:::tip
+Use random Iceberg table location when encountering conflicts
+In case your table is created in location that already exists, you can add random location tag with:
+
+```toml
+[destination.athena]
+table_location_layout="{dataset_name}/{table_name}_{location_tag}"
+```
+
+We observed the following error message:
+**com.amazonaws.services.s3.model.AmazonS3Exception: The specified key does not exist**
+when table with given name was deleted and re-created - but not always. Adding location tag
+prevents this error from showing up.
+:::
+
+You can change the default catalog name
+
+```toml
+[destination.athena]
+aws_data_catalog="awsdatacatalog"
+```
+
+By default, `dlt` uses the same catalog for both the staging and production (non-staging) tables. You can explicitly set the staging catalog to use separate catalogs:
+
+```toml
+[destination.athena]
+staging_aws_data_catalog="my-staging-catalog"
+```
+
+and provide any other `PyAthena` connection setting
+
+```toml
+[destination.athena.conn_properties]
+poll_interval=2
+```
+
+When `dlt` executes SQL queries that look up table names in the `INFORMATION_SCHEMA`
+it can be more effective to filter the tables in the code instead of doing it in the query.
+The threshold for this is usually 1000 tables, but we learned that for Athena a better default is
+90. You can change this threshold with the following setting:
+
+```toml
+[destination.athena]
+info_tables_query_threshold=90
+```
+
+You can specify the database location using db_location:
+
+```toml
+[destination.athena]
+db_location="s3://[your_bucket_name]" # replace with your bucket name
+```
+
+## S3 Tables
+
+The `athena` destination supports storing data in an [S3 Tables](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables.html) bucket by setting an S3 Tables Catalog:
+
+```toml
+[destination.athena]
+aws_data_catalog="s3tablescatalog/[your_table_bucket_name]"  # replace with your table bucket name
+```
+
+`dlt` assumes you already have a table bucket that's integrated with AWS analytics services. If that's not the case, look at these [instructions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-getting-started.html#s1-tables-tutorial-create-bucket).
+
+Using S3 Tables with Athena implies that:
+
+- data is stored in Iceberg tables
+- table locations are managed by the S3 Tables Catalog
+- the `table_location_layout` setting is ignored
+- the `s3_tables` [naming convention](../../general-usage/naming-convention.md#available-naming-conventions) is used
+- **production (non-staging)** and **staging tables** are registered in separate catalogs:
+  - *production:* S3 Tables Catalog
+  - *staging:* regular catalog
+
+When `staging_aws_data_catalog` is not specified, `dlt` normally uses the same catalog for both staging and production tables. However, when using an S3 Tables Catalog, the staging catalog defaults to `awsdatacatalog` because staging tables are not Iceberg tables and cannot be registered in the S3 Tables Catalog.
+
+## Write disposition
+
+The `athena` destination handles the write dispositions as follows:
+
+- `append` - files belonging to such tables are added to the dataset folder.
+- `replace` - all files that belong to such tables are deleted from the dataset folder, and then the current set of files is added.
+- `merge` - falls back to `append` (unless you're using [iceberg](#iceberg-data-tables) tables).
+
+## Data loading
+
+Data loading occurs by storing parquet files in an S3 bucket and defining a schema on Athena. If you query data via SQL queries on Athena, the returned data is read by scanning your bucket and reading all relevant parquet files in there.
+
+`dlt` internal tables are saved as Iceberg tables.
+
+### Data types
+
+Athena tables store timestamps with millisecond precision, and with that precision, we generate parquet files. Keep in mind that Iceberg tables have microsecond precision.
+
+Athena does not support JSON fields, so JSON is stored as a string.
+
+:::warning
+**Athena does not support TIME columns in parquet files**. `dlt` will fail such jobs permanently. Convert `datetime.time` objects to `str` or `datetime.datetime` to load them.
+:::
+
+### Table and column identifiers
+
+Athena uses case-insensitive identifiers and **will lowercase all the identifiers** that are stored in the INFORMATION SCHEMA. Do not use [case-sensitive naming conventions](../../general-usage/naming-convention.md#case-sensitive-and-insensitive-destinations). Letter casing will be removed anyway, and you risk generating identifier collisions, which are detected by `dlt` and will fail the load process.
+
+Under the hood, Athena uses different SQL engines for DDL (catalog) and DML/Queries:
+
+* DDL uses HIVE escaping with ``````
+* Other queries use PRESTO and regular SQL escaping.
+
+## Staging support
+
+Using a staging destination is mandatory when using the Athena destination. If you do not set staging to `filesystem`, `dlt` will automatically do this for you.
+
+If you decide to change the [filename layout](./filesystem#files-layout) from the default value, keep the following in mind so that Athena can reliably build your tables:
+
+ - You need to provide the `{table_name}` placeholder, and this placeholder needs to be followed by a forward slash.
+ - You need to provide the `{file_id}` placeholder, and it needs to be somewhere after the `{table_name}` placeholder.
+ - `{table_name}` must be the first placeholder in the layout.
+
+## Additional destination options
+
+### Iceberg data tables
+
+You can save your tables as Iceberg tables to Athena. This will enable you, for example, to delete data from them later if you need to. To switch a resource to the Iceberg table format, supply the table_format argument like this:
+
+```py
+from typing import Iterable
+from dlt.common.typing import TDataItem
+
+@dlt.resource(table_format="iceberg")
+def data() -> Iterable[TDataItem]:
+    ...
+```
+
+For every table created as an Iceberg table, the Athena destination will create a regular Athena table in the staging dataset of both the filesystem and the Athena glue catalog, and then copy all data into the final Iceberg table that lives with the non-Iceberg tables in the same dataset on both the filesystem and the glue catalog. Switching from Iceberg to regular table or vice versa is not supported.
+
+See [athena adapter](#athena-adapter) for partitioning and other options.
+
+You can also force all tables to be in iceberg format:
+
+```toml
+[destination.athena]
+force_iceberg = true
+```
+
+You can also adjust iceberg table properties:
+
+```toml
+[destination.athena.table_properties]
+vacuum_max_snapshot_age_seconds = 86400
+```
+
+### LakeFormation tags
+
+AWS lakeformation tags can be set on the database level when running a pipeline. Resources/tables will inherit the same tags as their parent database. It will not affect data in staging.
+
+#### Prerequisites
+
+- The lakeformation tags you want to apply must already exists, created through IAC or the AWS console.
+- The s3 location the data lands in must be registered as a data location in lakeformation
+
+- The IAM role/user running the pipeline is required to have lakeformation permissions in addition to regular IAM permissions
+  - ASSOCIATE on the lf tags to apply
+  - CREATE_TABLE/DESCRIBE/ALTER on Database with the lf tags to apply
+  - ALL on Table
+
+[See full Lake Formation permission reference](https://docs.aws.amazon.com/lake-formation/latest/dg/lf-permissions-reference.html)
+
+Tags can be set on database level using the destination config
+
+```toml
+[destination.athena.lakeformation_config]
+enabled = true
+
+[destination.athena.lakeformation_config.tags]
+my_tag = "my_key"
+```
+
+To remove lakeformation tags you can set:
+
+```toml
+[destination.athena.lakeformation_config]
+enabled = false
+```
+
+#### `merge` support
+
+The `merge` write disposition is supported for Athena when using Iceberg tables.
+
+:::note
+
+1. There is a risk of tables ending up in an inconsistent state in case a pipeline run fails mid-flight because Athena doesn't support transactions, and `dlt` uses multiple DELETE/UPDATE/INSERT statements to implement `merge`.
+2. `dlt` creates additional helper tables called `insert_<table name>` and `delete_<table name>` in the staging schema to work around Athena's lack of temporary tables.
+:::
+
+### dbt support
+
+Athena is supported via `dbt-athena-community`. Credentials are passed into `aws_access_key_id` and `aws_secret_access_key` of the generated dbt profile. Iceberg tables are supported, but you need to make sure that you materialize your models as Iceberg tables if your source table is Iceberg. We encountered problems with materializing date-time columns due to different precision on Iceberg (nanosecond) and regular Athena tables (millisecond).
+The Athena adapter requires that you set up **region_name** in the Athena configuration below. You can also set up the table catalog name to change the default: **awsdatacatalog**
+
+```toml
+[destination.athena]
+aws_data_catalog="awsdatacatalog"
+```
+
+### Syncing of `dlt` state
+
+- This destination fully supports [dlt state sync.](../../general-usage/state#syncing-state-with-destination). The state is saved in Athena Iceberg tables in your S3 bucket.
+
+## Supported file formats
+
+* [Parquet](../file-formats.md#parquet) is used by default.
+
+## Athena adapter
+
+You can use the `athena_adapter` to add partitioning to Athena tables. This is currently only supported for Iceberg tables.
+
+Iceberg tables support a few transformation functions for partitioning. Info on all supported functions in the [AWS documentation](https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-creating-tables.html#querying-iceberg-creating-tables-query-editor).
+
+Use the `athena_partition` helper to generate the partitioning hints for these functions:
+
+* `athena_partition.year(column_name: str)`: Partition by year of date/datetime column.
+* `athena_partition.month(column_name: str)`: Partition by month of date/datetime column.
+* `athena_partition.day(column_name: str)`: Partition by day of date/datetime column.
+* `athena_partition.hour(column_name: str)`: Partition by hour of date/datetime column.
+* `athena_partition.bucket(n: int, column_name: str)`: Partition by hashed value to `n` buckets
+* `athena_partition.truncate(length: int, column_name: str)`: Partition by truncated value to `length` (or width for numbers)
+
+Here is an example of how to use the adapter to partition a table:
+
+```py
+from datetime import date
+
+import dlt
+from dlt.destinations.adapters import athena_partition, athena_adapter
+
+data_items = [
+    (1, "A", date(2021, 1, 1)),
+    (2, "A", date(2021, 1, 2)),
+    (3, "A", date(2021, 1, 3)),
+    (4, "A", date(2021, 2, 1)),
+    (5, "A", date(2021, 2, 2)),
+    (6, "B", date(2021, 1, 1)),
+    (7, "B", date(2021, 1, 2)),
+    (8, "B", date(2021, 1, 3)),
+    (9, "B", date(2021, 2, 1)),
+    (10, "B", date(2021, 3, 2)),
+]
+
+@dlt.resource(table_format="iceberg")
+def partitioned_data():
+    yield [{"id": i, "category": c, "created_at": d} for i, c, d in data_items]
+
+# Add partitioning hints to the table
+athena_adapter(
+    partitioned_data,
+    partition=[
+        # Partition per category and month
+        "category",
+        athena_partition.month("created_at"),
+    ],
+)
+
+
+pipeline = dlt.pipeline("athena_example")
+pipeline.run(partitioned_data)
+```
+
+<!--@@@DLT_TUBA athena-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/bigquery.md =====
+
+---
+title: BigQuery
+description: Google BigQuery `dlt` destination
+keywords: [bigquery, destination, data warehouse]
+---
+# Google BigQuery
+
+## Install dlt with BigQuery
+
+To install the dlt library with BigQuery dependencies:
+
+```sh
+pip install "dlt[bigquery]"
+```
+
+<!--@@@DLT_DESTINATION_CAPABILITIES bigquery-->
+
+## Setup guide
+
+1. Initialize a project with a pipeline that loads to BigQuery by running:
+
+```sh
+dlt init chess bigquery
+```
+
+2. Install the necessary dependencies for BigQuery by running:
+
+```sh
+pip install -r requirements.txt
+```
+
+This will install dlt with the `bigquery` extra, which contains all the dependencies required by the BigQuery client.
+
+3. Log in to or create a Google Cloud account
+
+Sign up for or log in to the [Google Cloud Platform](https://console.cloud.google.com/) in your web browser.
+
+4. Create a new Google Cloud project
+
+After arriving at the [Google Cloud console welcome page](https://console.cloud.google.com/welcome), click the project selector in the top left, then click the `New Project` button, and finally click the `Create` button after naming the project whatever you would like.
+
+5. Create a service account and grant BigQuery permissions
+
+You will then need to [create a service account](https://cloud.google.com/iam/docs/creating-managing-service-accounts#creating). After clicking the `Go to Create service account` button on the linked docs page, select the project you created and name the service account whatever you would like.
+
+Click the `Continue` button and grant the following roles, so that `dlt` can create schemas and load data:
+
+- *BigQuery Data Editor*
+- *BigQuery Job User*
+- *BigQuery Read Session User*
+
+You don't need to grant users access to this service account now, so click the `Done` button.
+
+6. Download the service account JSON
+
+In the service accounts table page that you're redirected to after clicking `Done` as instructed above, select the three dots under the `Actions` column for the service account you created and select `Manage keys`.
+
+This will take you to a page where you can click the `Add key` button, then the `Create new key` button, and finally the `Create` button, keeping the preselected `JSON` option.
+
+A `JSON` file that includes your service account private key will then be downloaded.
+
+7. Update your `dlt` credentials file with your service account info
+
+Open your `dlt` credentials file:
+
+```sh
+open .dlt/secrets.toml
+```
+
+Replace the `project_id`, `private_key`, and `client_email` with the values from the downloaded `JSON` file:
+
+```toml
+[destination.bigquery]
+location = "US"
+
+[destination.bigquery.credentials]
+project_id = "project_id" # please set me up!
+private_key = "private_key" # please set me up!
+client_email = "client_email" # please set me up!
+```
+
+You can specify the location of the data, i.e., `EU` instead of `US`, which is the default.
+
+### OAuth 2.0 authentication
+
+You can use OAuth 2.0 authentication. You'll need to generate a **refresh token** with the right scopes (we suggest asking our GPT-4 assistant for details). Then you can fill the following information in `secrets.toml`:
+
+```toml
+[destination.bigquery]
+location = "US"
+
+[destination.bigquery.credentials]
+project_id="project_id"  # please set me up!
+client_id = "client_id"  # please set me up!
+client_secret = "client_secret"  # please set me up!
+refresh_token = "refresh_token"  # please set me up!
+```
+
+### Using default credentials
+
+Google provides several ways to get default credentials, i.e., from the `GOOGLE_APPLICATION_CREDENTIALS` environment variable or metadata services. VMs available on GCP (cloud functions, Composer runners, Colab notebooks) have associated service accounts or authenticated users. `dlt` will try to use default credentials if nothing is explicitly specified in the secrets.
+
+```toml
+[destination.bigquery]
+location = "US"
+```
+
+### Using different `project_id`
+
+You can set the `project_id` in your configuration to be different from the one in your credentials, provided your account has access to it:
+
+```toml
+[destination.bigquery]
+project_id = "project_id_destination"
+
+[destination.bigquery.credentials]
+project_id = "project_id_credentials"
+```
+
+In this scenario, `project_id_credentials` will be used for authentication, while `project_id_destination` will be used as the data destination.
+
+## Write disposition
+
+All write dispositions are supported.
+
+If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be dropped and recreated with a [clone command](https://cloud.google.com/bigquery/docs/table-clones-create) from the staging tables.
+
+### Atomic, metadata-preserving replace
+
+`staging-optimized` drops and recreates the table, which loses table-level access controls, column policy tags, primary key constraints, row access policies, and breaks dependent materialized views. If you need a full refresh that keeps all of this, enable `enable_atomic_replace`:
+
+```toml
+[destination.bigquery]
+enable_atomic_replace = true
+```
+
+When enabled, the `truncate-and-insert` replace strategy loads a table's staged files with a single BigQuery load job using `write_disposition=WRITE_TRUNCATE_DATA`. This replaces the data **in place**: the table object is kept, so its schema, descriptions, labels, column policy tags, primary key constraints, and row access policies survive the refresh, dependent materialized views keep working, and there is no empty-table window (the truncate and load are atomic).
+
+Requirements and behavior:
+
+- Requires a [Google Cloud Storage staging destination](#staging-support) (`gs://` bucket). With no staging, or a non-GCS staging bucket, `dlt` logs a warning and falls back to the regular `truncate-and-insert` (which briefly empties the table).
+- Active only when the replace strategy is `truncate-and-insert` (the default). Other strategies are unaffected.
+- Atomicity is **per table**: every table in a nested chain is replaced by its own atomic load job, not the whole chain as a single transaction.
+
+You can also enable it in code:
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    "bq_pipeline",
+    destination=dlt.destinations.bigquery(enable_atomic_replace=True),
+    staging="filesystem",
+)
+```
+
+## Data loading
+
+`dlt` uses `BigQuery` load jobs that send files from the local filesystem or GCS buckets.
+The loader follows [Google recommendations](https://cloud.google.com/bigquery/docs/error-messages) when retrying and terminating jobs.
+The Google BigQuery client implements an elaborate retry mechanism and timeouts for queries and file uploads, which may be configured in destination options.
+
+BigQuery destination also supports [streaming insert](https://cloud.google.com/bigquery/docs/streaming-data-into-bigquery). The mode provides better performance with small batches, but it buffers the data, preventing any update/delete operations on it. Due to this, streaming inserts are only available with `write_disposition="append"`, and the inserted data is blocked for editing for up to 90 min (reading, however, is available immediately). [See more](https://cloud.google.com/bigquery/quotas#streaming_inserts).
+
+To switch the resource into streaming insert mode, use hints:
+
+```py
+@dlt.resource(write_disposition="append")
+def streamed_resource():
+    yield {"field1": 1, "field2": 2}
+
+streamed_resource.apply_hints(additional_table_hints={"x-insert-api": "streaming"})
+```
+
+### Use BigQuery schema autodetect for nested fields
+
+You can let BigQuery infer schemas and create destination tables instead of `dlt`. As a consequence, nested fields (i.e., `RECORD`), which `dlt` does not support at
+this moment (they are stored as JSON), may be created. You can select certain resources with the [BigQuery Adapter](#bigquery-adapter) or all of them with the following config option:
+
+```toml
+[destination.bigquery]
+autodetect_schema=true
+```
+
+We recommend yielding [Arrow tables](../verified-sources/arrow-pandas.md) from your resources and using the Parquet file format to load the data. In that case, the schemas generated by `dlt` and BigQuery
+will be identical. BigQuery will also preserve the column order from the generated parquet files. You can convert JSON data into Arrow tables with [pyarrow or duckdb](../verified-sources/arrow-pandas.md#loading-json-documents).
+
+```py
+import pyarrow.json as paj
+
+import dlt
+from dlt.destinations.adapters import bigquery_adapter
+
+@dlt.resource(name="cve")
+def load_cve():
+  with open("cve.json", 'rb') as f:
+    # autodetect arrow schema and yield arrow table
+    yield paj.read_json(f)
+
+pipeline = dlt.pipeline("load_json_struct", destination="bigquery")
+pipeline.run(
+  bigquery_adapter(load_cve(), autodetect_schema=True)
+)
+```
+
+Above, we use the `pyarrow` library to convert a JSON document into an Arrow table and use `bigquery_adapter` to enable schema autodetect for the **cve** resource.
+
+Yielding Python dicts/lists and loading them as JSONL works as well. In many cases, the resulting nested structure is simpler than those obtained via pyarrow/duckdb and parquet. However, there are slight differences in inferred types from `dlt` (BigQuery coerces types more aggressively). BigQuery also does not try to preserve the column order in relation to the order of fields in JSON.
+
+```py
+import dlt
+from dlt.destinations.adapters import bigquery_adapter
+
+@dlt.resource(name="cve", max_table_nesting=1)
+def load_cve():
+  with open("cve.json", 'rb') as f:
+    yield json.load(f)
+
+pipeline = dlt.pipeline("load_json_struct", destination="bigquery")
+pipeline.run(
+  bigquery_adapter(load_cve(), autodetect_schema=True)
+)
+```
+
+In the example below, we represent JSON data as tables up to nesting level 1. Above this nesting level, we let BigQuery create nested fields.
+
+:::warning
+If you yield data as Python objects (dicts) and load this data as Parquet, the nested fields will be converted into strings. This is one of the consequences of
+`dlt` not being able to infer nested fields.
+:::
+
+## Supported file formats
+
+You can configure the following file formats to load data to BigQuery:
+
+* [JSONL](../file-formats.md#jsonl) is used by default.
+* [Parquet](../file-formats.md#parquet) is supported.
+
+When staging is enabled:
+
+* [JSONL](../file-formats.md#jsonl) is used by default.
+* [Parquet](../file-formats.md#parquet) is supported.
+
+:::warning
+**BigQuery cannot load JSON columns from Parquet files**. `dlt` will fail such jobs permanently. Instead:
+
+* Switch to JSONL to load and parse JSON properly.
+* Use schema [autodetect and nested fields](#use-bigquery-schema-autodetect-for-nested-fields)
+:::
+
+## Supported column hints
+
+BigQuery supports the following [column hints](../../general-usage/schema#tables-and-columns):
+
+* `partition` - creates a partition with a day granularity on the decorated column (`PARTITION BY DATE`).
+  It may be used with `datetime`, `date`, and `bigint` data types.
+  Only one column per table is supported and only when a new table is created.
+  For more information on BigQuery partitioning, read the [official docs](https://cloud.google.com/bigquery/docs/partitioned-tables).
+

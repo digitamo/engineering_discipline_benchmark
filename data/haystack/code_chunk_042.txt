@@ -1,0 +1,3321 @@
+1. Initialize a project with a pipeline that loads to Fabric by running:
+
+```sh
+dlt init chess fabric
+```
+
+2. Install the necessary dependencies for Fabric by running:
+
+```sh
+pip install -r requirements.txt
+```
+
+or run:
+
+```sh
+pip install "dlt[fabric]"
+```
+
+3. Enter your credentials into `.dlt/secrets.toml`.
+
+```toml
+[destination.fabric.credentials]
+host = "<your-warehouse-guid>.datawarehouse.fabric.microsoft.com"
+database = "mydb"
+azure_tenant_id = "your-azure-tenant-id"
+azure_client_id = "your-client-id"
+azure_client_secret = "your-client-secret"
+port = 1433
+connect_timeout = 30
+```
+
+## Write disposition
+
+All write dispositions are supported, including the [`upsert`](../../general-usage/merge-loading.md#upsert-strategy) and [`insert-only`](../../general-usage/merge-loading.md#insert-only-strategy) merge strategies.
+
+If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be dropped and recreated with an `ALTER SCHEMA ... TRANSFER`. The operation is atomic: Fabric supports DDL transactions.
+
+## Staging support
+
+Fabric Warehouse supports staging data via **OneLake Lakehouse** or **Azure Blob / Data Lake Storage** using the `COPY INTO` command for efficient bulk loading. This is the recommended approach for large datasets.
+
+### Examples
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    destination="fabric",
+    staging="filesystem",
+    dataset_name='my_dataset'
+)
+```
+
+#### `.dlt/secrets.toml` when using OneLake
+
+```toml
+[destination.fabric.credentials]
+# your fabric credentials
+
+[destination.filesystem]
+bucket_url = "abfss://<your-workspace-guid>@onelake.dfs.fabric.microsoft.com/<your-lakehouse-guid>/Files"
+
+[destination.filesystem.credentials]
+azure_storage_account_name = "onelake"
+azure_account_host = "onelake.blob.fabric.microsoft.com"
+# use same Service Principal credentials as in [destination.fabric.credentials]
+azure_tenant_id = "your-tenant-id"
+azure_client_id = "your-client-id"
+azure_client_secret = "your-client-secret"
+```
+
+**Finding your GUIDs**:
+
+1. Navigate to your Fabric workspace in the browser
+2. The workspace GUID is in the URL: `https://fabric.microsoft.com/groups/<workspace_guid>/...`
+3. Open your Lakehouse
+4. The lakehouse GUID is in the URL: `https://fabric.microsoft.com/.../lakehouses/<lakehouse_guid>`
+
+#### `.dlt/secrets.toml` when using Azure Blob / Data Lake Storage
+
+```toml
+[destination.fabric.credentials]
+# your fabric credentials
+
+[destination.filesystem]
+bucket_url = "az://your-container-name"
+
+[destination.filesystem.credentials]
+azure_storage_account_name = "your-storage-account-name"
+azure_storage_account_key = "your-storage-account-key"
+```
+
+## Data loading
+
+Data is loaded via INSERT statements by default. Fabric Warehouse has a limit of 1000 rows per INSERT, and this is what we use.
+
+## Supported file formats
+
+* [insert-values](../file-formats.md#sql-insert) is the default and currently only supported format
+
+## Supported column hints
+
+**fabric** will create unique indexes for all columns with `unique` hints. This behavior **is disabled by default**.
+
+### Table and column identifiers
+
+Fabric Warehouse (like SQL Server) uses **case-insensitive identifiers** but preserves the casing of identifiers stored in the INFORMATION SCHEMA. You can use [case-sensitive naming conventions](../../general-usage/naming-convention.md#case-sensitive-and-insensitive-destinations) to keep the identifier casing. Note that you risk generating identifier collisions, which are detected by `dlt` and will fail the load process.
+
+## Syncing of `dlt` state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+## Data types
+
+Fabric Warehouse differs from standard SQL Server in several important ways:
+
+### VARCHAR vs NVARCHAR
+
+Fabric Warehouse uses `varchar` for text columns instead of `nvarchar`. Because `varchar` lengths are counted in
+bytes while `precision` counts characters, the precision is multiplied by 4 (the worst case for UTF-8):
+
+- `text` → `varchar(max)`
+- `text` with `precision` → `varchar(precision * 4)`, for example `precision=25` → `varchar(100)`
+- `text` with `precision` above 2000 → `varchar(max)`, since 8000 is the longest length Fabric accepts
+
+### DATETIME2 vs DATETIMEOFFSET
+
+Fabric uses `datetime2` for timestamps instead of `datetimeoffset`:
+
+- `timestamp` → `datetime2(6)` (precision limited to 0-6, not 0-7)
+- `time` → `time(6)` (explicit precision required)
+
+### JSON Storage
+
+Fabric does not support native JSON columns. JSON objects are stored as `varchar(max)` columns.
+
+## Collation Support
+
+Fabric Warehouse supports UTF-8 collations. The destination automatically configures `LongAsMax=yes` which is required for UTF-8 collations to work properly.
+
+**Default collation**: `Latin1_General_100_BIN2_UTF8` (case-sensitive, UTF-8)
+
+You can specify a different collation:
+
+```toml
+[destination.fabric]
+collation = "Latin1_General_100_CI_AS_KS_WS_SC_UTF8"  # case-insensitive
+```
+
+Or in code:
+
+```py
+pipeline = dlt.pipeline(
+    destination=dlt.destinations.fabric(
+        credentials={},
+        collation="Latin1_General_100_CI_AS_KS_WS_SC_UTF8"
+    )
+)
+```
+
+## Additional destination options
+
+The **fabric** destination **does not** create UNIQUE indexes by default on columns with the `unique` hint (i.e., `_dlt_id`). To enable this behavior:
+
+```toml
+[destination.fabric]
+create_indexes=true
+```
+
+You can explicitly set the ODBC driver name:
+
+```toml
+[destination.fabric.credentials]
+driver="ODBC Driver 18 for SQL Server"
+```
+
+## Differences from MSSQL Destination
+
+While Fabric Warehouse is based on SQL Server, there are key differences:
+
+1. **Authentication**: Fabric requires Service Principal; username/password auth is not supported
+2. **Type System**: Uses `varchar` and `datetime2` instead of `nvarchar` and `datetimeoffset`
+3. **Collation**: Optimized for UTF-8 collations with automatic `LongAsMax` configuration
+4. **SQL Dialect**: Uses `fabric` SQLglot dialect for proper SQL generation
+
+### dbt support
+
+Integration with [dbt](../transformations/dbt/dbt.md) is supported via [dbt-fabric](https://github.com/Microsoft/dbt-fabric). Both Service Principal and default Azure credentials are supported and shared with dbt runners.
+
+## Troubleshooting
+
+### ODBC Driver Not Found
+
+If you see "No supported ODBC driver found", install the Microsoft ODBC Driver 18 for SQL Server:
+
+```sh
+# Ubuntu/Debian
+curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+curl https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+sudo apt-get update
+sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18
+```
+
+### Authentication Failures
+
+Ensure your Service Principal has:
+
+- Proper permissions on the Fabric workspace
+- Access to the target database/warehouse
+- Correct tenant ID (your Azure AD tenant, not the workspace/capacity ID)
+
+### UTF-8 Character Issues
+
+If you experience character encoding issues:
+
+1. Verify your warehouse uses a UTF-8 collation
+2. Check that `LongAsMax=yes` is in the connection (automatically added by this destination)
+3. Consider using the case-insensitive UTF-8 collation if needed
+
+## Additional Resources
+
+- [Microsoft Fabric Documentation](https://learn.microsoft.com/en-us/fabric/)
+- [Fabric Warehouse Documentation](https://learn.microsoft.com/en-us/fabric/data-warehouse/)
+- [Service Principal Setup Guide](https://learn.microsoft.com/en-us/fabric/security/service-principals)
+
+<!--@@@DLT_TUBA fabric-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/filesystem.md =====
+
+---
+title: Object store & filesystem
+description: Store data in remote file systems and object store services like AWS S3, Google Cloud Storage, or Azure Blob Storage
+keywords: [filesystem, s3, gcs, azure, blob storage, sftp, cloud storage, data lake, staging]
+---
+# Object store & filesystem
+
+The filesystem destination stores data in remote file systems and cloud storage services like **AWS S3**, **Google Cloud Storage**, or **Azure Blob Storage**. Underneath, it uses [fsspec](https://github.com/fsspec/filesystem_spec) to abstract file operations. Its primary role is to be used as a staging area for other destinations, but you can also quickly build a data lake with it.
+
+## Install dlt with filesystem
+
+Install the dlt library with filesystem dependencies:
+
+```sh
+pip install "dlt[filesystem]"
+```
+
+This installs the `s3fs` and `botocore` packages.
+
+:::warning
+
+You may also install the dependencies independently. Try:
+
+```sh
+pip install dlt
+pip install s3fs
+```
+
+so pip does not fail on backtracking.
+:::
+
+<!--@@@DLT_DESTINATION_CAPABILITIES filesystem-->
+
+## Initialize the dlt project
+
+Let's start by initializing a new dlt project as follows:
+
+```sh
+dlt init chess filesystem
+```
+
+:::note
+This command will initialize your pipeline with chess as the source and AWS S3 as the destination.
+:::
+
+## Set up the destination and credentials
+
+### AWS S3
+
+The command above creates a sample `secrets.toml` and requirements file for an AWS S3 bucket. You can install those dependencies by running:
+
+```sh
+pip install -r requirements.txt
+```
+
+To edit the dlt credentials file with your secret info, open `.dlt/secrets.toml`, which looks like this:
+
+```toml
+[destination.filesystem]
+bucket_url = "s3://[your_bucket_name]" # replace with your bucket name,
+
+[destination.filesystem.credentials]
+aws_access_key_id = "please set me up!" # copy the access key here
+aws_secret_access_key = "please set me up!" # copy the secret access key here
+```
+
+If you have your credentials stored in `~/.aws/credentials`, just remove the **[destination.filesystem.credentials]** section above, and dlt will fall back to your **default** profile in local credentials. If you want to switch the profile, pass the profile name as follows (here: `dlt-ci-user`):
+
+```toml
+[destination.filesystem.credentials]
+profile_name="dlt-ci-user"
+```
+
+You can also specify an AWS region:
+
+```toml
+[destination.filesystem.credentials]
+region_name="eu-central-1"
+```
+
+You need to create an S3 bucket and a user who can access that bucket. dlt does not create buckets automatically.
+
+1. You can create the S3 bucket in the AWS console by clicking on "Create Bucket" in S3 and assigning the appropriate name and permissions to the bucket.
+2. Once the bucket is created, you'll have the bucket URL. For example, if the bucket name is `dlt-ci-test-bucket`, then the bucket URL will be:
+
+   ```text
+   s3://dlt-ci-test-bucket
+   ```
+
+3. To grant permissions to the user being used to access the S3 bucket, go to IAM > Users, and click on “Add Permissions”.
+4. Below you can find a sample policy that gives the minimum permission required by dlt to a bucket we created above. The policy contains permissions to list files in a bucket, get, put, and delete objects. **Remember to place your bucket name in the Resource section of the policy!**
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "DltBucketAccess",
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:DeleteObject",
+                "s3:GetObjectAttributes",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::dlt-ci-test-bucket/*",
+                "arn:aws:s3:::dlt-ci-test-bucket"
+            ]
+        }
+    ]
+}
+```
+
+5. To obtain the access and secret key for the user, go to IAM > Users and in the “Security Credentials”, click on “Create Access Key”, and preferably select “Command Line Interface” and create the access key.
+6. Obtain the “Access Key” and “Secret Access Key” created that are to be used in "secrets.toml".
+
+#### Using S3 compatible storage
+
+To use an S3 compatible storage other than AWS S3, such as [MinIO](https://min.io/), [Tigris](https://www.tigrisdata.com), [Cloudflare R2](https://www.cloudflare.com/en-ca/developer-platform/r2/), or [Google
+Cloud Storage](https://cloud.google.com/storage/docs/interoperability), you may supply an `endpoint_url` in the config. This should be set along with AWS credentials:
+
+```toml
+[destination.filesystem]
+bucket_url = "s3://[your_bucket_name]" # replace with your bucket name,
+
+[destination.filesystem.credentials]
+aws_access_key_id = "please set me up!" # copy the access key here
+aws_secret_access_key = "please set me up!" # copy the secret access key here
+endpoint_url = "https://<account_id>.r2.cloudflarestorage.com" # copy your endpoint URL here
+```
+
+For Tigris, set `endpoint_url = "https://t3.storage.dev"` and use your Tigris access key ID (prefixed `tid_`) and secret access key (prefixed `tsec_`). Tigris uses a single global endpoint and doesn't charge egress fees, which matters when warehouses in different regions load from the same staging bucket.
+
+#### Adding additional configuration
+
+To pass any additional arguments to `fsspec`, you may supply `kwargs` and `client_kwargs` in `toml` config.
+
+```toml
+[destination.filesystem.kwargs]
+use_ssl=true
+auto_mkdir=true
+
+[destination.filesystem.client_kwargs]
+verify="public.crt"
+```
+
+To pass additional arguments via env variables, use **stringified dictionary**:
+`DESTINATION__FILESYSTEM__KWARGS='{"use_ssl": true, "auto_mkdir": true}`
+
+You can also override default `fsspec` settings used by `dlt`:
+
+```toml
+[destination.filesystem.kwargs]
+use_listings_cache=false  # listing cache disabled by default as you typically add files
+listings_expiry_time=60.0
+skip_instance_cache=false  # instance cache enabled by default, it is thread isolated anyway
+```
+
+There's however no good reason to do that, except debugging `fsspec` internal problems. You could try
+to enable listing cache but this cache is not shared across threads which `dlt` load steps uses to
+parallelize writes. You may get unpredictable cache invalidation behavior.
+
+### Google storage
+
+Run `pip install "dlt[gs]"` which will install the `gcfs` package.
+
+To edit the `dlt` credentials file with your secret info, open `.dlt/secrets.toml`.
+You'll see AWS credentials by default.
+Use Google cloud credentials that you may know from [BigQuery destination](bigquery)
+
+```toml
+[destination.filesystem]
+bucket_url = "gs://[your_bucket_name]" # replace with your bucket name,
+
+[destination.filesystem.credentials]
+project_id = "project_id" # please set me up!
+private_key = "private_key" # please set me up!
+client_email = "client_email" # please set me up!
+```
+
+:::note
+Note that you can share the same credentials with BigQuery, replace the `[destination.filesystem.credentials]` section with a less specific one: `[destination.credentials]` which applies to both destinations.
+:::
+
+If you have default Google Cloud credentials in your environment (i.e., on cloud function), remove the credentials sections above and `dlt` will fall back to the available default.
+
+Use **Cloud Storage** admin to create a new bucket. Then assign the **Storage Object Admin** role to your service account.
+
+### Azure Blob Storage
+
+Run `pip install "dlt[az]"` which will install the `adlfs` package to interface with Azure Blob Storage.
+
+Edit the credentials in `.dlt/secrets.toml`, you'll see AWS credentials by default; replace them with your Azure credentials.
+
+#### Supported schemes
+
+`dlt` supports both forms of the blob storage urls:
+
+```toml
+[destination.filesystem]
+bucket_url = "az://<container_name>/path" # replace with your container name and path
+```
+
+and
+
+```toml
+[destination.filesystem]
+bucket_url = "abfss://<container_name>@<storage_account_name>.dfs.core.windows.net/path"
+```
+
+You can use `az`, `abfss`, `azure` and `abfs` url schemes.
+
+If you need to use a custom host for your storage account, you can set it up like below:
+
+```toml
+[destination.filesystem.credentials]
+# The storage account name is always required
+azure_account_host = "<storage_account_name>.<host_base>"
+```
+
+Remember to include `storage_account_name` with your base host i.e. `dlt_ci.blob.core.usgovcloudapi.net`.
+
+`dlt` will use this host to connect to Azure Blob Storage without any modifications:
+
+:::tip OneLake (Fabric)
+Use the Blob endpoint (`azure_account_host = "onelake.blob.fabric.microsoft.com"`).
+
+**IMPORTANT**: OneLake bucket URLs must use **GUIDs** for workspace and lakehouse, not display names:
+
+```toml
+bucket_url = "abfss://<workspace_guid>@onelake.dfs.fabric.microsoft.com/<lakehouse_guid>/Files"
+```
+
+Find GUIDs in your browser URL when viewing workspace/lakehouse in Fabric portal.
+:::
+
+Two forms of Azure credentials are supported:
+
+#### SAS token credentials
+
+Supply storage account name and either SAS token or storage account key
+
+```toml
+[destination.filesystem.credentials]
+# The storage account name is always required
+azure_storage_account_name = "account_name" # please set me up!
+# You can set either account_key or sas_token, only one is needed
+azure_storage_account_key = "account_key" # please set me up!
+azure_storage_sas_token = "sas_token" # please set me up!
+```
+
+If you have the correct Azure credentials set up on your machine (e.g., via Azure CLI),
+you can omit both `azure_storage_account_key` and `azure_storage_sas_token` and `dlt` will fall back to the available default.
+Note that `azure_storage_account_name` is still required as it can't be inferred from the environment.
+
+#### Service principal credentials
+
+Supply a client ID, client secret, and a tenant ID for a service principal authorized to access your container.
+
+```toml
+[destination.filesystem.credentials]
+azure_storage_account_name = "account_name" # please set me up!
+azure_client_id = "client_id" # please set me up!
+azure_client_secret = "client_secret"
+azure_tenant_id = "tenant_id" # please set me up!
+```
+
+:::warning
+**Concurrent blob uploads**
+`dlt` limits the number of concurrent connections for a single uploaded blob to 1. By default, `adlfs` that we use splits blobs into 4 MB chunks and uploads them concurrently, which leads to gigabytes of used memory and thousands of connections for larger load packages. You can increase the maximum concurrency as follows:
+
+```toml
+[destination.filesystem.kwargs]
+max_concurrency=3
+```
+
+:::
+
+### Hugging Face
+
+The filesystem destination supports loading into [Hugging Face Datasets](https://huggingface.co/docs/datasets/index) using the `hf://` protocol. See the [Hugging Face destination](huggingface) page for setup and configuration details.
+
+### Local file system
+
+If for any reason you want to have those files in a local folder, set up the `bucket_url` as follows (you are free to use `config.toml` for that as there are no secrets required):
+
+```toml
+[destination.filesystem]
+bucket_url = "file:///absolute/path"  # three slashes (file:///) for an absolute path
+```
+
+:::tip
+For handling deeply nested layouts, consider enabling automatic directory creation for the local filesystem destination. This can be done by setting `kwargs` in `secrets.toml`:
+
+```toml
+[destination.filesystem]
+kwargs = '{"auto_mkdir": true}'
+```
+
+Or by setting an environment variable:
+
+```sh
+export DESTINATION__FILESYSTEM__KWARGS = '{"auto_mkdir": true/false}'
+```
+
+:::
+
+`dlt` correctly handles the native local file paths. Indeed, using the `file://` schema may not be intuitive, especially for Windows users.
+
+```toml
+[destination.unc_destination]
+bucket_url = 'C:\a\b\c'
+```
+
+In the example above, we specify `bucket_url` using **TOML's literal strings** that do not require [escaping of backslashes](https://github.com/toml-lang/toml/blob/main/toml.md#string).
+
+```toml
+[destination.unc_destination]
+bucket_url = '\\localhost\c$\a\b\c'  # UNC equivalent of C:\a\b\c
+
+[destination.posix_destination]
+bucket_url = '/var/local/data'  # absolute POSIX style path
+
+[destination.relative_destination]
+bucket_url = '_storage/data'  # relative POSIX style path
+```
+
+In the examples above, we define a few named filesystem destinations:
+
+* **unc_destination** demonstrates a Windows UNC path in native form.
+* **posix_destination** demonstrates a native POSIX (Linux/Mac) absolute path.
+* **relative_destination** demonstrates a native POSIX (Linux/Mac) relative path. In this case, the `filesystem` destination will store files in the `$cwd/_storage/data` path, where **$cwd** is your current working directory.
+
+`dlt` supports Windows [UNC paths with the file:// scheme](https://en.wikipedia.org/wiki/File_URI_scheme). They can be specified using **host** or purely as a **path** component.
+
+```toml
+[destination.unc_with_host]
+bucket_url="file://localhost/c$/a/b/c"
+
+[destination.unc_with_path]
+bucket_url="file:////localhost/c$/a/b/c"
+```
+
+:::warning
+Windows supports paths up to 255 characters. When you access a path longer than 255 characters, you'll see a `FileNotFound` exception.
+
+To overcome this limit, you can use [extended paths](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation?tabs=registry). `dlt` recognizes both regular and UNC extended paths.
+
+```toml
+[destination.regular_extended]
+bucket_url = '\\?\C:\a\b\c'
+
+[destination.unc_extended]
+bucket_url='\\?\UNC\localhost\c$\a\b\c'
+```
+
+:::
+
+### SFTP
+
+Run `pip install "dlt[sftp]"` which will install the `paramiko` package alongside `dlt`, enabling secure SFTP transfers.
+
+Configure your SFTP credentials by editing the `.dlt/secrets.toml` file. By default, the file contains placeholders for AWS credentials. You should replace these with your SFTP credentials.
+
+Below are the possible fields for SFTP credentials configuration:
+
+```text
+sftp_port                   # The port for SFTP, defaults to 22 (standard for SSH/SFTP)
+sftp_username               # Your SFTP username, defaults to None
+sftp_password               # Your SFTP password (if using password-based auth), defaults to None
+*sftp_pkey*                 # Your private key for key-based authentication, defaults to None
+sftp_key_filename           # Path to your private key file for key-based authentication, defaults to None
+sftp_key_passphrase         # Passphrase for your private key (if applicable), defaults to None
+sftp_timeout                # Timeout for establishing a connection, defaults to None
+sftp_banner_timeout         # Timeout for receiving the banner during authentication, defaults to None
+sftp_auth_timeout           # Authentication timeout, defaults to None
+sftp_channel_timeout        # Channel timeout for SFTP operations, defaults to None
+sftp_allow_agent            # Use SSH agent for key management (if available), defaults to True
+sftp_look_for_keys          # Search for SSH keys in the default SSH directory (~/.ssh/), defaults to True
+sftp_compress               # Enable compression (can improve performance over slow networks), defaults to False
+*sftp_sock*                 # Custom socket to use for communication to target host, defaults to None
+sftp_gss_auth               # Use GSS-API for authentication, defaults to False
+sftp_gss_kex                # Use GSS-API for key exchange, defaults to False
+sftp_gss_deleg_creds        # Delegate credentials with GSS-API, defaults to True
+sftp_gss_host               # Host for GSS-API, defaults to None
+sftp_gss_trust_dns          # Trust DNS for GSS-API, defaults to True
+*sftp_disabled_algorithms*  # Disable specific algorithms for security, defaults to None
+*sftp_transport_factory*    # Custom transport factory, defaults to None
+*sftp_auth_strategy*        # Authentication strategy, defaults to None
+```
+
+:::note
+The `*` credentials indicate parameters that cannot be set through `.dlt/secrets.toml` and must be set through code instantiation.
+:::
+
+:::info
+For more information about credentials parameters: [https://docs.paramiko.org/en/3.3/api/client.html#paramiko.client.SSHClient.connect](https://docs.paramiko.org/en/3.3/api/client.html#paramiko.client.SSHClient.connect)
+:::
+
+### Authentication methods
+
+SFTP authentication is attempted in the following order of priority:
+
+1. **Key-based authentication**: If you provide a `key_filename` containing the path to a private key or a corresponding OpenSSH public certificate (e.g., `id_rsa` and `id_rsa-cert.pub`), these will be used for authentication. If the private key requires a passphrase, you can specify it via `sftp_key_passphrase`. If your private key requires a passphrase to unlock, and you’ve provided one, it will be used to attempt to unlock the key.
+
+2. **SSH Agent-based authentication**: If `allow_agent=True` (default), Paramiko will look for any SSH keys stored in your local SSH agent (such as `id_rsa`, `id_dsa`, or `id_ecdsa` keys stored in `~/.ssh/`).
+
+3. **Username/Password authentication**: If a password is provided (`sftp_password`), plain username/password authentication will be attempted.
+
+4. **GSS-API authentication**: If GSS-API (Kerberos) is enabled (`sftp_gss_auth=True`), authentication will use the Kerberos protocol. GSS-API may also be used for key exchange (`sftp_gss_kex=True`) and credential delegation (`sftp_gss_deleg_creds=True`). This method is useful in environments where Kerberos is set up, often in enterprise networks.
+
+#### 1. Key-based authentication
+
+If you use an SSH key instead of a password, you can specify the path to your private key in the configuration.
+
+```toml
+[destination.filesystem]
+bucket_url = "sftp://[hostname]/[path]"
+file_glob = "*"
+
+[destination.filesystem.credentials]
+sftp_username = "foo"
+sftp_key_filename = "/path/to/id_rsa"     # Replace with the path to your private key file
+sftp_key_passphrase = "your_passphrase"   # Optional: passphrase for your private key
+```
+
+#### 2. SSH agent-based authentication
+
+If you have an SSH agent running with loaded keys, you can allow Paramiko to use these keys automatically. You can omit the password and key fields if you're relying on the SSH agent.
+
+```toml
+[destination.filesystem]
+bucket_url = "sftp://[hostname]/[path]"
+file_glob = "*"
+
+[destination.filesystem.credentials]
+sftp_username = "foo"
+sftp_key_passphrase = "your_passphrase"   # Optional: passphrase for your private key
+```
+
+The loaded key must be one of the following types stored in ~/.ssh/: id_rsa, id_dsa, or id_ecdsa.
+
+#### 3. Username and password authentication
+
+This is the simplest form of authentication, where you supply a username and password directly.
+
+```toml
+[destination.filesystem]
+bucket_url = "sftp://[hostname]/[path]"  # The hostname of your SFTP server and the remote path
+file_glob = "*"                          # Pattern to match the files you want to upload/download
+
+[destination.filesystem.credentials]
+sftp_username = "foo"                    # Replace "foo" with your SFTP username
+sftp_password = "pass"                   # Replace "pass" with your SFTP password
+```
+
+### Notes
+
+- **Key-based authentication**: Make sure your private key has the correct permissions (`chmod 600`), or SSH will refuse to use it.
+- **Timeouts**: It's important to adjust timeout values based on your network conditions to avoid connection issues.
+
+This configuration allows flexible SFTP authentication, whether you're using passwords, keys, or agents, and ensures secure communication between your local environment and the SFTP server.
+
+## Write disposition
+
+The filesystem destination handles the write dispositions as follows:
+
+- `append` - files belonging to such tables are added to the dataset folder
+- `replace` - all files that belong to such tables are deleted from the dataset folder, and then the current set of files is added.
+- `merge` - falls back to `append`
+
+## File compression
+
+The filesystem destination in the dlt library uses `gzip` compression by default for efficiency.
+
+To handle compressed files:
+
+- To disable compression, you can modify the `data_writer.disable_compression` setting in your "config.toml" file. This can be useful if you want to access the files directly without needing to decompress them. For example:
+
+```toml
+[normalize.data_writer]
+disable_compression=true
+```
+
+- To decompress a `gzip` file, you can use tools like `gunzip`. This will convert the compressed file back to its original format, making it readable.
+
+:::note
+Starting with dlt version 1.15.0, compressed `csv` and `jsonl` files automatically include a `.gz` extension to reflect their gzip-compressed format. In versions prior to 1.15.0, compressed files were saved without the `.gz` extension. If you have a dataset created with an earlier version (e.g., 1.14.0 or below), dlt will automatically detect the older format and preserve the original naming (without `.gz`) for that dataset. New datasets created with 1.15.0 or later will include the `.gz` extension by default.
+:::
+
+For more details on managing file compression, please visit our documentation on performance optimization: [Disabling and enabling file compression](../../reference/performance#disabling-and-enabling-file-compression).
+
+## Files layout
+
+All the files are stored in a single folder with the name of the dataset that you passed to the `run` or `load` methods of the `pipeline`. In our example chess pipeline, it is **chess_players_games_data**.
+
+:::note
+Object storages are, in fact, key-blob storage, so the folder structure is emulated by splitting file names into components by a separator (`/`).
+:::
+
+You can control the files layout by specifying the desired configuration. There are several ways to do this.
+
+### Default layout
+
+Current default layout: `{table_name}/{load_id}.{file_id}.{ext}`
+
+:::note
+The default layout format has changed from `{schema_name}.{table_name}.{load_id}.{file_id}.{ext}` to `{table_name}/{load_id}.{file_id}.{ext}` in dlt 0.3.12. You can revert to the old layout by setting it manually.
+:::
+
+### Available layout placeholders
+
+#### Standard placeholders
+
+* `schema_name` - the name of the [schema](../../general-usage/schema)
+* `table_name` - the table name
+* `load_id` - the ID of the [load package](../../general-usage/destination-tables#load-packages-and-load-ids) from which the file comes
+* `file_id` - the ID of the file; if there are many files with data for a single table, they are copied with different file IDs
+* `ext` - the format of the file, i.e., `jsonl` or `parquet`
+
+#### Date and time placeholders
+
+:::tip
+Keep in mind all values are lowercased.
+:::
+
+* `timestamp` - the current timestamp in Unix Timestamp format rounded to seconds
+* `timestamp_ms` - the current timestamp in Unix Timestamp format in milliseconds
+* `load_package_timestamp` - timestamp from [load package](../../general-usage/destination-tables#load-packages-and-load-ids) in Unix Timestamp format rounded to seconds
+* `load_package_timestamp_ms` - timestamp from [load package](../../general-usage/destination-tables#load-packages-and-load-ids) in Unix Timestamp format in milliseconds
+
+:::note
+Both `timestamp_ms` and `load_package_timestamp_ms` are in milliseconds (e.g., 12334455233), not fractional seconds to ensure millisecond precision without decimals.
+:::
+
+* Years
+  * `YYYY` - 2024, 2025
+  * `Y` - 2024, 2025
+* Months
+  * `MMMM` - January, February, March
+  * `MMM` - Jan, Feb, Mar
+  * `MM` - 01, 02, 03
+  * `M` - 1, 2, 3
+* Days of the month
+  * `DD` - 01, 02
+  * `D` - 1, 2
+* Hours 24h format
+  * `HH` - 00, 01, 02...23
+  * `H` - 0, 1, 2...23
+* Minutes
+  * `mm` - 00, 01, 02...59
+  * `m` - 0, 1, 2...59
+* Seconds
+  * `ss` - 00, 01, 02...59
+  * `s` - 0, 1, 2...59
+* Fractional seconds
+  * `SSSS` - 000[0..] 001[0..] ... 998[0..] 999[0..]
+  * `SSS` - 000 001 ... 998 999
+  * `SS` - 00, 01, 02 ... 98, 99
+  * `S` - 0 1 ... 8 9
+* Days of the week
+  * `dddd` - Monday, Tuesday, Wednesday
+  * `ddd` - Mon, Tue, Wed
+  * `dd` - Mo, Tu, We
+  * `d` - 0-6
+* `Q` - quarters 1, 2, 3, 4
+
+You can change the file name format by providing the layout setting for the filesystem destination like so:
+
+```toml
+[destination.filesystem]
+layout="{table_name}/{load_id}.{file_id}.{ext}" # current preconfigured naming scheme
+
+# More examples
+# With timestamp
+# layout = "{table_name}/{timestamp}/{load_id}.{file_id}.{ext}"
+
+# With timestamp of the load package
+# layout = "{table_name}/{load_package_timestamp}/{load_id}.{file_id}.{ext}"
+
+# Parquet-like layout (note: it is not compatible with the internal datetime of the parquet file)
+# layout = "{table_name}/year={YYYY}/month={MM}/day={DD}/{load_id}.{file_id}.{ext}"
+
+# Custom placeholders
+# extra_placeholders = { "owner" = "admin", "department" = "finance" }
+# layout = "{table_name}/{owner}/{department}/{load_id}.{file_id}.{ext}"
+```
+
+A few things to know when specifying your filename layout:
+
+- If you want a different base path that is common to all filenames, you can suffix your `bucket_url` rather than prefix your `layout` setting.
+- If you do not provide the `{ext}` placeholder, it will automatically be added to your layout at the end with a dot as a separator.
+- It is best practice to have a separator between each placeholder. Dots, dashes, and forward slashes are the most common separators.
+- When you are using the `replace` disposition, `dlt` will have to be able to figure out the correct files to delete before loading the new data. For this to work, you have to:
+  - include the `{table_name}` placeholder in your layout
+  - not have any other placeholders except for the `{schema_name}` placeholder before the table_name placeholder and
+  - have a separator after the table_name placeholder
+- The separator after `{table_name}` must be a character that your [naming convention](../../general-usage/naming-convention.md) removes from table names. `dlt` selects the files of a table by this prefix. With `_` under `snake_case`, the prefix of `event` also matches the nested table `event__child`, so a `replace` of `event` deletes the child files. `/` and `.` are safe under `snake_case`.
+- `duck_case` and `direct` keep `/` and `.` inside table names, so under those conventions no separator is safe. Make sure your table names do not contain the separator you pick.
+- `dlt` warns when a layout has such a separator. To silence the warning, set `warn_unsafe_layout_separators=False` on the destination.
+
+Please note:
+
+- `dlt` will mark complete loads by creating a json file in the `./_dlt_loads` folders that corresponds to the `_dlt_loads` table. For example, if the `chess__1685299832.jsonl` file is present in the loads folder, you can be sure that all files for the load package `1685299832` are completely loaded.
+
+### Advanced layout configuration
+
+The filesystem destination configuration supports advanced layout customization and the inclusion of additional placeholders. This can be done through `config.toml` or programmatically when initializing via a factory method.
+
+#### Configuration via `config.toml`
+
+To configure the layout and placeholders using `config.toml`, use the following format:
+
+```toml
+[destination.filesystem]
+layout = "{table_name}/{test_placeholder}/{YYYY}-{MM}-{DD}/{ddd}/{mm}/{load_id}.{file_id}.{ext}"
+extra_placeholders = { "test_placeholder" = "test_value" }
+current_datetime="2024-04-14T00:00:00"
+# for automatic directory creation in the local filesystem
+kwargs = '{"auto_mkdir": true}'
+```
+
+:::note
+Ensure that the placeholder names match the intended usage. For example, `{test_placeholer}` should be corrected to `{test_placeholder}` for consistency.
+:::
+
+#### Dynamic configuration in the code
+
+Configuration options, including layout and placeholders, can be overridden dynamically when initializing and passing the filesystem destination directly to the pipeline.
+
+```py
+import pendulum
+
+import dlt
+from dlt.destinations import filesystem
+
+pipeline = dlt.pipeline(
+    pipeline_name="data_things",
+    destination=filesystem(
+        layout="{table_name}/{test_placeholder}/{timestamp}/{load_id}.{file_id}.{ext}",
+        current_datetime=pendulum.now(),
+        extra_placeholders={
+            "test_placeholder": "test_value",
+        }
+    )
+)
+```
+
+Furthermore, it is possible to:
+
+1. Customize the behavior with callbacks for extra placeholder functionality. Each callback must accept the following positional arguments and return a string.
+2. Customize the `current_datetime`, which can also be a callback function and is expected to return a `pendulum.DateTime` instance.
+
+```py
+import pendulum
+
+import dlt
+from dlt.destinations import filesystem
+
+def placeholder_callback(schema_name: str, table_name: str, load_id: str, file_id: str, ext: str) -> str:
+    # Custom logic here
+    return "custom_value"
+
+def get_current_datetime() -> pendulum.DateTime:
+    return pendulum.now()
+
+pipeline = dlt.pipeline(
+    pipeline_name="data_things",
+    destination=filesystem(
+        layout="{table_name}/{placeholder_x}/{timestamp}/{load_id}.{file_id}.{ext}",
+        current_datetime=get_current_datetime,
+        extra_placeholders={
+            "placeholder_x": placeholder_callback
+        }
+    )
+)
+```
+
+### Recommended layout
+
+The currently recommended layout structure is straightforward:
+
+```toml
+layout="{table_name}/{load_id}.{file_id}.{ext}"
+```
+
+Adopting this layout offers several advantages:
+
+1. **Efficiency:** It's fast and simple to process.
+2. **Compatibility:** Supports `replace` as the write disposition method.
+3. **Flexibility:** Compatible with various destinations, including Athena.
+4. **Performance:** A deeply nested structure can slow down file navigation, whereas a simpler layout mitigates this issue.
+
+## Supported file formats
+
+You can choose the following file formats:
+
+* [JSONL](../file-formats.md#jsonl) is used by default
+* [Parquet](../file-formats.md#parquet) is supported
+* [CSV](../file-formats.md#csv) is supported
+
+## Supported table formats
+
+You can choose the following table formats:
+
+* [Delta table](./delta-iceberg)
+* [Iceberg](./iceberg)
+
+## Syncing of dlt state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination). To this end, special folders and files will be created at your destination which hold information about your pipeline state, schemas, and completed loads. These folders DO NOT respect your settings in the layout section. When using filesystem as a staging destination, not all of these folders are created, as the state and schemas are managed in the regular way by the final destination you have configured.
+
+You will also notice `init` files being present in the root folder and the special `dlt` folders. In the absence of the concepts of schemas and tables in blob storages and directories, `dlt` uses these special files to harmonize the behavior of the `filesystem` destination with the other implemented destinations.
+
+:::note
+When a load generates a new state, for example when using incremental loads, a new state file appears in the `_dlt_pipeline_state` folder at the destination. To prevent data accumulation, state cleanup mechanisms automatically remove old state files, retaining only the latest 100 by default. This cleanup process can be customized or disabled using the filesystem configuration `max_state_files`, which determines the maximum number of pipeline state files to retain (default is 100). Setting this value to 0 or a negative number disables the cleanup of old states.
+:::
+
+## Data access
+
+`filesystem` implements [`sql_client`](../transformations/sql.md#the-filesystem-sql-client) which provides read only
+SQL access to files and iceberg/delta tables with duckdb dialect. This also enables [`pipeline.dataset()`](../../general-usage/dataset-access/dataset), giving you Python-native access to loaded data as Pandas DataFrames, PyArrow tables, or Python tuples.
+
+By default views that are created are "frozen" to minimize reading from bucket.
+You can enable views autorefresh:
+
+```toml
+[destination.filesystem]
+always_refresh_views=true
+```
+
+## Troubleshooting
+
+### File Name Too Long Error
+
+When running your pipeline, you might encounter an error like `[Errno 36] File name too long Error`. This error occurs because the generated file name exceeds the maximum allowed length on your filesystem.
+
+To prevent the file name length error, set the `max_identifier_length` parameter for your destination. This truncates all identifiers (including filenames) to a specified maximum length.
+For example:
+
+```py
+from dlt.destinations import duckdb as duckdb_destination
+
+pipeline = dlt.pipeline(
+    pipeline_name="your_pipeline_name",
+    destination=duckdb_destination(
+        max_identifier_length=200,  # Adjust the length as needed
+    ),
+)
+```
+
+:::note
+
+- `max_identifier_length` truncates all identifiers (tables, columns). Ensure the length maintains uniqueness to avoid collisions.
+- Adjust `max_identifier_length` based on your data structure and filesystem limits.
+:::
+
+<!--@@@DLT_TUBA filesystem-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/huggingface.md =====
+
+---
+title: Hugging Face
+description: Load data into Hugging Face Datasets repositories using dlt
+keywords: [hugging face, hf, datasets, parquet, filesystem, hub]
+---
+# Hugging Face
+
+The Hugging Face destination loads data into [Hugging Face Datasets](https://huggingface.co/docs/datasets/index) repositories. It is built on top of the [filesystem](filesystem) destination and uses the `hf://` protocol to write [Parquet](../file-formats.md#parquet) files to the Hugging Face Hub.
+
+:::note
+Because this destination extends `filesystem`, most filesystem concepts (file layouts, write dispositions, dlt state sync, etc.) apply here. This page covers the Hugging Face-specific behavior and configuration. Refer to the [filesystem destination docs](filesystem) for the full feature set.
+:::
+
+## Install dlt with Hugging Face support
+
+```sh
+pip install "dlt[hf]"
+```
+
+This installs the `huggingface_hub` package alongside `dlt`.
+
+## Initialize the dlt project
+
+```sh
+dlt init chess filesystem
+```
+
+This creates a sample pipeline with the `filesystem` destination. To use Hugging Face, update the `bucket_url` in `.dlt/secrets.toml` to use the `hf://` scheme as shown below.
+
+## Set up credentials and destination
+
+### bucket_url
+
+The `bucket_url` uses the `hf://datasets/<namespace>` scheme, where `<namespace>` is your Hugging Face username or organization name.
+
+Each dlt dataset becomes a **separate Hugging Face dataset repository** under that namespace. For example, loading to the dataset name `chess_data` with namespace `my-org` creates the repository `my-org/chess_data`.
+
+```toml
+[destination.filesystem]
+bucket_url = "hf://datasets/my-org"    # replace "my-org" with your username or org
+```
+
+### Authentication
+
+Configure your [Hugging Face User Access Token](https://huggingface.co/docs/hub/security-tokens) in `.dlt/secrets.toml`:
+
+```toml
+[destination.filesystem.credentials]
+hf_token = "hf_..."    # replace with your Hugging Face User Access Token
+```
+
+Instead of setting `hf_token` in config, you can authenticate by:
+
+- Setting the `HF_TOKEN` [environment variable](#hugging-face-environment-variables)
+- Using a [locally saved token](https://huggingface.co/docs/huggingface_hub/en/quick-start#login-command) created with `huggingface-cli login`
+
+Authentication is attempted in that order of priority: `hf_token` config → `HF_TOKEN` env var → locally saved token.
+
+### Private Hub endpoint
+
+By default, `https://huggingface.co` is used as the API endpoint. To use a [Private Hub](https://huggingface.co/docs/hub/enterprise-hub) or a self-hosted endpoint, set `hf_endpoint`:
+
+```toml
+[destination.filesystem.credentials]
+hf_endpoint = "https://your-private-hub.example.com"    # replace with your Hugging Face endpoint
+```
+
+Alternatively, you can set the `HF_ENDPOINT` [environment variable](#hugging-face-environment-variables). When both are set, the `hf_endpoint` config takes precedence over the `HF_ENDPOINT` env var.
+
+### Full example configuration
+
+```toml
+[destination.filesystem]
+bucket_url = "hf://datasets/my-org"
+
+[destination.filesystem.credentials]
+hf_token = "hf_..."
+```
+
+## Write disposition
+
+The Hugging Face destination supports two write dispositions:
+
+- `append` — new data files are added to the dataset repository
+- `replace` — existing data files for the table are deleted, then the new files are added
+
+:::warning
+`merge` write disposition is **not supported** for the Hugging Face destination. Pipelines using `merge` will fall back to `append` with a warning.
+:::
+
+## File format
+
+The Hugging Face destination **always uses [Parquet](../file-formats.md#parquet)** as the file format, regardless of other configuration. This is required because the [Hugging Face dataset viewer](https://huggingface.co/docs/dataset-viewer/index) needs Parquet files to preview datasets on the Hub.
+
+The Parquet files are written with:
+
+- **Page index** ([Apache Parquet page index](https://github.com/apache/parquet-format/blob/master/PageIndex.md)) for efficient column statistics and skipping
+- **[Content-defined chunking](https://huggingface.co/blog/parquet-cdc)** for efficient versioned storage on the Hub
+
+## Table formats
+
+The Hugging Face destination does **not** support [Delta](./delta-iceberg) or [Iceberg](./iceberg) table formats.
+
+## Files layout
+
+The Hugging Face destination uses the same layout system as the [filesystem destination](filesystem#files-layout). The default layout is:
+
+```text
+{table_name}/{load_id}.{file_id}.{ext}
+```
+
+You can customize the layout using the same `layout` and `extra_placeholders` settings as the filesystem destination. See [Files layout](filesystem#files-layout) for all available placeholders and examples.
+
+```toml
+[destination.filesystem]
+bucket_url = "hf://datasets/my-org"
+layout = "{table_name}/{load_id}.{file_id}.{ext}"
+```
+
+## Hugging Face-specific behavior
+
+### Dataset repositories
+
+Each dlt dataset creates or updates a Hugging Face dataset repository (not a directory). The repository name is `<namespace>/<dataset_name>`, where `<namespace>` comes from the `bucket_url` and `<dataset_name>` is the pipeline's `dataset_name`.
+
+### Dataset repository visibility
+
+The Hugging Face dataset repositories created by `dlt` are **public**, unless your Hugging Face organization's default is private.
+
+### Dataset card
+
+`dlt` creates a [dataset card](https://huggingface.co/docs/datasets/dataset_card) (i.e. the repo's `README.md`) without any content (but with metadata). You can manually update the dataset card to e.g. add a dataset description.
+
+:::note
+Do not manually change the [configurations](https://huggingface.co/docs/datasets/repository_structure#configurations) specified in the `YAML` metadata section. This metadata defines the subsets (see next section) and is managed by `dlt`.
+:::
+
+### Subsets and split
+
+`dlt` creates a [subset](https://huggingface.co/docs/dataset-viewer/en/configs_and_splits#subsets) for each table in the dataset, so the dataset viewer displays each table properly. All data is loaded into the `train` [split](https://huggingface.co/docs/dataset-viewer/en/configs_and_splits#splits).
+
+### Disabling dataset card management
+
+To disable automatic dataset card creation and metadata updates (e.g. to reduce API calls and avoid [rate limits](https://huggingface.co/docs/hub/rate-limits#rate-limit-tiers)), set `hf_dataset_card` to `false`:
+
+```toml
+[destination.filesystem]
+hf_dataset_card = false
+```
+
+When disabled, the dataset viewer will not display table subsets, but data loading is unaffected.
+
+### Atomic commits
+
+All data files for a table and its child tables are committed to the Hub in a single git commit via the `HfApi` client. This minimizes the number of commits, avoids hitting Hugging Face [rate limits](https://huggingface.co/docs/hub/rate-limits#rate-limit-tiers), and prevents commit conflicts.
+
+### No table formats
+
+The `hf` protocol does **not** support the `iceberg` and `delta` table formats.
+
+### Parquet with page index and CDC
+
+The `hf` protocol defaults to `parquet` file format and always writes files with [page index](https://github.com/apache/parquet-format/blob/master/PageIndex.md) and [content-defined chunking](https://huggingface.co/blog/parquet-cdc) for efficient versioned storage on the Hub. This enables efficient column statistics and skipping, and is required for the Hugging Face [dataset viewer](https://huggingface.co/docs/dataset-viewer/index) to preview datasets on the Hub.
+
+### Dual client
+
+`dlt` uses two Hugging Face clients together:
+
+- **`HfApi`** — used for repository management (create/delete repo) and atomic commits
+- **`HfFileSystem`** (fsspec) — used for file reads and DuckDB data access
+
+The fsspec cache is invalidated after each `HfApi` mutation to keep the two clients consistent.
+
+## Syncing dlt state
+
+The Hugging Face destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination). Special files and folders (e.g., `_dlt_loads`, `_dlt_pipeline_state`) are created in the dataset repository to track pipeline state, schemas, and completed loads. These folders do not follow the `layout` setting.
+
+By default, the last 100 pipeline state files are retained. You can configure this with `max_state_files`:
+
+```toml
+[destination.filesystem]
+max_state_files = 100  # set to 0 or negative to disable cleanup
+```
+
+## Hugging Face environment variables
+
+You can set Hugging Face [environment variables](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables) to configure the `huggingface_hub` library that `dlt` uses under the hood. For example, to increase the download timeout:
+
+```sh
+HF_HUB_DOWNLOAD_TIMEOUT="30" python run_my_dlt_pipe.py
+```
+
+## Data access
+
+The Hugging Face destination inherits the `sql_client` from the filesystem destination, which provides read-only SQL access to Parquet files using a DuckDB dialect. This also enables [`pipeline.dataset()`](../../general-usage/dataset-access/dataset), giving you Python-native access to loaded data as Pandas DataFrames, PyArrow tables, or Python tuples. See [filesystem data access](filesystem#data-access) for details.
+
+## Example pipeline
+
+```py
+import dlt
+
+@dlt.resource
+def my_data():
+    yield [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+# Requires bucket_url = "hf://datasets/<namespace>" in .dlt/secrets.toml
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline",
+    destination="filesystem",
+    dataset_name="my_dataset",
+)
+
+pipeline.run(my_data(), write_disposition="append")
+```
+
+With the `hf://` bucket URL configured, this creates or updates the `my-org/my_dataset` repository on Hugging Face with a Parquet file under `my_data/`.
+
+## Troubleshooting
+
+### Rate limit errors
+
+Hugging Face enforces [rate limits](https://huggingface.co/docs/hub/rate-limits#rate-limit-tiers) on repository commits. The `dlt` HF client automatically batches all file writes for a table into a single commit to minimize commit frequency. If you still hit rate limits, consider reducing the pipeline frequency or upgrading your Hugging Face plan.
+
+### Authentication errors
+
+If you see authentication errors, verify that:
+
+1. Your token has **write** access to the target namespace.
+2. The token is correctly set in `hf_token`, `HF_TOKEN`, or via `hf auth login`.
+3. If using a Private Hub, `hf_endpoint` (or `HF_ENDPOINT`) is set to the correct URL.
+4. Dataset `dataset_name` exists.
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/iceberg.md =====
+
+---
+title: Iceberg
+description: Iceberg dlt destination
+keywords: [iceberg, destination, data warehouse]
+---
+# Iceberg table format
+
+dlt supports writing [Iceberg](https://iceberg.apache.org/) tables when using the [filesystem](./filesystem.md) destination.
+
+## How it works
+
+dlt uses the [PyIceberg](https://py.iceberg.apache.org/) library to write Iceberg tables. One or multiple Parquet files are prepared during the extract and normalize steps. In the load step, these Parquet files are exposed as an Arrow data structure and fed into `pyiceberg`.
+
+## Iceberg catalogs support
+
+dlt leverages `pyiceberg`'s `load_catalog` function to be able to work with the same catalogs that `pyiceberg` would support, including `REST` and `SQL` catalogs. This includes using single-table, ephemeral, in-memory, SQLite-based catalogs. For more information on how `pyiceberg` works with catalogs, reference [their documentation](https://py.iceberg.apache.org/). To enable this, dlt either translates the configuration in the `secrets.toml` and `config.toml` into a valid `pyiceberg` config, or it delegates `pyiceberg` the task of resolving the needed configuration.
+
+## Iceberg dependencies
+
+You need Python version 3.10 or higher and the `pyiceberg` package to use this format:
+
+```sh
+pip install "dlt[pyiceberg]"
+```
+
+You also need `sqlalchemy>=2.0.18`:
+
+```sh
+pip install 'sqlalchemy>=2.0.18'
+```
+
+## Additional permissions for Iceberg
+
+When using Iceberg with object stores like S3, additional permissions may be required for operations like multipart uploads and tagging. Make sure your IAM role or user has the following permissions:
+
+```json
+[
+  "s3:ListBucketMultipartUploads",
+  "s3:GetBucketLocation",
+  "s3:AbortMultipartUpload",
+  "s3:PutObjectTagging",
+  "s3:GetObjectTagging"
+]
+```
+
+## Set the config for your catalog and, if required, your storage config
+
+This is applicable only if you already have a catalog set-up. If you want to use ephemeral catalogs, you can skip this section, dlt will default to it.
+
+dlt allows you to either provide `pyiceberg`'s config through dlt's config mechanisms (`secrets.toml` or environment variables), or through the `pyiceberg` mechanisms supported by `load_catalog` (i.e. `.pyiceberg.yaml` or `pyiceberg`'s env vars). To better learn how to set up `.pyiceberg.yaml` or to learn how `pyiceberg` utilizes env vars, please visit their documentation [here](https://py.iceberg.apache.org/configuration/). In the remaining of this doc snippet we will cover how to set it up through dlt's config mechanisms.
+
+In the back, dlt utilizes `load_catalog`, so we try to keep the config we will pass along, as close as possible to the `pyiceberg` one. Specifically, we want to provide a catalog name and catalog type (`rest` or `sql`), and we provide them under the `iceberg_catalog` section of the `secrets.toml` or the env vars. These two variables will be used either to detect the catalog we want to load (for example, you have a `.pyiceberg.yaml` with multiple catalogs), and to do some validations when required.
+
+```toml
+[iceberg_catalog]
+iceberg_catalog_name = "default"
+iceberg_catalog_type = "rest"
+```
+
+or
+
+```sh
+export ICEBERG_CATALOG__ICEBERG_CATALOG_NAME=default
+export ICEBERG_CATALOG__ICEBERG_CATALOG_TYPE=rest
+```
+
+If we don't provide these variables they will default to `iceberg_catalog_name = 'default'` and `iceberg_catalog_type = 'sql'`.
+
+On top of this we will always require to provide a catalog configuration, either through dlt or through `pyiceberg`, dlt attempts to load your catalog in the following priority order:
+
+1. **Explicit config from `secrets.toml`** (highest priority) - If you provide `iceberg_catalog.iceberg_catalog_config` in your `secrets.toml`, dlt will use this configuration
+2. **PyIceberg's standard mechanisms** - If no explicit config is found, dlt delegates to `pyiceberg`'s `load_catalog`, which searches for `.pyiceberg.yaml` or `PYICEBERG_CATALOG_*` environment variables
+3. **Ephemeral SQLite catalog** (fallback) - If no configuration is found, dlt creates an in-memory SQLite catalog for backward compatibility and creates the configuration
+
+In some cases, we will want the storage configuration as well (for instance, if you are not using `vended-credential` and instead you are using `remote-signing`). Let's start with the catalog configuration, which we store under `iceberg_catalog.iceberg_catalog_config`:
+
+```toml
+[iceberg_catalog.iceberg_catalog_config]
+uri = "http://localhost:8181/catalog" # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__URI
+type = "rest" # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__TYPE
+warehouse = "default" # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__WAREHOUSE
+```
+
+In this case we are using a `rest` catalog located in `localhost:8181` and we look for the default warehouse. These configs are passed in the same way and names as `pyiceberg` expects, which makes it easier to pass new configuration even if it is not in this snippet.
+
+So let's continue now with storage. In some cases your catalog and storage may be able to handle `vended-credentials`, in that case you don't need to include the storage credentials here as the `vended-credentials` process will allow the catalog to temporarily generate those credentials. However, if you use `remote-signing` we need to provide them, and our configuration would become something like this:
+
+```toml
+[iceberg_catalog.iceberg_catalog_config]
+uri = "http://localhost:8181/catalog"                 # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__URI
+type = "rest"                                         # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__TYPE
+warehouse = "default"                                 # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__WAREHOUSE
+header.X-Iceberg-Access-Delegation = "remote-signing" # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__HEADER_X_ICEBERG_ACCESS_DELEGATION
+py-io-impl = "pyiceberg.io.fsspec.FsspecFileIO"       # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__PY_IO_IMPL
+s3.endpoint = "https://awesome-s3-buckets.example"    # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__S3_ENDPOINT
+s3.access-key-id = "x1"                               # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__S3_ACCESS_KEY_ID
+s3.secret-access-key = "y1"                           # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__S3_SECRET_ACCESS_KEY
+s3.region = "eu-fr-1"                                 # DLT_ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__S3_REGION
+```
+
+That's it!
+
+## Table truncation and drop
+
+How dlt empties or drops Iceberg tables depends on the catalog:
+
+- **Persistent catalog** (configured as above): truncation — with [`refresh="drop_data"`](../../general-usage/pipeline.md#refresh-pipeline-data-and-state) or for tables in a `replace` chain that receive no data — is a transactional delete that keeps the table registered and its snapshot history intact. Dropping a table (e.g. with `refresh="drop_sources"`) removes it from the catalog and dlt deletes the table files itself. Set `destination.filesystem.iceberg_use_catalog_purge` to `true` to delegate file deletion to the catalog's `purge_table` instead — note that catalogs may then leave files in place (Polaris rejects purge unless `DROP_WITH_PURGE_ENABLED` is set, Nessie defers file cleanup to its GC, others purge asynchronously).
+- **Ephemeral catalog** (the default in-memory fallback): dlt deletes the table files directly, removing the table entirely; it is recreated on the next load.
+
+:::caution
+With `iceberg_use_catalog_purge` enabled, dlt recreates dropped tables at the same name and location while the catalog may still be cleaning them up. Behavior depends on the catalog: when files are left in place (Nessie, rejected purge) the next load re-registers the old table metadata and resurrects its data; catalogs with soft deletes or asynchronous cleanup may reject the recreation with a conflict (Lakekeeper, Gravitino) or, for Lakekeeper hard deletes, purge the recreated table's files. Keep `iceberg_use_catalog_purge` disabled unless you understand your catalog's drop semantics.
+:::
+
+## Set table format
+
+Set the `table_format` argument to `iceberg` when defining your resource:
+
+```py
+@dlt.resource(table_format="iceberg")
+def my_iceberg_resource():
+    ...
+```
+
+or when calling `run` on your pipeline:
+
+```py
+pipeline.run(my_resource, table_format="iceberg")
+```
+
+:::note
+dlt always uses Parquet as `loader_file_format` when using the `iceberg` table format. Any setting of `loader_file_format` is disregarded.
+:::
+
+## Partitioning
+
+Apache Iceberg supports [table partitioning](https://iceberg.apache.org/docs/latest/partitioning/) to optimize query performance. There are two ways to configure partitioning:
+
+1. Using the [`iceberg_adapter`](#using-the-iceberg_adapter) function - for advanced partitioning with transformations (year, month, day, hour, bucket, truncate)
+2. Using column-level [`partition`](#using-column-level-partition-property) property - for simple identity partitioning
+
+:::note
+Iceberg uses [hidden partitioning](https://iceberg.apache.org/docs/latest/partitioning/).
+:::
+
+:::warning
+Partition evolution (changing partition columns after a table has been created) is not supported.
+:::
+
+### Using the `iceberg_adapter`
+
+The `iceberg_adapter` function allows you to configure partitioning with various transformation functions.
+
+#### Basic example
+
+```py
+from datetime import date
+
+import dlt
+from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+
+data_items = [
+    {"id": 1, "category": "A", "created_at": date(2025, 1, 1)},
+    {"id": 2, "category": "A", "created_at": date(2025, 1, 15)},
+    {"id": 3, "category": "B", "created_at": date(2025, 2, 1)},
+]
+
+@dlt.resource(table_format="iceberg")
+def events():
+    yield data_items
+
+# Partition by category and month of created_at
+iceberg_adapter(
+    events,
+    partition=[
+        "category",  # identity partition (shorthand)
+        iceberg_partition.month("created_at"),
+    ],
+)
+
+pipeline = dlt.pipeline("iceberg_example", destination="filesystem")
+pipeline.run(events)
+```
+
+To use advanced partitioning, import both the adapter and the `iceberg_partition` helper:
+
+```py
+from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+```
+
+#### Partition transformations
+
+Iceberg supports several transformation functions for partitioning. Use the `iceberg_partition` helper to create partition specifications:
+
+* `iceberg_partition.identity(column_name)`: Partition by exact column values (this is the same as passing the column name as a string to the `iceberg_adapter`)
+* `iceberg_partition.year(column_name)`: Partition by year from a date column
+* `iceberg_partition.month(column_name)`: Partition by month from a date column
+* `iceberg_partition.day(column_name)`: Partition by day from a date column
+* `iceberg_partition.hour(column_name)`: Partition by hour from a timestamp column
+* `iceberg_partition.bucket(n, column_name)`: Partition by hashed value into `n` buckets
+* `iceberg_partition.truncate(length, column_name)`: Partition by truncated string value to `length`
+
+#### Bucket partitioning
+
+Distribute data across a fixed number of buckets using a hash function:
+
+```py
+from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+
+iceberg_adapter(
+    resource,
+    partition=[iceberg_partition.bucket(16, "user_id")],
+)
+```
+
+#### Truncate partitioning
+
+Partition string values by a fixed prefix length:
+
+```py
+from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+
+iceberg_adapter(
+    resource,
+    partition=[iceberg_partition.truncate(3, "category")],  # "ELECTRONICS" → "ELE"
+)
+```
+
+#### Custom partition field names
+
+Specify custom names for partition fields:
+
+```py
+from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+
+iceberg_adapter(
+    resource,
+    partition=[
+        iceberg_partition.year("activity_time", "activity_year"),
+        iceberg_partition.bucket(8, "user_id", "user_bucket"),
+    ],
+)
+```
+
+### Using column-level `partition` property
+
+For simple identity partitioning, you can use the `partition` column hint directly in the resource definition:
+
+```py
+@dlt.resource(
+    table_format="iceberg",
+    columns={"region": {"partition": True}}
+)
+def my_iceberg_resource():
+    yield [
+        {"id": 1, "region": "US", "amount": 100},
+        {"id": 2, "region": "EU", "amount": 200},
+    ]
+```
+
+Multiple columns can be partitioned:
+
+```py
+@dlt.resource(
+    table_format="iceberg",
+    columns={
+        "region": {"partition": True},
+        "category": {"partition": True},
+    }
+)
+def multi_partition_data():
+    ...
+```
+
+## Table properties
+
+You can set [Iceberg table properties](https://iceberg.apache.org/docs/latest/configuration/) at two levels. Properties are applied when the table is first created and are not updated on subsequent loads.
+
+### Destination-level defaults
+
+Set default properties for all Iceberg tables via configuration:
+
+```toml
+[destination.filesystem]
+iceberg_table_properties = '{"write.format.default": "parquet", "write.target-file-size-bytes": "536870912"}'
+```
+
+### Per-table properties with `iceberg_adapter`
+
+Use `iceberg_adapter` to set or override properties on individual resources:
+
+```py
+import dlt
+from dlt.destinations.adapters import iceberg_adapter
+
+@dlt.resource(table_format="iceberg")
+def my_data():
+    yield [{"id": 1, "value": "a"}]
+
+iceberg_adapter(
+    my_data,
+    table_properties={
+        "write.format.default": "parquet",
+        "write.target-file-size-bytes": "536870912",
+    },
+)
+
+pipeline = dlt.pipeline("iceberg_props", destination="filesystem")
+pipeline.run(my_data)
+```
+
+You can combine table properties with partitioning:
+
+```py
+from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+
+@dlt.resource(table_format="iceberg")
+def my_data():
+    yield [{"id": 1, "value": "a"}]
+
+iceberg_adapter(
+    my_data,
+    partition=[iceberg_partition.month("created_at")],
+    table_properties={"write.format.default": "parquet"},
+)
+```
+
+### Merge behavior
+
+When both destination-level and per-table properties are set, they are merged. Per-table adapter properties take precedence over destination-level defaults on any conflicting keys.
+
+:::note
+Table properties are only applied at table creation time. If the table already exists, the properties are ignored.
+:::
+
+## Namespace properties
+
+You can set properties on the Iceberg namespace (schema) via configuration. These are passed to the catalog when the namespace is first created.
+
+```toml
+[destination.filesystem]
+iceberg_namespace_properties = '{"owner": "data-team", "description": "Production tables"}'
+```
+
+:::note
+Namespace properties are only applied at namespace creation time. If the namespace already exists, the properties are ignored.
+:::
+
+## Table access helper functions
+
+You can use the `get_iceberg_tables` helper function to access native table objects. These are `pyiceberg` [Table](https://py.iceberg.apache.org/reference/pyiceberg/table/#pyiceberg.table.Table) objects.
+
+```py
+from dlt.common.libs.pyiceberg import get_iceberg_tables
+
+# get dictionary of Table objects
+iceberg_tables = get_iceberg_tables(pipeline)
+
+# execute operations on Table objects
+# etc.
+```
+
+## Google Cloud Storage authentication
+
+Note that not all authentication methods are supported when using Iceberg on Google Cloud Storage:
+
+- [OAuth](../destinations/bigquery.md#oauth-20-authentication) - ✅ Supported
+- [Service Account](bigquery.md#setup-guide) - ❌ Not supported
+- [Application Default Credentials](bigquery.md#using-default-credentials) - ❌ Not supported
+
+:::note
+The [S3-compatible](./filesystem.md#using-s3-compatible-storage) interface for Google Cloud Storage is not supported when using `iceberg`.
+:::
+
+## Iceberg Azure scheme
+
+The `az` [scheme](./filesystem.md#supported-schemes) is not supported when using the `iceberg` table format. Please use the `abfss` scheme. This is because `pyiceberg`, which dlt used under the hood, currently does not support `az`.
+
+## Table format `merge` support
+
+The [`upsert`](../../general-usage/merge-loading.md#upsert-strategy) and [`insert-only`](../../general-usage/merge-loading.md#insert-only-strategy) merge strategies are supported for `iceberg`. These strategies require that the input data contains no duplicate rows based on the key columns, and that the target table also does not contain duplicates on those keys.
+
+`upsert` does not support [`skip_unchanged_rows`](../../general-usage/merge-loading.md#skip-unchanged-records) or `source_filter`. With either option, dlt stops before the load starts. _pyiceberg_ compares all columns, including `_dlt_load_id`. As a result, `upsert` updates every record whose key exists.
+
+:::warning
+Until _pyiceberg_ > 0.9.1 is released, upsert is executed in chunks of **1000** rows.
+:::
+
+:::warning
+Schema evolution (changing the set of columns) is not supported when using the `upsert` merge strategy with _pyiceberg_ == 0.10.0
+:::
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "upsert"},
+    primary_key="my_primary_key",
+    table_format="iceberg"
+)
+def my_upsert_resource():
+    ...
+```
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/index.md =====
+
+---
+title: Destinations
+description: List of destinations
+keywords: ['destinations']
+---
+# Overview
+
+import DocCardList from '@theme/DocCardList';
+import Link from '../../_book-onboarding-call.md';
+
+* Is a destination or feature missing? [Join our Slack community](https://dlthub.com/community) and ask for it.
+* Need more info? [Join our Slack community](https://dlthub.com/community) and ask in the tech help channel or <Link/>.
+
+Otherwise, pick a destination below:
+
+<DocCardList />
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/lance.md =====
+
+---
+title: Lance
+description: Lance is an open-source columnar format for AI/ML that can be used as a destination in dlt.
+keywords: [lance, lakehouse, vector database, destination, dlt, embeddings, branching, catalog]
+---
+# Lance
+
+[Lance](https://lance.org) is an open-source columnar data format designed for AI/ML workloads, with native support for versioning, zero-copy access, and fast vector search. The `lance` destination lets you load data into Lance datasets stored on local disk or cloud object storage (S3, Azure, GCS).
+
+Optionally, the destination can generate **vector embeddings** using the [LanceDB](https://lancedb.com/) embedding functions library.
+
+<!--@@@DLT_DESTINATION_CAPABILITIES lance-->
+
+:::note Lance vs. LanceDB destination
+dlt ships two Lance-related destinations:
+
+- **`lance`** (this page) — stores data on local disk or cloud object storage (S3, GCS, Azure). Uses the [`lance`](https://github.com/lancedb/lance) library for table management and, optionally, the [`lancedb`](https://github.com/lancedb/lancedb) library for embedding generation.
+- **`lancedb`** ([docs](lancedb.md)) — stores data locally or on [LanceDB Cloud](https://docs.lancedb.com/cloud/index). Uses the `lancedb` library exclusively for all operations.
+
+The `lancedb` destination will be phased out in favor of `lance`.
+:::
+
+## Setup guide
+
+### Install dlt with `lance` dependencies
+
+```sh
+pip install "dlt[lance]"
+```
+
+The `lance` extra requires Python 3.10+ and installs `pylance>=6.0.1`.
+
+### Quick start
+
+```py
+import dlt
+
+movies = [
+    {"id": 1, "title": "Blade Runner", "year": 1982},
+    {"id": 2, "title": "Ghost in the Shell", "year": 1995},
+    {"id": 3, "title": "The Matrix", "year": 1999},
+]
+
+pipeline = dlt.pipeline(
+    pipeline_name="movies",
+    destination="lance",
+    dataset_name="movies_db",
+)
+
+info = pipeline.run(movies, table_name="movies")
+```
+
+To add vector embeddings, wrap your data with `lance_adapter` — see [Embeddings](#embeddings-configuration) below.
+
+## Storage configuration
+
+Configure storage in `~/.dlt/config.toml` (or secrets/environment variables). The `bucket_url` determines the storage backend.
+
+### Local storage (default)
+
+If `bucket_url` is not configured, the current working directory is used.
+
+```toml
+[destination.lance.storage]
+bucket_url = "/my/dir"
+```
+
+### Cloud storage
+
+Cloud credentials use the same configuration fields as the [filesystem destination](filesystem.md#set-up-the-destination-and-credentials), just under `destination.lance.storage` instead of `destination.filesystem`. Under the hood, credentials are passed to the [object_store](https://docs.rs/object_store/latest/object_store/) Rust crate (not `fsspec`), so some filesystem-specific options are not supported.
+
+#### Amazon S3
+
+```toml
+[destination.lance.storage]
+bucket_url = "s3://my-bucket"
+
+[destination.lance.storage.credentials]
+aws_access_key_id = "AKIA..."
+aws_secret_access_key = "..."
+region_name = "us-east-1"
+```
+
+#### Google Cloud Storage
+
+```toml
+[destination.lance.storage]
+bucket_url = "gs://my-bucket"
+
+[destination.lance.storage.credentials]
+project_id = "my-project"
+client_email = "...@...iam.gserviceaccount.com"
+private_key = "-----BEGIN RSA PRIVATE KEY-----\n..."
+```
+
+#### Azure Blob Storage
+
+```toml
+[destination.lance.storage]
+bucket_url = "az://my-container"
+
+[destination.lance.storage.credentials]
+azure_storage_account_name = "myaccount"
+azure_storage_account_key = "..."
+```
+
+### Additional storage options
+
+You can pass storage-specific options via the `options` dict. These are forwarded to the [object_store](https://docs.rs/object_store/latest/object_store/) Rust crate. See the [Lance Object Store Configuration](https://lance.org/guide/object_store/) docs for all available options.
+
+For cloud storage, the following defaults are set automatically to prevent connection hangs:
+
+| Option            | Default | Description             |
+| ----------------- | ------- | ----------------------- |
+| `connect_timeout` | `30s`   | TCP connection timeout  |
+| `timeout`         | `120s`  | Overall request timeout |
+
+You can override these or add additional options:
+
+```toml
+[destination.lance.storage]
+bucket_url = "s3://my-bucket"
+
+[destination.lance.storage.options]
+allow_http = "true"
+timeout = "300s"
+```
+
+## Catalog and storage
+
+The `lance` destination uses a [Lance Namespace](https://lance.org/format/namespace/) as catalog. Two different namespace specs are currently supported:
+
+- [Directory Namespace](https://lance.org/format/namespace/dir/catalog-spec/) (V2 Catalog Spec) — used by default
+- [REST Namespace](https://lance.org/format/namespace/rest/catalog-spec/)  — experimental support only
+
+### Directory Namespace
+
+The destination uses a Directory Namespace by default. Two concepts are configured separately:
+
+- **Storage** — where table data files are written. Configured under `[destination.lance.storage]`.
+- **Catalog** — a `__manifest` table that tracks namespaces and tables. By default the catalog is colocated with storage (the `__manifest` lives under `storage.bucket_url/storage.namespace_name`). For advanced setups you can point the catalog at a separate location via `[destination.lance.credentials]` — see [Advanced: separate catalog location](#advanced-separate-catalog-location).
+
+The logical layout of the default (colocated) case is:
+
+```text
+bucket_url/
+└── namespace_name/                ← root namespace directory (default: "dlt_lance_root")
+    ├── __manifest/                ← catalog tracking namespaces and tables
+    ├── <hash>_<dataset>$movies/   ← lance table data
+    ├── <hash>_<dataset>$_dlt_version/
+    └── ...
+```
+
+- **Root namespace** — a physical directory at `bucket_url/namespace_name`. The `namespace_name` defaults to `"dlt_lance_root"` and can be set to `""` to use `bucket_url` directly.
+- **Dataset namespace** — when `dataset_name` is set, a logical child namespace named after it is created automatically (tracked in the `__manifest/` catalog) and all tables for the dataset are registered inside it. `dataset_name` is **optional**: when omitted, tables are created directly in the root namespace (single-level table ids) and no per-dataset child namespace is used.
+- **Tables** — stored as hash-prefixed directories at the root namespace level, not nested under a dataset subdirectory.
+
+:::note
+`dataset_name` is optional for `lance`. If you do not pass one, dlt does **not** auto-generate a dataset name and writes tables to the **root namespace**. Pass a `dataset_name` to isolate a pipeline's tables.
+:::
+
+```toml
+[destination.lance.storage]
+bucket_url = "s3://my-bucket"
+namespace_name = "production"  # root namespace subdirectory
+```
+
+#### Directory Namespace capabilities
+
+Two capability flags control how the directory catalog tracks tables and namespaces. The defaults work for almost everyone:
+
+```toml
+[destination.lance.capabilities]
+manifest_enabled = true
+dir_listing_enabled = true
+```
+
+- **`manifest_enabled`** (default `true`) — enables the [V2 catalog](https://lance.org/format/namespace/dir/impl-spec/): a single `__manifest` Lance table at the root that tracks every namespace and table. Enables fast listing, nested namespaces, and multi-level table ids (which dlt uses to place tables under their dataset namespace). Recommended for single-writer or low-concurrency scenarios.
+- **`dir_listing_enabled`** (default `true`) — enables the V1 fallback that discovers tables by scanning directories for `.lance` suffixes. Safe to leave on.
+
+**When to disable `manifest_enabled`**: if many writers hit the same catalog root concurrently (for example, multiple pipelines or parallel jobs sharing one `bucket_url`/`namespace_name`), conflicting commits to the shared `__manifest` table on S3/GCS can cause contention and retries. Disabling the manifest eliminates the shared write point at the cost of slower listing and no nested-namespace support. If you disable it, give each pipeline run its own `namespace_name` to isolate datasets.
+
+:::note
+You can disable `manifest_enabled` only when the pipeline does not use a `dataset_name`: dlt creates the dataset as a child namespace, which requires manifest mode (loads fail with `Child namespaces are only supported when manifest mode is enabled`). Without a `dataset_name`, tables live in the root namespace and the catalog works with plain directory listing — no `__manifest` commits on table creation and no manifest reads when opening tables, which also makes loads noticeably faster on object stores.
+:::
+
+### REST Namespace (experimental)
+
+:::warning
+Lance REST Namespace support is an **experimental feature**.
+:::
+
+To connect to a Lance REST Namespace server, set `catalog_type = "rest"` and provide the REST server URI. You may also need to set `api_key` and/or `auth_token` if the server requires authentication.
+
+```toml
+[destination.lance]
+catalog_type = "rest"
+
+[destination.lance.credentials]
+uri = "http://127.0.0.1:2333"
+
+# Optional auth, sent as HTTP headers
+api_key = "..."      # sent as x-api-key
+auth_token = "..."   # sent as Authorization: Bearer <auth_token>
+```
+
+## Branching
+
+Lance datasets support [branches](https://lance.org/guide/tags_and_branches/) — lightweight version pointers for isolated reads and writes. Configure a branch name to direct all pipeline operations to that branch:
+
+```toml
+[destination.lance]
+branch_name = "staging"
+```
+
+Or in Python:
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    destination=dlt.destinations.lance(branch_name="staging"),
+    dataset_name="my_data",
+)
+```
+
+When `branch_name` is not set, the default `main` branch is used. Branches are created automatically on first write if they don't exist.
+
+Branching is dataset-wide — all tables, including dlt system tables (`_dlt_version`, `_dlt_loads`, `_dlt_pipeline_state`), are read from and written to the configured branch. This means each branch maintains its own pipeline state, schema history, and load metadata, providing full isolation between branches. Schemas can evolve independently in different branches.
+
+## Advanced: separate catalog location
+
+By default the catalog `__manifest` lives under `storage.bucket_url`. You can put it in a completely different location — for example on fast local storage while data stays on cheap object storage, or in a shared bucket while each team writes data to its own bucket. Populate `[destination.lance.credentials]` with its own bucket/credentials/options:
+
+```toml
+[destination.lance.storage]
+bucket_url = "s3://data-bucket"
+
+[destination.lance.credentials]
+bucket_url = "s3://catalog-bucket/production"
+
+[destination.lance.credentials.credentials]
+aws_access_key_id = "AKIA..."
+aws_secret_access_key = "..."
+region_name = "us-east-1"
+```
+
+Any field left empty under `credentials` falls back to the corresponding `storage` value, so you only specify what actually differs. When `credentials` is omitted entirely, the catalog colocates with storage (the common case).
+
+## Write dispositions
+
+All [write dispositions](../../general-usage/incremental-loading.md#choosing-a-write-disposition) are supported.
+
+Each table receives a single lance commit per load, regardless of how many job files the
+load produces: load jobs write data fragments in parallel without committing and a followup
+job commits them in one atomic version. Readers never observe a partially loaded table and
+parallel jobs do not contend on dataset versions.
+
+### Append
+
+The default. Inserts all records without updating or deleting existing data.
+
+### Replace
+
+Replaces all data in the table with a single overwrite commit:
+
+```py
+movies = [{"name": "E.T.", "summary": ...}, ...]
+info = pipeline.run(movies, table_name="movies", write_disposition="replace")
+```
+
+Tables of a replaced resource that receive no data in a load (e.g. a nested table absent
+from the current run) are truncated before loading; tables receiving data are replaced
+atomically by their overwrite commit, without an intermediate truncation.
+
+### Merge (upsert)
+
+Updates existing records and inserts new ones based on a unique identifier. Use `lance_adapter` to specify the `merge_key`:
+
+```py
+from dlt.destinations.adapters import lance_adapter
+
+pipeline.run(
+    lance_adapter(data, merge_key="doc_id"),
+    write_disposition={"disposition": "merge", "strategy": "upsert"},
+    primary_key=["doc_id", "chunk_id"],
+)
+```
+
+The `merge_key` identifies the parent document. If `merge_key` is not specified, the first element of `primary_key` is used as fallback. When orphan removal is enabled (the default), only a single merge key is supported because the orphan deletion filter operates on a single column. To use compound merge keys, disable orphan removal with `remove_orphans=False`.
+
+#### Orphan removal
+
+By default, when parent documents are updated or deleted during a merge, orphaned child records (chunks that no longer have a matching parent) are automatically removed. To disable this:
+
+```py
+from dlt.destinations.adapters import lance_adapter
+
+lance_adapter(data, merge_key="doc_id", remove_orphans=False)
+```
+
+## Embeddings configuration
+
+To generate vector embeddings automatically, configure an embedding provider. The embedding generation is powered by the [LanceDB embedding functions](https://docs.lancedb.com/embedding/index#embedding-model-providers) library.
+
+```toml
+[destination.lance.embeddings]
+provider = "openai"
+name = "text-embedding-3-small"
+vector_column = "vector"
+max_retries = 3
+
+[destination.lance.embeddings.credentials]
+api_key = "sk-..."
+```
+
+Any additional provider-specific arguments can be passed via `kwargs`:
+
+```toml
+[destination.lance.embeddings.kwargs]
+api_base = "https://my-proxy.example.com/v1"
+```
+
+Then use `lance_adapter` to specify which columns should be embedded. The destination automatically adds a column named after `vector_column` (default: `"vector"`) to store the generated embeddings:
+
+```py
+from dlt.destinations.adapters import lance_adapter
+
+movies = [{"name": "E.T.", "summary": ...}, ...]
+info = pipeline.run(
+    lance_adapter(movies, embed=["title", "description"]),
+    table_name="movies",
+)
+```
+
+## Access loaded data
+
+### Standard dataset access
+
+You can query loaded data using dlt's [dataset access](../../general-usage/dataset-access/dataset) interface, which works the same way as with any other destination:
+
+```py
+dataset = pipeline.dataset()
+df = dataset["movies"].df()
+```
+
+Reads go through an in-memory DuckDB instance that scans the Lance datasets via views. The DuckDB lance extension caches each dataset per connection at the version it was first opened, so a table read on an **already-open** connection does not pick up data written afterwards — **neither new rows nor schema changes (new columns) are visible** until the connection is refreshed. Enable `always_refresh_views` to refresh on every read; dlt then reopens the DuckDB connection (dropping the cached dataset) and recreates the scanner views, so reads observe the latest dataset version:
+
+```toml
+[destination.lance]
+always_refresh_views = true
+```
+
+This adds a small overhead per read, so leave it disabled unless you read tables back after writing them through a long-lived dataset connection (or read evolving schemas).
+
+### Low-level Lance access
+
+For operations specific to the Lance format — such as version management, tagging, or direct reads — use `open_lance_dataset` on the destination client. It returns a `lance.LanceDataset` from the [lance](https://github.com/lancedb/lance) library:
+
+```py notype
+with pipeline.destination_client() as client:
+    ds = client.open_lance_dataset("movies")
+    ds.create_tag("v1.0")
+    print(ds.tags())
+```
+
+You can also check out a specific branch or version:
+
+```py notype
+with pipeline.destination_client() as client:
+    ds = client.open_lance_dataset("movies", branch_name="staging", version_number=5)
+```
+
+### LanceDB vector search
+
+For vector similarity search and other LanceDB-specific features, use `open_lancedb_table`. It returns a `lancedb.table.LanceTable` from the [lancedb](https://github.com/lancedb/lancedb) library:
+
+```py notype
+with pipeline.destination_client() as client:
+    tbl = client.open_lancedb_table("movies")
+    results = tbl.search("sci-fi classic").limit(5).to_list()
+```
+
+## dbt support
+
+The Lance destination does not support dbt integration.
+
+## Syncing of `dlt` state
+
+The Lance destination supports syncing of the `dlt` state.
+
+<!--@@@DLT_TUBA lance-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/lancedb.md =====
+
+---
+title: LanceDB
+description: LanceDB is a multimodal lakehouse for AI that can be used as a destination in dlt.
+keywords: [ lancedb, vector database, destination, dlt ]
+---
+# LanceDB
+
+[LanceDB](https://lancedb.com/) is a multimodal lakehouse for AI, built on top of [Lance](https://lance.org), an open-source lakehouse format. It allows you to store data objects and perform similarity searches over them.
+This destination helps you load data into LanceDB from [dlt resources](../../general-usage/resource.md).
+
+<!--@@@DLT_DESTINATION_CAPABILITIES lancedb-->
+
+## Setup guide
+
+### Choose a model provider
+
+First, you need to decide which embedding model provider to use. You can find all supported providers by visiting the official [LanceDB docs](https://docs.lancedb.com/embedding/index#embedding-model-providers).
+
+### Install dlt with LanceDB
+
+To use LanceDB as a destination, make sure `dlt` is installed with the `lancedb` extra:
+
+```sh
+pip install "dlt[lancedb]"
+```
+
+The lancedb extra only installs `dlt` and `lancedb`. You will need to install your model provider's SDK.
+
+You can find which libraries you need by also referring to the [LanceDB docs](https://docs.lancedb.com/embedding/index#embedding-model-providers).
+
+### Configure the destination
+
+Configure the destination in the dlt secrets file located at `~/.dlt/secrets.toml` by default. Add the following section:
+
+```toml
+[destination.lancedb]
+lance_uri = ".lancedb"
+embedding_model_provider = "ollama"
+embedding_model = "mxbai-embed-large"
+embedding_model_provider_host = "http://localhost:11434"  # Optional: custom endpoint for providers that support it
+
+[destination.lancedb.credentials]
+api_key = "api_key" # API key to connect to LanceDB Cloud. Comment out if you are using LanceDB OSS.
+embedding_model_provider_api_key = "embedding_model_provider_api_key" # Not needed for providers that don't need authentication (ollama, sentence-transformers).
+```
+
+- The `lance_uri` specifies the location of your LanceDB instance. It defaults to a local, on-disk instance if not provided.
+- The `api_key` is your API key for LanceDB Cloud connections. If you're using LanceDB OSS, you don't need to supply this key.
+- The `embedding_model_provider` specifies the embedding provider used for generating embeddings. The default is `cohere`.
+- The `embedding_model` specifies the model used by the embedding provider for generating embeddings.
+  Check with the embedding provider which options are available.
+  Reference [https://lancedb.github.io/lancedb/embeddings/default_embedding_functions/](https://lancedb.github.io/lancedb/embeddings/default_embedding_functions/).
+- The `embedding_model_provider_host` specifies the full host URL with protocol and port for providers that support custom endpoints (like Ollama). If not specified, the provider's default endpoint will be used.
+- The `embedding_model_provider_api_key` is the API key for the embedding model provider used to generate embeddings. If you're using a provider that doesn't need authentication, such as Ollama, you don't need to supply this key.
+
+:::info Available model providers
+
+- "gemini-text"
+- "bedrock-text"
+- "cohere"
+- "gte-text"
+- "imagebind"
+- "instructor"
+- "open-clip"
+- "openai"
+- "sentence-transformers"
+- "huggingface"
+- "colbert"
+- "ollama"
+:::
+
+:::info
+Local database name and location:
+
+`lancedb` databases follow the same naming rules as `duckdb`:
+
+1. By default, the database file name is `<pipeline_name>.lancedb` and is placed in current working directory.
+2. For a named destination, database file name is `<destination name>.lancedb`
+3. The `:pipeline:` `lance_uri` will place database file in pipeline working folder
+:::
+
+### Configure cloud destination
+
+`lance_uri` starting with **db://** schema is interpreted as location on LandeDB cloud. In that case you need to pass `api_key` in order to connect. `dlt` uses [the same names as LanceDB connect() function](https://lancedb.github.io/lancedb/python/python/#connections-synchronous):
+
+```toml
+[destination.lancedb.credentials]
+api_key = "api_key"
+region = "us-east-1"
+read_consistency_interval=2.5
+```
+
+`read_consistency_interval` is None by default (no read consistency, `dlt` assumes that it is a single writer to particular table.)
+
+:::tip
+You can pass `storage_options` in the credentials collection that allows you to [store lancedb data on a bucket](https://docs.lancedb.com/storage). You can try this out but we didn't test that.
+:::
+
+### Define your data source
+
+For example:
+
+```py
+import dlt
+from dlt.destinations.adapters import lancedb_adapter
+
+movies = [
+  {
+    "id": 1,
+    "title": "Blade Runner",
+    "year": 1982,
+  },
+  {
+    "id": 2,
+    "title": "Ghost in the Shell",
+    "year": 1995,
+  },
+  {
+    "id": 3,
+    "title": "The Matrix",
+    "year": 1999,
+  },
+]
+
+pipeline = dlt.pipeline(
+  pipeline_name="movies",
+  destination="lancedb",
+)
+
+info = pipeline.run(
+  lancedb_adapter(
+    movies,
+    embed="title",
+  ),
+  table_name="movies",
+)
+```
+
+The data is now loaded into LanceDB.
+
+To use **vector search** after loading, you **must specify which fields LanceDB should generate embeddings for**. Do this by wrapping the data (or dlt resource) with the **`lancedb_adapter`** function. Above we requested the embedding to be created on `title` column using the configured embedding provider and model.
+
+:::note
+We created `pipeline` without a dataset name. In the example above data is stored in `movies` table as expected. If dataset name is specified, `dlt` follows
+the same pattern as for other schema-less storages: it will prefix all the tables with `database_name`. For example:
+
+```py
+pipeline = dlt.pipeline(
+  pipeline_name="movies",
+  destination="lancedb",
+  dataset_name="movies_db",
+)
+```
+
+will name the table `movies_db___movies` where `___` (3 underscores) is a configurable separator.
+
+:::
+
+## Use an adapter to specify columns to vectorize
+
+Out of the box, LanceDB will act as a normal database. To use LanceDB's embedding facilities, you'll need to specify which fields you'd like to embed in your dlt resource.
+
+The `lancedb_adapter` is a helper function that configures the resource for the LanceDB destination:
+
+```py
+from dlt.destinations.adapters import lancedb_adapter
+ 
+lancedb_adapter(data, embed="title")
+```
+
+It accepts the following arguments:
+
+- `data`: a dlt resource object, or a Python data structure (e.g., a list of dictionaries).
+- `embed`: a name of the field or a list of names to generate embeddings for.
+
+Returns: [dlt resource](../../general-usage/resource.md) object that you can pass to the `pipeline.run()`.
+
+Example:
+
+```py
+from dlt.destinations.adapters import lancedb_adapter
+
+lancedb_adapter(
+  resource,
+  embed=["title", "description"],
+)
+```
+
+When using the `lancedb_adapter`, it's important to apply it directly to resources, not to the whole source. Here's an example:
+
+```py
+from dlt.sources.sql_database import sql_database
+from dlt.destinations.adapters import lancedb_adapter
+
+products_tables = sql_database().with_resources("products", "customers")
+
+pipeline = dlt.pipeline(
+        pipeline_name="postgres_to_lancedb_pipeline",
+        destination="lancedb",
+    )
+
+# Apply adapter to the needed resources
+lancedb_adapter(products_tables.products, embed="description")
+lancedb_adapter(products_tables.customers, embed="bio")
+
+info = pipeline.run(products_tables)
+```
+
+## Load data with Arrow or Pandas
+
+Both `dlt` and `LanceDB` support Arrow and Pandas natively. You will be able to [ingest data with high performance](../verified-sources/arrow-pandas.md) and without unnecessary rewrites and copies.
+
+If you plan to use `merge` write disposition, remember to [enable load ids](../verified-sources/) tracking for arrow tables.
+
+## Access loaded data
+
+You can access the data that got loaded in many ways. You can create lancedb client yourself, pass it to `dlt` pipeline
+for loading and then use it for querying:
+
+```py notype
+import dlt
+import lancedb
+
+db = lancedb.connect("movies.db")
+
+pipeline = dlt.pipeline(
+  pipeline_name="movies",
+  destination=dlt.destinations.lancedb(credentials=db),
+)
+
+...
+
+tbl = db.table("movies")
+print(tbl.query("magic dog"))
+```
+
+Alternatively you can get authenticated client from the pipeline:
+
+```py
+import dlt
+from lancedb import DBConnection
+
+pipeline = dlt.pipeline(
+  pipeline_name="movies",
+  destination="lancedb",
+)
+
+...
+
+with pipeline.destination_client() as job_client:  # type: ignore
+  db: DBConnection = job_client.db_client  # type: ignore
+  tbl = db.open_table("movies")
+  tbl.create_scalar_index("id")
+
+```
+
+## Bring your own vectors
+
+By default `dlt` will add a vector column automatically using the embeddings indicated in `lancedb_adapter`. You can also choose to pass vector data explicitly. Currently this function is available only if
+you yield Arrow tables with properly created schema. Remember to declare your vector as fixed length:
+
+```py
+import pyarrow as pa
+import numpy as np
+import dlt
+
+vector_dim = 5
+vectors = [np.random.rand(vector_dim).tolist() for _ in range(4)]
+table = pa.table(
+    {
+        "id": pa.array(list(range(1, 5)), pa.int32()),
+        "vector": pa.array(
+            vectors, pa.list_(pa.float32(), vector_dim)
+        ),
+    }
+)
+
+print(dlt.run(table, table_name="vectors", destination="lancedb"))
+```
+
+## Write disposition
+
+All [write dispositions](../../general-usage/incremental-loading.md#choosing-a-write-disposition) are supported by the LanceDB destination.
+
+### Replace
+
+The [replace](../../general-usage/full-loading.md) disposition replaces the data in the destination with the data from the resource.
+
+```py
+from dlt.destinations.adapters import lancedb_adapter
+
+movies = [{"id": 1, "title": "Blade Runner", "year": 1982}, ...]
+info = pipeline.run(
+  lancedb_adapter(
+    movies,
+    embed="title",
+  ),
+  write_disposition="replace",
+)
+```
+
+### Merge
+
+The [merge](../../general-usage/incremental-loading.md) write disposition merges the data from the resource with the data at the destination based on a unique identifier. The LanceDB destination supports `upsert` and `insert-only` merge strategies. `upsert` updates existing records and inserts new ones. `insert-only` inserts new records without updating existing ones (see [insert-only strategy](../../general-usage/merge-loading.md#insert-only-strategy)).
+
+You can specify the merge disposition, primary key, and merge key either in a resource or adapter:
+
+```py
+from typing import Generator
+from dlt.common.typing import DictStrAny
+from dlt.destinations.adapters import lancedb_adapter
+
+@dlt.resource(
+  primary_key=["doc_id", "chunk_id"],
+  merge_key=["doc_id"],
+  write_disposition={"disposition": "merge", "strategy": "upsert"},
+)
+def my_rag_docs(
+  data: list[DictStrAny],
+) -> Generator[list[DictStrAny], None, None]:
+    yield data
+
+pipeline.run(
+  lancedb_adapter(
+    my_rag_docs,
+    merge_key="doc_id"
+  ),
+  write_disposition={"disposition": "merge", "strategy": "upsert"},
+  primary_key=["doc_id", "chunk_id"],
+)
+```
+
+The `primary_key` uniquely identifies each record, typically comprising a document ID and a chunk ID.
+The `merge_key`, which cannot be compound, should correspond to the canonical `doc_id` used in vector databases and represent the document identifier in your data model.
+It must be the first element of the `primary_key`.
+This `merge_key` is crucial for document identification and orphan removal during merge operations.
+This structure ensures proper record identification and maintains consistency with vector database concepts.
+
+#### Orphan Removal
+
+LanceDB **automatically removes orphaned chunks** when updating or deleting parent documents during a merge operation. To disable this feature:
+
+```py
+from dlt.destinations.adapters import lancedb_adapter
+
+movies = [{"id": 1, "title": "Blade Runner", "year": 1982}, ...]
+pipeline.run(
+  lancedb_adapter(
+    movies,
+    embed="title",
+    no_remove_orphans=True # Disable with the `no_remove_orphans` flag.
+  ),
+  write_disposition={"disposition": "merge", "strategy": "upsert"},
+  primary_key=["doc_id", "chunk_id"],
+)
+```
+
+While it's possible to omit the `merge_key` for brevity (in which case it is assumed to be the first entry of `primary_key`),
+explicitly specifying both is recommended for clarity.
+
+:::note
+Orphan removal requires the presence of the `_dlt_id` and `_dlt_load_id` fields, which are not included by default when arrow tables are loaded. You must [enable it](../../dlt-ecosystem/verified-sources/arrow-pandas#add-_dlt_load_id-and-_dlt_id-to-your-tables) by setting the `add_dlt_id` option to `true` in the normalize configuration.
+:::
+
+### Append
+
+This is the default disposition. It will append the data to the existing data in the destination.
+
+## Additional destination options
+
+- `dataset_separator`: The character used to separate the dataset name from table names. Defaults to "___".
+- `vector_field_name`: The name of the special field to store vector embeddings. Defaults to "vector".
+- `max_retries`: The maximum number of retries for embedding operations. Set to 0 to disable retries. Defaults to 3.
+
+## dbt support
+
+The LanceDB destination doesn't support dbt integration.
+
+## Syncing of `dlt` state
+
+The LanceDB destination supports syncing of the `dlt` state.
+
+<!--@@@DLT_TUBA lancedb-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/motherduck.md =====
+
+---
+title: MotherDuck
+description: MotherDuck `dlt` destination for hosted DuckDB and DuckLake.
+keywords: [MotherDuck, duckdb, destination, data warehouse, DuckLake]
+---
+# MotherDuck
+
+## Install dlt with MotherDuck
+
+To install the dlt library with MotherDuck dependencies:
+
+```sh
+pip install "dlt[motherduck]"
+```
+
+:::tip
+If you see a lot of retries in your logs with various timeouts, decrease the number of load workers to 3-5 depending on the quality of your internet connection. Add the following to your `config.toml`:
+
+```toml
+[load]
+workers=3
+```
+
+or export the **LOAD__WORKERS=3** env variable. See more in [performance](../../reference/performance.md)
+:::
+
+<!--@@@DLT_DESTINATION_CAPABILITIES motherduck-->
+
+## Setup guide
+
+1. Initialize a project with a pipeline that loads to MotherDuck by running
+
+```sh
+dlt init chess motherduck
+```
+
+2. Install the necessary dependencies for MotherDuck by running
+
+```sh
+pip install -r requirements.txt
+```
+
+This will install dlt with the **motherduck** extra which contains **duckdb** and **pyarrow** dependencies.
+
+3. Add your MotherDuck token to `.dlt/secrets.toml`
+
+```toml
+[destination.motherduck.credentials]
+database = "dlt_data_3"
+password = "<your token here>"
+```
+
+Paste your **service token** into the password field. The `database` field is optional, but we recommend setting it. MotherDuck will create this database (in this case `dlt_data_3`) for you.
+
+Alternatively, you can use the connection string syntax.
+
+```toml
+[destination]
+motherduck.credentials="md:dlt_data_3?motherduck_token=<my service token>"
+```
+
+:::tip
+Motherduck now supports configurable **access tokens**. Please refer to the [documentation](https://motherduck.com/docs/key-tasks/authenticating-to-motherduck/#authentication-using-an-access-token)
+
+You can pass token in a native Motherduck environment variable:
+
+```sh
+export MOTHERDUCK_TOKEN='<token>'
+```
+
+in that case you can skip **password** / **motherduck_token** secret.
+
+**database** defaults to `my_db`.
+
+More in Motherduck [documentation](https://motherduck.com/docs/key-tasks/authenticating-and-connecting-to-motherduck/authenticating-to-motherduck/#storing-the-access-token-as-an-environment-variable)
+:::
+
+4. Run the pipeline
+
+```sh
+python3 chess_pipeline.py
+```
+
+### DuckLake setup
+
+DuckLake can be used to manage and persist your MotherDuck databases on external object storage like S3. This is especially useful if you want more control over where your data is stored or if you’re integrating with your own cloud infrastructure.
+The steps below show how to set up a DuckLake-managed database backed by S3.
+
+1. Create the S3-Backed DuckLake Database
+You can create a DuckLake-managed database using the following SQL command, which should be run in the MotherDuck SQL Editor or any SQL client connected to your MotherDuck account:
+
+```sql
+CREATE DATABASE my_ducklake (
+  TYPE DUCKLAKE,
+  DATA_PATH 's3://mybucket/my_optional_path/'
+);
+```
+
+2. Register S3 Credentials with a MotherDuck Secret
+
+```sql
+CREATE SECRET my_secret IN MOTHERDUCK (
+  TYPE S3,
+  KEY_ID 'my_s3_access_key',
+  SECRET 'my_s3_secret_key',
+  REGION 'my-bucket-region'
+);
+```
+
+3. Configure `secrets.toml` in your dlt project
+Your `secrets.toml` only needs to reference the DuckLake database and your service token:
+
+```toml
+[destination.motherduck.credentials]
+database = "my_ducklake"
+password = "<your token here>"
+```
+
+As long as the DuckLake database and the corresponding S3 secret have been set up in MotherDuck, dlt can load data into it without requiring direct access to the S3 credentials.
+
+With this setup, you can now load data into DuckLake tables using dlt, just like with any DuckDB destination through MotherDuck.
+
+### Motherduck connection identifier
+
+We enable Motherduck to identify that the connection is created by `dlt`. Motherduck will use this identifier to better understand the usage patterns
+associated with `dlt` integration. The connection identifier is `dltHub_dlt/DLT_VERSION(OS_NAME)`.
+
+### Additional configuration
+
+Query string will be passed to `duckdb` connection. Several global configs may be set using it:
+
+```toml
+[destination]
+motherduck.credentials="md:dlt_data_3?dbinstance_inactivity_ttl=0s"
+```
+
+will disable connection caching.
+
+Additional `duckdb` config, [where you can set up extensions, pragmas, the session timezone, and global and local config](duckdb.md#additional-config), is also supported.
+
+## Write disposition
+
+All write dispositions are supported.
+
+## Data loading
+
+By default, Parquet files and the `COPY` command are used to move files to the remote duckdb database. All write dispositions are supported.
+
+The **INSERT** format is also supported and will execute large INSERT queries directly into the remote database. This method is significantly slower and may exceed the maximum query size, so it is not advised.
+
+## dbt support
+
+This destination [integrates with dbt](../transformations/dbt/dbt.md) via [dbt-duckdb](https://github.com/jwills/dbt-duckdb), which is a community-supported package. `dbt` version >= 1.7 is required.
+
+## Multi-statement transaction support
+
+Motherduck supports multi-statement transactions. This change happened with `duckdb 0.10.2`.
+
+## Syncing of `dlt` state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+## Troubleshooting
+
+### I see some exception with home_dir missing when opening `md:` connection
+
+Some internal component (HTTPS) requires the **HOME** env variable to be present. Export such a variable to the command line. Here is what we do in our tests:
+
+```py notype
+os.environ["HOME"] = "/tmp"
+```
+
+before opening the connection.
+
+<!--@@@DLT_TUBA motherduck-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/mssql.md =====
+
+---
+title: MS SQL
+description: Microsoft SQL Server `dlt` destination
+keywords: [mssql, sqlserver, destination, data warehouse]
+---
+# Microsoft SQL Server
+
+## Install dlt with MS SQL
+
+To install the dlt library with MS SQL dependencies, use:
+
+```sh
+pip install "dlt[mssql]"
+```
+
+<!--@@@DLT_DESTINATION_CAPABILITIES mssql-->
+
+## Setup guide
+
+### Prerequisites
+
+The _Microsoft ODBC Driver for SQL Server_ must be installed to use this destination.
+This cannot be included with `dlt`'s Python dependencies, so you must install it separately on your system. You can find the official installation instructions [here](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server?view=sql-server-ver16).
+
+Supported driver versions:
+
+* `ODBC Driver 18 for SQL Server`
+* `ODBC Driver 17 for SQL Server`
+
+You can also [configure the driver name](#additional-destination-options) explicitly.
+
+### Create a pipeline
+
+1. Initialize a project with a pipeline that loads to MS SQL by running:
+
+```sh
+dlt init chess mssql
+```
+
+2. Install the necessary dependencies for MS SQL by running:
+
+```sh
+pip install -r requirements.txt
+```
+
+or run:
+
+```sh
+pip install "dlt[mssql]"
+```
+
+This will install `dlt` with the `mssql` extra, which contains all the dependencies required by the SQL server client.
+
+3. Enter your credentials into `.dlt/secrets.toml`.
+
+For example, replace with your database connection info:
+
+```toml
+[destination.mssql.credentials]
+database = "dlt_data"
+username = "loader"
+password = "<password>"
+host = "loader.database.windows.net"
+port = 1433
+connect_timeout = 15
+[destination.mssql.credentials.query]
+# trust self-signed SSL certificates
+TrustServerCertificate="yes"
+# require SSL connection
+Encrypt="yes"
+# send large string as VARCHAR, not legacy TEXT
+LongAsMax="yes"
+```
+
+You can also pass a SQLAlchemy-like database connection:
+
+```toml
+# Keep it at the top of your TOML file, before any section starts
+destination.mssql.credentials="mssql://loader:<password>@loader.database.windows.net/dlt_data?TrustServerCertificate=yes&Encrypt=yes&LongAsMax=yes"
+```
+
+You can place any ODBC-specific settings into the query string or **destination.mssql.credentials.query** TOML table as in the example above.
+
+**To connect to an `mssql` server using Windows authentication**, include `trusted_connection=yes` in the connection string.
+
+```toml
+destination.mssql.credentials="mssql://loader.database.windows.net/dlt_data?trusted_connection=yes"
+```
+
+:::note
+If you encounter missing credentials errors when using Windows authentication, set the 'username' and 'password' as empty strings in the TOML file.
+:::
+
+**To connect to a local SQL server instance running without SSL**, pass the `encrypt=no` parameter:
+
+```toml
+destination.mssql.credentials="mssql://loader:loader@localhost/dlt_data?encrypt=no"
+```
+
+**To allow a self-signed SSL certificate** when you are getting `certificate verify failed: unable to get local issuer certificate`:
+
+```toml
+destination.mssql.credentials="mssql://loader:loader@localhost/dlt_data?TrustServerCertificate=yes"
+```
+
+**To use long strings (>8k) and avoid collation errors**:
+
+```toml
+destination.mssql.credentials="mssql://loader:loader@localhost/dlt_data?LongAsMax=yes"
+```
+
+**To pass credentials directly**, use the [explicit instance of the destination](../../general-usage/destination.md#pass-explicit-credentials)
+
+```py
+pipeline = dlt.pipeline(
+  pipeline_name='chess',
+  destination=dlt.destinations.mssql("mssql://loader:<password>@loader.database.windows.net/dlt_data?connect_timeout=15"),
+  dataset_name='chess_data')
+```
+
+## Write disposition
+
+All write dispositions are supported.
+
+If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be dropped and
+recreated with an `ALTER SCHEMA ... TRANSFER`. The operation is atomic: MSSQL supports DDL transactions.
+
+## Data loading
+
+:::tip
+We recommend using ADBC + parquet to load data. We observed 10x - 100x increase in loading speed compared to the INSERT method. **parquet** file format
+will activate automatically if the right driver is present in the system.
+:::
+
+### Fast loading with parquet
+
+[parquet](../file-formats.md#parquet) file format is supported via [ADBC driver](https://arrow.apache.org/adbc/). **mssql** driver is provided by
+[Columnar](https://columnar.tech/). To install it you'll need `dbc` which is a tool to manage ADBC drivers:
+
+```sh
+pip install adbc-driver-manager dbc
+dbc install mssql
+```
+
+with `uv` you can run `dbc` directly:
+
+```sh
+uv tool run dbc search
+```
+
+`dlt` will make **parquet** the preferred file format once driver is detected at runtime. This method is 10x-70x faster than INSERT and
+we make it a default for all input data types.
+
+Not all arrow data types are supported by the driver, see driver docs for more details:
+
+* fixed length binary
+* time with precision different than microseconds
+
+We copy parquet files with batches of size of 1 row group. All groups are copied in a single transaction.
+
+:::caution
+It looks like ADBC driver is based on [go-mssqldb](https://github.com/denisenkom/go-mssqldb?tab=readme-ov-file)
+
+DSN format is different. We translate a few overlapping keys. `pyodbc` and `adbc` ignore unknown keys so you can specify keys for both in the same string.
+:::
+
+You can go back to `insert_values` by passing `loader_file_format` to a resource or pipeline
+
+```py
+# revert to INSERT statements
+data_iter = iter(())  # your data generator
+pipeline.run(data_iter, dataset_name="speed_test_2", write_disposition="replace", table_name="unsw_flow", loader_file_format="insert_values")
+```
+
+### Loading with INSERT statements
+
+Data is loaded via INSERT statements by default. MSSQL has a limit of 1000 rows per INSERT, and this is what we use. We send multiple
+sql statements in a single batch. In case you observe odbc driver locking (i.e. when connection with open transaction leaks into the pool) you can:
+
+1. disable `pyodbc` connection pool.
+
+```py
+import pyodbc
+pyodbc.pooling = False
+```
+
+2. disable batching of multiple statements in `dlt`
+
+```py
+dlt.destinations.mssql("mssql://loader:<password>@loader.database.windows.net/dlt_data?connect_timeout=15", supports_multiple_statements=False)
+```
+
+## Supported file formats
+
+* [insert-values](../file-formats.md#sql-insert) is used by default
+* [parquet](../file-formats.md#parquet) is used if mssql ADBC driver is installed
+
+## Supported column hints
+
+**mssql** will create unique indexes for all columns with `unique` hints. This behavior **is disabled by default**.
+
+### Table and column identifiers
+
+SQL Server **with the default collation** uses case-insensitive identifiers but will preserve the casing of identifiers that are stored in the INFORMATION SCHEMA. You can use [case-sensitive naming conventions](../../general-usage/naming-convention.md#case-sensitive-and-insensitive-destinations) to keep the identifier casing. Note that you risk generating identifier collisions, which are detected by `dlt` and will fail the load process.
+
+If you change the SQL Server server/database collation to case-sensitive, this will also affect the identifiers. Configure your destination as below in order to use case-sensitive naming conventions without collisions:
+
+```toml
+[destination.mssql]
+has_case_sensitive_identifiers=true
+```
+
+## Syncing of `dlt` state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+## Data types
+
+MS SQL does not support JSON columns, so JSON objects are stored as strings in `nvarchar` columns.
+
+## Additional destination options
+
+The **mssql** destination **does not** create UNIQUE indexes by default on columns with the `unique` hint (i.e., `_dlt_id`). To enable this behavior:
+
+```toml
+[destination.mssql]
+create_indexes=true
+```
+
+You can explicitly set the ODBC driver name:
+
+```toml
+[destination.mssql.credentials]
+driver="ODBC Driver 18 for SQL Server"
+```
+
+When using a SQLAlchemy connection string, replace spaces with `+`:
+
+```toml
+# Keep it at the top of your TOML file, before any section starts
+destination.mssql.credentials="mssql://loader:<password>@loader.database.windows.net/dlt_data?driver=ODBC+Driver+18+for+SQL+Server"
+```
+
+### dbt support
+
+This destination [integrates with dbt](../transformations/dbt/dbt.md) via [dbt-sqlserver](https://github.com/dbt-msft/dbt-sqlserver).
+
+<!--@@@DLT_TUBA mssql-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/postgres.md =====
+
+---
+title: Postgres
+description: Postgres `dlt` destination
+keywords: [postgres, destination, data warehouse]
+---
+# Postgres
+
+## Install dlt with PostgreSQL
+
+To install the dlt library with PostgreSQL dependencies, run:
+
+```sh
+pip install "dlt[postgres]"
+```
+
+<!--@@@DLT_DESTINATION_CAPABILITIES postgres-->
+
+## Setup guide
+
+1. Initialize a project with a pipeline that loads to Postgres by running:
+
+```sh
+dlt init chess postgres
+```
+
+2. Install the necessary dependencies for Postgres by running:
+
+```sh
+pip install -r requirements.txt
+```
+
+This will install dlt with the `postgres` extra, which contains the `psycopg2` client.
+
+3. After setting up a Postgres instance and `psql` or a query editor, create a new database by running:
+
+```sql
+CREATE DATABASE dlt_data;
+```
+
+Add the `dlt_data` database to `.dlt/secrets.toml`.
+
+4. Create a new user by running:
+
+```sql
+CREATE USER loader WITH PASSWORD '<password>';
+```
+
+Add the `loader` user and `<password>` password to `.dlt/secrets.toml`.
+
+5. Give the `loader` user owner permissions by running:
+
+```sql
+ALTER DATABASE dlt_data OWNER TO loader;
+```
+
+You can set more restrictive permissions (e.g., give user access to a specific schema).
+
+6. Enter your credentials into `.dlt/secrets.toml`.
+It should now look like this:
+
+```toml
+[destination.postgres.credentials]
+
+database = "dlt_data"
+username = "loader"
+password = "<password>" # replace with your password
+host = "localhost" # or the IP address location of your database
+port = 5432
+connect_timeout = 15
+session_timezone = "Europe/Paris"
+```
+
+You can also pass a database connection string similar to the one used by the `psycopg2` library or [SQLAlchemy](https://docs.sqlalchemy.org/en/20/core/engines.html#postgresql). The credentials above will look like this:
+
+```toml
+# Keep it at the top of your TOML file, before any section starts
+destination.postgres.credentials="postgresql://loader:<password>@localhost/dlt_data?connect_timeout=15&options=-ctimezone%3DEurope%2FParis"
+```
+
+To pass credentials directly, use the [explicit instance of the destination](../../general-usage/destination.md#pass-explicit-credentials)
+
+```py
+pipeline = dlt.pipeline(
+  pipeline_name='chess',
+  destination=dlt.destinations.postgres("postgresql://loader:<password>@localhost/dlt_data"),
+  dataset_name='chess_data' #your destination schema name
+)
+```
+
+## Write disposition
+
+All write dispositions are supported.
+
+If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be dropped and replaced by the staging tables.
+
+## Data loading
+
+`dlt` will load data using large INSERT VALUES statements by default. Loading is multithreaded (20 threads by default).
+
+### Data types
+
+`postgres` supports various timestamp types, which can be configured using the column flags `timezone` and `precision` in the `dlt.resource` decorator or the `pipeline.run` method.
+
+- **Precision**: allows you to specify the number of decimal places for fractional seconds, ranging from 0 to 6. It can be used in combination with the `timezone` flag.
+- **Timezone**:
+  - Setting `timezone=False` maps to `TIMESTAMP WITHOUT TIME ZONE`.
+  - Setting `timezone=True` (or omitting the flag, which defaults to `True`) maps to `TIMESTAMP WITH TIME ZONE`.
+
+#### Example precision and timezone: TIMESTAMP (3) WITHOUT TIME ZONE
+
+```py
+@dlt.resource(
+    columns={"event_tstamp": {"data_type": "timestamp", "precision": 3, "timezone": False}},
+    primary_key="event_id",
+)
+def events():
+    yield [{"event_id": 1, "event_tstamp": "2024-07-30T10:00:00.123"}]
+
+pipeline = dlt.pipeline(destination="postgres")
+pipeline.run(events())
+```
+
+### Fast loading with Arrow tables and CSV
+
+You can use [Arrow tables](../verified-sources/arrow-pandas.md) and [CSV](../file-formats.md#csv) to quickly load tabular data. Pick the CSV loader file format like below:
+
+```py
+info = pipeline.run(arrow_table, loader_file_format="csv")
+```
+
+In the example above, `arrow_table` will be converted to CSV with **pyarrow** and then streamed into **postgres** with the COPY command. This method skips the regular `dlt` normalizer used for Python objects and is several times faster.
+
+### Fast loading with Arrow tables and parquet
+
+[parquet](../file-formats.md#parquet) file format is supported via [ADBC driver](https://arrow.apache.org/adbc/current/driver/postgresql.html).
+To install it you'll need `dbc` which is a tool to manage ADBC drivers:
+
+```sh
+pip install adbc-driver-manager dbc
+dbc install postgresql
+```
+
+Installation via Python package is supported as well:
+
+```sh
+pip install adbc-driver-postgresql
+```
+
+with this driver installed, you can set `parquet` as `loader_file_format` for `dlt` resources.
+
+Not all `postgres` types are supported, see driver docs for more details:
+
+* `JSONB` is not supported so we use `JSON` instead if the resource was explicitly decorated.
+* `INT8` (128 bit) not supported and `TIME(3)` (millisecond precision) are not supported
+* We observed problems with some decimal precision/scale i.e. `decimal128(6, 2)` is not properly decoded.
+* large decimals are not supported. `postgres` is the only destination that fully supports `wei` (256 bit) decimal precision, this does not work with ADBC.
+
+We copy parquet files with batches of size of 1 row group. Each file is copied in a single transaction.
+
+## Supported file formats
+
+* [insert-values](../file-formats.md#sql-insert) is used by default.
+* [CSV](../file-formats.md#csv) is supported.
+* [parquet](../file-formats.md#parquet) is supported via [ADBC](https://arrow.apache.org/adbc/current/driver/postgresql.html)
+
+## Supported column hints
+
+`postgres` will create unique indexes for all columns with `unique` hints. This behavior **may be disabled**.
+
+### Spatial Types
+
+To enable GIS capabilities in your Postgres destination, use the `x-postgres-geometry` and `x-postgres-srid` hints for columns containing geometric data.
+The `postgres_adapter` facilitates applying these hints conveniently, with a default SRID of `4326`.
+
+**Supported Geometry Types:**
+
+- WKT (Well-Known Text)
+- Hex Representation
+
+If you have geometry data in binary format, you will need to convert it to hexadecimal representation before loading.
+
+**Example:** Using `postgres_adapter` with Different Geometry Types
+
+```py
+from dlt.destinations.impl.postgres.postgres_adapter import postgres_adapter
+
+# Sample data with various geometry types
+data_wkt = [
+  {"type": "Point_wkt", "geom": "POINT (1 1)"},
+  {"type": "Point_wkt", "geom": "Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])"},
+  ]
+
+data_wkb_hex = [
+  {"type": "Point_wkb_hex", "geom": "0101000000000000000000F03F000000000000F03F"},
+  {"type": "Point_wkb_hex", "geom": "01020000000300000000000000000000000000000000000000000000000000F03F000000000000F03F00000000000000400000000000000040"},
+]
+
+
+
+# Apply postgres_adapter to the 'geom' column with default SRID 4326
+resource_wkt = postgres_adapter(data_wkt, geometry="geom")
+resource_wkb_hex = postgres_adapter(data_wkb_hex, geometry="geom")
+
+# If you need a different SRID
+resource_wkt = postgres_adapter(data_wkt, geometry="geom", srid=3242)
+```
+
+Ensure that the PostGIS extension is enabled in your Postgres database:
+
+```sql
+CREATE EXTENSION postgis;
+```
+
+This configuration allows `dlt` to map the `geom` column to the PostGIS `geometry` type for spatial queries and analyses.
+
+:::warning
+`LinearRing` geometry type isn't supported.
+:::
+
+## Table and column identifiers
+
+Postgres supports both case-sensitive and case-insensitive identifiers. All unquoted and lowercase identifiers resolve case-insensitively in SQL statements. Case insensitive [naming conventions](../../general-usage/naming-convention.md#case-sensitive-and-insensitive-destinations) like the default **snake_case** will generate case-insensitive identifiers. Case sensitive (like **sql_cs_v1**) will generate case-sensitive identifiers that must be quoted in SQL statements.
+
+## Additional destination options
+
+The Postgres destination creates UNIQUE indexes by default on columns with the `unique` hint (i.e., `_dlt_id`). To disable this behavior:
+
+```toml
+[destination.postgres]
+create_indexes=false
+```
+
+### Session timezone
+
+Postgres uses the server timezone unless you set one. `session_timezone` sets it per connection. The
+setting decides how Postgres reads values without a UTC offset into `timestamp with time zone`
+columns. It also decides which timezone Postgres returns for those columns. It does not change the
+column types that `CREATE TABLE` produces.
+
+```toml
+[destination.postgres.credentials]
+session_timezone = "Europe/Paris"
+```
+
+`dlt` passes it as a libpq startup option, so it also survives the connection reset that `dlt` performs
+after a failed statement. Setting `query.options = "-ctimezone=Europe/Paris"` yourself still works and
+takes precedence.
+
+### Setting up CSV format
+
+You can provide [non-default](../file-formats.md#settings) CSV settings via a configuration file or explicitly.
+
+```toml
+[destination.postgres.csv_format]
+delimiter="|"
+include_header=false
+```
+
+or
+
+```py
+from dlt.destinations import postgres
+from dlt.common.data_writers.configuration import CsvFormatConfiguration
+
+csv_format = CsvFormatConfiguration(delimiter="|", include_header=False)
+
+dest_ = postgres(csv_format=csv_format)
+```
+
+Above, we set the `CSV` file without a header, with **|** as a separator.
+
+:::tip
+You'll need those settings when [importing external files](../../general-usage/resource.md#import-external-files).
+:::
+
+### dbt support
+
+This destination [integrates with dbt](../transformations/dbt/dbt.md) via dbt-postgres.
+
+### Syncing of dlt state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+<!--@@@DLT_TUBA postgres-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/qdrant.md =====
+
+---
+title: Qdrant
+description: Qdrant is a high-performance vector search engine/database that can be used as a destination in dlt.
+keywords: [qdrant, vector database, destination, dlt]
+---
+# Qdrant
+
+[Qdrant](https://qdrant.tech/) is an open-source, high-performance vector search engine/database. It deploys as an API service, providing a search for the nearest high-dimensional vectors.
+This destination helps you load data into Qdrant from [dlt resources](../../general-usage/resource.md).
+
+<!--@@@DLT_DESTINATION_CAPABILITIES qdrant-->
+
+## Setup guide
+
+1. To use Qdrant as a destination, make sure `dlt` is installed with the `qdrant` extra:
+
+```sh
+pip install "dlt[qdrant]"
+```
+
+2. Next, configure the destination in the dlt secrets file. The file is located at `~/.dlt/secrets.toml` by default. Add the following section to the secrets file:
+
+```toml
+[destination.qdrant]
+qd_location = "https://your-qdrant-url"
+[destination.qdrant.credentials]
+api_key = "your-qdrant-api-key"
+```
+
+In this setup guide, we are using the [Qdrant Cloud](https://cloud.qdrant.io/) to get a hosted Qdrant instance and the [FastEmbed](https://github.com/qdrant/fastembed) package that is built into the [Qdrant client library](https://github.com/qdrant/qdrant-client) for generating embeddings.
+
+If no configuration options are provided, the default fallback will be `http://localhost:6333` with no API key.
+
+You can use Qdrant without a backend, where the database is stored in a file:
+
+```toml
+[destination.qdrant]
+qd_path = "db.qdrant"
+```
+
+Data will be stored in `db.qdrant` file placed in current working directory.
+
+3. Define the source of the data. For starters, let's load some data from a simple data structure:
+
+```py
+import dlt
+from dlt.destinations.adapters import qdrant_adapter
+
+movies = [
+    {
+        "title": "Blade Runner",
+        "year": 1982,
+    },
+    {
+        "title": "Ghost in the Shell",
+        "year": 1995,
+    },
+    {
+        "title": "The Matrix",
+        "year": 1999,
+    }
+]
+
+pipeline = dlt.pipeline(
+    pipeline_name="movies",
+    destination="qdrant",
+    dataset_name="MoviesDataset",
+)
+
+info = pipeline.run(
+    qdrant_adapter(
+        movies,
+        embed="title",
+    )
+)
+
+print(info)
+```
+
+The data is now loaded into Qdrant.
+
+To use vector search after the data has been loaded, you must specify which fields Qdrant needs to generate embeddings for. You do that by wrapping the data (or dlt resource) with the `qdrant_adapter` function.
+
+## qdrant_adapter
+
+The `qdrant_adapter` is a helper function that configures the resource for the Qdrant destination:
+
+```py
+from dlt.destinations.adapters import qdrant_adapter
+
+qdrant_adapter(data, embed="title")
+```
+
+It accepts the following arguments:
+
+- `data`: a dlt resource object or a Python data structure (e.g., a list of dictionaries).
+- `embed`: a name of the field or a list of names to generate embeddings for.
+
+Returns: [dlt resource](../../general-usage/resource.md) object that you can pass to the `pipeline.run()`.
+
+Example:
+
+```py
+from dlt.destinations.adapters import qdrant_adapter
+
+qdrant_adapter(
+    resource,
+    embed=["title", "description"],
+)
+```
+
+When using the `qdrant_adapter`, it's important to apply it directly to resources, not to the whole source. Here's an example:
+
+```py
+from dlt.sources.sql_database import sql_database
+from dlt.destinations.adapters import qdrant_adapter
+
+products_tables = sql_database().with_resources("products", "customers")
+
+pipeline = dlt.pipeline(
+        pipeline_name="postgres_to_qdrant_pipeline",
+        destination="qdrant",
+    )
+
+# apply adapter to the needed resources
+qdrant_adapter(products_tables.products, embed="description")
+qdrant_adapter(products_tables.customers, embed="bio")
+
+info = pipeline.run(products_tables)
+```
+
+:::tip
+A more comprehensive pipeline would load data from some API or use one of dlt's [verified sources](../verified-sources/).
+:::
+
+## Write disposition
+
+A [write disposition](../../general-usage/incremental-loading.md#choosing-a-write-disposition) defines how the data should be written to the destination. All write dispositions are supported by the Qdrant destination.
+
+### Replace
+
+The [replace](../../general-usage/full-loading.md) disposition replaces the data in the destination with the data from the resource. It deletes all the classes and objects and recreates the schema before loading the data.
+
+In the movie example from the [setup guide](#setup-guide), we can use the `replace` disposition to reload the data every time we run the pipeline:
+
+```py
+from dlt.destinations.adapters import qdrant_adapter
+
+movies = [{"id": 1, "title": "Blade Runner", "year": 1982}, ...]
+info = pipeline.run(
+    qdrant_adapter(
+        movies,
+        embed="title",
+    ),
+    write_disposition="replace",
+)
+```
+
+### Merge
+
+The [merge](../../general-usage/incremental-loading.md) write disposition merges the data from the resource with the data at the destination.
+For the `merge` disposition, you need to specify a `primary_key` for the resource:
+
+```py
+from dlt.destinations.adapters import qdrant_adapter
+

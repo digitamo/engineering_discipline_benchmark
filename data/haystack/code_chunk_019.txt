@@ -1,0 +1,3004 @@
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index cb72e7127..45c2a1b12 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -108,7 +108,4 @@ jobs:
+   # test_tools_dbt_cloud:
+   #   needs: [test_common, authorize_run_from_fork]
+   #   uses: ./.github/workflows/test_tools_dbt_cloud.yml
+-  #   secrets: inherit
+-
+-
+-
++  #   secrets: inherit
+\ No newline at end of file
+diff --git a/.github/workflows/test_destinations_local.yml b/.github/workflows/test_destinations_local.yml
+index 05d15c164..344e0fded 100644
+--- a/.github/workflows/test_destinations_local.yml
++++ b/.github/workflows/test_destinations_local.yml
+@@ -23,15 +23,23 @@ jobs:
+         include:
+ 
+           # Duckdb, Postgres, Filesystem, Weaviate, Qdrant (could be split?)
+-          - name: filesystem, weaviate, qdrant
+-            destinations: "[\"filesystem\", \"weaviate\", \"qdrant\"]"
++          - name: filesystem, weaviate
++            destinations: "[\"filesystem\", \"weaviate\"]"
+             filesystem_drivers: "[\"memory\", \"file\", \"sftp\"]"
+-            extras: "--extra parquet --extra cli --extra filesystem --extra qdrant --extra weaviate --extra deltalake --extra pyiceberg --extra sftp"
++            extras: "--extra parquet --extra cli --extra filesystem --extra weaviate --extra deltalake --extra pyiceberg --extra sftp"
+             needs_weaviate: true
+-            needs_qdrant: true
+             needs_ftp: true
+             post_install_commands: "uv run pip install sqlalchemy==2.0.18" # minimum version required by `pyiceberg`
+ 
++          # Qdrant runs test serially, concurrency is problematic
++          - name: qdrant
++            destinations: "[\"qdrant\"]"
++            filesystem_drivers: "[\"memory\", \"file\", \"sftp\"]"
++            extras: "--extra parquet --extra cli --extra qdrant --extra sftp"
++            needs_qdrant: true
++            needs_ftp: true
++            pytest_xdist_n: 1
++
+           # TODO: also test ducklake in remote mode with a buckets and remote postgres
+           - name: postgres, duckdb, ducklake, and dummy
+             destinations: "[\"postgres\", \"duckdb\", \"ducklake\", \"dummy\"]"
+@@ -186,10 +194,10 @@ jobs:
+         if: ${{ matrix.post_install_commands }}
+ 
+       # always run full suite, also on branches
+-      - name: Run tests (limiting xdist workers to 4 since local postgres cant handle more)
++      - name: Run destination load tests
+         run: make test-dest-load
+         env:
+-          PYTEST_XDIST_N: 4
++          PYTEST_XDIST_N: ${{ matrix.pytest_xdist_n || 4 }}
+ 
+       #
+       # Tear down services 
+diff --git a/.gitignore b/.gitignore
+index 67bd1801e..cec73cb2c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -157,3 +157,6 @@ local_cache/
+ # test file for examples are generated and should not be committed
+ docs/examples/**/test*.py
+ compiled_requirements.txt
++
++# docker folder for running tests as other OS
++tests/.docker/
+diff --git a/tests/load/qdrant/test_pipeline.py b/tests/load/qdrant/test_pipeline.py
+index b289b17f5..8dec36945 100644
+--- a/tests/load/qdrant/test_pipeline.py
++++ b/tests/load/qdrant/test_pipeline.py
+@@ -376,7 +376,7 @@ def test_qdrant_local_parallelism_disabled(preserve_environ) -> None:
+     os.environ["DATA_WRITER__FILE_MAX_ITEMS"] = "20"
+ 
+     with TemporaryDirectory() as tmpdir:
+-        p = dlt.pipeline(destination=dlt.destinations.qdrant(path=tmpdir))
++        p = dlt.pipeline(destination=dlt.destinations.qdrant(qd_path=tmpdir))
+ 
+         # Data writer limit ensures that we create multiple load files to the same table
+         @dlt.resource
+diff --git a/tests/load/test_job_client.py b/tests/load/test_job_client.py
+index d8ed61b1a..af3acb0dd 100644
+--- a/tests/load/test_job_client.py
++++ b/tests/load/test_job_client.py
+@@ -1143,7 +1143,7 @@ def test_many_schemas_single_dataset(
+     ids=lambda x: x.name,
+ )
+ def test_schema_retrieval(destination_config: DestinationTestConfiguration) -> None:
+-    p = destination_config.setup_pipeline("schema_test", dev_mode=True)
++    p = destination_config.setup_pipeline("schema_test" + uniq_id(), dev_mode=True)
+     from dlt.common.schema import utils
+ 
+     # we create 2 versions of 2 schemas
+diff --git a/tests/load/utils.py b/tests/load/utils.py
+index a7eda4f11..8d26e5537 100644
+--- a/tests/load/utils.py
++++ b/tests/load/utils.py
+@@ -554,7 +554,7 @@ def destinations_configs(
+             ),
+             DestinationTestConfiguration(
+                 destination_type="qdrant",
+-                credentials=dict(path=str(Path(FILE_BUCKET) / f"qdrant_data_{worker}")),
++                credentials=dict(path="qdrant_data"),
+                 extra_info="local-file",
+             ),
+             DestinationTestConfiguration(
+
+
+===== COMMIT 76dc74e4 =====
+
+
+commit 76dc74e46
+Author: Anton Karling
+Date: 2026-02-05
+
+    fix (3591) - respect `filename=True` in `read_csv_duckdb` (#3606)
+
+diff --git a/dlt/sources/filesystem/readers.py b/dlt/sources/filesystem/readers.py
+index dd36a05ac..b87cbae97 100644
+--- a/dlt/sources/filesystem/readers.py
++++ b/dlt/sources/filesystem/readers.py
+@@ -115,11 +115,17 @@ def _read_csv_duckdb(
+ 
+     helper = fetch_arrow if use_pyarrow else fetch_json
+ 
++    add_filename = duckdb_kwargs.pop("filename", False)
++
+     for item in items:
+         with item.open() as f:
+             file_data = duckdb.from_csv_auto(f, **duckdb_kwargs)  # type: ignore
+ 
+-            yield from helper(file_data, chunk_size)
++            for batch in helper(file_data, chunk_size):
++                if add_filename:
++                    for record in batch:
++                        record["filename"] = item["file_name"]  # type: ignore
++                yield batch
+ 
+ 
+ if TYPE_CHECKING:
+diff --git a/tests/sources/filesystem/test_readers.py b/tests/sources/filesystem/test_readers.py
+index 2acc5fc7e..00f70910e 100644
+--- a/tests/sources/filesystem/test_readers.py
++++ b/tests/sources/filesystem/test_readers.py
+@@ -152,6 +152,16 @@ def test_read_csv_duckdb(tmp_path: pathlib.Path, data: list[dict[str, Any]]) ->
+     assert read_data == [data]
+ 
+ 
++def test_read_csv_duckdb_filename(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
++    file_ = _create_csv_file(data=data, tmp_path=tmp_path)
++
++    for record in _read_csv_duckdb([file_], filename=True):
++        assert record[0]["filename"] == file_["file_name"]
++
++    for record in _read_csv_duckdb([file_]):
++        assert "filename" not in record[0].keys()
++
++
+ def test_read_csv_duckdb_use_pyarrow(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
+     file_ = _create_csv_file(data=data, tmp_path=tmp_path)
+     iterator = _read_csv_duckdb([file_], use_pyarrow=True)
+
+
+===== COMMIT 7507025d =====
+
+
+commit 7507025d7
+Author: Shreyas
+Date: 2026-02-04
+
+    feat: update GitHub API pipeline template (#3603)
+
+diff --git a/dlt/_workspace/_templates/_single_file_templates/github_api_pipeline.py b/dlt/_workspace/_templates/_single_file_templates/github_api_pipeline.py
+index 1423a8dc3..4f93dd46e 100644
+--- a/dlt/_workspace/_templates/_single_file_templates/github_api_pipeline.py
++++ b/dlt/_workspace/_templates/_single_file_templates/github_api_pipeline.py
+@@ -1,47 +1,69 @@
+-"""The Github API templates provides a starting point to read data from REST APIs with REST Client helper"""
++"""The Github API templates provides a starting point to read data from REST APIs with REST Client"""
+ 
+ # mypy: disable-error-code="no-untyped-def,arg-type"
+ 
+ from typing import Optional
+-
+ import dlt
+-
+-from dlt.sources.helpers.rest_client import paginate
++from dlt.sources.helpers.rest_client import RESTClient
+ from dlt.sources.helpers.rest_client.auth import BearerTokenAuth
+ from dlt.sources.helpers.rest_client.paginators import HeaderLinkPaginator
+ 
+ 
+-@dlt.resource(write_disposition="replace")
+-def github_api_resource(access_token: Optional[str] = dlt.secrets.value):
+-    url = "https://api.github.com/repos/dlt-hub/dlt/issues"
++@dlt.source
++def github_source(access_token: Optional[str] = dlt.secrets.value):
++    # Optional auth: works with and without secrets
++    auth = BearerTokenAuth(token=access_token) if access_token else None
++
++    client = RESTClient(
++        base_url="https://api.github.com",
++        auth=auth,
++        paginator=HeaderLinkPaginator(),
++        headers={
++            "Accept": "application/vnd.github+json",
++            "X-GitHub-Api-Version": "2022-11-28",
++        },
++    )
+ 
+-    # Github allows both authenticated and non-authenticated requests (with low rate limits)
+-    auth = BearerTokenAuth(access_token) if access_token else None
+-    for page in paginate(
+-        url, auth=auth, paginator=HeaderLinkPaginator(), params={"state": "open", "per_page": "100"}
++    # Define a resource which fetches repos data
++    @dlt.resource(name="repos", write_disposition="replace")
++    def repos():
++        for page in client.paginate("orgs/dlt-hub/repos"):
++            yield page
++
++    # Define a resource which fetches issues data (incremental by updated_at timestamp)
++    @dlt.resource(name="issues", write_disposition="append")
++    def issues(
++        updated_at=dlt.sources.incremental(
++            "updated_at",
++            initial_value="2026-01-01T00:00:00Z",
++        )
+     ):
+-        yield page
++        for page in client.paginate(
++            "repos/dlt-hub/dlt/issues",
++            params={
++                "state": "open",
++                "sort": "updated",
++                "direction": "desc",
++                "since": updated_at.start_value,
++                "per_page": "100",
++            },
++        ):
++            yield page
+ 
+-
+-@dlt.source
+-def github_api_source(access_token: Optional[str] = dlt.secrets.value):
+-    return github_api_resource(access_token=access_token)
++    return [repos, issues]
+ 
+ 
+ def run_source() -> None:
+-    # configure the pipeline with your destination details
++    # Define pipeline
+     pipeline = dlt.pipeline(
+-        pipeline_name="github_api_pipeline", destination="duckdb", dataset_name="github_api_data"
++        pipeline_name="github_api_pipeline",
++        destination="duckdb",
++        dataset_name="github_api_data",
++        progress="log",
+     )
+ 
+-    # print credentials by running the resource
+-    data = list(github_api_resource())
+-
+-    # print the data yielded from resource
+-    print(data)  # noqa: T201
+-
+     # run the pipeline with your parameters
+-    load_info = pipeline.run(github_api_source())
++    load_info = pipeline.run(github_source())
+ 
+     # pretty print the information on data that was loaded
+     print(load_info)  # noqa: T201
+
+
+===== COMMIT d919dd2b =====
+
+
+commit d919dd2b0
+Author: rudolfix
+Date: 2026-02-04
+
+    escapes sort columns (#3594)
+
+diff --git a/dlt/destinations/sql_jobs.py b/dlt/destinations/sql_jobs.py
+index d15777ebc..96cb770e2 100644
+--- a/dlt/destinations/sql_jobs.py
++++ b/dlt/destinations/sql_jobs.py
+@@ -652,6 +652,8 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+ 
+         # get dedup sort information
+         dedup_sort = get_dedup_sort_tuple(root_table)
++        if dedup_sort is not None:
++            dedup_sort = (escape_column_id(dedup_sort[0]), dedup_sort[1])
+         skip_dedup: bool = root_table.get("x-stage-data-deduplicated", False)  # type: ignore[assignment]
+ 
+         insert_temp_table_name: str = None
+diff --git a/tests/load/pipeline/test_merge_disposition.py b/tests/load/pipeline/test_merge_disposition.py
+index 583384b21..998e53891 100644
+--- a/tests/load/pipeline/test_merge_disposition.py
++++ b/tests/load/pipeline/test_merge_disposition.py
+@@ -1,4 +1,5 @@
+ from copy import copy
++import os
+ import pytest
+ import random
+ from typing import List, cast
+@@ -1588,6 +1589,54 @@ def test_dedup_sort_hint(destination_config: DestinationTestConfiguration) -> No
+         info = p.run(r(), **destination_config.run_kwargs)
+ 
+ 
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(default_sql_configs=True, supports_merge=True),
++    ids=lambda x: x.name,
++)
++def test_dedup_sort_hint_case_sensitive(
++    destination_config: DestinationTestConfiguration,
++) -> None:
++    """Test that dedup_sort column names are properly escaped in merge SQL.
++
++    Reproduces https://github.com/dlt-hub/dlt/issues/3529 where unescaped
++    dedup_sort column names cause failures with case-sensitive naming
++    conventions on destinations that casefold unquoted identifiers.
++    """
++    # use direct naming to preserve mixed case in column names
++    os.environ["SCHEMA__NAMING"] = "direct"
++
++    table_name = "test_dedup_sort_cs"
++
++    @dlt.resource(
++        name=table_name,
++        write_disposition="merge",
++        primary_key="id",
++        columns={"Sequence": {"dedup_sort": "desc", "nullable": False}},
++    )
++    def data_resource(data):
++        yield data
++
++    p = destination_config.setup_pipeline("dedup_sort_cs", dev_mode=True)
++
++    # three records with same primary key
++    data = [
++        {"id": 1, "val": "foo", "Sequence": 1},
++        {"id": 1, "val": "baz", "Sequence": 3},
++        {"id": 1, "val": "bar", "Sequence": 2},
++    ]
++    info = p.run(data_resource(data), **destination_config.run_kwargs)
++    assert_load_info(info)
++    assert load_table_counts(p, table_name)[table_name] == 1
++
++    # record with highest value in sort column is inserted (because "desc")
++    result = load_tables_to_dicts(p, table_name, exclude_system_cols=True)
++    assert_records_as_set(
++        result[table_name],
++        [{"id": 1, "val": "baz", "Sequence": 3}],
++    )
++
++
+ @pytest.mark.no_load
+ def test_merge_strategy_config() -> None:
+     # merge strategy invalid
+
+
+===== COMMIT 666805d0 =====
+
+
+commit 666805d0f
+Author: rudolfix
+Date: 2026-02-04
+
+    bumps to 1.21.1a0 (#3607)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index d834a90fa..534c9b52b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "dlt"
+-version = "1.21.0"
++version = "1.21.1a0"
+ description = "dlt is an open-source python-first scalable data loading library that does not require any backend to run."
+ authors = [{ name = "dltHub Inc.", email = "services@dlthub.com" }]
+ requires-python = ">=3.9.2, <3.15"
+diff --git a/uv.lock b/uv.lock
+index 7eaad642f..49117f30f 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2060,7 +2060,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.21.0"
++version = "1.21.1a0"
+ source = { editable = "." }
+ dependencies = [
+     { name = "click" },
+
+
+===== COMMIT 41dfabfc =====
+
+
+commit 41dfabfc7
+Author: rudolfix
+Date: 2026-02-04
+
+    implements several bug fixes and tests for pydantic model synth (#3605)
+
+diff --git a/dlt/common/libs/pydantic.py b/dlt/common/libs/pydantic.py
+index 5595af364..30c77e0f6 100644
+--- a/dlt/common/libs/pydantic.py
++++ b/dlt/common/libs/pydantic.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations as _annotations
++import collections.abc
+ from copy import copy
+ from typing import (
+     Dict,
+@@ -60,6 +61,14 @@ _TPydanticModel = TypeVar("_TPydanticModel", bound=BaseModel)
+ snake_case_naming_convention = SnakeCaseNamingConvention()
+ 
+ 
++def _is_set_origin(origin: type) -> bool:
++    """Check if a type origin is set-like (set or frozenset)."""
++    try:
++        return issubclass(origin, collections.abc.Set)
++    except TypeError:
++        return False
++
++
+ class ListModel(BaseModel, Generic[_TPydanticModel]):
+     items: List[_TPydanticModel]
+ 
+@@ -100,7 +109,6 @@ def pydantic_to_table_schema_columns(
+     Args:
+         model: The pydantic model to convert. Can be a class or an instance.
+ 
+-
+     Returns:
+         TTableSchemaColumns: table schema columns dict
+     """
+@@ -222,6 +230,7 @@ def apply_schema_contract_to_model(
+     model: Type[_TPydanticModel],
+     column_mode: TSchemaEvolutionMode,
+     data_mode: TSchemaEvolutionMode = "freeze",
++    _child_models: Optional[Dict[int, Type[BaseModel]]] = None,
+ ) -> Type[_TPydanticModel]:
+     """Configures or re-creates `model` so it behaves according to `column_mode` and `data_mode` settings.
+ 
+@@ -230,6 +239,9 @@ def apply_schema_contract_to_model(
+ 
+     `discard_row` is implemented in `validate_item`.
+     """
++    # save dlt_config before model may be replaced by the evolve path
++    original_dlt_config = getattr(model, "dlt_config", None)
++
+     if data_mode == "evolve":
+         # create a lenient model that accepts any data
+         model = create_model(model.__name__ + "Any", **{n: (Any, None) for n in model.model_fields})  # type: ignore
+@@ -242,7 +254,9 @@ def apply_schema_contract_to_model(
+     extra = column_mode_to_extra(column_mode)
+ 
+     if extra == get_extra_from_model(model):
+-        # no need to change the model
++        # no need to change the model, but restore dlt_config lost by the evolve path
++        if original_dlt_config:
++            model.dlt_config = original_dlt_config  # type: ignore[attr-defined]
+         return model
+ 
+     if _PYDANTIC_2:
+@@ -255,21 +269,38 @@ def apply_schema_contract_to_model(
+         config.extra = extra  # type: ignore[attr-defined]
+         prepare_config(config, model.Config.__name__)  # type: ignore[attr-defined]
+ 
+-    _child_models: Dict[int, Type[BaseModel]] = {}
++    if _child_models is None:
++        _child_models = {}
+ 
+     def _process_annotation(t_: Type[Any]) -> Type[Any]:
+         """Recursively recreates models with applied schema contract"""
+         if is_annotated(t_):
+             a_t, *a_m = get_args(t_)
+             return Annotated[_process_annotation(a_t), tuple(a_m)]  # type: ignore[return-value]
++        origin = get_origin(t_)
++        # tuple must be checked before is_list_generic_type (tuple is a Sequence)
++        if origin is tuple:
++            args = get_args(t_)
++            if not args:
++                return t_
++            if len(args) == 2 and args[1] is Ellipsis:
++                # variable-length: Tuple[T, ...]
++                return origin[_process_annotation(args[0]), ...]  # type: ignore[no-any-return]
++            # heterogeneous: Tuple[T1, T2, ...]
++            processed = tuple(_process_annotation(a) for a in args)
++            return origin[processed]  # type: ignore[no-any-return]
+         elif is_list_generic_type(t_):
+             l_t: Type[Any] = get_args(t_)[0]
+-            return get_origin(t_)[_process_annotation(l_t)]  # type: ignore[no-any-return]
++            return origin[_process_annotation(l_t)]  # type: ignore[no-any-return]
+         elif is_dict_generic_type(t_):
+             k_t: Type[Any]
+             v_t: Type[Any]
+             k_t, v_t = get_args(t_)
+-            return get_origin(t_)[k_t, _process_annotation(v_t)]  # type: ignore[no-any-return]
++            return origin[k_t, _process_annotation(v_t)]  # type: ignore[no-any-return]
++        # set/frozenset are not Sequence or Mapping so need a separate check
++        elif origin is not None and _is_set_origin(origin):
++            s_t: Type[Any] = get_args(t_)[0]
++            return origin[_process_annotation(s_t)]  # type: ignore[no-any-return]
+         elif is_union_type(t_):
+             u_t_s = tuple(_process_annotation(u_t) for u_t in extract_union_types(t_))
+             return Union[u_t_s]  # type: ignore[return-value]
+@@ -279,7 +310,7 @@ def apply_schema_contract_to_model(
+                 return _child_models[id(t_)]
+             else:
+                 _child_models[id(t_)] = child_model = apply_schema_contract_to_model(
+-                    t_, column_mode, data_mode
++                    t_, column_mode, data_mode, _child_models=_child_models
+                 )
+                 return child_model
+         return t_
+@@ -290,15 +321,33 @@ def apply_schema_contract_to_model(
+         else:
+             return f.annotation  # type: ignore[no-any-return]
+ 
+-    new_model: Type[_TPydanticModel] = create_model(  # type: ignore[call-overload]
+-        model.__name__ + "Extra" + extra.title(),
+-        __config__=config,
+-        **{n: (_process_annotation(_rebuild_annotated(f)), f) for n, f in model.__fields__.items()},  # type: ignore[attr-defined]
+-    )
+-    # pass dlt config along
+-    dlt_config = getattr(model, "dlt_config", None)
+-    if dlt_config:
+-        new_model.dlt_config = dlt_config  # type: ignore[attr-defined]
++    processed_fields = {
++        n: (_process_annotation(_rebuild_annotated(f)), f)
++        for n, f in model.__fields__.items()  # type: ignore[attr-defined]
++    }
++
++    if _PYDANTIC_2:
++        # use __base__ to inherit validators (@field_validator, @model_validator)
++        new_model: Type[_TPydanticModel] = create_model(  # type: ignore[call-overload]
++            model.__name__ + "Extra" + extra.title(),
++            __base__=model,
++            **processed_fields,
++        )
++        # override config on the subclass and rebuild to pick up the new extra setting
++        new_model.model_config = config
++        new_model.model_rebuild(force=True)
++    else:
++        new_model = create_model(  # type: ignore[call-overload]
++            model.__name__ + "Extra" + extra.title(),
++            __config__=config,
++            **processed_fields,
++        )
++
++    # restore dlt_config: the evolve path replaces model with a bare "Any" model that
++    # lacks dlt_config. For the non-evolve path __base__ inheritance preserves it,
++    # but setting it explicitly is harmless and keeps both paths consistent.
++    if original_dlt_config:
++        new_model.dlt_config = original_dlt_config  # type: ignore[attr-defined]
+     return new_model
+ 
+ 
+diff --git a/tests/libs/test_pydantic.py b/tests/libs/test_pydantic.py
+index 7e3e539fa..5fea69571 100644
+--- a/tests/libs/test_pydantic.py
++++ b/tests/libs/test_pydantic.py
+@@ -1,4 +1,5 @@
+ import sys
++import warnings
+ from copy import copy
+ from dataclasses import dataclass, field
+ import uuid
+@@ -6,12 +7,15 @@ import pytest
+ from typing import (
+     ClassVar,
+     Final,
++    FrozenSet,
+     Generic,
+     Sequence,
++    Set,
+     Mapping,
+     Dict,
+     MutableMapping,
+     MutableSequence,
++    Tuple,
+     TypeVar,
+     Union,
+     Optional,
+@@ -33,8 +37,22 @@ from dlt.common.libs.pydantic import (
+     validate_and_filter_item,
+     validate_and_filter_items,
+     create_list_model,
++    column_mode_to_extra,
++    extra_to_column_mode,
++    get_extra_from_model,
++)
++from dlt.common.warnings import Dlt100DeprecationWarning
++from pydantic import (
++    UUID4,
++    BaseModel,
++    Field,
++    Json,
++    AnyHttpUrl,
++    ConfigDict,
++    ValidationError,
++    field_validator,
++    model_validator,
+ )
+-from pydantic import UUID4, BaseModel, Json, AnyHttpUrl, ConfigDict, ValidationError
+ 
+ from dlt.common.schema.exceptions import DataValidationError
+ 
+@@ -755,3 +773,682 @@ def test_parent_nullable_means_children_nullable():
+ 
+     assert schema["optional_child__child_attribute"]["nullable"]
+     assert schema["non_optional_child__child_attribute"]["nullable"] is False
++
++
++# --- Group 1: Helper function unit tests ---
++
++
++def test_column_mode_to_extra() -> None:
++    """All TSchemaEvolutionMode values map to the correct pydantic extra setting."""
++    assert column_mode_to_extra("evolve") == "allow"
++    assert column_mode_to_extra("discard_value") == "ignore"
++    assert column_mode_to_extra("freeze") == "forbid"
++    # discard_row falls through to the default "forbid"
++    assert column_mode_to_extra("discard_row") == "forbid"
++
++
++def test_extra_to_column_mode() -> None:
++    """Reverse mapping from pydantic extra setting to TSchemaEvolutionMode."""
++    assert extra_to_column_mode("forbid") == "freeze"
++    assert extra_to_column_mode("allow") == "evolve"
++    assert extra_to_column_mode("ignore") == "discard_value"
++    # any other value also maps to discard_value
++    assert extra_to_column_mode("something_else") == "discard_value"
++
++
++def test_get_extra_from_model() -> None:
++    """get_extra_from_model returns the correct extra config for various models."""
++    # ModelWithConfig has explicit extra="allow"
++    assert get_extra_from_model(ModelWithConfig) == "allow"
++    # Model has no explicit extra — defaults to "ignore" in pydantic 2
++    assert get_extra_from_model(Model) == "ignore"
++
++    # model with extra="forbid"
++    class ForbidModel(BaseModel):
++        model_config = ConfigDict(extra="forbid")
++        x: int = 0
++
++    assert get_extra_from_model(ForbidModel) == "forbid"
++
++
++# --- Group 2: Synthesized model structure ---
++
++
++def test_synthesized_any_model_has_any_types() -> None:
++    """When data_mode='evolve', a lenient model is created with Any types."""
++
++    class StrictModel(BaseModel):
++        b: bool
++        n: int
++        s: str
++
++    result = apply_schema_contract_to_model(StrictModel, "freeze", "evolve")
++    # model name ends with "Any" (then "ExtraForbid" for the column mode)
++    assert "Any" in result.__name__
++    # all original field names are preserved
++    assert set(result.model_fields.keys()) == {"b", "n", "s"}
++    # model accepts wrong types because all fields are Any
++    instance = result.model_validate({"b": "not_bool", "n": "not_int", "s": 999})
++    assert instance.b == "not_bool"
++    assert instance.n == "not_int"
++    assert instance.s == 999
++
++
++def test_apply_schema_contract_early_return_identity() -> None:
++    """When the model already has the desired extra, it is returned as-is."""
++    # ModelWithConfig has extra="allow" which maps to column_mode="evolve"
++    result = apply_schema_contract_to_model(ModelWithConfig, "evolve")
++    assert result is ModelWithConfig
++
++    # Model has extra="ignore" which maps to column_mode="discard_value"
++    result2 = apply_schema_contract_to_model(Model, "discard_value")
++    assert result2 is Model
++
++
++def test_dlt_config_preserved_on_synthesized_model() -> None:
++    """dlt_config attribute is carried over to the synthesized model."""
++
++    class ConfiguredModel(BaseModel):
++        x: int = 0
++        dlt_config: ClassVar[DltConfig] = {
++            "skip_nested_types": True,
++            "return_validated_models": True,
++        }
++
++    # column mode change triggers model synthesis
++    result = apply_schema_contract_to_model(ConfiguredModel, "freeze")
++    assert hasattr(result, "dlt_config")
++    assert result.dlt_config["skip_nested_types"] is True
++    assert result.dlt_config["return_validated_models"] is True
++
++    # data_mode="evolve" creates an intermediate "Any" model, but dlt_config is
++    # preserved from the original model via original_dlt_config save/restore
++    result2 = apply_schema_contract_to_model(ConfiguredModel, "evolve", "evolve")
++    assert hasattr(result2, "dlt_config")
++    assert result2.dlt_config == ConfiguredModel.dlt_config
++
++    # evolve + discard_value triggers the early return path (the "Any" model's
++    # default extra="ignore" matches discard_value) — dlt_config must still survive
++    result3 = apply_schema_contract_to_model(ConfiguredModel, "discard_value", "evolve")
++    assert hasattr(result3, "dlt_config")
++    assert result3.dlt_config == ConfiguredModel.dlt_config
++
++
++def test_synthesized_model_is_subclass_of_original() -> None:
++    """Synthesized model inherits from the original via __base__, so isinstance works."""
++
++    class Original(BaseModel):
++        x: int = 0
++
++    synthesized = apply_schema_contract_to_model(Original, "evolve", "freeze")
++    assert synthesized is not Original
++    assert issubclass(synthesized, Original)
++
++    # instances of the synthesized model pass isinstance checks against the original
++    instance = synthesized.model_validate({"x": 1, "extra": "allowed"})
++    assert isinstance(instance, Original)
++    assert instance.x == 1
++
++    # the evolve path (data_mode="evolve") creates an "Any" model without __base__,
++    # then wraps it — so the final model is NOT a subclass of the original
++    any_model = apply_schema_contract_to_model(Original, "freeze", "evolve")
++    assert not issubclass(any_model, Original)
++
++
++# --- Group 3: Nested model transformation ---
++
++
++def test_nested_model_config_propagation_validates_data() -> None:
++    """Synthesized User model with evolve column mode actually validates data."""
++    model_evolve = apply_schema_contract_to_model(User, "evolve", "freeze")
++
++    # add extra fields at root and nested levels
++    data = copy(USER_INSTANCE_DATA)
++    data["extra_root"] = "extra_value"
++    data["address"] = copy(data["address"])
++    data["address"]["extra_nested"] = "nested_extra"  # type: ignore[index]
++
++    # should parse without errors because column_mode=evolve allows extra fields
++    instance = model_evolve.model_validate(data)
++    assert instance.user_id == 1
++    assert instance.extra_root == "extra_value"  # type: ignore[attr-defined]
++    # nested model also accepts extra fields
++    assert instance.address.extra_nested == "nested_extra"  # type: ignore[attr-defined]
++
++
++def test_nested_model_transformation_in_containers() -> None:
++    """Inner BaseModel types inside List, Dict, Union, Mapping etc. are replaced."""
++    model = apply_schema_contract_to_model(User, "evolve", "freeze")
++
++    # helper: extract the inner model name from a field annotation
++    def get_inner_model_names(annotation: Any) -> List[str]:
++        """Collect all BaseModel subclass names found in the annotation."""
++        names: List[str] = []
++        args = get_args(annotation)
++        for arg in args:
++            if isinstance(arg, type) and issubclass(arg, BaseModel):
++                names.append(arg.__name__)
++            else:
++                names.extend(get_inner_model_names(arg))
++        return names
++
++    # user_labels: List[UserLabel] — inner model should be transformed
++    user_labels_ann = model.model_fields["user_labels"].annotation
++    inner_names = get_inner_model_names(user_labels_ann)
++    assert any(
++        "ExtraAllow" in n for n in inner_names
++    ), f"UserLabel in List not transformed: {inner_names}"
++
++    # unity: Union[UserAddress, UserLabel, Dict[str, UserAddress]]
++    unity_ann = model.model_fields["unity"].annotation
++    inner_names = get_inner_model_names(unity_ann)
++    # should have transformed versions of UserAddress and UserLabel
++    assert any(
++        "UserAddress" in n and "ExtraAllow" in n for n in inner_names
++    ), f"UserAddress in Union not transformed: {inner_names}"
++    assert any(
++        "UserLabel" in n and "ExtraAllow" in n for n in inner_names
++    ), f"UserLabel in Union not transformed: {inner_names}"
++
++    # address field itself is Annotated[UserAddress, ...] — check the inner type
++    address_ann = model.model_fields["address"].annotation
++    assert "ExtraAllow" in address_ann.__name__
++
++    # inside transformed UserAddress, check ro_labels: Mapping[str, UserLabel]
++    addr_model = address_ann
++    ro_labels_ann = addr_model.model_fields["ro_labels"].annotation
++    inner_names = get_inner_model_names(ro_labels_ann)
++    assert any(
++        "ExtraAllow" in n for n in inner_names
++    ), f"UserLabel in Mapping not transformed: {inner_names}"
++
++
++def test_child_model_cache_shared_across_nesting_levels() -> None:
++    """_child_models cache is shared across the whole nested tree, so the same
++    original type always produces the same synthesized class regardless of
++    nesting depth.
++    """
++    model = apply_schema_contract_to_model(User, "evolve", "freeze")
++
++    # UserLabel at User level: user_label and user_labels use the same synthesized class
++    user_label_type = model.model_fields["user_label"].annotation
++    user_labels_inner = get_args(model.model_fields["user_labels"].annotation)[0]
++    assert user_label_type is user_labels_inner, "same-level references must be identical"
++
++    # UserLabel also appears in unity: Union[UserAddress, UserLabel, ...]
++    unity_args = get_args(model.model_fields["unity"].annotation)
++    unity_user_label = next(
++        a for a in unity_args if isinstance(a, type) and issubclass(a, UserLabel)
++    )
++    assert unity_user_label is user_label_type, "same-level Union member must be identical"
++
++    # UserAddress at User level: address and unity use the same synthesized class
++    address_type = model.model_fields["address"].annotation
++    unity_user_address = next(
++        a for a in unity_args if isinstance(a, type) and issubclass(a, UserAddress)
++    )
++    assert address_type is unity_user_address, "same-level references must be identical"
++
++    # UserLabel inside UserAddress (nested level) is the SAME class as at User level
++    addr_model = address_type
++    addr_label_type = addr_model.model_fields["label"].annotation
++    # Optional[UserLabel] → extract UserLabel from the union
++    addr_label_inner = next(
++        a for a in get_args(addr_label_type) if isinstance(a, type) and issubclass(a, UserLabel)
++    )
++    assert addr_label_inner is user_label_type, "cross-level references must be identical"
++    assert issubclass(user_label_type, UserLabel)
++
++
++def test_nested_model_discard_row_on_nested_violation() -> None:
++    """When a nested model field has invalid data, the whole item is discarded."""
++
++    class Inner(BaseModel):
++        value: int
++
++    class Outer(BaseModel):
++        name: str
++        inner: Inner
++
++    # discard_row for both columns and data
++    model = apply_schema_contract_to_model(Outer, "discard_row", "discard_row")
++
++    # valid item works
++    result = validate_and_filter_item(
++        "test", model, {"name": "ok", "inner": {"value": 1}}, "discard_row", "discard_row"
++    )
++    assert result is not None
++    assert result.name == "ok"
++
++    # invalid nested data — value should be int, not a string
++    result = validate_and_filter_item(
++        "test",
++        model,
++        {"name": "bad", "inner": {"value": "not_int"}},
++        "discard_row",
++        "discard_row",
++    )
++    # whole item discarded because nested model fails validation
++    assert result is None
++
++    # extra field in nested model
++    result = validate_and_filter_item(
++        "test",
++        model,
++        {"name": "extra", "inner": {"value": 1, "extra": "x"}},
++        "discard_row",
++        "discard_row",
++    )
++    assert result is None
++
++
++# --- Group 4: Validation happy paths and edge cases ---
++
++
++def test_validate_item_happy_path() -> None:
++    """Valid single item returns a proper model instance."""
++
++    class ItemModel(BaseModel):
++        a: int
++        b: str
++
++    model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++    result = validate_and_filter_item(
++        "test_table", model, {"a": 42, "b": "hello"}, "freeze", "freeze"
++    )
++    assert result is not None
++    assert isinstance(result, BaseModel)
++    assert result.a == 42
++    assert result.b == "hello"
++
++
++def test_validate_items_happy_path() -> None:
++    """All-valid list returns all items as model instances."""
++
++    class ItemModel(BaseModel):
++        x: int
++
++    model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++    list_model = create_list_model(model)
++    items = [{"x": 1}, {"x": 2}, {"x": 3}]
++    result = validate_and_filter_items("test_table", list_model, items, "freeze", "freeze")
++    assert len(result) == 3
++    assert all(isinstance(r, BaseModel) for r in result)
++    assert [r.x for r in result] == [1, 2, 3]
++
++
++def test_validate_items_empty_list() -> None:
++    """Empty input list returns empty output."""
++
++    class ItemModel(BaseModel):
++        x: int
++
++    model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++    list_model = create_list_model(model)
++    result = validate_and_filter_items("test_table", list_model, [], "freeze", "freeze")
++    assert result == []
++
++
++def test_validate_item_unsupported_modes() -> None:
++    """NotImplementedError for unsupported mode combinations in single-item validation."""
++
++    class ItemModel(BaseModel):
++        b: bool
++
++    # model with forbid extra — will raise extra_forbidden on extra fields
++    freeze_model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++
++    # extra_forbidden error with unsupported column_mode="evolve" passed to validate
++    # (the model itself forbids extra, but we tell validate to treat it as "evolve")
++    with pytest.raises(NotImplementedError, match="column_mode"):
++        validate_and_filter_item("test", freeze_model, {"b": True, "extra": 1}, "evolve", "freeze")
++
++    # data type error with unsupported data_mode="evolve" passed to validate
++    # (the model is strict but we tell validate to treat it as "evolve")
++    with pytest.raises(NotImplementedError, match="data_mode"):
++        validate_and_filter_item("test", freeze_model, {"b": 2}, "freeze", "evolve")
++
++
++def test_validate_items_unsupported_modes() -> None:
++    """NotImplementedError for unsupported mode combinations in list validation."""
++
++    class ItemModel(BaseModel):
++        b: bool
++
++    freeze_model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++    list_model = create_list_model(freeze_model)
++
++    # extra_forbidden error with unsupported column_mode
++    with pytest.raises(NotImplementedError, match="column_mode"):
++        validate_and_filter_items(
++            "test",
++            list_model,
++            [{"b": True}, {"b": False, "extra": 1}],
++            "evolve",
++            "freeze",
++        )
++
++    # data type error with unsupported data_mode
++    with pytest.raises(NotImplementedError, match="data_mode"):
++        validate_and_filter_items(
++            "test",
++            list_model,
++            [{"b": True}, {"b": 2}],
++            "freeze",
++            "evolve",
++        )
++
++
++# --- Group 5: Schema generation edge cases ---
++
++
++def test_model_with_field_aliases() -> None:
++    """Field aliases are used as column names in schema generation."""
++
++    class AliasModel(BaseModel):
++        model_config = ConfigDict(populate_by_name=True)
++        full_name: str = Field(alias="fullName")
++        age: int
++
++    result = pydantic_to_table_schema_columns(AliasModel)
++    # alias "fullName" should be used as the column name
++    assert "fullName" in result
++    assert result["fullName"]["data_type"] == "text"
++    assert result["fullName"]["name"] == "fullName"
++    # non-aliased field uses its own name
++    assert "age" in result
++
++
++def test_unknown_type_fallback_to_text() -> None:
++    """Custom class that is not a BaseModel falls back to data_type='text'."""
++
++    class CustomType:
++        pass
++
++    class ModelWithCustomType(BaseModel):
++        model_config = ConfigDict(arbitrary_types_allowed=True)
++        custom: CustomType
++        normal: int
++
++    result = pydantic_to_table_schema_columns(ModelWithCustomType)
++    # unknown type falls back to text
++    assert result["custom"]["data_type"] == "text"
++    assert result["normal"]["data_type"] == "bigint"
++
++
++def test_deeply_nested_model_flattening_respects_per_model_config() -> None:
++    """skip_nested_types is per-model — it is NOT propagated to nested models.
++
++    Parent(skip_nested_types=True) flattens its own Child field into separate
++    columns. But Child has no dlt_config, so when recursing into Child,
++    GrandChild is treated as json (the default, no flattening).
++    """
++
++    class GrandChild(BaseModel):
++        gc_field: str
++
++    class ChildDeep(BaseModel):
++        gc: GrandChild
++        c_field: int
++
++    class ParentDeep(BaseModel):
++        child: ChildDeep
++        p_field: float
++        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
++
++    result = pydantic_to_table_schema_columns(ParentDeep)
++    # top-level scalar
++    assert "p_field" in result
++    assert result["p_field"]["data_type"] == "double"
++    # child scalar is flattened one level (Parent's skip_nested_types applies)
++    assert "child__c_field" in result
++    assert result["child__c_field"]["data_type"] == "bigint"
++    # grandchild is NOT flattened further — Child has no dlt_config so
++    # GrandChild appears as json in the recursive call
++    assert "child__gc" in result
++    assert result["child__gc"]["data_type"] == "json"
++
++
++def test_deeply_nested_model_flattening_with_explicit_child_config() -> None:
++    """When the nested model ALSO has skip_nested_types=True, it flattens its own children."""
++
++    class GrandChild(BaseModel):
++        gc_field: str
++
++    class ChildDeep(BaseModel):
++        gc: GrandChild
++        c_field: int
++        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
++
++    class ParentDeep(BaseModel):
++        child: ChildDeep
++        p_field: float
++        dlt_config: ClassVar[DltConfig] = {"skip_nested_types": True}
++
++    result = pydantic_to_table_schema_columns(ParentDeep)
++    assert result["p_field"]["data_type"] == "double"
++    assert result["child__c_field"]["data_type"] == "bigint"
++    # both Parent and Child have skip_nested_types=True, so full flattening
++    assert "child__gc__gc_field" in result
++    assert result["child__gc__gc_field"]["data_type"] == "text"
++
++
++def test_skip_complex_types_emits_deprecation_warning() -> None:
++    """Using skip_complex_types triggers Dlt100DeprecationWarning."""
++
++    class DepModel(BaseModel):
++        x: int = 0
++        nested: Dict[str, Any] = {}
++        dlt_config: ClassVar[DltConfig] = {"skip_complex_types": True}
++
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        pydantic_to_table_schema_columns(DepModel)
++
++    dep_warnings = [w for w in caught if issubclass(w.category, Dlt100DeprecationWarning)]
++    assert len(dep_warnings) >= 1
++    assert "skip_complex_types" in str(dep_warnings[0].message)
++
++
++# --- Group 6: create_list_model gaps ---
++
++
++def test_create_list_model_naming() -> None:
++    """create_list_model produces a model name derived from the module __name__.
++
++    NOTE: the current implementation uses 'List' + __name__ of the pydantic module,
++    which produces 'Listdlt.common.libs.pydantic'. This test documents the current
++    behavior which is likely a bug — it should probably use the model class name.
++    """
++
++    class MyItem(BaseModel):
++        x: int
++
++    list_model = create_list_model(MyItem)
++    # current (buggy) behavior: name is module-based, not model-based
++    assert list_model.__name__ == "Listdlt.common.libs.pydantic"
++
++
++# --- Group 7: DataValidationError schema_contract field ---
++
++
++def test_validation_error_schema_contract_field() -> None:
++    """DataValidationError.schema_contract contains a partial dict per entity.
++
++    NOTE: the docs claim schema_contract is 'the full, expanded schema contract'
++    but the implementation passes only the violated entity. This test documents
++    the current behavior.
++    """
++
++    class ItemModel(BaseModel):
++        b: bool
++
++    freeze_model = apply_schema_contract_to_model(ItemModel, "freeze", "freeze")
++
++    # data_type violation — schema_contract should reference data_type
++    with pytest.raises(DataValidationError) as exc_info:
++        validate_and_filter_item("test", freeze_model, {"b": 2}, "freeze", "freeze")
++    assert exc_info.value.schema_contract == {"data_type": "freeze"}
++    assert exc_info.value.schema_entity == "data_type"
++
++    # columns violation (extra field) — schema_contract should reference columns
++    with pytest.raises(DataValidationError) as exc_info:
++        validate_and_filter_item("test", freeze_model, {"b": True, "extra": 1}, "freeze", "freeze")
++    assert exc_info.value.schema_contract == {"columns": "freeze"}
++    assert exc_info.value.schema_entity == "columns"
++
++    # same for list validation
++    list_model = create_list_model(freeze_model)
++    with pytest.raises(DataValidationError) as exc_info:
++        validate_and_filter_items("test", list_model, [{"b": 2}], "freeze", "freeze")
++    assert exc_info.value.schema_contract == {"data_type": "freeze"}
++
++    with pytest.raises(DataValidationError) as exc_info:
++        validate_and_filter_items("test", list_model, [{"b": True, "extra": 1}], "freeze", "freeze")
++    assert exc_info.value.schema_contract == {"columns": "freeze"}
++
++
++# --- Group 8: Bidirectional mapping ---
++
++
++def test_default_contract_from_model_extra_setting() -> None:
++    """Unit test for the bidirectional column mode ↔ model extra mapping.
++
++    This is used in validation.py to derive the default schema contract from a
++    model's existing extra setting.
++    """
++    # default model (no explicit extra) → "ignore" → "discard_value"
++    assert extra_to_column_mode(get_extra_from_model(Model)) == "discard_value"
++    # model with extra="allow" → "evolve"
++    assert extra_to_column_mode(get_extra_from_model(ModelWithConfig)) == "evolve"
++
++    # model with extra="forbid" → "freeze"
++    class ForbidModel(BaseModel):
++        model_config = ConfigDict(extra="forbid")
++        x: int = 0
++
++    assert extra_to_column_mode(get_extra_from_model(ForbidModel)) == "freeze"
++
++
++# --- Group 9: _process_annotation edge cases ---
++
++
++def test_set_inner_model_transformed() -> None:
++    """_process_annotation recurses into Set[BaseModel] and transforms the inner model."""
++
++    class Inner(BaseModel):
++        model_config = ConfigDict(frozen=True)
++        x: int
++
++    class WithSet(BaseModel):
++        items: Set[Inner]
++
++    evolved = apply_schema_contract_to_model(WithSet, "evolve", "freeze")
++    # the inner model should have been transformed to accept extra fields
++    ann = evolved.model_fields["items"].annotation
++    inner_args = get_args(ann)
++    assert len(inner_args) == 1
++    # inner model should have "ExtraAllow" in name if transformed
++    inner_name = getattr(inner_args[0], "__name__", "")
++    assert "ExtraAllow" in inner_name, f"Inner model in Set not transformed: {inner_name}"
++
++
++def test_frozenset_inner_model_transformed() -> None:
++    """_process_annotation recurses into FrozenSet[BaseModel] and transforms the inner model."""
++
++    class Inner(BaseModel):
++        model_config = ConfigDict(frozen=True)
++        x: int
++
++    class WithFrozenSet(BaseModel):
++        items: FrozenSet[Inner]
++
++    evolved = apply_schema_contract_to_model(WithFrozenSet, "evolve", "freeze")
++    ann = evolved.model_fields["items"].annotation
++    inner_args = get_args(ann)
++    assert len(inner_args) == 1
++    inner_name = getattr(inner_args[0], "__name__", "")
++    assert "ExtraAllow" in inner_name, f"Inner model in FrozenSet not transformed: {inner_name}"
++
++
++def test_variable_length_tuple_preserved() -> None:
++    """_process_annotation preserves Tuple[Model, ...] variable-length semantics."""
++
++    class Inner(BaseModel):
++        x: int
++
++    class WithVarTuple(BaseModel):
++        items: Tuple[Inner, ...]
++
++    evolved = apply_schema_contract_to_model(WithVarTuple, "evolve", "freeze")
++    # should still accept variable-length tuples after transformation
++    inst = evolved.model_validate({"items": [{"x": 1}, {"x": 2}, {"x": 3}]})
++    assert len(inst.items) == 3
++
++
++def test_heterogeneous_tuple_preserved() -> None:
++    """_process_annotation processes all elements of Tuple[T1, T2, T3]."""
++
++    class Inner(BaseModel):
++        x: int
++
++    class WithHetTuple(BaseModel):
++        items: Tuple[Inner, int, Inner]
++
++    evolved = apply_schema_contract_to_model(WithHetTuple, "evolve", "freeze")
++    # should accept a 3-element heterogeneous tuple
++    inst = evolved.model_validate({"items": [{"x": 1}, 42, {"x": 2}]})
++    assert len(inst.items) == 3
++    assert inst.items[1] == 42
++
++
++def test_field_validator_preserved_on_synthesis() -> None:
++    """@field_validator decorators are preserved when synthesizing models.
++
++    create_model uses __base__=model to inherit validators from the original.
++    """
++
++    class WithFieldValidator(BaseModel):
++        value: int
++
++        @field_validator("value")
++        @classmethod
++        def check_positive(cls, v: int) -> int:
++            if v < 0:
++                raise ValueError("must be positive")
++            return v
++
++    # original model rejects negative values
++    with pytest.raises(ValidationError):
++        WithFieldValidator(value=-1)
++
++    # synthesized model should also reject negative values
++    evolved = apply_schema_contract_to_model(WithFieldValidator, "evolve", "freeze")
++    with pytest.raises(ValidationError):
++        evolved.model_validate({"value": -1})
++
++
++def test_model_validator_preserved_on_synthesis() -> None:
++    """@model_validator decorators are preserved when synthesizing models.
++
++    create_model uses __base__=model to inherit validators from the original.
++    """
++
++    class WithModelValidator(BaseModel):
++        a: int
++        b: int
++
++        @model_validator(mode="after")
++        def check_sum(self) -> "WithModelValidator":
++            if self.a + self.b > 10:
++                raise ValueError("sum too large")
++            return self
++
++    # original model rejects sum > 10
++    with pytest.raises(ValidationError):
++        WithModelValidator(a=6, b=6)
++
++    # synthesized model should also reject
++    evolved = apply_schema_contract_to_model(WithModelValidator, "evolve", "freeze")
++    with pytest.raises(ValidationError):
++        evolved.model_validate({"a": 6, "b": 6})
+
+
+===== COMMIT dff5f03c =====
+
+
+commit dff5f03c4
+Author: rudolfix
+Date: 2026-02-03
+
+    implements managed engine for proper ref counting (#3601)
+
+diff --git a/dlt/destinations/impl/duckdb/configuration.py b/dlt/destinations/impl/duckdb/configuration.py
+index 178dad85f..80ffac3c9 100644
+--- a/dlt/destinations/impl/duckdb/configuration.py
++++ b/dlt/destinations/impl/duckdb/configuration.py
+@@ -36,6 +36,18 @@ class DuckDbBaseCredentials(CredentialsConfiguration):
+     """Local config applied to each borrowed connection"""
+     conn_pool: Annotated[Optional["DuckDbConnectionPool"], NotResolved()] = None
+ 
++    def copy(self: "DuckDbBaseCredentials") -> "DuckDbBaseCredentials":
++        new_obj = super().copy()
++        # conn_pool holds threading state that must not be shared across copies
++        if self.conn_pool is not None and not self.conn_pool._conn_owner:
++            # external connection: set _external_conn so pool constructor picks it up
++            new_obj._external_conn = self.conn_pool._conn
++            new_obj.conn_pool = DuckDbConnectionPool(new_obj)
++        else:
++            # owned connection: let on_resolved() create a fresh pool
++            new_obj.conn_pool = None
++        return new_obj
++
+     def parse_native_representation(self, native_value: Any) -> None:
+         try:
+             # check if database was passed as explicit connection
+diff --git a/dlt/destinations/impl/sqlalchemy/configuration.py b/dlt/destinations/impl/sqlalchemy/configuration.py
+index bddc10b5e..814a65136 100644
+--- a/dlt/destinations/impl/sqlalchemy/configuration.py
++++ b/dlt/destinations/impl/sqlalchemy/configuration.py
+@@ -7,30 +7,113 @@ import dataclasses
+ from dlt.common import logger
+ from dlt.common.configuration import configspec
+ from dlt.common.configuration.specs import ConnectionStringCredentials
++from dlt.common.configuration.specs.base_configuration import NotResolved
+ from dlt.common.destination.client import DestinationClientDwhConfiguration
+ from dlt.common.storages.configuration import WithLocalFiles
++from dlt.common.typing import Annotated
+ from dlt.common.warnings import DltDeprecationWarning
+ 
+ if TYPE_CHECKING:
+     from sqlalchemy.engine import Engine, Dialect, Connection
+ 
+ 
++class ManagedEngine:
++    """Thread-safe engine lifecycle with ref-counted connection borrowing.
++
++    Owned engines (created from URL) are disposed when the last borrowed
++    connection is returned. External engines are never disposed.
++    """
++
++    def __init__(
++        self,
++        credentials: "SqlalchemyCredentials",
++        engine: Optional["Engine"] = None,
++    ) -> None:
++        self._credentials = credentials
++        self._conn_lock = threading.RLock()
++        self._conn_borrows: int = 0
++        if engine is not None:
++            # external engine — not owned, not disposed by us
++            self._engine: Optional["Engine"] = engine
++            self._conn_owner: bool = False
++        else:
++            # owned engine — lazily created, disposed when refcount hits 0
++            self._engine = None
++            self._conn_owner = True
++
++    @property
++    def engine(self) -> "Engine":
++        """Lazily creates the engine for owned instances, returns external engine otherwise."""
++        import sqlalchemy as sa
++
++        if self._engine is None:
++            engine_kwargs = self._credentials._resolve_engine_kwargs()
++            self._engine = sa.create_engine(
++                self._credentials.to_url().render_as_string(hide_password=False),
++                **engine_kwargs,
++            )
++        return self._engine
++
++    def borrow_conn(self) -> "Connection":
++        """Borrow a connection from the engine. Must be returned via return_conn."""
++        with self._conn_lock:
++            engine_ = self.engine
++            self._conn_borrows += 1
++        try:
++            return engine_.connect()
++        except Exception:
++            with self._conn_lock:
++                self._conn_borrows -= 1
++                if self._conn_borrows == 0 and self._conn_owner:
++                    self._dispose_engine()
++            raise
++
++    def return_conn(self, borrowed_conn: "Connection") -> None:
++        """Return a borrowed connection. Disposes owned engine when refcount hits 0."""
++        with self._conn_lock:
++            borrowed_conn.close()
++            assert self._conn_borrows > 0, "Returning connection when borrows is 0"
++            self._conn_borrows -= 1
++            if self._conn_borrows == 0 and self._conn_owner:
++                self._dispose_engine()
++
++    def _dispose_engine(self) -> None:
++        if self._conn_borrows > 0:
++            warnings.warn(
++                f"Disposing engine {self._engine.url} with {self._conn_borrows} open conns."
++            )
++        if self._engine:
++            self._engine.dispose()
++            self._engine = None
++
++    def __del__(self) -> None:
++        if getattr(self, "_engine", None) and getattr(self, "_conn_owner", False):
++            self._dispose_engine()
++
++
+ @configspec(init=False)
+ class SqlalchemyCredentials(ConnectionStringCredentials):
+-    if TYPE_CHECKING:
+-        _engine: Optional["Engine"] = None
+-
+     engine_kwargs: Optional[Dict[str, Any]] = None
+     """Additional keyword arguments passed to `sqlalchemy.create_engine`"""
+ 
+     engine_args: Optional[Dict[str, Any]] = None
+     """DEPRECATED: use engine_kwargs instead"""
+ 
++    managed_engine: Annotated[Optional[ManagedEngine], NotResolved()] = None
++
+     def __init__(
+         self, connection_string: Optional[Union[str, Dict[str, Any], "Engine"]] = None
+     ) -> None:
+         super().__init__(connection_string)  # type: ignore[arg-type]
+-        self._conn_lock = threading.RLock()
++
++    def copy(self: "SqlalchemyCredentials") -> "SqlalchemyCredentials":
++        new_obj = super().copy()
++        # copy always holds the engine as unmanaged (never disposes)
++        if self.managed_engine is not None and self.managed_engine._engine is not None:
++            new_obj.managed_engine = ManagedEngine(new_obj, engine=self.managed_engine._engine)
++        else:
++            new_obj.managed_engine = None
++        return new_obj
+ 
+     def _resolve_engine_kwargs(self) -> Dict[str, Any]:
+         if self.engine_kwargs and self.engine_args:
+@@ -54,6 +137,7 @@ class SqlalchemyCredentials(ConnectionStringCredentials):
+         from sqlalchemy.engine import Engine
+ 
+         if isinstance(native_value, Engine):
++            # triggers setter which creates ManagedEngine wrapping external engine
+             self.engine = native_value
+             super().parse_native_representation(
+                 native_value.url.render_as_string(hide_password=False)
+@@ -61,69 +145,22 @@ class SqlalchemyCredentials(ConnectionStringCredentials):
+         else:
+             super().parse_native_representation(native_value)
+ 
+-    def borrow_conn(self) -> "Connection":
+-        # obtain a lock because we have refcount concurrency
+-        with self._conn_lock:
+-            engine_ = self.engine
+-            # track open connections to properly close it
+-            self._conn_borrows += 1
+-
+-        try:
+-            return engine_.connect()
+-        except Exception:
+-            with self._conn_lock:
+-                self._conn_borrows -= 1
+-                if self._conn_borrows == 0 and self._conn_owner:
+-                    self._delete_conn()
+-            raise
+-
+-    def return_conn(self, borrowed_conn: "Connection") -> None:
+-        # close the borrowed conn
+-        with self._conn_lock:
+-            borrowed_conn.close()
+-            # close the main conn if the last borrowed conn was closed
+-            assert self._conn_borrows > 0, "Returning connection when borrows is 0"
+-            self._conn_borrows -= 1
+-            if self._conn_borrows == 0 and self._conn_owner:
+-                self._delete_conn()
+-
+-    def _delete_conn(self) -> None:
+-        if self._conn_borrows > 0:
+-            warnings.warn(
+-                f"Disposing engine {self._engine.url} with {self._conn_borrows} open conns."
+-            )
+-        self._engine.dispose()
+-        delattr(self, "_engine")
+-
+-    def __del__(self) -> None:
+-        if hasattr(self, "_engine") and self._conn_owner:
+-            self._delete_conn()
++    def _ensure_managed_engine(self) -> ManagedEngine:
++        """Lazily create ManagedEngine on first access."""
++        if self.managed_engine is None:
++            external = getattr(self, "_external_engine", None)
++            self.managed_engine = ManagedEngine(self, engine=external)
++        return self.managed_engine
+ 
+     @property
+     def engine(self) -> Optional["Engine"]:
+-        import sqlalchemy as sa
+-
+-        # get existing or open and set new engine
+-        self._engine = getattr(
+-            self,
+-            "_engine",
+-            None,
+-        )
+-        if self._engine is None:
+-            engine_kwargs = self._resolve_engine_kwargs()
+-            self._engine = sa.create_engine(
+-                self.to_url().render_as_string(hide_password=False), **engine_kwargs
+-            )
+-        # set as owner if not yet set
+-        self._conn_owner = getattr(self, "_conn_owner", True)
+-        self._conn_borrows = getattr(self, "_conn_borrows", 0)
+-        return self._engine
++        return self._ensure_managed_engine().engine
+ 
+     @engine.setter
+     def engine(self, value: "Engine") -> None:
+-        self._engine = value
+-        self._conn_owner = False
+-        self._conn_borrows = 0
++        # backward compat: create ManagedEngine wrapping external engine
++        self._external_engine = value
++        self.managed_engine = ManagedEngine(self, engine=value)
+ 
+     def get_dialect(self) -> Optional[Type["Dialect"]]:
+         if not self.drivername:
+diff --git a/dlt/destinations/impl/sqlalchemy/db_api_client.py b/dlt/destinations/impl/sqlalchemy/db_api_client.py
+index 409c00c9a..981d3a8bd 100644
+--- a/dlt/destinations/impl/sqlalchemy/db_api_client.py
++++ b/dlt/destinations/impl/sqlalchemy/db_api_client.py
+@@ -101,7 +101,7 @@ class SqlalchemyClient(SqlClientBase[Connection]):
+ 
+     def open_connection(self) -> Connection:
+         if self._current_connection is None:
+-            self._current_connection = self.credentials.borrow_conn()
++            self._current_connection = self.credentials.managed_engine.borrow_conn()
+             if self.dialect_name == "sqlite":
+                 self._sqlite_reattach_dataset_if_exists(self.dataset_name)
+         return self._current_connection
+@@ -126,7 +126,7 @@ class SqlalchemyClient(SqlClientBase[Connection]):
+ 
+         try:
+             if self._current_connection is not None:
+-                self.credentials.return_conn(self._current_connection)
++                self.credentials.managed_engine.return_conn(self._current_connection)
+         finally:
+             self._current_connection = None
+ 
+diff --git a/tests/load/sqlalchemy/test_sqlalchemy_configuration.py b/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
+index 4da2a3587..f4e64f5d3 100644
+--- a/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
++++ b/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
+@@ -220,17 +220,18 @@ def test_owned_engine_ref_counting_disposes_on_last_return(mocker) -> None:
+     )
+ 
+     engine = c.credentials.engine
++    managed = c.credentials.managed_engine
+     dispose_spy = mocker.spy(engine, "dispose")
+ 
+-    assert c.credentials._conn_borrows == 0
+-    assert c.credentials._conn_owner is True
++    assert managed._conn_borrows == 0
++    assert managed._conn_owner is True
+ 
+-    conn = c.credentials.borrow_conn()
+-    assert c.credentials._conn_borrows == 1
++    conn = managed.borrow_conn()
++    assert managed._conn_borrows == 1
+ 
+-    c.credentials.return_conn(conn)
++    managed.return_conn(conn)
+ 
+-    assert c.credentials._conn_borrows == 0
++    assert managed._conn_borrows == 0
+     dispose_spy.assert_called_once()
+ 
+ 
+@@ -243,20 +244,21 @@ def test_owned_engine_multiple_borrows(mocker) -> None:
+     )
+ 
+     engine = c.credentials.engine
++    managed = c.credentials.managed_engine
+     dispose_spy = mocker.spy(engine, "dispose")
+ 
+-    conn1 = c.credentials.borrow_conn()
+-    assert c.credentials._conn_borrows == 1
++    conn1 = managed.borrow_conn()
++    assert managed._conn_borrows == 1
+ 
+-    conn2 = c.credentials.borrow_conn()
+-    assert c.credentials._conn_borrows == 2
++    conn2 = managed.borrow_conn()
++    assert managed._conn_borrows == 2
+ 
+-    c.credentials.return_conn(conn1)
+-    assert c.credentials._conn_borrows == 1
++    managed.return_conn(conn1)
++    assert managed._conn_borrows == 1
+     dispose_spy.assert_not_called()
+ 
+-    c.credentials.return_conn(conn2)
+-    assert c.credentials._conn_borrows == 0
++    managed.return_conn(conn2)
++    assert managed._conn_borrows == 0
+     dispose_spy.assert_called_once()
+ 
+ 
+@@ -268,18 +270,19 @@ def test_owned_engine_connect_failure_does_not_leak_refcount(mocker) -> None:
+         )._bind_dataset_name(dataset_name="test_dataset")
+     )
+ 
+-    # Force engine creation so we can spy on it
++    # force engine creation so we can spy on it
+     engine = c.credentials.engine
+-    assert c.credentials._conn_borrows == 0
++    managed = c.credentials.managed_engine
++    assert managed._conn_borrows == 0
+ 
+-    # Make connect() raise
++    # make connect() raise
+     mocker.patch.object(engine, "connect", side_effect=sa.exc.OperationalError("fail", {}, None))
+ 
+     with pytest.raises(sa.exc.OperationalError):
+-        c.credentials.borrow_conn()
++        managed.borrow_conn()
+ 
+-    # Refcount must be back to 0, not stuck at 1
+-    assert c.credentials._conn_borrows == 0
++    # refcount must be back to 0, not stuck at 1
++    assert managed._conn_borrows == 0
+ 
+ 
+ def test_external_engine_ref_counting_does_not_dispose(mocker) -> None:
+@@ -301,16 +304,17 @@ def test_external_engine_ref_counting_does_not_dispose(mocker) -> None:
+             )._bind_dataset_name(dataset_name="test_dataset")
+         )
+ 
++        managed = c.credentials.managed_engine
+         dispose_spy = mocker.spy(engine, "dispose")
+ 
+-        assert c.credentials._conn_owner is False
+-        assert c.credentials._conn_borrows == 0
++        assert managed._conn_owner is False
++        assert managed._conn_borrows == 0
+ 
+-        conn = c.credentials.borrow_conn()
+-        assert c.credentials._conn_borrows == 1
++        conn = managed.borrow_conn()
++        assert managed._conn_borrows == 1
+ 
+-        c.credentials.return_conn(conn)
+-        assert c.credentials._conn_borrows == 0
++        managed.return_conn(conn)
++        assert managed._conn_borrows == 0
+ 
+         dispose_spy.assert_not_called()
+ 
+@@ -320,3 +324,64 @@ def test_external_engine_ref_counting_does_not_dispose(mocker) -> None:
+             assert rows == [(1,)]
+     finally:
+         engine.dispose()
++
++
++def test_copy_external_engine_gets_unmanaged_engine() -> None:
++    """Copy of credentials with external engine gets a new ManagedEngine holding the same engine."""
++    engine = sa.create_engine("sqlite:///:memory:", poolclass=sa.pool.StaticPool)
++    try:
++        creds = SqlalchemyCredentials(engine)
++        copied = creds.copy()
++
++        # copy has its own ManagedEngine instance
++        assert copied.managed_engine is not creds.managed_engine
++        # but holds the same external engine reference (unmanaged)
++        assert copied.engine is engine
++        assert copied.managed_engine._conn_owner is False
++
++        # borrow/return must work on the copy
++        conn = copied.managed_engine.borrow_conn()
++        copied.managed_engine.return_conn(conn)
++    finally:
++        engine.dispose()
++
++
++def test_copy_owned_engine_gets_unmanaged_engine() -> None:
++    """Copy of credentials with owned engine gets an unmanaged reference to the same engine."""
++    creds = SqlalchemyCredentials("sqlite:///:memory:")
++    # force engine creation
++    original_engine = creds.engine
++    assert creds.managed_engine._conn_owner is True
++
++    copied = creds.copy()
++
++    # copy has its own ManagedEngine wrapping the original engine as unmanaged
++    assert copied.managed_engine is not creds.managed_engine
++    assert copied.engine is original_engine
++    assert copied.managed_engine._conn_owner is False
++
++    # borrow/return works on the copy without affecting original's refcount
++    conn = copied.managed_engine.borrow_conn()
++    assert copied.managed_engine._conn_borrows == 1
++    assert creds.managed_engine._conn_borrows == 0
++    copied.managed_engine.return_conn(conn)
++
++    # cleanup — only the original owner disposes
++    original_engine.dispose()
++
++
++def test_copy_before_engine_access_gets_lazy_managed_engine() -> None:
++    """Copy before engine is accessed gets managed_engine=None (lazy creation)."""
++    creds = SqlalchemyCredentials("sqlite:///:memory:")
++    # do NOT access creds.engine — managed_engine should be None
++    assert creds.managed_engine is None
++
++    copied = creds.copy()
++    assert copied.managed_engine is None
++
++    # accessing engine on the copy creates its own owned ManagedEngine
++    engine = copied.engine
++    assert copied.managed_engine is not None
++    assert copied.managed_engine._conn_owner is True
++
++    engine.dispose()
+
+
+===== COMMIT 25b1269d =====
+
+
+commit 25b1269df
+Author: rudolfix
+Date: 2026-02-03
+
+    (fix) 3299 implements consistend handling of UUID as strings (#3599)
+
+diff --git a/dlt/sources/sql_database/schema_types.py b/dlt/sources/sql_database/schema_types.py
+index ed287e460..3964d3844 100644
+--- a/dlt/sources/sql_database/schema_types.py
++++ b/dlt/sources/sql_database/schema_types.py
+@@ -37,6 +37,25 @@ else:
+ TTypeAdapter = Callable[[TypeEngineAny], Optional[Union[TypeEngineAny, Type[TypeEngineAny]]]]
+ 
+ 
++def _is_uuid_type(sql_t: TypeEngineAny) -> bool:
++    """Detect UUID-like types across SQLAlchemy 1.4 and 2.0.
++
++    SA 2.0 has a common sqltypes.Uuid base for PG UUID, MSSQL UNIQUEIDENTIFIER, etc.
++    SA 1.4 has none of that: PG UUID exposes `as_uuid` but MSSQL UNIQUEIDENTIFIER
++    has neither `as_uuid` nor a Uuid base class — only its __visit_name__ identifies it.
++    """
++    # SA 2.0: common Uuid base type
++    if hasattr(sqltypes, "Uuid") and isinstance(sql_t, sqltypes.Uuid):
++        return True
++    # SA 1.4: PG UUID has as_uuid but no Uuid base
++    if hasattr(sql_t, "as_uuid"):
++        return True
++    # SA 1.4: MSSQL UNIQUEIDENTIFIER has neither as_uuid nor Uuid base
++    if getattr(sql_t, "__visit_name__", None) == "UNIQUEIDENTIFIER":
++        return True
++    return False
++
++
+ class TReflectedHints(TypedDict, total=False):
+     columns: TTableSchemaColumns
+     references: Optional[List[TTableReference]]
+@@ -62,8 +81,9 @@ def default_table_adapter(
+ 
+     for col in table._columns:  # type: ignore[attr-defined]
+         sql_t = col.type
+-        if hasattr(sqltypes, "Uuid") and isinstance(sql_t, sqltypes.Uuid):
+-            # emit uuids as string by default
++        if _is_uuid_type(sql_t) and hasattr(sql_t, "as_uuid"):
++            # emit uuids as string by default (PG UUID and SA 2.0 Uuid have as_uuid,
++            # MSSQL UNIQUEIDENTIFIER on SA 1.4 does not — pyodbc already returns strings)
+             sql_t.as_uuid = False
+ 
+ 
+@@ -108,7 +128,7 @@ def sqla_col_to_column_schema(
+ 
+     add_precision = reflection_level == "full_with_precision"
+ 
+-    if hasattr(sqltypes, "Uuid") and isinstance(sql_t, sqltypes.Uuid):
++    if _is_uuid_type(sql_t):
+         # we represent UUID as text by default, see default_table_adapter
+         col["data_type"] = "text"
+     elif isinstance(sql_t, sqltypes.Numeric):
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md
+index e099d49e7..fb53f4510 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md
+@@ -119,8 +119,14 @@ No issues were found for these databases. Postgres is the only backend where we
+ 
+ In the `SQLAlchemy` backend, the JSON data type is represented as a Python object, and in the `PyArrow` backend, it is represented as a JSON string. At present, it does not work correctly with `pandas` and `ConnectorX`, which cast Python objects to `str`, generating invalid JSON strings that cannot be loaded into the destination.
+ 
+-#### UUID  
+-UUIDs are represented as strings by default. You can switch this behavior by using `table_adapter_callback` to modify properties of the UUID type for a particular column. (See the code example [here](./configuration#pyarrow) for how to modify the data type properties of a particular column.)
++#### UUID
++UUID columns (PostgreSQL `UUID`, MSSQL `UNIQUEIDENTIFIER`, and SQLAlchemy 2.0 generic `Uuid`) are
++mapped to `dlt` data type `text` and always yielded as strings. This ensures consistent
++casing across initial and incremental loads regardless of the backend used.
++
++You can switch this behavior by using `table_adapter_callback` to modify properties of the UUID type
++for a particular column. (See the code example [here](./configuration#pyarrow) for how to modify the
++data type properties of a particular column.)
+ 
+ ### Notes on data loading
+ 
+diff --git a/tests/load/sources/sql_database/test_mssql_database_source.py b/tests/load/sources/sql_database/test_mssql_database_source.py
+index 50eade906..f5df03ce8 100644
+--- a/tests/load/sources/sql_database/test_mssql_database_source.py
++++ b/tests/load/sources/sql_database/test_mssql_database_source.py
+@@ -1,3 +1,5 @@
++from typing import List
++
+ import pytest
+ 
+ import dlt
+@@ -10,7 +12,10 @@ from dlt.common.utils import uniq_id
+ from dlt.pipeline.exceptions import PipelineStepFailed
+ from dlt.sources import DltResource
+ 
+-from tests.load.sources.sql_database.utils import assert_incremental_chunks
++from tests.load.sources.sql_database.utils import (
++    assert_extracted_uuids_are_strings,
++    assert_incremental_chunks,
++)
+ from tests.pipeline.utils import (
+     assert_load_info,
+     assert_schema_on_data,
+@@ -191,3 +196,92 @@ def test_sql_table_high_datetime(
+             load_tables_to_dicts(pipeline, "app_user")["app_user"][0]["some_datetime2"]
+             == ensure_pendulum_datetime_utc("2918-08-01 00:00:00.000").naive()
+         )
++
++
++@pytest.mark.parametrize("backend", ["pyarrow", "sqlalchemy", "pandas"])
++def test_uniqueidentifier_data_type(
++    mssql_db: MSSQLSourceDB,
++    backend: TableBackend,
++) -> None:
++    """UNIQUEIDENTIFIER as merge key must not create duplicates due to casing mismatch.
++
++    Reproduces the user case from #3299: initial load followed by incremental merge with
++    both updates and inserts must not create duplicate rows.
++    """
++    import uuid
++
++    pipeline = make_pipeline("duckdb")
++    rc = mssql_db.table_infos["app_user"]["row_count"]
++
++    # reuse sql_table resource for both loads
++    table = sql_table(
++        credentials=mssql_db.credentials,
++        table="app_user",
++        schema=mssql_db.schema,
++        backend=backend,
++        reflection_level="full",
++        write_disposition="merge",
++        primary_key="some_uniqueidentifier",
++        incremental=dlt.sources.incremental(
++            "updated_at",
++            initial_value=ensure_pendulum_datetime_utc("1999-01-01T00:00:00+00:00"),
++        ),
++    )
++
++    # 1. initial full load with UUID as merge primary key
++    info = pipeline.run(table, loader_file_format="parquet")
++    assert_load_info(info)
++
++    # schema must have data_type="text" for the UNIQUEIDENTIFIER column
++    uid_col = pipeline.default_schema.tables["app_user"]["columns"]["some_uniqueidentifier"]
++    assert uid_col["data_type"] == "text"
++
++    rows_after_initial = load_tables_to_dicts(pipeline, "app_user")["app_user"]
++    assert len(rows_after_initial) == rc
++    for val in (row["some_uniqueidentifier"] for row in rows_after_initial):
++        uuid.UUID(val)  # validates well-formed
++
++    # 2. update 3 existing rows' updated_at AND insert 10 new rows, then merge
++    # updated_at set far in the future so updated rows enter the incremental window
++    future_ts = ensure_pendulum_datetime_utc("2030-01-01T00:00:00+00:00")
++    for i, row in enumerate(rows_after_initial[:3]):
++        mssql_db.update_row(
++            {"updated_at": future_ts.add(seconds=i)},
++            f"id = {row['id']}",
++        )
++    mssql_db.generate_users(n=10)
++
++    info = pipeline.run(table, loader_file_format="parquet")
++    assert_load_info(info)
++
++    rows_after_merge = load_tables_to_dicts(pipeline, "app_user")["app_user"]
++    # merge must not create duplicates: rc initial + 10 new
++    assert len(rows_after_merge) == rc + 10
++
++
++@pytest.mark.parametrize("backend", ["sqlalchemy", "pyarrow", "pandas", "connectorx"])
++def test_uniqueidentifier_yields_str(
++    mssql_db: MSSQLSourceDB,
++    backend: TableBackend,
++) -> None:
++    """The resource must yield UNIQUEIDENTIFIER values as Python str, never uuid.UUID objects."""
++    import uuid
++
++    if backend == "connectorx":
++        pytest.importorskip("sqlalchemy", minversion="2.0")
++
++    table = sql_table(
++        credentials=mssql_db.credentials,
++        table="app_user",
++        schema=mssql_db.schema,
++        backend=backend,
++        reflection_level="full",
++    )
++
++    all_uuids: List[str] = []
++    for item in table:
++        all_uuids.extend(assert_extracted_uuids_are_strings("some_uniqueidentifier", item))
++
++    assert len(all_uuids) == mssql_db.table_infos["app_user"]["row_count"]
++    for val in all_uuids:
++        uuid.UUID(val)  # validates well-formed
+diff --git a/tests/load/sources/sql_database/test_sql_database_source.py b/tests/load/sources/sql_database/test_sql_database_source.py
+index a10424bb2..770fbd386 100644
+--- a/tests/load/sources/sql_database/test_sql_database_source.py
++++ b/tests/load/sources/sql_database/test_sql_database_source.py
+@@ -24,7 +24,10 @@ from dlt.extract.incremental.transform import JsonIncremental, ArrowIncremental
+ from dlt.sources import DltResource
+ 
+ import dlt.sources.sql_database
+-from tests.load.sources.sql_database.utils import assert_incremental_chunks
++from tests.load.sources.sql_database.utils import (
++    assert_extracted_uuids_are_strings,
++    assert_incremental_chunks,
++)
+ from tests.pipeline.utils import (
+     assert_load_info,
+     assert_schema_on_data,
+@@ -1472,6 +1475,170 @@ def test_query_adapter_callback(
+     assert_row_counts(pipeline, postgres_db, ["chat_message"])
+ 
+ 
++def _get_uuid_type_params() -> List[Any]:
++    """Build parametrize values for UUID column types.
++
++    Always includes postgresql.UUID. Adds generic sa.Uuid on SA 2.0.
++    """
++    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
++
++    params = [pytest.param(PG_UUID(), id="pg_uuid")]
++    if hasattr(sa, "Uuid"):
++        params.append(pytest.param(sa.Uuid(), id="sa_uuid"))
++    return params
++
++
++@pytest.mark.parametrize("backend", ["pyarrow", "sqlalchemy", "pandas"])
++@pytest.mark.parametrize("uuid_type", _get_uuid_type_params())
++def test_pg_uuid_data_type(
++    postgres_db: PostgresSourceDB,
++    backend: TableBackend,
++    uuid_type: sa.types.TypeEngine,
++) -> None:
++    """UUID as primary key must not create duplicates during merge due to casing mismatch.
++
++    Reproduces the user case from #3299: initial load followed by incremental merge with
++    both inserts and updates must not create duplicate rows.
++    Tests both postgresql.UUID and generic sa.Uuid (SA 2.0).
++    """
++    import uuid as uuid_mod
++    from datetime import datetime, timedelta
++
++    temp_table_name = "test_uuid_" + uniq_id()
++    temp_table = sa.Table(
++        temp_table_name,
++        postgres_db.metadata,
++        # UUID is the primary key — reproduces the #3299 merge scenario
++        sa.Column("guid", uuid_type, primary_key=True),
++        sa.Column("name", sa.Text),
++        sa.Column("updated_at", sa.DateTime, server_default=sa.func.now()),
++    )
++    temp_table.create(bind=postgres_db.engine)
++    try:
++        # insert initial rows with explicit timestamps
++        base_ts = datetime(2024, 1, 1)
++        initial_guids = [str(uuid_mod.uuid4()) for _ in range(5)]
++        with postgres_db.engine.begin() as conn:
++            for i, guid in enumerate(initial_guids):
++                conn.execute(
++                    temp_table.insert().values(
++                        guid=guid,
++                        name=f"user_{i}",
++                        updated_at=base_ts + timedelta(seconds=i),
++                    )
++                )
++
++        # reuse sql_table resource for both loads
++        # use a datetime object for initial_value so pyarrow can coerce it to timestamp
++        table = sql_table(
++            credentials=postgres_db.credentials,
++            table=temp_table_name,
++            schema=postgres_db.schema,
++            backend=backend,
++            reflection_level="full",
++            write_disposition="merge",
++            primary_key="guid",
++            incremental=dlt.sources.incremental("updated_at", initial_value=datetime(1999, 1, 1)),
++        )
++
++        # 1. initial full load with merge on UUID primary key
++        pipeline = make_pipeline("duckdb")
++        info = pipeline.run(table, loader_file_format="parquet")
++        assert_load_info(info)
++
++        # schema must map UUID to text
++        guid_col = pipeline.default_schema.tables[temp_table_name]["columns"]["guid"]
++        assert guid_col["data_type"] == "text"
++
++        rows_after_initial = load_tables_to_dicts(pipeline, temp_table_name)[temp_table_name]
++        assert len(rows_after_initial) == 5
++        for row in rows_after_initial:
++            uuid_mod.UUID(row["guid"])
++
++        # 2. update 2 existing rows AND insert 5 new rows, then incremental merge
++        # updated rows get new updated_at so they enter the incremental window
++        update_ts = base_ts + timedelta(hours=1)
++        with postgres_db.engine.begin() as conn:
++            for i, guid in enumerate(initial_guids[:2]):
++                conn.execute(
++                    temp_table.update()
++                    .where(temp_table.c.guid == guid)
++                    .values(name=f"updated_user_{i}", updated_at=update_ts + timedelta(seconds=i))
++                )
++            for i in range(5):
++                conn.execute(
++                    temp_table.insert().values(
++                        guid=str(uuid_mod.uuid4()),
++                        name=f"new_user_{i}",
++                        updated_at=update_ts + timedelta(seconds=10 + i),
++                    )
++                )
++
++        info = pipeline.run(table, loader_file_format="parquet")
++        assert_load_info(info)
++
++        rows_after_merge = load_tables_to_dicts(pipeline, temp_table_name)[temp_table_name]
++        # 5 initial + 5 new = 10 (updated rows merged, not duplicated)
++        assert len(rows_after_merge) == 10
++
++        # verify updated rows were merged correctly
++        merged = {row["guid"]: row for row in rows_after_merge}
++        for guid in initial_guids[:2]:
++            matches = [g for g in merged if g.lower() == guid.lower()]
++            assert len(matches) == 1, f"Expected 1 row for guid {guid}, got {len(matches)}"
++            assert merged[matches[0]]["name"].startswith("updated_user_")
++    finally:
++        temp_table.drop(bind=postgres_db.engine)
++
++
++@pytest.mark.parametrize("backend", ["sqlalchemy", "pyarrow", "pandas", "connectorx"])
++@pytest.mark.parametrize("uuid_type", _get_uuid_type_params())
++def test_pg_uuid_yields_str(
++    postgres_db: PostgresSourceDB,
++    backend: TableBackend,
++    uuid_type: sa.types.TypeEngine,
++) -> None:
++    """The resource must yield UUID values as Python str, never uuid.UUID objects.
++
++    Tests both postgresql.UUID and generic sa.Uuid (SA 2.0).
++    """
++    import uuid as uuid_mod
++
++    if backend == "connectorx":
++        pytest.importorskip("sqlalchemy", minversion="2.0")
++
++    temp_table_name = "test_uuid_str_" + uniq_id()
++    temp_table = sa.Table(
++        temp_table_name,
++        postgres_db.metadata,
++        sa.Column("id", sa.Integer, primary_key=True),
++        sa.Column("guid", uuid_type),
++    )
++    temp_table.create(bind=postgres_db.engine)
++    try:
++        with postgres_db.engine.begin() as conn:
++            for i in range(5):
++                conn.execute(temp_table.insert().values(id=i, guid=str(uuid_mod.uuid4())))
++
++        table = sql_table(
++            credentials=postgres_db.credentials,
++            table=temp_table_name,
++            schema=postgres_db.schema,
++            backend=backend,
++            reflection_level="full",
++        )
++
++        all_uuids: List[str] = []
++        for item in table:
++            all_uuids.extend(assert_extracted_uuids_are_strings("guid", item))
++
++        assert len(all_uuids) == 5
++        for val in all_uuids:
++            uuid_mod.UUID(val)  # validates well-formed
++    finally:
++        temp_table.drop(bind=postgres_db.engine)
++
++
+ def assert_row_counts(
+     pipeline: dlt.Pipeline,
+     postgres_db: PostgresSourceDB,
+diff --git a/tests/load/sources/sql_database/utils.py b/tests/load/sources/sql_database/utils.py
+index d30640086..c1a421f90 100644
+--- a/tests/load/sources/sql_database/utils.py
++++ b/tests/load/sources/sql_database/utils.py
+@@ -1,4 +1,7 @@
++from typing import List
++
+ import dlt
++from dlt.common.typing import TDataItem
+ from dlt.extract.resource import DltResource
+ from tests.pipeline.utils import assert_load_info
+ 
+@@ -21,3 +24,30 @@ def assert_incremental_chunks(
+     pipeline.run(table)
+     r_counts = pipeline.last_trace.last_normalize_info.row_counts
+     assert table.name not in r_counts or r_counts[table.name] == 0
++
++
++def assert_extracted_uuids_are_strings(column_name: str, item: TDataItem) -> List[str]:
++    """Assert that UUID column values are Python str in a yielded data item.
++
++    Works with all backends: sqlalchemy (dicts), pyarrow (Tables), pandas (DataFrames).
++    Returns the extracted string values.
++    """
++    import pyarrow as pa
++
++    if isinstance(item, pa.Table):
++        col = item.column(column_name)
++        assert pa.types.is_string(col.type) or pa.types.is_large_string(
++            col.type
++        ), f"Expected string arrow type for {column_name}, got {col.type}"
++        return col.to_pylist()
++    elif hasattr(item, "iterrows"):
++        # pandas DataFrame
++        vals = list(item[column_name])
++        for val in vals:
++            assert isinstance(val, str), f"Expected str, got {type(val).__name__}"
++        return vals
++    else:
++        # sqlalchemy backend yields dicts
++        val = item[column_name]
++        assert isinstance(val, str), f"Expected str, got {type(val).__name__}"
++        return [val]
+diff --git a/tests/sources/sql_database/test_schema_types.py b/tests/sources/sql_database/test_schema_types.py
+index d616b93a2..94c8197fa 100644
+--- a/tests/sources/sql_database/test_schema_types.py
++++ b/tests/sources/sql_database/test_schema_types.py
+@@ -1,6 +1,88 @@
++import pytest
+ import sqlalchemy as sa
++from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
++from sqlalchemy.dialects.postgresql import UUID
++
++from dlt.sources.sql_database.schema_types import (
++    default_table_adapter,
++    get_table_references,
++    sqla_col_to_column_schema,
++    _is_uuid_type,
++)
++
++
++@pytest.mark.parametrize(
++    "sql_type,expected",
++    [
++        (UNIQUEIDENTIFIER(), True),
++        (UUID(), True),
++        (sa.String(), False),
++        (sa.Integer(), False),
++        (sa.DateTime(), False),
++    ],
++    ids=["uniqueidentifier", "pg_uuid", "string", "integer", "datetime"],
++)
++def test_is_uuid_type(sql_type: sa.types.TypeEngine, expected: bool) -> None:
++    """_is_uuid_type detects UUID-like types across SA versions."""
++    assert _is_uuid_type(sql_type) is expected
++
++
++def test_is_uuid_type_sa2_generic_uuid() -> None:
++    """_is_uuid_type detects the generic sa.Uuid introduced in SA 2.0."""
++    sa_uuid = pytest.importorskip("sqlalchemy", minversion="2.0")
++    sql_t = sa_uuid.Uuid()
++    assert _is_uuid_type(sql_t) is True
++
++
++@pytest.mark.parametrize(
++    "sql_type",
++    [UNIQUEIDENTIFIER(), UUID()],
++    ids=["uniqueidentifier", "pg_uuid"],
++)
++def test_uuid_mapped_to_text(sql_type: sa.types.TypeEngine) -> None:
++    """sqla_col_to_column_schema maps UUID-like types to data_type='text'."""
++    metadata = sa.MetaData()
++    table = sa.Table("t", metadata, sa.Column("col", sql_type))
++    col_schema = sqla_col_to_column_schema(table.c.col, "full")
++    assert col_schema is not None
++    assert col_schema["data_type"] == "text"
++
+ 
+-from dlt.sources.sql_database.schema_types import get_table_references
++def test_uuid_mapped_to_text_sa2_generic_uuid() -> None:
++    """sqla_col_to_column_schema maps generic sa.Uuid (SA 2.0) to data_type='text'."""
++    sa_uuid = pytest.importorskip("sqlalchemy", minversion="2.0")
++    metadata = sa.MetaData()
++    table = sa.Table("t", metadata, sa.Column("col", sa_uuid.Uuid()))
++    col_schema = sqla_col_to_column_schema(table.c.col, "full")
++    assert col_schema is not None
++    assert col_schema["data_type"] == "text"
++
++
++@pytest.mark.parametrize(
++    "sql_type",
++    [UUID(as_uuid=True), UNIQUEIDENTIFIER()],
++    ids=["pg_uuid", "uniqueidentifier"],
++)
++def test_default_table_adapter_uuid(sql_type: sa.types.TypeEngine) -> None:
++    """default_table_adapter sets as_uuid=False when the attribute exists, never crashes.
++
++    PG UUID always has as_uuid. MSSQL UNIQUEIDENTIFIER has it on SA 2.0 only.
++    """
++    metadata = sa.MetaData()
++    table = sa.Table("t", metadata, sa.Column("col", sql_type))
++    # must not raise on any SA version
++    default_table_adapter(table, included_columns=None)
++    if hasattr(table.c.col.type, "as_uuid"):
++        assert table.c.col.type.as_uuid is False
++
++
++def test_default_table_adapter_sa2_generic_uuid() -> None:
++    """default_table_adapter sets as_uuid=False on generic sa.Uuid (SA 2.0)."""
++    sa_uuid = pytest.importorskip("sqlalchemy", minversion="2.0")
++    metadata = sa.MetaData()
++    table = sa.Table("t", metadata, sa.Column("col", sa_uuid.Uuid()))
++    default_table_adapter(table, included_columns=None)
++    assert table.c.col.type.as_uuid is False
+ 
+ 
+ def test_get_table_references() -> None:
+
+
+===== COMMIT 42ed6e2f =====
+
+
+commit 42ed6e2fa
+Author: rudolfix
+Date: 2026-02-01
+
+    fixes snippet and brings READMEs up to date with tooling (#3596)
+
+diff --git a/.gitignore b/.gitignore
+index 065da82c3..67bd1801e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,6 +1,8 @@
+ 
+-# git worktrees used by Claude Code
++# Claude Code
+ .worktrees
++CLAUDE.local.md
++.claude/settings.local.json
+ 
+ # temp requirements generated by uv
+ _gen_requirements*.txt
+diff --git a/Makefile b/Makefile
+index 5bbc3c748..d116edfc7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,3 +1,4 @@
++.DEFAULT_GOAL := help
+ .PHONY: install-uv has-uv dev lint test test-common test-common-p reset-test-storage recreate-compiled-deps build-library-prerelease build-library publish-library test-load-local test-load-local-p test-load-local-postgres test-load-local-postgres-p install-snowflake-extras test-remote-snowflake test-remote-snowflake-p install-common-core test-common-core install-common-core-source test-common-core-source install-common-source install-pipeline-min test-pipeline-min install-pipeline-arrow test-pipeline-arrow install-pipeline-min-arrow test-pipeline-min-arrow install-workspace test-workspace test-workspace-dashboard install-pipeline-full test-pipeline-full install-pipeline-full-sql test-pipeline-full-sql install-sqlalchemy2 test-with-sqlalchemy-2 test-dest-load test-dest-remote-essential test-dest-remote-nonessential test-dbt-no-venv test-dbt-runner-venv test-sources-load test-sources-sql-database
+ 
+ PYV=$(shell python3 -c "import sys;t='{v[0]}.{v[1]}'.format(v=list(sys.version_info[:2]));sys.stdout.write(t)")
+@@ -13,30 +14,12 @@ PYV=$(shell python3 -c "import sys;t='{v[0]}.{v[1]}'.format(v=list(sys.version_i
+ # VERSION := ${AUTV}${VERSION_SUFFIX}
+ # VERSION_MM := ${AUTVMINMAJ}${VERSION_SUFFIX}
+ 
+-help:
+-	@echo "make"
+-	@echo "		install-uv"
+-	@echo "			installs newest uv version"
+-	@echo "		dev"
+-	@echo "			prepares development env"
+-	@echo "		lint"
+-	@echo "			runs flake and mypy"
+-	@echo "		test"
+-	@echo "			tests all the components including destinations"
+-	@echo "		test-load-local"
+-	@echo "			tests all components using local destinations: duckdb and postgres"
+-	@echo "		test-common"
+-	@echo "			tests common components"
+-	@echo "		test-common-p"
+-	@echo "			tests common components using multiple processes in parallel"
+-	@echo "		lint-and-test-snippets"
+-	@echo "			tests and lints snippets and examples in docs"
+-	@echo "		build-library"
+-	@echo "			makes dev and then builds dlt package for distribution"
+-	@echo "		publish-library"
+-	@echo "			builds library and then publishes it to pypi"
+-
+-install-uv:
++# Add " ## description" after any target name to include it in `make help` output.
++# Example:  my-target: ## Does something useful
++help: ## Shows this help message
++	@grep -E '^[a-zA-Z0-9_-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-32s %s\n", $$1, $$2}'
++
++install-uv: ## Installs newest uv version
+ ifneq ($(VIRTUAL_ENV),)
+ 	$(error you cannot be under virtual environment $(VIRTUAL_ENV))
+ endif
+@@ -45,22 +28,22 @@ endif
+ has-uv:
+ 	uv --version
+ 
+-dev: has-uv
++dev: has-uv ## Prepares development environment
+ 	uv sync --all-extras --no-extra hub --group dev --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group adbc --group dashboard-tests
+ 
+-dev-airflow: has-uv
++dev-airflow: has-uv ## Prepares development environment with airflow support
+ 	uv sync --all-extras --no-extra hub --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group airflow
+ 
+-dev-hub: has-uv
++dev-hub: has-uv ## Prepares development environment with hub support
+ 	uv sync --all-extras --group dev --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group adbc --group dashboard-tests
+ 
+-lint: lint-core lint-security lint-docstrings lint-lock
++lint: lint-core lint-security lint-docstrings lint-lock ## Runs all linters (mypy, ruff, flake8, bandit, docstrings, lockfile)
+ 
+-lint-lock:
++lint-lock: ## Checks uv lockfile and hub extras are in sync
+ 	uv lock --check
+ 	uv run python tools/check_hub_extras.py
+ 
+-lint-core:
++lint-core: ## Runs core linting (mypy, ruff, flake8)
+ 	uv run mypy --config-file mypy.ini dlt tests tools
+ 	# NOTE: we need to make sure docstring_parser_fork is the only version of docstring_parser installed
+ 	uv pip uninstall docstring_parser
+@@ -70,19 +53,18 @@ lint-core:
+ 	uv run flake8 --extend-ignore=D --max-line-length=200 dlt tools
+ 	uv run flake8 --extend-ignore=D --max-line-length=200 tests --exclude tests/reflection/module_cases,tests/common/reflection/cases/modules/
+ 
+-format:
++format: ## Formats code with black
+ 	uv run black dlt tests tools --extend-exclude='.*syntax_error.py|^_storage[^/]*/'
+ 
+-format-check:
++format-check: ## Formats and verifies no files changed (CI)
+ 	$(MAKE) format
+ 	git diff --exit-code
+ 
+-lint-security:
++lint-security: ## Runs security linting with bandit
+ 	# go for ll by cleaning up eval and SQL warnings.
+ 	uv run bandit -r dlt/ -n 3 -lll
+ 
+-# check docstrings for all important public classes and functions
+-lint-docstrings:
++lint-docstrings: ## Checks docstrings for public API classes and functions
+ 	uv run flake8 --count \
+ 		dlt/common/pipeline.py \
+ 		dlt/extract/decorators.py \
+@@ -152,7 +134,7 @@ endef
+ # LOCAL / DEV TESTING
+ # ======================================================================
+ 
+-test:
++test: ## Tests all components including destinations
+ 	$(PYTEST_BASE) tests
+ 
+ TEST_COMMON_PATHS = \
+@@ -167,10 +149,10 @@ TEST_COMMON_PATHS = \
+ 	tests/libs \
+ 	tests/destinations
+ 
+-test-common:
++test-common: ## Tests common components without external resources
+ 	$(call RUN_XDIST_SAFE_SPLIT,$(TEST_COMMON_PATHS))
+ 
+-test-common-p:
++test-common-p: ## Tests common components in parallel
+ 	$(MAKE) test-common PYTEST_XDIST_N=auto
+ 
+ # ----------------------------------------------------------------------
+@@ -179,37 +161,37 @@ test-common-p:
+ 
+ TEST_LOAD_PATHS = tests/load
+ 
+-test-load-local:
++test-load-local: ## Tests load with local destinations (duckdb + filesystem)
+ 	ACTIVE_DESTINATIONS='["duckdb", "filesystem"]' \
+ 	ALL_FILESYSTEM_DRIVERS='["memory", "file"]' \
+ 	$(call RUN_XDIST_SAFE_SPLIT,$(TEST_LOAD_PATHS))
+ 
+-test-load-local-p:
++test-load-local-p: ## Tests load with local destinations in parallel
+ 	$(MAKE) test-load-local PYTEST_XDIST_N=auto
+ 
+-test-load-local-postgres:
++test-load-local-postgres: ## Tests load with local postgres (requires start-test-containers)
+ 	DESTINATION__POSTGRES__CREDENTIALS=postgresql://loader:loader@localhost:5432/dlt_data \
+ 	ACTIVE_DESTINATIONS='["postgres"]' \
+ 	ALL_FILESYSTEM_DRIVERS='["memory"]' \
+ 	$(call RUN_XDIST_SAFE_SPLIT,$(TEST_LOAD_PATHS))
+ 
+-test-load-local-postgres-p:
++test-load-local-postgres-p: ## Tests load with local postgres in parallel
+ 	$(MAKE) test-load-local-postgres PYTEST_XDIST_N=auto
+ 
+ # ----------------------------------------------------------------------
+ # Local remote-destination smoke (not used by CI)
+ # ----------------------------------------------------------------------
+ 
+-install-snowflake-extras:
++install-snowflake-extras: ## Installs extras needed for snowflake testing
+ 	uv sync --group pipeline --group ibis --group providers \
+ 		--extra snowflake --extra s3 --extra gs --extra az --extra parquet
+ 
+-test-remote-snowflake:
++test-remote-snowflake: ## Tests essential load tests against snowflake
+ 	ACTIVE_DESTINATIONS='["snowflake"]' \
+ 	ALL_FILESYSTEM_DRIVERS='["memory"]' \
+ 	$(MAKE) test-dest-remote-essential
+ 
+-test-remote-snowflake-p:
++test-remote-snowflake-p: ## Tests essential load tests against snowflake in parallel
+ 	$(MAKE) test-remote-snowflake PYTEST_XDIST_N=auto
+ 
+ # ======================================================================
+@@ -381,19 +363,19 @@ test-sources-sql-database:
+ 
+ ###################### END CI
+ 
+-build-library: dev lint-lock
++build-library: dev lint-lock ## Builds dlt package for distribution
+ 	uv version
+ 	uv build
+ 
+-clean-dist:
++clean-dist: ## Removes dist/ directory
+ 	-@rm -r dist/
+ 
+-publish-library: clean-dist build-library
++publish-library: clean-dist build-library ## Builds and publishes dlt to PyPI
+ 	ls -l dist/
+ 	@bash -c 'read -s -p "Enter PyPI API token: " PYPI_API_TOKEN; echo; \
+ 	uv publish --token "$$PYPI_API_TOKEN"'
+ 
+-test-build-images: build-library
++test-build-images: build-library ## Builds Docker images for testing
+ 	# NOTE: uv export does not work with our many different deps, we install a subset and freeze
+ 	# uv sync --extra gcp --extra redshift --extra duckdb
+ 	# uv pip freeze > _gen_requirements.txt
+@@ -402,7 +384,7 @@ test-build-images: build-library
+ 	docker build -f deploy/dlt/Dockerfile.airflow --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell uv version --short)" .
+ 	docker build -f deploy/dlt/Dockerfile.minimal --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell uv version --short)" .
+ 
+-start-test-containers:
++start-test-containers: ## Starts docker containers for local testing (postgres, clickhouse, etc.)
+ 	docker compose -f "tests/load/dremio/docker-compose.yml" up -d
+ 	docker compose -f "tests/load/postgres/docker-compose.yml" up -d
+ 	docker compose -f "tests/load/weaviate/docker-compose.yml" up -d
+@@ -410,21 +392,17 @@ start-test-containers:
+ 	docker compose -f "tests/load/sqlalchemy/docker-compose.yml" up -d
+ 	docker compose -f "tests/load/clickhouse/docker-compose.yml" up -d
+ 
+-update-cli-docs:
++update-cli-docs: ## Regenerates CLI reference docs
+ 	uv run dlt --debug render-docs docs/website/docs/reference/command-line-interface.md
+ 
+-check-cli-docs:
++check-cli-docs: ## Checks CLI reference docs are up to date (CI)
+ 	uv run dlt --debug render-docs docs/website/docs/reference/command-line-interface.md --compare
+ 
+-# Commands for running dashboard e2e tests
+-# To run these tests locally, run `make start-dlt-dashboard-e2e` in one terminal and `make test-e2e-dashboard-headed` in another terminal
+-
+-test-e2e-dashboard:
++test-e2e-dashboard: ## Runs dashboard e2e tests with headless chromium
+ 	uv run pytest --browser chromium tests/e2e
+ 
+-test-e2e-dashboard-headed:
++test-e2e-dashboard-headed: ## Runs dashboard e2e tests with visible browser
+ 	uv run pytest --headed --browser chromium tests/e2e
+ 
+-# creates the dashboard test pipelines globally for manual testing of the dashboard app and cli
+-create-test-pipelines:
++create-test-pipelines: ## Creates test pipelines for manual dashboard testing
+ 	uv run python tests/workspace/helpers/dashboard/example_pipelines.py
+diff --git a/docs/Makefile b/docs/Makefile
+index f55d90cef..704cca6a6 100644
+--- a/docs/Makefile
++++ b/docs/Makefile
+@@ -1,4 +1,9 @@
++.DEFAULT_GOAL := help
+ 
++# Add " ## description" after any target name to include it in `make help` output.
++# Example:  my-target: ## Does something useful
++help: ## Shows this help message
++	@grep -E '^[a-zA-Z0-9_-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-28s %s\n", $$1, $$2}'
+ 
+ dev: ## Prepares development environment for docs tooling
+ 	uv sync 
+diff --git a/docs/README.md b/docs/README.md
+index 9a22fb9f8..9e25b5cd8 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -6,60 +6,78 @@ Please go to ./website/README.md to learn more about how to contribute to the do
+ 
+ ## Docs examples
+ 
+-Please go to ./excamples/CONTRIBUTING.md to learn how to add the code examples found here: https://dlthub.com/docs/examples
++Please go to ./examples/CONTRIBUTING.md to learn how to add the code examples found here: https://dlthub.com/docs/examples
+ 
+ ## Education
+ 
+-Please check the ./education folder to find the dlt education notebooks, that are also found at on the website at: https://dlthub.com/docs/tutorial/education
++Please check the ./education folder to find the dlt education notebooks, that are also found on the website.
+ 
+ ## WASM notebooks
+ 
+-Got to ./notebooks to see the WASM notebooks deployed to our website, currently we only have the WASM playground you can find at https://dlthub.com/docs/tutorial/playground
++Go to ./notebooks to see the WASM notebooks deployed to our website, currently we only have the WASM playground you can find at https://dlthub.com/docs/tutorial/playground
++
++## Setup
++
++You will need [uv](https://docs.astral.sh/uv/) and Node.js on your system. Then from the `docs/` directory:
++
++```sh
++# Install Python dependencies (tools, linters, dlt itself)
++make dev
++
++# Install Node.js dependencies for the website
++cd website && npm install
++```
++
++`make dev` must be run before any other command below.
++
++## Makefile targets
++
++The `Makefile` in this folder is the main entrypoint for docs tasks. Run `make help` (or just `make`) to see all available targets with descriptions.
+ 
+ ## Tools
+ 
+-in the docs_tools folder you can find various tools that can aid you when working with the docs. You will need to install the python uv packages manager (https://dlthub.com/docs/tutorial/playground) on your system to run these commands.
++In the `docs_tools/` folder you can find various tools that can also be called directly via `uv run`.
+ 
+-## `uv run check-embedded-snippets`
+-This script find's all embedded snippets in our docs, extracts them and performs the following checks:
++### `uv run lint-embedded-snippets`
++Finds all embedded snippets in our docs, extracts them and performs the following checks:
+ 
+ * Snippet must have a valid language set, e.g. ```py
+ * Snippet must be parseable (works for py, toml, yaml and json snippets)
+ * Snippet must pass linting (works for py)
+-* Coming soon: snippet must pass type checking with mypy
++* Snippet must pass type checking with mypy (works for py)
+ 
+ This script is run on CI to ensure code quality in our docs.
+ 
+-### Usage
++#### Usage
+ 
+ ```sh
+ # Run a full check on all snippets
+-uv run check-embedded-snippets full
++uv run lint-embedded-snippets full
+ 
+-# Show all Available subcommands and arguments for this script
+-uv run check-embedded-snippets --help
++# Show all available subcommands and arguments for this script
++uv run lint-embedded-snippets --help
+ 
+ # Only run the linting stage
+-uv run check-embedded-snippets lint
++uv run lint-embedded-snippets lint
+ 
+ # Run all stages but only for snippets in files that have the string "walkthrough" in the filepath
+ # you will probably be using this a lot when working on one doc page
+-uv run check-embedded-snippets full -f walkthrough
++uv run lint-embedded-snippets full -f walkthrough
+ 
+ # Run the parsing stage, but only on snippets 49, 345 and 789
+-uv run check-embedded-snippets parse -s 49,345,789
++uv run lint-embedded-snippets parse -s 49,345,789
+ 
+ # run all checks but with a bit more output to the terminal
+-uv run check-embedded-snippets full -v
++uv run lint-embedded-snippets full -v
+ ```
+ 
+-### Snippet numbers
++#### Snippet numbers
+ Each snippet will be assigned an index in the order it is encountered. This is useful during creation of new snippets in the docs to selectively only run a few snippets. These numbers will change as snippets are inserted into the docs.
+ 
+-## `uv run fix-grammar`
+-This script will run all (or selected) docs markdown files through the open ai api to correct grammar. You will need to place the open ai key in an `.env` file in this or the root folder. See `.env.example`. We pay for each openai api call, so be a bit considerate of your usage :). It is good to check the grammar on new pages.
++### `uv run fix-grammar`
++Runs all (or selected) docs markdown files through the OpenAI API to correct grammar. You will need to place the OpenAI key in an `.env` file in this or the root folder. We pay for each OpenAI API call, so be a bit considerate of your usage :). It is good to check the grammar on new pages.
+ 
+-### Usage
++#### Usage
+ 
+ ```sh
+ # Fix all pages
+@@ -72,9 +90,9 @@ uv run fix-grammar -f walkthrough
+ uv run fix-grammar -f ../website/docs/intro.md
+ ```
+ 
+-## `uv run prepare-examples-tests`
++### `uv run prepare-examples-tests`
+ 
+-Prepares the examples you find at ./examples to by able to be tested with pytest. See the `test-examples` Make command in this folder.
++Prepares the examples you find at ./examples to be able to be tested with pytest. See the `test-examples` Make target in this folder.
+ 
+-## `uv run preprocess-docs`
+-Copies the markdown files for the website from ./docs to ./docs_processed and performs various tasks underway, such as embedding snippets, inserting destination info into the destination pages and various sanity checks. Is called by the npm script that preview and build the website.
++### `uv run preprocess-docs`
++Copies the markdown files for the website from ./docs to ./docs_processed and performs various tasks underway, such as embedding snippets, inserting destination info into the destination pages and various sanity checks. Is called by the npm script that previews and builds the website.
+diff --git a/docs/uv.lock b/docs/uv.lock
+index 1b55c94a8..42a460d68 100644
+--- a/docs/uv.lock
++++ b/docs/uv.lock
+@@ -834,7 +834,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.20.0"
++version = "1.21.0"
+ source = { editable = "../" }
+ dependencies = [
+     { name = "click" },
+@@ -929,8 +929,8 @@ requires-dist = [
+     { name = "db-dtypes", marker = "extra == 'bigquery'", specifier = ">=1.2.0" },
+     { name = "db-dtypes", marker = "extra == 'gcp'", specifier = ">=1.2.0" },
+     { name = "deltalake", marker = "extra == 'deltalake'", specifier = ">=0.25.1" },
+-    { name = "dlt-runtime", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0a0,<0.21" },
+-    { name = "dlthub", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0a1,<0.21" },
++    { name = "dlt-runtime", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.22" },
++    { name = "dlthub", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.22" },
+     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=0.9" },
+     { name = "duckdb", marker = "extra == 'ducklake'", specifier = ">=1.2.0" },
+     { name = "duckdb", marker = "extra == 'lancedb'", specifier = ">=1.4.3" },
+@@ -1060,6 +1060,7 @@ dev = [
+     { name = "pytest-forked", specifier = ">=1.3.0" },
+     { name = "pytest-mock", specifier = ">=3.14.0,<4" },
+     { name = "pytest-order", specifier = ">=1.0.0" },
++    { name = "pytest-xdist", specifier = ">=3.5,<4" },
+     { name = "requests-mock", specifier = ">=1.10.0,<2" },
+     { name = "ruff", specifier = ">=0.3.2,<0.4" },
+     { name = "sqlfluff", specifier = ">=2.3.2,<3" },
+diff --git a/docs/website/README.md b/docs/website/README.md
+index ae37dbbd7..4dff2059a 100644
+--- a/docs/website/README.md
++++ b/docs/website/README.md
+@@ -23,17 +23,13 @@ That command installs our Node.js package defined in `package.json`.
+ 
+ ### Python Dependencies
+ 
+-The website build process requires Python dependencies, including `pydoc-markdown` for generating API documentation. Install them with:
++The website build process requires Python dependencies, including `pydoc-markdown` for generating API documentation. From the `docs/` directory run:
+ 
+ ```
+-$ uv pip install -r requirements.txt
++$ make dev
+ ```
+ 
+-Or if you're using the project's `uv` environment from the root directory:
+-
+-```
+-$ uv sync --group docs
+-```
++This calls `uv sync` and installs all Python tooling into the docs virtual environment.
+ 
+ ### Are you new to Node?
+ 
+@@ -107,4 +103,4 @@ You can clear these versions with
+ npm run clear-versions
+ ```
+ 
+-The netflify deployment of these docs need to happen from the master branch so that the current version gets properly selected.
+\ No newline at end of file
++The cloudflare deployment of these docs needs to happen from the master branch so that the current version gets properly selected.
+\ No newline at end of file
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+index 80ee04fa6..1ef9877a9 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+@@ -413,12 +413,13 @@ dlt's staging mechanisms for ClickHouse.
+ When using S3 for a staging area you can alternatively have ClickHouse authenticate using Role-based access with the
+ [supported](https://clickhouse.com/docs/sql-reference/table-functions/s3#using-s3-credentials-clickhouse-cloud) `extra_credentials` argument by setting this with the destination credentials:
+ ```py
++import dlt
+ from dlt.destinations import clickhouse
+ 
+ destination = clickhouse(
+   credentials={
+-    ... # Other credentials you need
+-    s3_extra_credentials={
++    # Other credentials you need
++    "s3_extra_credentials": {
+       'role_arn': 'arn:your:role' # The AWS Role assumed by ClickHouse
+     }
+   }
+
+
+===== COMMIT 51946ed1 =====
+
+
+commit 51946ed1b
+Author: Arel Cordero
+Date: 2026-02-01
+
+    Making query_result_bucket optional (#3566)
+
+diff --git a/dlt/destinations/impl/athena/configuration.py b/dlt/destinations/impl/athena/configuration.py
+index 8801ad9ef..c8d267c8a 100644
+--- a/dlt/destinations/impl/athena/configuration.py
++++ b/dlt/destinations/impl/athena/configuration.py
+@@ -20,7 +20,7 @@ class LakeformationConfig:
+ @configspec
+ class AthenaClientConfiguration(DestinationClientDwhWithStagingConfiguration):
+     destination_type: Final[str] = dataclasses.field(default="athena", init=False, repr=False, compare=False)  # type: ignore[misc]
+-    query_result_bucket: str = None
++    query_result_bucket: Optional[str] = None
+     credentials: AwsCredentials = None
+     athena_work_group: Optional[str] = None
+     aws_data_catalog: str = DEFAULT_AWS_DATA_CATALOG
+@@ -36,6 +36,7 @@ class AthenaClientConfiguration(DestinationClientDwhWithStagingConfiguration):
+     db_location: Optional[str] = None
+ 
+     __config_gen_annotations__: ClassVar[List[str]] = [
++        "query_result_bucket",
+         "athena_work_group",
+         "aws_data_catalog",
+         "info_tables_query_threshold",
+diff --git a/dlt/destinations/impl/athena/factory.py b/dlt/destinations/impl/athena/factory.py
+index 868ee15a3..3fe19f80f 100644
+--- a/dlt/destinations/impl/athena/factory.py
++++ b/dlt/destinations/impl/athena/factory.py
+@@ -195,7 +195,7 @@ class athena(Destination[AthenaClientConfiguration, "AthenaClient"]):
+ 
+     def __init__(
+         self,
+-        query_result_bucket: str = None,
++        query_result_bucket: Optional[str] = None,
+         credentials: Union[AwsCredentials, Dict[str, Any], Any] = None,
+         athena_work_group: str = None,
+         aws_data_catalog: str = DEFAULT_AWS_DATA_CATALOG,
+@@ -209,7 +209,7 @@ class athena(Destination[AthenaClientConfiguration, "AthenaClient"]):
+         All arguments provided here supersede other configuration sources such as environment variables and dlt config files.
+ 
+         Args:
+-            query_result_bucket (str, optional): S3 bucket to store query results in
++            query_result_bucket (Optional[str], optional): S3 bucket to store query results in. May be omitted when using Athena managed query results.
+             credentials (Union[AwsCredentials, Dict[str, Any], Any], optional): AWS credentials to connect to the Athena database. Can be an instance of `AwsCredentials` or
+                 a dict with AWS credentials
+             athena_work_group (str, optional): Athena work group to use
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/athena.md b/docs/website/docs/dlt-ecosystem/destinations/athena.md
+index 54c529547..6dc192e6b 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/athena.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/athena.md
+@@ -46,7 +46,7 @@ pip install pyathena
+ so pip does not fail on backtracking.
+ :::
+ 
+-To edit the `dlt` credentials file with your secret info, open `.dlt/secrets.toml`. You will need to provide a `bucket_url`, which holds the uploaded parquet files, a `query_result_bucket`, which Athena uses to write query results to, and credentials that have write and read access to these two buckets as well as the full Athena access AWS role.
++To edit the `dlt` credentials file with your secret info, open `.dlt/secrets.toml`. You will need to provide a `bucket_url`, which holds the uploaded parquet files, and credentials that have write and read access to the bucket as well as the full Athena access AWS role. You should also provide a `query_result_bucket`, which Athena uses to write query results to. If your Athena workgroup has [Managed Query Results](https://docs.aws.amazon.com/athena/latest/ug/querying-athena-managed-query-results.html) enabled, omit `query_result_bucket` (or leave it unset) — Athena will manage the results storage automatically.
+ 
+ The TOML file looks like this:
+ 
+diff --git a/tests/load/athena_iceberg/test_athena_configuration.py b/tests/load/athena_iceberg/test_athena_configuration.py
+index f18f43978..16253c2fa 100644
+--- a/tests/load/athena_iceberg/test_athena_configuration.py
++++ b/tests/load/athena_iceberg/test_athena_configuration.py
+@@ -1,5 +1,10 @@
++from typing import cast
++
+ from dlt.common.typing import StrAny
+-from dlt.destinations.impl.athena.configuration import DEFAULT_AWS_DATA_CATALOG
++from dlt.destinations.impl.athena.configuration import (
++    AthenaClientConfiguration,
++    DEFAULT_AWS_DATA_CATALOG,
++)
+ 
+ from tests.load.utils import S3_TABLES_CATALOG, cm_yield_client
+ 
+@@ -40,3 +45,20 @@ def test_catalog_name() -> None:
+         assert client.sql_client.catalog_name(quote=False) == DEFAULT_AWS_DATA_CATALOG
+         with client.sql_client.with_staging_dataset():
+             assert client.sql_client.catalog_name(quote=False) == "dummycatalog"
++
++
++def test_query_result_bucket_optional() -> None:
++    # query_result_bucket is Optional[str] so it should be resolved even when None.
++    # this enables users with Athena managed query results to omit it.
++    # see: https://github.com/dlt-hub/dlt/issues/3565
++    hints = AthenaClientConfiguration.get_resolvable_fields()
++    # None must be accepted as resolved for optional fields
++    assert AthenaClientConfiguration.is_field_resolved(None, hints["query_result_bucket"])
++    # query_result_bucket maps to pyathena's s3_staging_dir in to_connector_params().
++    # when None, pyathena omits OutputLocation from the StartQueryExecution request,
++    # which is required for workgroups with managed query results.
++    with cm_yield_client("athena", "dummy_dataset") as client:
++        athena_config = cast(AthenaClientConfiguration, client.config)
++        athena_config.query_result_bucket = None
++        connector_params = athena_config.to_connector_params()
++        assert connector_params["s3_staging_dir"] is None
+diff --git a/tests/load/pipeline/test_athena.py b/tests/load/pipeline/test_athena.py
+index 2eb561cc4..074eec00e 100644
+--- a/tests/load/pipeline/test_athena.py
++++ b/tests/load/pipeline/test_athena.py
+@@ -12,7 +12,7 @@ from tests.cases import table_update_and_row, assert_all_data_types_row
+ from tests.load.pipeline.utils import TableBucketTestClient, simple_nested_source
+ from tests.pipeline.utils import assert_load_info, load_table_counts
+ from tests.pipeline.utils import load_table_counts
+-from dlt.destinations.exceptions import CantExtractTablePrefix
++from dlt.destinations.exceptions import CantExtractTablePrefix, DatabaseTransientException
+ from dlt.destinations.adapters import athena_partition, athena_adapter
+ 
+ from tests.load.utils import (
+@@ -371,3 +371,47 @@ def test_athena_s3_tables(destination_config: DestinationTestConfiguration) -> N
+     assert table_bucket_test_client.namespace_exists(pipe.dataset_name)
+     assert table_bucket_test_client.table_exists(pipe.dataset_name, "lists")
+     assert table_bucket_test_client.table_exists(pipe.dataset_name, "lists__value")
++
++
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(
++        default_sql_configs=True,
++        subset=["athena"],
++        # exclude S3 Tables Catalog, not relevant for this test
++        is_athena_s3_tables=False,
++    ),
++    ids=lambda x: x.name,
++)
++def test_athena_no_query_result_bucket(
++    destination_config: DestinationTestConfiguration,
++) -> None:
++    """Test that query_result_bucket=None resolves and reaches Athena without
++    ConfigFieldMissingException.
++
++    Our CI Athena workgroup does not have managed query results enabled, so the pipeline
++    will fail at load time with an Athena-side error about missing output location. This
++    verifies that the config resolution accepts None and the error comes from Athena itself.
++    See: https://github.com/dlt-hub/dlt/issues/3565
++    """
++    # create destination and force query_result_bucket=None to override secrets
++    dest = destination_config.destination_factory(athena_work_group="primary")
++    dest.config_params["query_result_bucket"] = None
++
++    pipeline = destination_config.setup_pipeline(
++        "athena_" + uniq_id(), dev_mode=True, destination=dest
++    )
++
++    @dlt.resource(name="items", write_disposition="append")
++    def items():
++        yield {"id": 1, "name": "item"}
++
++    # pipeline should fail at load with an Athena-side error about output location,
++    # NOT with ConfigFieldMissingException
++    with pytest.raises(PipelineStepFailed) as pip_ex:
++        pipeline.run(items, **destination_config.run_kwargs)
++    assert isinstance(pip_ex.value.__cause__, DatabaseTransientException)
++    # athena rejects queries when no output location is set and workgroup doesn't manage it
++    assert "output location" in str(pip_ex.value.__cause__).lower() or "ResultConfiguration" in str(
++        pip_ex.value.__cause__
++    )
+
+
+===== COMMIT c2d4030b =====
+
+
+commit c2d4030ba
+Author: Tim Hable
+Date: 2026-02-01
+
+    Redshift fix: Use correct view to determine schema existence (#3570)
+
+diff --git a/dlt/destinations/impl/redshift/redshift.py b/dlt/destinations/impl/redshift/redshift.py
+index 2d4c92a40..8c374243c 100644
+--- a/dlt/destinations/impl/redshift/redshift.py
++++ b/dlt/destinations/impl/redshift/redshift.py
+@@ -28,14 +28,13 @@ from dlt.common.configuration.specs import AwsCredentialsWithoutDefaults
+ 
+ from dlt.destinations.insert_job_client import InsertValuesJobClient
+ from dlt.destinations.sql_jobs import SqlMergeFollowupJob
+-from dlt.destinations.exceptions import DatabaseTerminalException
++from dlt.destinations.exceptions import DatabaseTerminalException, DatabaseException
+ from dlt.destinations.job_client_impl import CopyRemoteFileLoadJob
+ from dlt.destinations.impl.postgres.sql_client import Psycopg2SqlClient
+ from dlt.destinations.impl.redshift.configuration import RedshiftClientConfiguration
+ from dlt.destinations.job_impl import ReferenceFollowupJobRequest
+ from dlt.destinations.path_utils import get_file_format_and_compression
+ 
+-
+ HINT_TO_REDSHIFT_ATTR: Dict[TColumnHint, str] = {
+     "cluster": "DISTKEY",
+     # it is better to not enforce constraints in redshift
+@@ -48,10 +47,21 @@ class RedshiftSqlClient(Psycopg2SqlClient):
+     def has_dataset(self) -> bool:
+         # In Redshift, the 'public' schema always exists but may not be
+         # returned by INFORMATION_SCHEMA.SCHEMATA query, so we handle it as a special case
+-        if self.dataset_name == "public":
++        if self.dataset_name.lower() == "public":
+             return True
+ 
+-        return super().has_dataset()
++        all_schemas_view_name = "svv_redshift_schemas"
++
++        db_params = []
++        _, schema_name, _ = self._get_information_schema_components()
++        query = f"SELECT 1 FROM {all_schemas_view_name} WHERE schema_name = %s"
++        db_params.append(schema_name)
++        try:
++            rows = self.execute_sql(query, *db_params)
++            return len(rows) > 0
++        except DatabaseException:
++            # fallback to INFORMATION_SCHEMA.SCHEMATA if svv_redshift_schemas is not available
++            return super().has_dataset()
+ 
+     @staticmethod
+     def _maybe_make_terminal_exception_from_data_error(
+diff --git a/tests/load/redshift/test_redshift_client.py b/tests/load/redshift/test_redshift_client.py
+index 07858ace5..818be11a8 100644
+--- a/tests/load/redshift/test_redshift_client.py
++++ b/tests/load/redshift/test_redshift_client.py
+@@ -12,7 +12,7 @@ from dlt.common.storages import FileStorage
+ from dlt.common.storages.schema_storage import SchemaStorage
+ from dlt.common.utils import uniq_id
+ 
+-from dlt.destinations.exceptions import DatabaseTerminalException
++from dlt.destinations.exceptions import DatabaseTerminalException, DatabaseUndefinedRelation
+ from dlt.destinations import redshift
+ from dlt.destinations.impl.redshift.configuration import (
+     RedshiftCredentials,
+@@ -175,3 +175,32 @@ def test_public_schema_has_dataset_override() -> None:
+     )._bind_dataset_name("public")
+     client_public = RedshiftClient(schema, config_public, redshift().capabilities())
+     assert client_public.sql_client.has_dataset() is True
++
++
++def test_has_dataset_falls_back_on_svv_failure() -> None:
++    """Test that has_dataset falls back to INFORMATION_SCHEMA when svv_redshift_schemas
++    query raises a DatabaseException (e.g. view does not exist)."""
++    from dlt.destinations.sql_client import SqlClientBase
++    from dlt.destinations.impl.redshift.redshift import RedshiftSqlClient
++
++    schema = Schema("test_schema")
++    config = RedshiftClientConfiguration(credentials=RedshiftCredentials())._bind_dataset_name(
++        "test_dataset"
++    )
++    client = RedshiftClient(schema, config, redshift().capabilities())
++    sql_client = client.sql_client
++
++    # simulate svv_redshift_schemas not available: execute_sql raises
++    # DatabaseUndefinedRelation (which is what @raise_database_error produces
++    # for a missing relation). The fallback calls SqlClientBase.has_dataset
++    # which we patch to return a known value.
++    with (
++        patch.object(
++            RedshiftSqlClient,
++            "execute_sql",
++            side_effect=DatabaseUndefinedRelation(Exception("relation does not exist")),
++        ),
++        patch.object(SqlClientBase, "has_dataset", return_value=True) as fallback_mock,
++    ):
++        assert sql_client.has_dataset() is True
++        fallback_mock.assert_called_once()
+
+
+===== COMMIT b1ec246a =====
+
+
+commit b1ec246af
+Author: Jeff
+Date: 2026-02-01
+
+    Add extra_credentials to clickhouse destination configuration (#2888)
+

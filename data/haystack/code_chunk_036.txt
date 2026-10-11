@@ -1,0 +1,2791 @@
+diff --git a/dlt/common/configuration/specs/sftp_credentials.py b/dlt/common/configuration/specs/sftp_credentials.py
+index eae0cd02b..c91761407 100644
+--- a/dlt/common/configuration/specs/sftp_credentials.py
++++ b/dlt/common/configuration/specs/sftp_credentials.py
+@@ -1,12 +1,29 @@
+-from typing import Any, Dict, Optional, Annotated
+-
+-from dlt.common.typing import TSecretStrValue, DictStrAny, SocketLike
++from typing import Any, Dict, Optional, Annotated, TYPE_CHECKING, List
++from typing_extensions import TypeAlias, Callable
++import socket
++from dlt.common.typing import TSecretStrValue, SocketLike
+ from dlt.common.configuration.specs.base_configuration import (
+     CredentialsConfiguration,
+     configspec,
+     NotResolved,
+ )
+ 
++if TYPE_CHECKING:
++    try:
++        from paramiko import PKey
++        from paramiko.auth_strategy import AuthStrategy
++        from paramiko import Transport
++    except ImportError:
++        PKey = Any  # type: ignore[misc, assignment]
++        AuthStrategy = Any  # type: ignore[misc, assignment]
++        Transport = Any  # type: ignore[misc, assignment]
++else:
++    PKey = Any
++    AuthStrategy = Any
++    Transport = Any
++
++SFTPTransportFactory: TypeAlias = Callable[[socket.socket], Transport]
++
+ 
+ @configspec
+ class SFTPCredentials(CredentialsConfiguration):
+@@ -32,6 +49,8 @@ class SFTPCredentials(CredentialsConfiguration):
+     sftp_port: Optional[int] = 22
+     sftp_username: Optional[str] = None
+     sftp_password: Optional[TSecretStrValue] = None
++    # Runtime-only pkey; cannot be loaded from env var, skip configspec.
++    sftp_pkey: Annotated[Optional[PKey], NotResolved()] = None
+     sftp_key_filename: Optional[str] = None
+     sftp_key_passphrase: Optional[TSecretStrValue] = None
+     sftp_timeout: Optional[float] = None
+@@ -48,6 +67,10 @@ class SFTPCredentials(CredentialsConfiguration):
+     sftp_gss_deleg_creds: Optional[bool] = True
+     sftp_gss_host: Optional[str] = None
+     sftp_gss_trust_dns: Optional[bool] = True
++    # Runtime-only vars below; cannot be loaded from env var, skip configspec.
++    sftp_disabled_algorithms: Annotated[Optional[Dict[str, List[str]]], NotResolved()] = None
++    sftp_transport_factory: Annotated[Optional[SFTPTransportFactory], NotResolved()] = None
++    sftp_auth_strategy: Annotated[Optional[AuthStrategy], NotResolved()] = None
+ 
+     def to_fsspec_credentials(self) -> Dict[str, Any]:
+         """Return a dict that can be passed to fsspec SFTP/SSHClient.connect method."""
+@@ -56,6 +79,7 @@ class SFTPCredentials(CredentialsConfiguration):
+             "port": self.sftp_port,
+             "username": self.sftp_username,
+             "password": self.sftp_password,
++            "pkey": self.sftp_pkey,
+             "key_filename": self.sftp_key_filename,
+             "passphrase": self.sftp_key_passphrase,
+             "timeout": self.sftp_timeout,
+@@ -71,6 +95,9 @@ class SFTPCredentials(CredentialsConfiguration):
+             "gss_deleg_creds": self.sftp_gss_deleg_creds,
+             "gss_host": self.sftp_gss_host,
+             "gss_trust_dns": self.sftp_gss_trust_dns,
++            "disabled_algorithms": self.sftp_disabled_algorithms,
++            "transport_factory": self.sftp_transport_factory,
++            "auth_strategy": self.sftp_auth_strategy,
+         }
+ 
+         return credentials
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/filesystem.md b/docs/website/docs/dlt-ecosystem/destinations/filesystem.md
+index 35ef24f4a..93e5d62f6 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/filesystem.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/filesystem.md
+@@ -328,24 +328,32 @@ Configure your SFTP credentials by editing the `.dlt/secrets.toml` file. By defa
+ Below are the possible fields for SFTP credentials configuration:
+ 
+ ```text
+-sftp_port             # The port for SFTP, defaults to 22 (standard for SSH/SFTP)
+-sftp_username         # Your SFTP username, defaults to None
+-sftp_password         # Your SFTP password (if using password-based auth), defaults to None
+-sftp_key_filename     # Path to your private key file for key-based authentication, defaults to None
+-sftp_key_passphrase   # Passphrase for your private key (if applicable), defaults to None
+-sftp_timeout          # Timeout for establishing a connection, defaults to None
+-sftp_banner_timeout   # Timeout for receiving the banner during authentication, defaults to None
+-sftp_auth_timeout     # Authentication timeout, defaults to None
+-sftp_channel_timeout  # Channel timeout for SFTP operations, defaults to None
+-sftp_allow_agent      # Use SSH agent for key management (if available), defaults to True
+-sftp_look_for_keys    # Search for SSH keys in the default SSH directory (~/.ssh/), defaults to True
+-sftp_compress         # Enable compression (can improve performance over slow networks), defaults to False
+-sftp_gss_auth         # Use GSS-API for authentication, defaults to False
+-sftp_gss_kex          # Use GSS-API for key exchange, defaults to False
+-sftp_gss_deleg_creds  # Delegate credentials with GSS-API, defaults to True
+-sftp_gss_host         # Host for GSS-API, defaults to None
+-sftp_gss_trust_dns    # Trust DNS for GSS-API, defaults to True
++sftp_port                   # The port for SFTP, defaults to 22 (standard for SSH/SFTP)
++sftp_username               # Your SFTP username, defaults to None
++sftp_password               # Your SFTP password (if using password-based auth), defaults to None
++*sftp_pkey*                 # Your private key for key-based authentication, defaults to None
++sftp_key_filename           # Path to your private key file for key-based authentication, defaults to None
++sftp_key_passphrase         # Passphrase for your private key (if applicable), defaults to None
++sftp_timeout                # Timeout for establishing a connection, defaults to None
++sftp_banner_timeout         # Timeout for receiving the banner during authentication, defaults to None
++sftp_auth_timeout           # Authentication timeout, defaults to None
++sftp_channel_timeout        # Channel timeout for SFTP operations, defaults to None
++sftp_allow_agent            # Use SSH agent for key management (if available), defaults to True
++sftp_look_for_keys          # Search for SSH keys in the default SSH directory (~/.ssh/), defaults to True
++sftp_compress               # Enable compression (can improve performance over slow networks), defaults to False
++*sftp_sock*                 # Custom socket to use for communication to target host, defaults to None
++sftp_gss_auth               # Use GSS-API for authentication, defaults to False
++sftp_gss_kex                # Use GSS-API for key exchange, defaults to False
++sftp_gss_deleg_creds        # Delegate credentials with GSS-API, defaults to True
++sftp_gss_host               # Host for GSS-API, defaults to None
++sftp_gss_trust_dns          # Trust DNS for GSS-API, defaults to True
++*sftp_disabled_algorithms*  # Disable specific algorithms for security, defaults to None
++*sftp_transport_factory*    # Custom transport factory, defaults to None
++*sftp_auth_strategy*        # Authentication strategy, defaults to None
+ ```
++:::note
++The `*` credentials indicate parameters that cannot be set through `.dlt/secrets.toml` and must be set through code instantiation.
++:::
+ 
+ :::info
+ For more information about credentials parameters: https://docs.paramiko.org/en/3.3/api/client.html#paramiko.client.SSHClient.connect
+diff --git a/pyproject.toml b/pyproject.toml
+index 95d7ffb7d..be9b0d80e 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -234,6 +234,7 @@ dev = [
+     "flake8-print>=5.0.0,<6",
+     "pip>=24.0.0",
+     "pydoclint>=0.6.5,<0.7",
++    "types-paramiko>=3.5.0.20250708",
+ ]
+ 
+ # NOTE: those dependencies are used to test built in sources
+diff --git a/tests/load/filesystem_sftp/test_filesystem_sftp.py b/tests/load/filesystem_sftp/test_filesystem_sftp.py
+index be159d97b..51fb0040a 100644
+--- a/tests/load/filesystem_sftp/test_filesystem_sftp.py
++++ b/tests/load/filesystem_sftp/test_filesystem_sftp.py
+@@ -3,7 +3,6 @@ import pytest
+ import fsspec
+ import socket
+ import dlt
+-from dlt.common.configuration.specs import SFTPCredentials
+ 
+ from dlt.common.json import json
+ from dlt.common.configuration.inject import with_config
+@@ -12,9 +11,14 @@ from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
+ 
+ from tests.load.utils import ALL_FILESYSTEM_DRIVERS
+ 
++
+ if "sftp" not in ALL_FILESYSTEM_DRIVERS:
+     pytest.skip("sftp filesystem driver not configured", allow_module_level=True)
+ 
++from paramiko.auth_strategy import Password
++from paramiko import RSAKey, Transport
++from paramiko.ssh_exception import SSHException
++
+ 
+ @with_config(spec=FilesystemConfiguration, sections=("sources", "filesystem"))
+ def get_config(config: FilesystemConfiguration = None) -> FilesystemConfiguration:
+@@ -126,7 +130,17 @@ def test_filesystem_sftp_pipeline(sftp_filesystem):
+         assert sorted(result_states) == sorted(expected_states)
+ 
+ 
+-def run_sftp_auth(user, password=None, key=None, passphrase=None, sock=None):
++def run_sftp_auth(
++    user,
++    password=None,
++    pkey=None,
++    key=None,
++    passphrase=None,
++    sock=None,
++    disabled_algorithms=None,
++    transport_factory=None,
++    auth_strategy=None,
++):
+     env_vars = {
+         "SOURCES__FILESYSTEM__BUCKET_URL": "sftp://localhost",
+         "SOURCES__FILESYSTEM__CREDENTIALS__SFTP_PORT": "2222",
+@@ -144,6 +158,14 @@ def run_sftp_auth(user, password=None, key=None, passphrase=None, sock=None):
+ 
+     config = get_config()
+ 
++    if disabled_algorithms:
++        config.credentials.sftp_disabled_algorithms = disabled_algorithms  # type: ignore[union-attr]
++    if transport_factory:
++        config.credentials.sftp_transport_factory = transport_factory  # type: ignore[union-attr]
++    if auth_strategy:
++        config.credentials.sftp_auth_strategy = auth_strategy  # type: ignore[union-attr]
++    if pkey:
++        config.credentials.sftp_pkey = pkey  # type: ignore[union-attr]
+     if sock:
+         config.credentials.sftp_sock = sock  # type: ignore[union-attr]
+ 
+@@ -163,6 +185,17 @@ def test_filesystem_sftp_auth_private_key_protected():
+     run_sftp_auth("bobby", key=get_key_path("bobby"), passphrase="passphrase123")
+ 
+ 
++def test_filesystem_sftp_auth_pkey():
++    run_sftp_auth("foo", pkey=RSAKey.from_private_key_file(get_key_path("foo")))
++
++
++def test_filesystem_sftp_pkey_auth_pkey_protected():
++    run_sftp_auth(
++        "bobby",
++        pkey=RSAKey.from_private_key_file(filename=get_key_path("bobby"), password="passphrase123"),
++    )
++
++
+ # Test requires - ssh_agent with user's bobby key loaded. The commands and file names required are:
+ # eval "$(ssh-agent -s)"
+ # cp /path/to/tests/load/filesystem_sftp/bobby_rsa* ~/.ssh/id_rsa
+@@ -190,3 +223,52 @@ def test_filesystem_sftp_with_socket():
+     sock.close()
+     with pytest.raises(OSError):
+         run_sftp_auth("billy", key=get_key_path("billy"), sock=sock)
++
++
++class TaggedTransport(Transport):
++    """A Transport class that tags itself so we can detect it in tests."""
++
++    def __init__(self, sock, **kwargs):
++        super().__init__(sock, **kwargs)
++        # Add any custom state or markers you like:
++        self.factory_tag = "used-tagged-transport"
++
++
++def test_filesystem_sftp_with_tagged_transport():
++    created = []
++
++    def factory(sock, **kwargs):
++        t = TaggedTransport(sock, **kwargs)
++        created.append(t)
++        return t
++
++    run_sftp_auth("foo", key=get_key_path("foo"), transport_factory=factory)
++
++    # Verify it was used
++    assert len(created) == 1, "Custom transport factory never ran"
++    transport = created[0]
++    assert isinstance(transport, TaggedTransport)
++    assert transport.factory_tag == "used-tagged-transport"
++
++    # And ensure it's still functional
++    sftp = transport.open_sftp_client()
++    assert hasattr(sftp, "listdir")
++    sftp.close()
++
++
++def test_filesystem_sftp_disabled_algorithms():
++    # we know foo’s server uses rsa keys
++    with pytest.raises(SSHException):
++        run_sftp_auth(
++            "foo",
++            key=get_key_path("foo"),
++            disabled_algorithms={"pubkeys": ["ssh-rsa", "rsa-sha2-256", "rsa-sha2-512"]},
++        )
++
++
++def test_filesystem_sftp_auth_strategy():
++    # Verify that passing an alternate auth_strategy makes it through config.
++    run_sftp_auth(
++        "foo",
++        auth_strategy=Password("foo", lambda: "pass"),
++    )
+diff --git a/uv.lock b/uv.lock
+index 12b961d5b..46f428b0f 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2230,6 +2230,7 @@ dev = [
+     { name = "types-cachetools" },
+     { name = "types-click" },
+     { name = "types-deprecated" },
++    { name = "types-paramiko" },
+     { name = "types-protobuf" },
+     { name = "types-psutil" },
+     { name = "types-psycopg2" },
+@@ -2443,6 +2444,7 @@ dev = [
+     { name = "types-cachetools", specifier = ">=4.2.9" },
+     { name = "types-click", specifier = ">=7.1.8,<8" },
+     { name = "types-deprecated", specifier = ">=1.2.9.2,<2" },
++    { name = "types-paramiko", specifier = ">=3.5.0.20250708" },
+     { name = "types-protobuf", specifier = ">=3.19.8" },
+     { name = "types-psutil", specifier = ">=5.9.5.16,<6" },
+     { name = "types-psycopg2", specifier = ">=2.9.21.14,<3" },
+@@ -9088,6 +9090,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/4d/e3/c18aa72ab84e0bc127a3a94e93be1a6ac2cb281371d3a45376ab7cfdd31c/types_deprecated-1.2.15.20250304-py3-none-any.whl", hash = "sha256:86a65aa550ea8acf49f27e226b8953288cd851de887970fbbdf2239c116c3107", size = 8553 },
+ ]
+ 
++[[package]]
++name = "types-paramiko"
++version = "3.5.0.20250708"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "cryptography" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/8e/7e/a50c3538a088eb3dbf167d16f5b0d8b62c821496df7488af4d7841c06bc5/types_paramiko-3.5.0.20250708.tar.gz", hash = "sha256:45125bff40766db2d7d53bd1a4f329868293e512f2e6b7fe11c335111df027f2", size = 28877, upload-time = "2025-07-08T03:15:04.769Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/6f/42/0a052da12277848f44825532d97858d2ba8851b603b0a4923356f503e31c/types_paramiko-3.5.0.20250708-py3-none-any.whl", hash = "sha256:c761ecff3445d847a40c0d831a0daaba2bddbd2bdc74315659be5ff4835bb434", size = 39758, upload-time = "2025-07-08T03:15:03.95Z" },
++]
++
+ [[package]]
+ name = "types-protobuf"
+ version = "6.30.2.20250516"
+
+
+===== COMMIT 440a7a35 =====
+
+
+commit 440a7a35a
+Author: Thierry Jean
+Date: 2025-08-08
+
+    fix: `MissingDependencyException` now inherits `ImportError` (#2977)
+
+diff --git a/dlt/common/exceptions.py b/dlt/common/exceptions.py
+index 485d0d4f8..edfee5fce 100644
+--- a/dlt/common/exceptions.py
++++ b/dlt/common/exceptions.py
+@@ -152,7 +152,7 @@ class ArgumentsOverloadException(DltException):
+         super().__init__(msg)
+ 
+ 
+-class MissingDependencyException(DltException):
++class MissingDependencyException(DltException, ImportError):
+     def __init__(self, caller: str, dependencies: Sequence[str], appendix: str = "") -> None:
+         self.caller = caller
+         self.dependencies = dependencies
+diff --git a/dlt/common/reflection/ref.py b/dlt/common/reflection/ref.py
+index 09711f84f..3cd1c78c9 100644
+--- a/dlt/common/reflection/ref.py
++++ b/dlt/common/reflection/ref.py
+@@ -53,13 +53,7 @@ def import_module_with_missing(name: str, missing_modules: Tuple[str, ...] = ())
+         while True:
+             try:
+                 return import_module(name)
+-            except ImportError as ie:
+-                if ie.name is None:
+-                    raise
+-                # print(f"ADD {ie.name} {ie.path} vs {name} vs {str(ie)}")
+-                if ie.name in missing_modules:
+-                    raise
+-                missing_modules += (ie.name,)
++            # `MissingDependencyException` is an `ImportError`
+             except MissingDependencyException as me:
+                 if isinstance(me.__context__, ImportError):
+                     if me.__context__.name is None:
+@@ -71,6 +65,14 @@ def import_module_with_missing(name: str, missing_modules: Tuple[str, ...] = ())
+                     missing_modules += (me.__context__.name,)
+                 else:
+                     raise
++            # catch `ImportError` that are not `MissingDependencyException`
++            except ImportError as ie:
++                if ie.name is None:
++                    raise
++                # print(f"ADD {ie.name} {ie.path} vs {name} vs {str(ie)}")
++                if ie.name in missing_modules:
++                    raise
++                missing_modules += (ie.name,)
+     finally:
+         builtins.__import__ = real_import
+ 
+
+
+===== COMMIT 105904fd =====
+
+
+commit 105904fd2
+Author: David Scharf
+Date: 2025-08-08
+
+    re-enable python 3.10 common tests (#2979)
+
+diff --git a/.github/workflows/test_common.yml b/.github/workflows/test_common.yml
+index c47396894..f959ecd8e 100644
+--- a/.github/workflows/test_common.yml
++++ b/.github/workflows/test_common.yml
+@@ -31,7 +31,7 @@ jobs:
+             python-version: "3.9"
+             shell: bash
+           - os: ubuntu-latest
+-            python-version: "3.11"
++            python-version: "3.10"
+             shell: bash
+           - os: ubuntu-latest
+             python-version: "3.11"
+
+
+===== COMMIT 3273d27f =====
+
+
+commit 3273d27f6
+Author: Thierry Jean
+Date: 2025-08-06
+
+    fix: avoid private interfaces; explicit compiler mapping (#2966)
+
+diff --git a/dlt/helpers/ibis.py b/dlt/helpers/ibis.py
+index aeb67a4b3..a92cb5834 100644
+--- a/dlt/helpers/ibis.py
++++ b/dlt/helpers/ibis.py
+@@ -1,6 +1,6 @@
+ from typing import cast, Any
+ 
+-from dlt.common.exceptions import MissingDependencyException
++from dlt.common.exceptions import MissingDependencyException, ValueErrorWithKnownValues
+ from dlt.common.destination import TDestinationReferenceArg, Destination
+ from dlt.common.destination.client import JobClientBase
+ from dlt.common.schema import Schema
+@@ -22,6 +22,7 @@ from dlt.destinations.impl.synapse.configuration import SynapseClientConfigurati
+ try:
+     import ibis
+     import sqlglot
++    import sqlglot.expressions as sge
+     from ibis import BaseBackend, Expr, Table
+     import ibis.backends.sql.compilers as sc
+     from ibis.backends.sql.compilers.base import SQLGlotCompiler
+@@ -214,28 +215,52 @@ def create_unbound_ibis_table(schema: Schema, dataset_name: str, table_name: str
+     return unbound_table
+ 
+ 
+-def get_compiler_for_dialect(dialect: TSqlGlotDialect) -> SQLGlotCompiler:
++def _get_ibis_to_sqlglot_compiler(dialect: TSqlGlotDialect) -> SQLGlotCompiler:
+     """Get the compiler for a given dialect."""
+-
+-    ibis_dialect: str = dialect
+-    if dialect == "tsql":
+-        ibis_dialect = "mssql"
+-    if dialect == "redshift":
+-        ibis_dialect = "postgres"
+-
+-    try:
+-        compiler_provider = getattr(sc, ibis_dialect)
+-    except AttributeError:
+-        # default is duckdb
+-        compiler_provider = sc.duckdb
+-
+-    if (compiler := getattr(compiler_provider, "compiler", None)) is None:
+-        raise NotImplementedError(f"{compiler_provider} is not a SQL backend")
++    if dialect == "athena":
++        compiler = sc.AthenaCompiler()
++    elif dialect == "bigquery":
++        compiler = sc.BigQueryCompiler()
++    elif dialect == "clickhouse":
++        compiler = sc.ClickHouseCompiler()
++    elif dialect == "databricks":
++        compiler = sc.DatabricksCompiler()
++    elif dialect == "druid":
++        compiler = sc.DruidCompiler()
++    elif dialect == "duckdb":
++        compiler = sc.DuckDBCompiler()
++    elif dialect == "mysql":
++        compiler = sc.MySQLCompiler()
++    elif dialect == "oracle":
++        compiler = sc.OracleCompiler()
++    elif dialect == "postgres":
++        compiler = sc.PostgresCompiler()
++    elif dialect == "presto":
++        compiler = sc.TrinoCompiler()
++    elif dialect == "redshift":
++        compiler = sc.PostgresCompiler()
++    elif dialect == "risingwave":
++        compiler = sc.RisingWaveCompiler()
++    elif dialect == "snowflake":
++        compiler = sc.SnowflakeCompiler()
++    # NOTE I'm unsure if both `spark` and `spark2` are supported by the same compiler
++    elif dialect == "spark":
++        compiler = sc.PySparkCompiler()
++    elif dialect == "spark2":
++        compiler = sc.PySparkCompiler()
++    elif dialect == "sqlite":
++        compiler = sc.SQLiteCompiler()
++    elif dialect == "trino":
++        compiler = sc.TrinoCompiler()
++    elif dialect == "tsql":
++        compiler = sc.MSSQLCompiler()
++    else:
++        compiler = sc.DuckDBCompiler()
+ 
+     return compiler
+ 
+ 
+-def compile_ibis_to_sqlglot(ibis_expr: Expr, dialect: TSqlGlotDialect) -> sqlglot.expressions.Query:
++def compile_ibis_to_sqlglot(ibis_expr: Expr, dialect: TSqlGlotDialect) -> sge.Query:
+     """Compile an ibis expression to a sqlglot query."""
+-    compiler = get_compiler_for_dialect(dialect)
+-    return cast(sqlglot.expressions.Query, compiler.to_sqlglot(ibis_expr))
++    compiler = _get_ibis_to_sqlglot_compiler(dialect)
++    return cast(sge.Query, compiler.to_sqlglot(ibis_expr))
+diff --git a/tests/helpers/test_ibis.py b/tests/helpers/test_ibis.py
+new file mode 100644
+index 000000000..27fb78224
+--- /dev/null
++++ b/tests/helpers/test_ibis.py
+@@ -0,0 +1,41 @@
++import pytest
++import ibis.backends.sql.compilers as sc
++
++from dlt.helpers.ibis import _get_ibis_to_sqlglot_compiler
++
++
++@pytest.mark.parametrize(
++    "dialect, expected_compiler",
++    [
++        ("athena", sc.AthenaCompiler),
++        ("bigquery", sc.BigQueryCompiler),
++        ("clickhouse", sc.ClickHouseCompiler),
++        ("databricks", sc.DatabricksCompiler),
++        ("doris", sc.DuckDBCompiler),  # default value
++        ("drill", sc.DuckDBCompiler),  # default value
++        ("druid", sc.DruidCompiler),
++        ("duckdb", sc.DuckDBCompiler),
++        ("dune", sc.DuckDBCompiler),  # default value
++        ("hive", sc.DuckDBCompiler),  # default value
++        ("materialize", sc.DuckDBCompiler),  # default value
++        ("mysql", sc.MySQLCompiler),
++        ("oracle", sc.OracleCompiler),
++        ("postgres", sc.PostgresCompiler),
++        ("presto", sc.TrinoCompiler),
++        ("prql", sc.DuckDBCompiler),  # default value
++        ("redshift", sc.PostgresCompiler),
++        ("risingwave", sc.RisingWaveCompiler),
++        ("snowflake", sc.SnowflakeCompiler),
++        ("spark", sc.PySparkCompiler),
++        ("spark2", sc.PySparkCompiler),
++        ("sqlite", sc.SQLiteCompiler),
++        ("starrocks", sc.DuckDBCompiler),  # default value
++        ("tableau", sc.DuckDBCompiler),  # default value
++        ("teradata", sc.DuckDBCompiler),  # default value
++        ("trino", sc.TrinoCompiler),
++        ("tsql", sc.MSSQLCompiler),
++    ],
++)
++def test_get_ibis_to_sqlglot_compiler(dialect, expected_compiler) -> None:
++    compiler = _get_ibis_to_sqlglot_compiler(dialect)
++    assert isinstance(compiler, expected_compiler)
+
+
+===== COMMIT dc0ab559 =====
+
+
+commit dc0ab5597
+Author: David Scharf
+Date: 2025-08-05
+
+    fix failing top level module imports (#2963)
+
+diff --git a/dlt/common/runtime/run_context.py b/dlt/common/runtime/run_context.py
+index cb7994792..dcdc7bf5f 100644
+--- a/dlt/common/runtime/run_context.py
++++ b/dlt/common/runtime/run_context.py
+@@ -81,7 +81,7 @@ class RunContext(SupportsRunContext):
+     def module(self) -> Optional[ModuleType]:
+         try:
+             return self.import_run_dir_module(self.run_dir)
+-        except ImportError:
++        except (ImportError, TypeError):
+             return None
+ 
+     @property
+
+
+===== COMMIT 51439387 =====
+
+
+commit 514393872
+Author: anuunchin
+Date: 2025-08-05
+
+    Allow setting streamed_exec in delta upsert (#2961)
+
+diff --git a/dlt/common/libs/deltalake.py b/dlt/common/libs/deltalake.py
+index 20d331368..7004b09d4 100644
+--- a/dlt/common/libs/deltalake.py
++++ b/dlt/common/libs/deltalake.py
+@@ -118,6 +118,7 @@ def merge_delta_table(
+     data: Union[pa.Table, pa.RecordBatchReader],
+     schema: TTableSchema,
+     load_table_name: str,
++    streamed_exec: bool,
+ ) -> None:
+     """Merges in-memory Arrow data into on-disk Delta table."""
+ 
+@@ -142,6 +143,7 @@ def merge_delta_table(
+                 predicate=predicate,
+                 source_alias="source",
+                 target_alias="target",
++                streamed_exec=streamed_exec,
+             )
+             .when_matched_update_all()
+             .when_not_matched_insert_all()
+diff --git a/dlt/common/storages/configuration.py b/dlt/common/storages/configuration.py
+index f1c544773..23d100f6f 100644
+--- a/dlt/common/storages/configuration.py
++++ b/dlt/common/storages/configuration.py
+@@ -202,6 +202,7 @@ class FilesystemConfiguration(BaseConfiguration):
+     """Additional arguments as Config in botocore"""
+     deltalake_storage_options: Optional[DictStrAny] = None
+     deltalake_configuration: Optional[DictStrOptionalStr] = None
++    deltalake_streamed_exec: bool = True
+ 
+     @property
+     def protocol(self) -> str:
+diff --git a/dlt/destinations/impl/filesystem/filesystem.py b/dlt/destinations/impl/filesystem/filesystem.py
+index fe71c66d4..c1d11209c 100644
+--- a/dlt/destinations/impl/filesystem/filesystem.py
++++ b/dlt/destinations/impl/filesystem/filesystem.py
+@@ -200,6 +200,7 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
+                     data=arrow_rbr,
+                     schema=self._load_table,
+                     load_table_name=self.load_table_name,
++                    streamed_exec=self._job_client.config.deltalake_streamed_exec,
+                 )
+             else:
+                 location = self._job_client.get_open_table_location("delta", self.load_table_name)
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/delta-iceberg.md b/docs/website/docs/dlt-ecosystem/destinations/delta-iceberg.md
+index e0c6da0a1..5f1286f30 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/delta-iceberg.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/delta-iceberg.md
+@@ -110,6 +110,13 @@ def my_upsert_resource():
+ - Deleting records from nested tables not supported
+   - This means updates to JSON columns that involve element removals are not propagated. For example, if you first load `{"key": 1, "nested": [1, 2]}` and then load `{"key": 1, "nested": [1]}`, then the record for element `2` will not be deleted from the nested table.
+ 
++By default, dlt runs Delta table upserts in streamed mode to reduce memory pressure. To enable the use of source table statistics to derive an early pruning predicate, set:
++
++```toml
++[destination.filesystem]
++deltalake_streamed_exec = false
++```
++
+ ## Delta table format storage options and configuration
+ You can pass storage options and configuration by configuring both `destination.filesystem.deltalake_storage_options` and
+ `destination.filesystem.deltalake_configuration`:
+diff --git a/tests/load/filesystem/test_filesystem_common.py b/tests/load/filesystem/test_filesystem_common.py
+index 67b946bc5..14124ce31 100644
+--- a/tests/load/filesystem/test_filesystem_common.py
++++ b/tests/load/filesystem/test_filesystem_common.py
+@@ -59,6 +59,7 @@ def test_filesystem_configuration() -> None:
+         "kwargs": None,
+         "deltalake_storage_options": None,
+         "deltalake_configuration": None,
++        "deltalake_streamed_exec": True,
+     }
+ 
+ 
+@@ -234,6 +235,7 @@ def test_filesystem_configuration_with_additional_arguments() -> None:
+             "delta.minWriterVersion": "7",
+             "delta.enableChangeDataFeed": "true",
+         },
++        deltalake_streamed_exec=False,
+     )
+     assert dict(config) == {
+         "read_only": False,
+@@ -247,6 +249,7 @@ def test_filesystem_configuration_with_additional_arguments() -> None:
+             "delta.minWriterVersion": "7",
+             "delta.enableChangeDataFeed": "true",
+         },
++        "deltalake_streamed_exec": False,
+     }
+ 
+ 
+
+
+===== COMMIT e23a302a =====
+
+
+commit e23a302a8
+Author: anuunchin
+Date: 2025-08-04
+
+    AI Command: extended with IDEs (#2937)
+
+diff --git a/dlt/cli/ai_command.py b/dlt/cli/ai_command.py
+index 2384097e9..c3564734d 100644
+--- a/dlt/cli/ai_command.py
++++ b/dlt/cli/ai_command.py
+@@ -1,25 +1,29 @@
+ import os
+ import shutil
+ from pathlib import Path
+-from typing import List, Tuple, get_args, Literal, Set, Union
++from typing import List, Tuple, get_args, Literal, Union, cast
+ 
+ from dlt.cli import echo as fmt
+ from dlt.common import git
+ from dlt.common.pipeline import get_dlt_repos_dir
+ from dlt.common.runtime import run_context
+ 
+-
+ TSupportedIde = Literal[
++    "amp",
++    "codex",
++    "claude",
++    "cody",
++    "cline",
+     "cursor",
+     "continue",
+-    "cline",
+-    "claude_desktop",
++    "windsurf",
++    "copilot",
+ ]
+ 
+-SUPPORTED_IDES: Set[TSupportedIde] = list(get_args(TSupportedIde))  # type: ignore
++SUPPORTED_IDES = cast(Tuple[TSupportedIde, ...], get_args(TSupportedIde))
+ VERIFIED_SOURCES_AI_BASE_DIR = "ai"
+ 
+-# TODO Claude Desktop: rules need to be named `CLAUDE.md`, allow command to append to it
++# TODO Claude: rules need to be named `CLAUDE.md`, allow command to append to it
+ # TODO Continue: rules need to be in YAML file, allow command to properly edit it
+ # TODO generate more files based on the specifics of the source README and the destination
+ 
+@@ -27,6 +31,11 @@ VERIFIED_SOURCES_AI_BASE_DIR = "ai"
+ def _copy_repo_files(
+     src_dir: Path, dest_dir: Path, warn_on_overwrite: bool = True
+ ) -> Tuple[List[str], int]:
++    """
++    Copy either a single .md file or all files under a directory into dest_dir.
++    1. Single .md files (e.g. CLAUDE.md) are directly copied.
++    2. Rule files that follow a specific a folder structure (e.g .cursor/rules/) follow that structure.
++    """
+     copied_files = []
+     count_files = 0
+ 
+@@ -46,12 +55,10 @@ def _copy_repo_files(
+                 fmt.warning(f"Existing rules file found at {dest_file_path.absolute()}; Skipping.")
+             continue
+ 
++        dest_file_path.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(src_sub_path, dest_file_path)
+         copied_files.append(src_sub_path.name)
+ 
+-        if not dest_file_path.parent.exists():
+-            dest_file_path.parent.mkdir(parents=True, exist_ok=True)
+-
+-        shutil.copy2(src_sub_path, dest_file_path)
+     return copied_files, count_files
+ 
+ 
+diff --git a/dlt/cli/echo.py b/dlt/cli/echo.py
+index 2381c46c8..e64dbf02a 100644
+--- a/dlt/cli/echo.py
++++ b/dlt/cli/echo.py
+@@ -74,7 +74,13 @@ def confirm(text: str, default: Optional[bool] = None) -> bool:
+     return click.confirm(text, default=default)
+ 
+ 
+-def prompt(text: str, choices: Iterable[str], default: Optional[Any] = None) -> Any:
++def prompt(
++    text: str,
++    choices: Iterable[str],
++    default: Optional[Any] = None,
++    show_choices: bool = True,
++    show_default: bool = True,
++) -> Any:
+     if ALWAYS_CHOOSE_VALUE:
+         assert ALWAYS_CHOOSE_VALUE in choices
+         return ALWAYS_CHOOSE_VALUE
+@@ -82,7 +88,13 @@ def prompt(text: str, choices: Iterable[str], default: Optional[Any] = None) ->
+         assert default is not None
+         return default
+     click_choices = click.Choice(choices)
+-    return click.prompt(text, type=click_choices, default=default)
++    return click.prompt(
++        text,
++        type=click_choices,
++        default=default,
++        show_choices=show_choices,
++        show_default=show_default,
++    )
+ 
+ 
+ def text_input(text: str) -> str:
+diff --git a/dlt/cli/init_command.py b/dlt/cli/init_command.py
+index 3e3a8302a..c082ec710 100644
+--- a/dlt/cli/init_command.py
++++ b/dlt/cli/init_command.py
+@@ -1,7 +1,7 @@
+ import os
+ import ast
+ import shutil
+-from typing import Dict, Sequence, Tuple
++from typing import Dict, Sequence, Tuple, Optional
+ from pathlib import Path
+ 
+ 
+@@ -41,6 +41,7 @@ from dlt.cli.pipeline_files import (
+     TVerifiedSourceFileIndex,
+ )
+ from dlt.cli.exceptions import CliCommandInnerException
++from dlt.cli.ai_command import SUPPORTED_IDES, TSupportedIde
+ 
+ 
+ DLT_INIT_DOCS_URL = "https://dlthub.com/docs/reference/command-line-interface#dlt-init"
+@@ -104,7 +105,7 @@ def init_command(
+     sources_dir = run_ctx.get_run_entity("sources")
+ 
+     is_dlthub_source, display_source_name, _ = _get_source_display_name(source_name)
+-    copied_files, source_type = init_pipeline_at_destination(
++    copied_files, source_type, selected_ide = init_pipeline_at_destination(
+         source_name,
+         destination_type,
+         repo_location,
+@@ -116,13 +117,18 @@ def init_command(
+         settings_dir,
+         sources_dir,
+     )
+-    if is_dlthub_source and copied_files is not None:
++    if is_dlthub_source and copied_files is not None and selected_ide:
+         from dlt.cli import DEFAULT_VIBE_SOURCES_REPO, DEFAULT_VERIFIED_SOURCES_REPO
+         from dlt.cli.ai_command import ai_setup_command, vibe_source_setup
+ 
+         fmt.echo()
+         fmt.echo()
+-        ai_setup_command("cursor", DEFAULT_VERIFIED_SOURCES_REPO, branch=branch, hide_warnings=True)
++        ai_setup_command(
++            selected_ide,
++            DEFAULT_VERIFIED_SOURCES_REPO,
++            branch=branch,
++            hide_warnings=True,
++        )
+         fmt.echo()
+         fmt.echo()
+         # swap default repo location
+@@ -145,7 +151,7 @@ def init_pipeline_at_destination(
+     settings_dir: str = None,
+     sources_dir: str = None,
+     target_dependency_system: str = None,
+-) -> Tuple[Dict[str, str], files_ops.TSourceType]:
++) -> Tuple[Dict[str, str], files_ops.TSourceType, Optional[TSupportedIde]]:
+     """
+     Initializes a pipeline at the specified destination by setting up the required files, configurations, and dependencies.
+ 
+@@ -173,7 +179,7 @@ def init_pipeline_at_destination(
+             A tuple containing:
+             - A dictionary of copied files (destination path -> source path).
+             - The type of the source (e.g., "template", "core", "verified").
+-            - Extracted display name for the source
++            - Name of the selected ide for dlthub sources (defaults to "cursor")
+     """
+     # try to import the destination and get config spec
+     if destination_type:
+@@ -245,7 +251,7 @@ def init_pipeline_at_destination(
+             )
+         if not remote_deleted and not remote_modified:
+             fmt.echo("No files to update, exiting")
+-            return None, source_type
++            return None, source_type, None
+ 
+         if remote_index["is_dirty"]:
+             fmt.warning(
+@@ -284,7 +290,7 @@ def init_pipeline_at_destination(
+                 "Pipeline script %s already exists, exiting"
+                 % source_configuration.dest_pipeline_script
+             )
+-            return None, source_type
++            return None, source_type, None
+ 
+     # add .dlt/*.toml files to be copied
+     # source_configuration.files.extend(
+@@ -310,7 +316,7 @@ def init_pipeline_at_destination(
+                 "You can update dlt with: pip3 install -U"
+                 f' "{source_configuration.requirements.dlt_requirement_base}"'
+             )
+-            return None, source_type
++            return None, source_type, None
+ 
+     # read module source and parse it
+     visitor = utils.parse_init_script(
+@@ -414,6 +420,8 @@ def init_pipeline_at_destination(
+     # validate by parsing
+     ast.parse(source=dest_script_source)
+ 
++    selected_ide: TSupportedIde = None
++
+     # ask for confirmation
+     if is_new_source:
+         if source_configuration.source_type == "core":
+@@ -449,11 +457,21 @@ def init_pipeline_at_destination(
+                     " to see all available sources and templates."
+                 )
+             if is_dlthub_source:
++                fmt.echo("dlt will generate useful project rules tailored to your assistant/IDE.")
++                selected_ide = fmt.prompt(
++                    "Press Enter to accept the default (cursor), or type a name",
++                    choices=SUPPORTED_IDES,
++                    default="cursor",
++                    show_choices=False,
++                    show_default=False,
++                )
++
+                 fmt.echo(
+-                    "Initializing pipeline %s, adding cursor rules, code snippets and docs for %s"
++                    "Initializing pipeline %s, adding %s rules, code snippets and docs for %s"
+                     " source."
+                     % (
+                         fmt.bold(source_configuration.dest_pipeline_script),
++                        fmt.bold(selected_ide),
+                         fmt.bold(display_source_name),
+                     )
+                 )
+@@ -516,7 +534,7 @@ def init_pipeline_at_destination(
+         if add_example_pipeline_script:
+             files_to_create[pipeline_script_target_path] = dest_script_source
+         # todo: handle remote index changes?
+-        return files_to_create, source_type
++        return files_to_create, source_type, None
+ 
+     # modify storage
+     else:
+@@ -555,7 +573,7 @@ def init_pipeline_at_destination(
+             dest_storage.save(utils.REQUIREMENTS_TXT, requirements_txt)
+ 
+         copied_files: Dict[str, str] = {dest_path: src_path for src_path, dest_path in copy_files}
+-        return copied_files, source_type
++        return copied_files, source_type, selected_ide
+ 
+ 
+ def _get_source_display_name(source_name: str) -> Tuple[bool, str, str]:
+diff --git a/dlt/cli/pipeline_files.py b/dlt/cli/pipeline_files.py
+index 317a6ae67..d7dfb0fd8 100644
+--- a/dlt/cli/pipeline_files.py
++++ b/dlt/cli/pipeline_files.py
+@@ -16,7 +16,7 @@ from dlt.common.reflection.utils import get_module_docstring
+ from dlt.cli import utils
+ from dlt.cli.requirements import SourceRequirements
+ 
+-TSourceType = Literal["core", "verified", "template"]
++TSourceType = Literal["core", "verified", "template", "vibe"]
+ 
+ SOURCES_INIT_INFO_ENGINE_VERSION = 1
+ 
+@@ -169,8 +169,15 @@ def get_remote_source_index(
+ def get_sources_names(sources_storage: FileStorage, source_type: TSourceType) -> List[str]:
+     candidates: List[str] = []
+ 
++    # for vibe sources, we just find all directories, except for hidden ones (.git)
++    if source_type == "vibe":
++        candidates = [
++            name
++            for name in sources_storage.list_folder_dirs(".", to_root=False)
++            if not name.startswith(".")
++        ]
+     # for the templates we just find all the filenames
+-    if source_type == "template":
++    elif source_type == "template":
+         for name in sources_storage.list_folder_files(".", to_root=False):
+             if name.endswith(PIPELINE_FILE_SUFFIX):
+                 candidates.append(name.replace(PIPELINE_FILE_SUFFIX, ""))
+diff --git a/docs/website/docs/reference/command-line-interface.md b/docs/website/docs/reference/command-line-interface.md
+index 596741f57..ed5e8b5f0 100644
+--- a/docs/website/docs/reference/command-line-interface.md
++++ b/docs/website/docs/reference/command-line-interface.md
+@@ -702,7 +702,7 @@ Generate IDE-specific configuration and rules files.
+ **Usage**
+ ```sh
+ dlt ai setup [-h] [--location LOCATION] [--branch BRANCH]
+-    {cursor,continue,cline,claude_desktop}
++    {amp,codex,claude,cody,cline,cursor,continue,windsurf,copilot}
+ ```
+ 
+ **Description**
+diff --git a/tests/cli/test_ai_command.py b/tests/cli/test_ai_command.py
+new file mode 100644
+index 000000000..3d8dde246
+--- /dev/null
++++ b/tests/cli/test_ai_command.py
+@@ -0,0 +1,44 @@
++import pytest
++from pathlib import Path
++
++from dlt.common.utils import set_working_dir
++from dlt.cli import ai_command
++from dlt.cli.ai_command import TSupportedIde
++from dlt.cli.plugins import DEFAULT_VERIFIED_SOURCES_REPO
++from tests.utils import TEST_STORAGE_ROOT
++
++
++@pytest.mark.parametrize(
++    ("ide", "expected_relative_path", "is_single_file"),
++    (
++        ("amp", "AGENT.md", True),
++        ("codex", "AGENT.md", True),
++        ("claude", "CLAUDE.md", True),
++        ("cody", ".sourcegraph", False),
++        ("cline", ".clinerules", False),
++        ("cursor", ".cursor/rules/", False),
++        ("continue", ".continue/rules/", False),
++        ("windsurf", ".windsurf/rules/", False),
++        ("copilot", ".github/instructions/", False),
++    ),
++)
++def test_ai_setup_command(
++    ide: TSupportedIde, expected_relative_path: str, is_single_file: bool
++) -> None:
++    with set_working_dir(TEST_STORAGE_ROOT):
++        ai_command.ai_setup_command(ide=ide, location=DEFAULT_VERIFIED_SOURCES_REPO)
++
++    base_path = Path(TEST_STORAGE_ROOT).resolve()
++    expected_location = base_path / expected_relative_path
++
++    if is_single_file:
++        assert expected_location.is_file()
++        return
++
++    assert expected_location.is_dir()
++    all_files = list(expected_location.rglob("*"))
++    if ide == "cursor":
++        assert all(file.suffix == ".mdc" for file in all_files)
++        assert (base_path / ".cursorignore").is_file()
++    else:
++        assert all(file.suffix == ".md" for file in all_files)
+diff --git a/tests/cli/test_init_command.py b/tests/cli/test_init_command.py
+index cd9cea228..218e7146f 100644
+--- a/tests/cli/test_init_command.py
++++ b/tests/cli/test_init_command.py
+@@ -3,6 +3,7 @@ from copy import deepcopy
+ import hashlib
+ import os
+ import contextlib
++import shutil
+ from subprocess import CalledProcessError
+ from typing import List, Tuple, Optional
+ from hexbytes import HexBytes
+@@ -19,13 +20,20 @@ import cryptography.hazmat.bindings._rust
+ import dlt
+ 
+ from dlt.common import git
++from dlt.common.pipeline import get_dlt_repos_dir
+ from dlt.common.configuration.providers import CONFIG_TOML, SECRETS_TOML, SecretsTomlProvider
+ from dlt.common.runners import Venv
+ from dlt.common.storages.file_storage import FileStorage
+-from dlt.common.utils import set_working_dir
++from dlt.common.utils import set_working_dir, uniq_id
+ 
+ 
+-from dlt.cli import init_command, echo, utils, DEFAULT_VERIFIED_SOURCES_REPO
++from dlt.cli import (
++    init_command,
++    echo,
++    utils,
++    DEFAULT_VERIFIED_SOURCES_REPO,
++    DEFAULT_VIBE_SOURCES_REPO,
++)
+ from dlt.cli.init_command import (
+     SOURCES_MODULE_NAME,
+     SourceConfiguration,
+@@ -36,22 +44,26 @@ from dlt.cli.init_command import (
+     _list_template_sources,
+     _list_verified_sources,
+ )
++from dlt.cli.ai_command import SUPPORTED_IDES
+ from dlt.cli.exceptions import CliCommandInnerException
+ from dlt.cli.requirements import SourceRequirements
+ from dlt.reflection.script_visitor import PipelineScriptVisitor
+ from dlt.reflection import names as n
+ from dlt.cli.config_toml_writer import TYPE_EXAMPLES
++from dlt.cli.pipeline_files import TSourceType
+ 
+ from tests.cli.utils import (
+     echo_default_choice,
+     repo_dir,
++    vibe_repo_dir,
+     project_files,
+     cloned_init_repo,
++    clonet_init_vibe_repo,
+     get_repo_dir,
+     get_project_files,
+ )
+ from tests.common.utils import modify_and_commit_file
+-from tests.utils import IMPLEMENTED_DESTINATIONS, clean_test_storage
++from tests.utils import IMPLEMENTED_DESTINATIONS, clean_test_storage, TEST_STORAGE_ROOT
+ 
+ # we hardcode the core sources here so we can check that the init script picks
+ # up the right source
+@@ -78,10 +90,14 @@ TEMPLATES = [
+ SOME_KNOWN_VERIFIED_SOURCES = ["chess", "google_sheets", "pipedrive"]
+ 
+ 
+-def get_verified_source_candidates(repo_dir: str) -> List[str]:
+-    sources_storage = FileStorage(os.path.join(repo_dir, SOURCES_MODULE_NAME))
+-    # enumerate all candidate verified sources
+-    return files_ops.get_sources_names(sources_storage, source_type="verified")
++def get_source_candidates(repo_dir: str, source_type: TSourceType = "verified") -> List[str]:
++    # vibe sources are in the root folder, so no module name
++    if source_type == "vibe":
++        sources_storage = FileStorage(repo_dir)
++    else:
++        sources_storage = FileStorage(os.path.join(repo_dir, SOURCES_MODULE_NAME))
++    # enumerate all candidate sources
++    return files_ops.get_sources_names(sources_storage, source_type=source_type)
+ 
+ 
+ def test_init_command_pipeline_template(repo_dir: str, project_files: FileStorage) -> None:
+@@ -248,7 +264,7 @@ def test_init_list_sources_update_warning(repo_dir: str, project_files: FileStor
+ 
+ 
+ def test_init_all_sources_together(repo_dir: str, project_files: FileStorage) -> None:
+-    source_candidates = [*get_verified_source_candidates(repo_dir), *CORE_SOURCES, *TEMPLATES]
++    source_candidates = [*get_source_candidates(repo_dir), *CORE_SOURCES, *TEMPLATES]
+ 
+     # source_candidates = [source_name for source_name in source_candidates if source_name == "salesforce"]
+     for source_name in source_candidates:
+@@ -270,14 +286,14 @@ def test_init_all_sources_together(repo_dir: str, project_files: FileStorage) ->
+ 
+ 
+ def test_init_all_sources_isolated(cloned_init_repo: FileStorage) -> None:
+-    repo_dir = get_repo_dir(cloned_init_repo)
++    repo_dir = get_repo_dir(cloned_init_repo, f"verified_sources_repo_{uniq_id()}")
+     # ensure we test both sources form verified sources and core sources
+     source_candidates = (
+-        set(get_verified_source_candidates(repo_dir)).union(set(CORE_SOURCES)).union(set(TEMPLATES))
++        set(get_source_candidates(repo_dir)).union(set(CORE_SOURCES)).union(set(TEMPLATES))
+     )
+     for candidate in source_candidates:
+         clean_test_storage()
+-        repo_dir = get_repo_dir(cloned_init_repo)
++        repo_dir = get_repo_dir(cloned_init_repo, f"verified_sources_repo_{uniq_id()}")
+         files = get_project_files(clear_all_sources=False)
+         with set_working_dir(files.storage_path):
+             init_command.init_command(candidate, "bigquery", repo_dir)
+@@ -288,12 +304,12 @@ def test_init_all_sources_isolated(cloned_init_repo: FileStorage) -> None:
+ 
+ 
+ def test_init_core_sources_ejected(cloned_init_repo: FileStorage) -> None:
+-    repo_dir = get_repo_dir(cloned_init_repo)
++    repo_dir = get_repo_dir(cloned_init_repo, f"verified_sources_repo_{uniq_id()}")
+     # ensure we test both sources form verified sources and core sources
+     source_candidates = set(CORE_SOURCES)
+     for candidate in source_candidates:
+         clean_test_storage()
+-        repo_dir = get_repo_dir(cloned_init_repo)
++        repo_dir = get_repo_dir(cloned_init_repo, f"verified_sources_repo_{uniq_id()}")
+         files = get_project_files(clear_all_sources=False)
+         with set_working_dir(files.storage_path):
+             init_command.init_command(candidate, "bigquery", repo_dir, eject_source=True)
+@@ -617,6 +633,65 @@ def test_incompatible_dlt_version_warning(repo_dir: str, project_files: FileStor
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    "ide_choice",
++    SUPPORTED_IDES,
++)
++def test_init_vibe_source_editor_choice_ux(
++    ide_choice: str, vibe_repo_dir: str, project_files: FileStorage
++) -> None:
++    # Second yes/no prompt also receives the ide_choice, but it doesn't matter
++    with echo.always_choose(False, ide_choice):
++        with io.StringIO() as buf, contextlib.redirect_stdout(buf):
++            init_command.init_command("dlthub:github", "duckdb", vibe_repo_dir)
++            _out = buf.getvalue()
++
++    assert "dlt will generate useful project rules tailored to your assistant/IDE." in _out
++    assert f"adding {ide_choice} rules, code snippets and docs" in _out
++    assert "file(s) supporting github were copied:\ngithub-docs.yaml\n" in _out
++
++
++def test_init_all_vibe_sources_together(vibe_repo_dir: str, project_files: FileStorage) -> None:
++    # we test 20 hardcoded sources, use this to get all sources instead
++    # vibe_source_candidates = [*get_source_candidates(vibe_repo_dir, source_type="vibe")]
++    random_vibez = [
++        "news_api",
++        "alpaca",
++        "robin",
++        "kwanko",
++        "powerlink",
++        "fulcrum_data_management",
++        "mysql_instance",
++        "talkdesk_reports",
++        "insightly_crm",
++        "google_drive",
++        "coalesce",
++        "jobnimbus",
++        "piwik_pro",
++        "perplexity_ai",
++        "maileon",
++        "wrike_project_management",
++        "rocketreach",
++        "wordpress_site",
++        "deepinfra",
++        "no_crm_io",
++    ]
++
++    for source_name in random_vibez:
++        init_command.init_command(f"dlthub:{source_name}", "bigquery", vibe_repo_dir)
++        # all must install correctly
++        _, secrets = assert_source_files(
++            project_files, source_name, "bigquery", has_source_section=True, is_vibe_source=True
++        )
++
++    for source_name in random_vibez:
++        assert secrets.get_value(source_name, type, None, "sources") is not None
++
++    # credentials for all destinations
++    for destination_name in ["bigquery", "postgres", "redshift"]:
++        assert secrets.get_value(destination_name, type, None, "destination") is not None
++
++
+ def assert_init_files(
+     project_files: FileStorage,
+     pipeline_name: str,
+@@ -659,26 +734,36 @@ def assert_source_files(
+     source_name: str,
+     destination_name: str,
+     has_source_section: bool = True,
++    is_vibe_source: bool = False,
+ ) -> Tuple[PipelineScriptVisitor, SecretsTomlProvider]:
+     visitor, secrets = assert_common_files(
+         project_files, source_name + "_pipeline.py", destination_name
+     )
+-    assert project_files.has_folder(source_name) == (source_name not in [*CORE_SOURCES, *TEMPLATES])
++    assert project_files.has_folder(source_name) == (
++        source_name not in [*CORE_SOURCES, *TEMPLATES] and not is_vibe_source
++    )
+     source_secrets = secrets.get_value(source_name, type, None, source_name)
+     if has_source_section:
+         assert source_secrets is not None
+     else:
+         assert source_secrets is None
+-    local_index = files_ops.load_verified_sources_local_index(source_name)
+-    for file_entry in local_index["files"].values():
+-        # all files have the newest commit (first time clone)
+-        assert file_entry["commit_sha"] == local_index["last_commit_sha"]
+-        # sha1
+-        assert len(HexBytes(file_entry["commit_sha"])) == 20
+-        # git sha
+-        assert len(HexBytes(file_entry["git_sha"])) == 20
+-        # sha3
+-        assert len(HexBytes(file_entry["sha3_256"])) == 32
++    # no .sources files for vibe sources
++    if not is_vibe_source:
++        local_index = files_ops.load_verified_sources_local_index(source_name)
++        for file_entry in local_index["files"].values():
++            # all files have the newest commit (first time clone)
++            assert file_entry["commit_sha"] == local_index["last_commit_sha"]
++            # sha1
++            assert len(HexBytes(file_entry["commit_sha"])) == 20
++            # git sha
++            assert len(HexBytes(file_entry["git_sha"])) == 20
++            # sha3
++            assert len(HexBytes(file_entry["sha3_256"])) == 32
++    else:
++        # Ensure the yaml file is there for vibe sources
++        assert project_files.has_file(f"{source_name}-docs.yaml")
++        # Ensure rules are there (cursor by default)
++        assert project_files.has_folder(".cursor")
+ 
+     return visitor, secrets
+ 
+diff --git a/tests/cli/utils.py b/tests/cli/utils.py
+index 10f233a0c..ac4c31a4e 100644
+--- a/tests/cli/utils.py
++++ b/tests/cli/utils.py
+@@ -10,13 +10,15 @@ from dlt.common.utils import set_working_dir, uniq_id
+ 
+ from dlt.sources import SourceReference
+ 
+-from dlt.cli import echo, DEFAULT_VERIFIED_SOURCES_REPO
++from dlt.cli import echo, DEFAULT_VERIFIED_SOURCES_REPO, DEFAULT_VIBE_SOURCES_REPO
+ 
+ from tests.utils import TEST_STORAGE_ROOT
+ 
+ 
+ INIT_REPO_LOCATION = DEFAULT_VERIFIED_SOURCES_REPO
+ INIT_REPO_BRANCH = "master"
++INIT_VIBE_REPO_LOCATION = DEFAULT_VIBE_SOURCES_REPO
++INIT_VIBE_REPO_BRANCH = "main"
+ PROJECT_DIR = os.path.join(TEST_STORAGE_ROOT, "project")
+ 
+ 
+@@ -35,9 +37,21 @@ def cloned_init_repo() -> FileStorage:
+     )
+ 
+ 
++@pytest.fixture(scope="module")
++def clonet_init_vibe_repo() -> FileStorage:
++    return git.get_fresh_repo_files(
++        DEFAULT_VIBE_SOURCES_REPO, get_dlt_repos_dir(), branch=INIT_VIBE_REPO_BRANCH
++    )
++
++
+ @pytest.fixture
+ def repo_dir(cloned_init_repo: FileStorage) -> str:
+-    return get_repo_dir(cloned_init_repo)
++    return get_repo_dir(cloned_init_repo, f"verified_sources_repo_{uniq_id()}")
++
++
++@pytest.fixture
++def vibe_repo_dir(clonet_init_vibe_repo: FileStorage) -> str:
++    return get_repo_dir(clonet_init_vibe_repo, f"vibe_sources_repo_{uniq_id()}")
+ 
+ 
+ @pytest.fixture
+@@ -47,12 +61,10 @@ def project_files() -> Iterator[FileStorage]:
+         yield project_files
+ 
+ 
+-def get_repo_dir(cloned_init_repo: FileStorage) -> str:
+-    repo_dir = os.path.abspath(
+-        os.path.join(TEST_STORAGE_ROOT, f"verified_sources_repo_{uniq_id()}")
+-    )
++def get_repo_dir(cloned_repo: FileStorage, repo_name: str) -> str:
++    repo_dir = os.path.abspath(os.path.join(TEST_STORAGE_ROOT, repo_name))
+     # copy the whole repo into TEST_STORAGE_ROOT
+-    shutil.copytree(cloned_init_repo.storage_path, repo_dir)
++    shutil.copytree(cloned_repo.storage_path, repo_dir)
+     return repo_dir
+ 
+ 
+
+
+===== COMMIT 93483191 =====
+
+
+commit 93483191d
+Author: djudjuu
+Date: 2025-08-04
+
+    QoL: improve DataValidationError output:  use identifying columns if present (#2915)
+
+diff --git a/dlt/common/schema/exceptions.py b/dlt/common/schema/exceptions.py
+index 01d87e9d2..1dd2c1d6e 100644
+--- a/dlt/common/schema/exceptions.py
++++ b/dlt/common/schema/exceptions.py
+@@ -166,10 +166,7 @@ class DataValidationError(SchemaException):
+ 
+         Schema, table and column names are given as a context and full `schema_contract` and causing `data_item` as an evidence.
+         """
+-        msg = ""
+-        if schema_name:
+-            msg = f"Schema: `{schema_name}` "
+-        msg += f"Table: `{table_name}` "
++        msg = f"Table: `{table_name}` "
+         if column_name:
+             msg += f"Column: `{column_name}`"
+         msg = (
+@@ -178,6 +175,25 @@ class DataValidationError(SchemaException):
+             + f" . Contract on `{schema_entity}` with `{contract_mode=:}` is violated. "
+             + (extended_info or "")
+         )
++        data_item_str = ""
++        if (
++            data_item
++            and hasattr(data_item, "get")
++            and table_schema
++            and hasattr(table_schema, "get")
++        ):
++            identifier_columns = [
++                x.get("name")
++                for x in table_schema.get("columns", {}).values()
++                if x.get("primary_key") or x.get("merge_key") or x.get("unique")
++            ]
++            if identifier_columns:
++                data_item_str += "Offending data item: "
++                data_item_keys = [
++                    f"{column}: {data_item.get(column)}" for column in identifier_columns
++                ]
++                data_item_str += ", ".join(data_item_keys)
++                msg += f" {data_item_str}"
+         super().__init__(schema_name, msg)
+         self.table_name = table_name
+         self.column_name = column_name
+diff --git a/tests/common/schema/test_schema_contract.py b/tests/common/schema/test_schema_contract.py
+index 32f9583b2..80cba7ee4 100644
+--- a/tests/common/schema/test_schema_contract.py
++++ b/tests/common/schema/test_schema_contract.py
+@@ -354,3 +354,80 @@ def test_check_adding_new_variant() -> None:
+             cast(TSchemaContractDict, {**DEFAULT_SCHEMA_CONTRACT_MODE, **{"data_type": "freeze"}}),
+             copy.deepcopy(table_update),
+         )
++
++
++def test_data_validation_error_message_with_primary_key() -> None:
++    """Test that DataValidationError includes primary key information in the message"""
++    schema = get_schema()
++
++    table_update: TTableSchema = {
++        "name": "tables",
++        "columns": {"column_1": {"name": "column_1", "data_type": "text", "primary_key": True}},
++    }
++
++    partial_table, _ = schema.apply_schema_contract(DEFAULT_SCHEMA_CONTRACT_MODE, table_update)
++    schema.update_table(partial_table)
++
++    # Create a table update that tries to add a variant column
++    variant_table_update: TTableSchema = {
++        "name": "tables",
++        "columns": {
++            "column_2_variant": {
++                "name": "column_2_variant",
++                "data_type": "bool",
++                "variant": True,
++            }
++        },
++    }
++
++    # apply update with data_type freeze mode, providing data item as evidence
++    with pytest.raises(DataValidationError) as val_ex:
++        schema.apply_schema_contract(
++            {**DEFAULT_SCHEMA_CONTRACT_MODE, **{"data_type": "freeze"}},
++            variant_table_update,
++            data_item={"column_1": "test", "column_2": 123},
++        )
++
++    # data item should be included by primary key
++    assert "Offending data item: column_1: test" in str(val_ex.value)
++
++
++def test_data_validation_error_message_with_multiple_identifiers() -> None:
++    """Test that DataValidationError includes multiple identifier columns in the message"""
++    schema = get_schema()
++
++    table_update: TTableSchema = {
++        "name": "tables",
++        "columns": {
++            "column_1": {"name": "column_1", "data_type": "text", "primary_key": True},
++            "column_2": {"name": "column_2", "data_type": "bigint", "merge_key": True},
++            "column_3": {"name": "column_3", "data_type": "text", "unique": True},
++        },
++    }
++
++    partial_table, _ = schema.apply_schema_contract(DEFAULT_SCHEMA_CONTRACT_MODE, table_update)
++    schema.update_table(partial_table)
++
++    # Now create a table update that tries to add a variant column (data type evolution)
++    variant_table_update: TTableSchema = {
++        "name": "tables",
++        "columns": {
++            "column_4_variant": {"name": "column_4_variant", "data_type": "text", "variant": True}
++        },
++    }
++
++    with pytest.raises(DataValidationError) as val_ex:
++        schema.apply_schema_contract(
++            {**DEFAULT_SCHEMA_CONTRACT_MODE, **{"data_type": "freeze"}},
++            variant_table_update,
++            data_item={
++                "column_1": "test",
++                "column_2": 123,
++                "column_3": "unique_value",
++                "column_4": "some_text",
++            },
++        )
++
++    # Check that the message includes all identifier columns
++    error_msg = str(val_ex.value)
++    assert "Offending data item: column_1: test, column_2: 123, column_3: unique_value" in error_msg
+
+
+===== COMMIT 84bdc427 =====
+
+
+commit 84bdc4272
+Author: Fran Lozano
+Date: 2025-08-04
+
+    fix: prevent DuplicateSchema error when using public schema in Redshift (#2953)
+
+diff --git a/dlt/destinations/impl/redshift/redshift.py b/dlt/destinations/impl/redshift/redshift.py
+index f71b19fb3..28a0fcf99 100644
+--- a/dlt/destinations/impl/redshift/redshift.py
++++ b/dlt/destinations/impl/redshift/redshift.py
+@@ -45,6 +45,14 @@ HINT_TO_REDSHIFT_ATTR: Dict[TColumnHint, str] = {
+ 
+ 
+ class RedshiftSqlClient(Psycopg2SqlClient):
++    def has_dataset(self) -> bool:
++        # In Redshift, the 'public' schema always exists but may not be
++        # returned by INFORMATION_SCHEMA.SCHEMATA query, so we handle it as a special case
++        if self.dataset_name == "public":
++            return True
++
++        return super().has_dataset()
++
+     @staticmethod
+     def _maybe_make_terminal_exception_from_data_error(
+         pg_ex: psycopg2.DataError,
+diff --git a/tests/load/redshift/test_redshift_client.py b/tests/load/redshift/test_redshift_client.py
+index 42d356a95..18270f153 100644
+--- a/tests/load/redshift/test_redshift_client.py
++++ b/tests/load/redshift/test_redshift_client.py
+@@ -164,3 +164,14 @@ def test_maximum_query_size(client: RedshiftClient, file_storage: FileStorage) -
+             expect_load_file(client, file_storage, insert_sql, user_table_name)
+         # psycopg2.errors.SyntaxError: Statement is too large. Statement Size: 20971754 bytes. Maximum Allowed: 16777216 bytes
+         assert type(exv.value.dbapi_exception) is psycopg2.errors.SyntaxError
++
++
++def test_public_schema_has_dataset_override() -> None:
++    """Test that the has_dataset override correctly identifies public schema as existing."""
++    schema = Schema("test_schema")
++
++    config_public = RedshiftClientConfiguration(
++        credentials=RedshiftCredentials()
++    )._bind_dataset_name("public")
++    client_public = RedshiftClient(schema, config_public, redshift().capabilities())
++    assert client_public.sql_client.has_dataset() is True
+
+
+===== COMMIT 17fe9f83 =====
+
+
+commit 17fe9f83e
+Author: Anton Burnashev
+Date: 2025-08-04
+
+    fix: restclient: handle null data in response (#2936)
+
+diff --git a/dlt/sources/helpers/rest_client/client.py b/dlt/sources/helpers/rest_client/client.py
+index d7b77c4f7..37cced9a1 100644
+--- a/dlt/sources/helpers/rest_client/client.py
++++ b/dlt/sources/helpers/rest_client/client.py
+@@ -282,6 +282,11 @@ class RESTClient:
+         logger.info(
+             f"Extracted data of type {type(data).__name__} from path {data_selector}{length_info}"
+         )
++        if data is None:
++            logger.warning(
++                "Extracted data is None for path %s, returning empty list", data_selector
++            )
++            return []
+         # wrap single pages into lists
+         if not isinstance(data, list):
+             data = [data]
+diff --git a/tests/sources/helpers/rest_client/test_client.py b/tests/sources/helpers/rest_client/test_client.py
+index e2f71d2be..6a10bbb71 100644
+--- a/tests/sources/helpers/rest_client/test_client.py
++++ b/tests/sources/helpers/rest_client/test_client.py
+@@ -132,6 +132,21 @@ class TestRESTClient:
+ 
+         assert_pagination(pages)
+ 
++    def test_paginator_with_null_data_in_final_page(self, rest_client):
++        pages_iter = rest_client.paginate(
++            "/posts_cursor_null_terminated",
++            paginator=JSONResponseCursorPaginator(cursor_path="next_token", cursor_param="cursor"),
++            data_selector="users",
++        )
++
++        pages = list(pages_iter)
++        assert len(pages) == 3
++        assert len(pages[0]) == 10
++        assert len(pages[1]) == 4
++        # The third page is expected to be an empty list because the paginator
++        # converts null data in the final page to an empty list.
++        assert pages[2] == []
++
+     def test_paginate_with_hooks(self, rest_client: RESTClient):
+         def response_hook(response: Response, *args: Any, **kwargs: Any) -> None:
+             if response.status_code == 404:
+diff --git a/tests/sources/rest_api/conftest.py b/tests/sources/rest_api/conftest.py
+index 7df015087..c12d5ec2a 100644
+--- a/tests/sources/rest_api/conftest.py
++++ b/tests/sources/rest_api/conftest.py
+@@ -335,6 +335,28 @@ def mock_api_server():
+             context.status_code = 401
+             return {"error": "Unauthorized"}
+ 
++        @router.get(r"/posts_cursor_null_terminated(\?cursor=.*)?$")
++        def posts_cursor_null_terminated(request, context):
++            # Demonstrates the issue where the final page returns null data
++            # https://github.com/dlt-hub/dlt/issues/2932
++            cursor_param = request.qs.get("cursor", [None])[0]
++
++            if cursor_param is None:
++                # First page - return 10 items with next cursor
++                return {
++                    "users": [{"id": i, "name": f"User {i}"} for i in range(10)],
++                    "next_token": "cursor_page_2",
++                }
++            elif cursor_param == "cursor_page_2":
++                # Second page - return 4 items with next cursor
++                return {
++                    "users": [{"id": i, "name": f"User {i}"} for i in range(10, 14)],
++                    "next_token": "cursor_final",
++                }
++            elif cursor_param == "cursor_final":
++                # Final page - return null data and null cursor
++                return {"users": None, "next_token": None}
++
+         router.register_routes(m)
+ 
+         yield m
+
+
+===== COMMIT a5c37bef =====
+
+
+commit a5c37befc
+Author: dat-a-man
+Date: 2025-08-04
+
+    Updated merge loading docs on scd2 strategy handling nested structures (#2944)
+
+diff --git a/docs/website/docs/general-usage/merge-loading.md b/docs/website/docs/general-usage/merge-loading.md
+index 6b200a64e..f3f223294 100644
+--- a/docs/website/docs/general-usage/merge-loading.md
++++ b/docs/website/docs/general-usage/merge-loading.md
+@@ -461,6 +461,12 @@ pipeline.run(some_data())  # third run — 2024-01-03 10:30:05.750356
+ | 2024-01-03 03:01:11.943703 | NULL | 2024-01-02 | d |
+ | **2024-01-03 10:30:05.750356** | **NULL** | **2024-01-01** | **bb** |
+ 
++### Handling nested structures with SCD type 2
++To explore how SCD Type 2 handles nested JSON structures, refer to the hands-on demonstration provided in the Colab Notebook linked below.
++
++Execute all steps directly in your browser:
++[Open in Colab.](https://colab.research.google.com/drive/1GpG3JKGWveB-kR7eNvlJLr6oO0nM7Fbv?usp=sharing)
++
+ 
+ ### Example: configure validity column names
+ `_dlt_valid_from` and `_dlt_valid_to` are used by default as validity column names. Other names can be configured as follows:
+
+
+===== COMMIT c89ef1c4 =====
+
+
+commit c89ef1c46
+Author: Katharina Lenz
+Date: 2025-08-04
+
+    Docs/dlt plus project docs rest api restructuring (#2911)
+
+diff --git a/docs/website/docs/plus/features/project/index.md b/docs/website/docs/plus/features/project/index.md
+new file mode 100644
+index 000000000..5d7d820cc
+--- /dev/null
++++ b/docs/website/docs/plus/features/project/index.md
+@@ -0,0 +1,16 @@
++---
++id: index
++title: "Project"
++description: Create dlt projets using yaml files
++keywords: ["dlt+", "peoject", "source", "dbt"]
++---
++import DocCardList from '@theme/DocCardList';
++
++[dlt+ Project](../project/overview.md) is a structured, opinionated framework for managing data workflows. It automates essential tasks like data loading, transformations, quality checks, and governance, so data teams can collaborate more effectively and ship faster.
++
++Define everything in a declarative `dlt.yml`, manage [profiles](../project/overview.md#profiles) for different environments, ensure quality with built-in test utilities, and prepare for packaging your project as a [Python package](../project/python-api.md).
++
++
++
++<DocCardList />◊
++
+diff --git a/docs/website/docs/plus/features/project/overview.md b/docs/website/docs/plus/features/project/overview.md
+new file mode 100644
+index 000000000..806539dbc
+--- /dev/null
++++ b/docs/website/docs/plus/features/project/overview.md
+@@ -0,0 +1,305 @@
++---
++title: Project overview
++description: Define dlt+ Projects in YAML
++---
++
++# Project
++
++
++<img src="https://storage.googleapis.com/dlt-blog-images/plus/dlt_plus_projects.png" width="500"/>
++
++[dlt+ Project](../../core-concepts/project.md) provides a structured and opinionated approach to organizing data workflows while implementing best practices for data engineering teams. dlt+ Project automates key processes such as data loading, data transformations, data catalogs, and data governance, and enables different members of the data teams to work more easily with each other.
++
++With dlt+ Project, you can efficiently manage your data workflows by:
++
++1. [Using a declarative `dlt.yml` file](#the-dlt-manifest-file-dltyml) to define sources, destinations, pipelines, and transformations.
++2. Configuring [different profiles](../../core-concepts/profiles.md) for various use cases and environments.
++3. Ensuring data quality by defining tests with [dlt+ tests utils](../quality/tests.md).
++4. Packaging your project as a [Python package](../../getting-started/advanced_tutorial.md) and distributing it via PyPI or a git repository.
++
++This structured approach allows teams to work efficiently while maintaining flexibility and control over their data workflows.
++
++## Project structure
++
++A dlt+ Project has the following general structure:
++```text
++├── .dlt/                 # folder containing dlt configurations and profile settings
++│   ├── config.toml
++│   ├── dev.secrets.toml  # credentials for access profile 'dev'
++│   └── secrets.toml
++├── _data/                # local storage for your project, excluded from git
++├── sources/              # modules containing the source code for sources
++│   └── github.py         # source code for a GitHub source
++├── transformations/      # modules containing the source code for transformations
++├── .gitignore
++└── dlt.yml               # the main project manifest
++```
++
++## The dlt manifest file (dlt.yml)
++
++The main component of a dlt+ Project is the dlt manifest file (`dlt.yml`). It marks the root of your project and contains the main configurations. Here you can declare all of your data platform entities in a YAML format. It contains the following sections:
++
++### Sources
++
++[Sources](../project/source-configuration.md) can either be defined declaratively or by referencing an implementation from a Python module inside `sources/`. In the example below, two sources are declared:
++1. a dlt REST API source whose parameters are passed within the manifest
++2. a GitHub source defined in a function `source` whose source code inside `sources/github.py` is referenced
++
++For more detailed documentation on the core sources in dlt+, visit the [source configuration](../project/source-configuration.md) page. 
++
++```yaml
++sources:
++  pokemon:
++    type: rest_api
++    client:
++      base_url: https://pokeapi.co/api/v2/
++    resource_defaults:
++      endpoint:
++        params:
++          limit: 1000
++    resources:
++      - pokemon
++      - berry
++
++  github:
++    type: github.source
++```
++
++ 
++
++### Destinations
++
++The destinations section defines dlt destinations in a similar way to how you would define them in a pure Python dlt project. As with sources, you can also create a `destinations/` folder and reference custom implementations of destinations inside it.
++
++```yaml
++destinations:
++    duckdb:
++        type: duckdb
++```
++
++### Pipelines
++
++Pipelines can be used to load data from sources to destinations. The pipeline defined below loads data from the GitHub source to a dataset named "github_events_dataset" inside the duckdb destination.
++
++```yaml
++github_pipeline:
++  source: github
++  destination: duckdb
++  dataset_name: github_events_dataset
++```
++You can declare all arguments of `dlt.pipeline` in this section. For a full list of arguments, refer to the [docstrings](https://github.com/dlt-hub/dlt/blob/71b4975c70d1931750b3245e919a520a2400e870/dlt/pipeline/__init__.py#L30).
++
++### Datasets
++
++The datasets section defines datasets that live on a destination (defined in the destinations section). Any datasets declared in the [pipeline section](#pipelines) are automatically created if not declared here. Read more about datasets in dlt+ [here](../../core-concepts/datasets.md).
++
++```yaml
++datasets:
++  github_events_dataset:
++    destination:
++      - duckdb
++```
++
++### Cache 🧪
++
++In this section, you specify the input table(s) that you want to transform, and the output table(s) that you want to write after performing the transformations. The example below loads the table "events" from the destination dataset "github_events_dataset" into a local cache, then transforms it using the transformations inside the `transformations/` folder, and finally writes two tables back into the dataset "github_events_dataset": the original "events" table, and the transformed "events_aggregated" table. Read more about how local cache is used for transformations [here](../../core-concepts/datasets.md).
++
++The cache feature is currently limited to specific use cases and is only compatible with data stored in filesystem-based destinations. Please make sure that the input dataset for the cache is located in the filesystem-based destination ([Iceberg](../../ecosystem/iceberg.md), [Delta](../../ecosystem/delta.md), or [Cloud storage and filesystem](../../../dlt-ecosystem/destinations/filesystem.md)).
++
++```yaml
++caches:
++  github_events_cache:
++    inputs:
++      - dataset: github_events_dataset
++        tables:
++          events: events
++    outputs:
++      - dataset: github_events_dataset
++        tables:
++          events: events
++          events_aggregated: events_aggregated
++```
++:::note
++🚧 This feature is under development. Interested in becoming an early tester? [Join dlt+ early access](https://info.dlthub.com/waiting-list)
++:::
++
++### Transformations 🧪
++
++Here you specify the settings for your transformations. In the code example, we define an arrow-based transformation that will operate on the cache "github_events_cache". It will make use of code in the `transformations/` folder. Read more about how transformations are done [here](../../features/transformations/index.md).
++
++```yaml
++transformations:
++  github_events_transformations:
++    engine: arrow
++    cache: github_events_cache
++```
++:::note
++🚧 This feature is under development. Interested in becoming an early tester? [Join dlt+ early access](https://info.dlthub.com/waiting-list)
++:::
++
++### Profiles
++
++You can use the profiles section to define different environments (example: dev, staging, prod, tests). One package may have multiple profiles which can be specified using dlt+ cli commands. The default profile name is `dev`. It's created automatically alongside the `tests` profile.
++
++```yaml
++profiles:
++  dev: # Using "dev" profile will write to local filesystem
++    destinations:
++      delta_lake:
++        type: delta
++        bucket_url: delta_lake
++  prod: # Using "prod" profile will write to s3 bucket
++    destinations:
++      delta_lake:
++        type: delta
++        bucket_url: s3://dlt-ci-test-bucket/dlt_example_project/
++```
++
++### Project settings and variable substitution
++
++You can override default project settings using the `project` section:
++* `project_dir` - the root directory of the project, i.e., the directory where the project Python modules are stored.
++* `data_dir` and `local_dir` - [files created by pipelines and destinations](#local-and-temporary-files-data_dir), separated by the current profile name.
++* `name` - the name of the project.
++* `default_profile` - the name of the default profile, which can be configured in the project section as seen above.
++* `allow_undefined_entities` - by default, dlt+ will create entities like destinations, sources, and datasets ad hoc. This flag disables such behavior.
++
++In the example below:
++```yaml
++project:
++  name: test_project
++  data_dir: "{env.DLT_DATA_DIR}/{current_profile}"
++  allow_undefined_entities: false
++  default_profile: tests
++  local_dir: "{data_dir}/local"
++```
++* We set the project name to `test_project`, overriding the default (which is the name of the parent folder).
++* We set `data_dir` to the value of the environment variable `DLT_DATA_DIR` and separate it by the profile name `current_profile`.
++* We prevent any undefined entities (`allow_undefined_entities`) from being created (i.e., datasets or destinations).
++* We set the default profile name to `tests`.
++* We set the `local_dir` to a folder `local` in the `data_dir` we defined above.
++
++As you may guess from the example above, you can use Python-style formatters to substitute variables:
++* You can reference environment variables using the `{env.ENV_VARIABLE_NAME}` syntax.
++* Any of the project settings can be substituted as well.
++
++### Implicit entities
++By default, dlt+ will automatically create entities such as datasets or destinations when they are requested by the user or the executed code.
++For example, a minimal `dlt.yml` configuration might look like this:
++```yaml
++sources:
++  arrow:
++    type: sources.arrow.source
++
++destinations:
++  duckdb:
++    type: duckdb
++
++pipelines:
++  my_pipeline:
++    source: arrow
++    destination: duckdb
++    dataset_name: my_pipeline_dataset
++```
++Running the following command executes the pipeline:
++```sh
++dlt pipeline my_pipeline run
++```
++In this case, the `my_pipeline_dataset` dataset is not declared explicitly, so dlt+ creates it automatically. The `duckdb` destination and the `arrow` source are explicitly defined, so they do not need to be created implicitly. However, if any entity (such as a source or destination) is referenced only in the pipeline and not defined under the corresponding section, dlt+ will create it implicitly.
++
++Implicit creation of entities can be controlled using the `allow_undefined_entities` setting in the project configuration:
++
++```yaml
++project:
++  allow_undefined_entities: false
++```
++If `allow_undefined_entities` is set to `false`, dlt+ will no longer create missing entities automatically.
++Datasets and destinations must be declared explicitly in the `dlt.yml` file:
++```yaml
++datasets:
++  my_pipeline_dataset:
++    destination:
++        - duckdb
++```
++
++### Managing datasets and destinations
++
++When datasets are explicitly declared in the `dlt.yml` file, the `destination` field must list all destinations where the dataset is allowed to be materialized. This applies even if `allow_undefined_entities` is set to `true`.
++Each pipeline that references a dataset must use a destination that is included in the dataset’s `destination` list. If the pipeline specifies a destination not listed, dlt+ will raise a configuration error.
++
++```yaml
++datasets:
++  my_pipeline_dataset:
++    destination:
++      - duckdb
++      - bigquery
++```
++
++In this case, pipelines using either `duckdb` or `bigquery` as a destination can safely reference `my_pipeline_dataset`.
++
++:::note
++The destination field is an array, allowing you to specify one or more destinations where the dataset can be materialized.
++:::
++
++### Other settings
++
++`dlt.yml` is a [dlt config provider](../../../general-usage/credentials/setup.md), and you can use it in the same way you use `config.toml`.
++For example, you can configure the log level:
++
++```yaml
++runtime:
++  log_level: WARNING
++```
++
++or any of the settings we mention in the [performance](../../../reference/performance.md) chapter.
++
++## Local and temporary files (`data_dir`)
++
++The dlt+ project has a dedicated location (`data_dir`), where all working files are stored. By default, it is the `_data` folder in the root of the project.
++Working files for each profile are stored separately. For example, files for the `dev` profile are stored in `_data/dev`.
++
++Working files include:
++* Pipeline working directory (`{data_dir}/pipelines` folder) where load packages, pipeline state, and schemas are stored locally.
++* All files created by destinations (`{data_dir}/local`) i.e., local `filesystem` buckets, duckdb databases, iceberg, and delta lakes (if configured for the local filesystem).
++* Default locations for ad hoc (i.e., dbt related) Python virtual environments.
++
++:::tip
++Use relative paths when configuring destinations that generate local files to ensure they are automatically placed in the profile-separated
++`{data_dir}/local` folder. For example:
++
++```yaml
++destinations:
++  iceberg:
++    bucket_url: lake
++  my_duckdb:
++    type: duckdb
++```
++The `iceberg` destination will create an iceberg lake in the `_data/dev/local/lake` folder, and `duckdb` will create a database in
++`_data/dev/local/my_duckdb.duckdb`.
++
++You can clean up your working files with the `dlt project --profile name clean` command.
++:::
++
++
++
++
++## Config and secrets
++
++As shown above, it is possible to pass additional dlt settings and configurations in the manifest file itself. However, existing dlt config providers are also supported as usual, like:
++
++1. Environ provider
++2. `.dlt/config.toml` provider, including the global config
++3. `.dlt/<profile_name>.secrets.toml`, which is the secrets toml provider but scoped to a particular profile. A per-profile version (`dev.secrets.toml`) is sought instead of the `secrets.toml` file.
++
++:::note
++Based on the information about precedence in the [configuration docs](../../../general-usage/credentials/setup#choose-where-to-store-configuration), the yaml files provide the lowest precedence of all providers just above the default values for a config value. Settings in the yaml file will therefore be overridden by `toml` and `env` variables if present.
++:::
++
++## Project context
++
++The `dlt.yml` marks the root of a project. Projects can also be nested. If you run any dlt project CLI command, dlt will search for the project root in the filesystem tree starting from the current working directory and run all operations on the found project. So, if your `dlt.yml` is in the `tutorial` folder, you can run `dlt pipeline my_pipeline run` from this folder or any subfolder, and it will run the pipeline on the `tutorial` project.
++
++## Packaging and distributing the projects
++
++Projects can be distributed as [Python package](../../getting-started/advanced_tutorial.md) to share with your organization and enable data access. 
++
+diff --git a/docs/website/docs/plus/features/project/python-api.md b/docs/website/docs/plus/features/project/python-api.md
+new file mode 100644
+index 000000000..f567f2ebf
+--- /dev/null
++++ b/docs/website/docs/plus/features/project/python-api.md
+@@ -0,0 +1,155 @@
++---
++title: Python API
++description:  Python interface of dlt+ Project
++---
++
++# Python API to interact with dlt+ Project
++
++You can access any [dlt+ Project](../../core-concepts/project.md) entity or function via the Python interface.
++The current module provides access to various parts of your active dlt+ Project.
++
++Import statement:
++```py
++from dlt_plus import current
++```
++
++Available methods:
++- `current.project()` - Retrieves the project configuration
++- `current.entities()` - Returns a factory with all instantiated entities
++- `current.catalog()` - Provides access to all defined datasets in the catalog
++- `current.runner()` - Allows you to run pipelines programmatically
++
++:::info
++If you packaged your dlt+ Project into a pip-installable package, you can access all methods above directly from the package. For example:
++```py
++import my_dlt_package
++
++my_dlt_package.catalog()
++```
++[Learn more](../../getting-started/advanced_tutorial.md) about how to package your project.
++:::
++
++
++## Accessing project settings
++
++Here are a few examples of what you can access from the project object:
++```py
++from dlt_plus import current
++
++# show the currently active profile
++print(current.project().current_profile)
++# show the main project dir
++print(current.project().project_dir)
++# show the project config
++print(current.project().config)
++# list explicitly defined datasets (also works with destinations, sources, pipelines, etc.)
++print(current.project().datasets)
++```
++## Accessing entities
++
++Accessing entities in code works the same way as when referencing them in the `dlt.yml` file.
++If allowed, implicit entities will be created and returned automatically. If not, an error will be raised.
++```py
++import dlt_plus
++from dlt_plus import current
++
++entities = dlt_plus.current.entities()
++pipeline = entities.get_pipeline("my_pipeline")
++destination = entities.get_destination("duckdb")
++transformation = entities.get_transformation("stressed_transformation")
++
++```
++Here, we access the entities manager, which allows you to create sources, destinations, pipelines, and other objects.
++
++## Running pipelines with the runner
++
++dlt+ includes a pipeline runner, which is the same one used when you run pipelines from the CLI.
++You can also use it directly in your code through the project context:
++
++```py
++from dlt_plus import current
++
++# get the runner
++runner = current.runner()
++# run the "my_pipeline" pipeline from the currently active project
++runner.run_pipeline("my_pipeline")
++```
++
++## Accessing the catalog
++
++The catalog allows you to access all explicitly defined datasets:
++
++```py
++from dlt_plus import current
++
++# Get a dataset instance pointing to the default destination (first in dataset destinations list) and access data inside of it
++# Note: The dataset must already exist physically for this to work
++dataset = current.catalog().dataset("my_pipeline_dataset")
++# Get the row counts of all tables in the dataset as a dataframe
++print(dataset.row_counts().df())
++```
++
++:::tip
++Learn more about the available data access methods in dlt datasets by reading the [Python loaded data access guide](../../../general-usage/dataset-access/dataset).
++It covers how to browse, filter tables, and retrieve data in various formats.
++:::
++
++## Writing data back to the catalog
++
++You can also write data to datasets in the dlt+ catalog. Each dataset has a `.save()` method that lets you write data back to it.
++In the future, you'll be able to control which datasets are writable using contracts.
++Under the hood, dlt+ runs an ad-hoc pipeline to handle the write operation.
++
++:::warning
++Writing data to the catalog is an **experimental feature**.
++Use it with caution until it's fully stable.
++:::
++
++```py
++import pandas as pd
++from dlt_plus import current
++
++# Get a dataset from the catalog (it must already exist and be defined in dlt.yml)
++dataset = current.catalog().dataset("my_pipeline_dataset")
++# Write a DataFrame to the "my_table" table in the dataset
++dataset.save(pd.DataFrame({"name": ["John", "Jane", "Jim"], "age": [30, 25, 35]}), table_name="my_table")
++```
++
++You can also read from an existing table and write the data to a new table, either in the same or another dataset:
++
++```py
++from dlt_plus import current
++
++# Get dataset from the catalog
++dataset = current.catalog().dataset("my_pipeline_dataset")
++
++# This function reads data in chunks from an existing table and yields each chunk
++def transform_frames():
++    # Read the 'items' table in chunks of 1000 rows
++    for df in dataset.items.iter_df(chunk_size=1000):
++        # You can process the data here if needed
++        yield df
++
++# Write the data to a new table called "my_new_table"
++dataset.save(transform_frames, table_name="my_new_table")
++```
++
++## Switching profiles in code
++
++By default, when you access the project in code, it uses the default or pinned profile.
++You can switch to a different profile using the `switch_profile` function.
++
++Here’s an example:
++
++```py
++from dlt_plus import current
++from dlt_plus.project.run_context import switch_profile
++
++if __name__ == "__main__":
++    # Shows the current active profile
++    print(current.project().current_profile)
++    # Switch to the tests profile
++    switch_profile("tests")
++    # Now "tests" is the active profile, merged with the project config
++    print(current.project().current_profile)
++```
+\ No newline at end of file
+diff --git a/docs/website/docs/plus/features/project/source-configuration.md b/docs/website/docs/plus/features/project/source-configuration.md
+new file mode 100644
+index 000000000..a5568863e
+--- /dev/null
++++ b/docs/website/docs/plus/features/project/source-configuration.md
+@@ -0,0 +1,131 @@
++---
++title: Source configuration
++description: How to setup sources in YAML file
++---
++
++# Source configuration
++
++
++The `dlt.yml` file enables a fully declarative setup of your data source and its parameters. It supports built-in sources such as REST APIs, SQL databases, and cloud storage, as well as any custom source you define.
++
++Credential placeholders for the defined sources are automatically generated in `.dlt/secrets.toml`. Alternatively, configuration may also be provided directly within `dlt.yml`.
++
++
++## REST API
++
++The built-in `rest_api`-type enables configuration of [REST-based integrations](../../../dlt-ecosystem/verified-sources/rest_api/basic.md). Multiple endpoints can be defined under a single source.
++
++
++```yaml
++sources:
++  pokemon_api:
++    type: rest_api
++    client:
++      base_url: https://pokeapi.co/api/v2/
++      paginator: auto
++    resource_defaults:
++      primary_key: name
++    resources:
++      - pokemon
++      - berry
++      - 
++        name: encounter_conditions
++        endpoint:
++          path: encounter-conditions
++          params:
++            offset:
++              type: incremental
++              cursor_path: name
++        write_disposition: append
++```
++
++* `type: rest_api`: Specifies the use of the built-in REST API source.
++* `client.base_url`: Sets the root URL for all API requests.
++* `paginator: auto`: Enables automatic detection and handling of pagination.
++* `resource_defaults`: Contains the default values to configure the dlt resources. This configuration is applied to all resources unless overridden by the resource-specific configuration.
++* Each item in `resources`defines an endpoint to extract. Simple entries like `pokemon` and `berry` will fetch from `/pokemon` and `/berry`, respectively.
++* The `encounter-conditios` resource uses an advanced configuration:
++  * `path`: Point to the `/encounter-condition` endpoint.
++  * `params.offset`: Enables incremental loading using the `name` field as the cursor.
++  * `write_disposition: replace`: Replaces the destination dataset with whatever the source produced on this run.
++
++
++
++## SQL database
++
++For SQL-base extractions that require no table-specific parameter configuration, it's possible to initialize `type: sql_database` and declare multiple tables at once.
++ 
++### General SQL database source
++
++```yaml 
++sources:
++   sql_source:
++    type: sql_database
++    table_names: 
++      - family
++      - clan
++    incremental:
++        cursor_path: updated
++        initial_value: 2023-01-12T11:21:28Z 
++```
++
++This defines a connection to a SQL database with incremental loading applied across multiple tables.
++
++* `type: sql_database`: Specifies the SQL database connector.
++
++* `table_names`: List of tables to extract.
++
++* `incremental`: Global configuration for incremental extraction.
++
++### Table-specific configuration
++
++For table specific configurationssettings such as different `primary_key`s, individual tables can be defined as standalone sources using the `sql_table` type.
++
++
++```yaml
++sources: 
++  sql_family:
++      type: sql_database.sql_table
++      table: family
++      incremental:
++        cursor_path: updated
++        initial_value: 2023-01-12T11:21:28Z 
++      primary_key: rfam_id
++```
++
++* `type: sql_table`: Indicates a single-table extraction.
++
++* `table`: Name of the table to extract.
++
++* `incremental`: Enables incremental loading for the table.
++
++* `primary_key`: Specifies the table's unique identifier for deduplication and merges.
++
++
++## Filesystem
++
++Filesystem sources can be set via the `readers` type and the filesystem specific resources can be called via the CLI `run pipline` command.
++
++
++```yaml
++sources: 
++ file_source:
++    type: filesystem.readers
++    bucket_url: file://Users/admin/Documents/csv_files
++    file_glob: '*.csv'
++```
++
++`dlt pipeline file_pipeline run --resources read_csv`
++
++
++
++:::tip
++Source **type** is used to refer to the location in Python code where the `@dlt.source` decorated function is present. You can
++always use a full path to a function name in a Python module, but we also support shorthand and relative notations. For example:
++* `rest_api` will be expanded to `dlt.sources.rest_api.rest_api` where `dlt.sources.rest_api` is a Python module in OSS dlt and `rest_api` is a name of a function in that module.
++* `github.source` will be expanded to `sources.github.sources` in the current project.
++* `filesystem.readers` will be expanded to `dlt.sources.filesystem.readers`
++
++If the **type** cannot be resolved, dlt+ will provide you with a detailed list of all candidate types that were looked up
++so you can make required corrections.
++:::
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 578c8ac1b..a3e400767 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -125,8 +125,20 @@ const sidebars = {
+           type: 'category',
+           label: 'Features',
+           items: [
+-            'plus/features/projects',
+             'plus/features/data-access',
++            {
++              type: 'category',
++              label: 'Project',
++              link: {
++                type: 'doc',
++                id: 'plus/features/project/index',
++              },
++              items: [
++                'plus/features/project/overview',
++                'plus/features/project/source-configuration',
++                'plus/features/project/python-api',
++              ]
++            },
+             {
+               type: 'category',
+               label: 'Local transformations',
+
+
+===== COMMIT a5fbf756 =====
+
+
+commit a5fbf756c
+Author: Thierry Jean
+Date: 2025-08-03
+
+    added repr (#2940)
+
+diff --git a/dlt/transformations/transformation.py b/dlt/transformations/transformation.py
+index 362247b8e..43548dd52 100644
+--- a/dlt/transformations/transformation.py
++++ b/dlt/transformations/transformation.py
+@@ -29,7 +29,7 @@ from dlt.common.schema.typing import (
+     TTableReferenceParam,
+ )
+ from dlt.transformations.configuration import TransformationConfiguration
+-from dlt.common.utils import get_callable_name
++from dlt.common.utils import get_callable_name, simple_repr, without_none
+ from dlt.extract.exceptions import CurrentSourceNotAvailable
+ from dlt.extract.pipe_iterator import DataItemWithMeta
+ from dlt.extract.hints import DLT_HINTS_METADATA_KEY, make_hints
+@@ -87,6 +87,27 @@ class DltTransformationResource(DltResource):
+ 
+         return super().compute_table_schema(item, meta)
+ 
++    def __repr__(self) -> str:
++        kwargs = {
++            "name": self.name,
++            #  "section": self.section,  should this be explicitly passed?
++            "table_name": self._hints.get("table_name"),
++            "primary_key": self._hints.get("primary_key"),
++            "merge_key": self._hints.get("merge_key"),
++            "columns": "{...}" if self._hints.get("columns") else None,
++            "parent_table_name": self._hints.get("parent_table_name"),
++            "references": "{...}" if self._hints.get("references") else None,
++            "nested_hints": "{...}" if self._hints.get("nested_hints") else None,
++            "max_table_nesting": self._hints.get("max_table_nesting"),
++            "write_disposition": self._hints.get("write_disposition"),
++            "table_format": self._hints.get("table_format"),
++            "file_format": self._hints.get("file_format"),
++            "schema_contract": "{...}" if self._hints.get("schema_contract") else None,
++            "incremental": self.incremental,
++            "validator": self.validator,
++        }
++        return simple_repr("@dlt.transformation", **without_none(kwargs))
++
+ 
+ def make_transformation_resource(
+     func: Callable[TTransformationFunParams, Any],
+diff --git a/tests/transformations/test_transformations.py b/tests/transformations/test_transformations.py
+index 424c74752..7f339d3e1 100644
+--- a/tests/transformations/test_transformations.py
++++ b/tests/transformations/test_transformations.py
+@@ -1,3 +1,4 @@
++from unittest import mock
+ import pytest
+ 
+ from typing import Any
+@@ -296,3 +297,23 @@ def test_multiple_transformations_in_function(
+         assert job_types == {"multiple_transformations": {"model": 2}}
+     elif transformation_type == "mixed":
+         assert job_types == {"multiple_transformations": {"model": 1, "parquet": 1}}
++
++
++def test_transformation_repr() -> None:
++    @dlt.transformation
++    def my_transformation(dataset: dlt.Dataset):
++        yield "SELECT * FROM my_table"
++
++    sentinel = object()
++    mock_dataset = mock.MagicMock()
++    transformation = my_transformation(mock_dataset)
++
++    repr_ = transformation.__repr__()
++    assert isinstance(repr_, str)
++    assert "dlt.transformation(" in repr_
++
++    # check that properties used by `__repr__` exist
++    assert getattr(transformation, "name", sentinel) is not sentinel
++    assert getattr(transformation, "_hints", sentinel) is not sentinel
++    assert getattr(transformation, "incremental", sentinel) is not sentinel
++    assert getattr(transformation, "validator", sentinel) is not sentinel
+
+
+===== COMMIT abaed03e =====
+
+
+commit abaed03e5
+Author: Violetta Mishechkina
+Date: 2025-07-31
+
+    Optimize add_limit docs title for the search (#2949)
+
+diff --git a/docs/website/docs/general-usage/source.md b/docs/website/docs/general-usage/source.md
+index b6ed96849..fe6f8e0ab 100644
+--- a/docs/website/docs/general-usage/source.md
++++ b/docs/website/docs/general-usage/source.md
+@@ -95,7 +95,7 @@ source.deals.add_filter(lambda deal: deal["created_at"] > yesterday)
+ 
+ Find more on transforms [here](resource.md#filter-transform-and-pivot-data).
+ 
+-### Load data partially
++### Load data partially with `add_limit`
+ 
+ You can limit the number of items produced by each resource by calling the `add_limit` method on a source. This is useful for testing, debugging, and generating sample datasets for experimentation. You can easily get your test dataset in a few minutes, when otherwise you'd need to wait hours for the full loading to complete. Below, we limit the `pipedrive` source to just get **10 pages** of data from each endpoint. Mind that the transformers will be evaluated fully:
+ 
+
+
+===== COMMIT 64181c6d =====
+
+
+commit 64181c6d3
+Author: Alena Astrakhantseva
+Date: 2025-07-31
+
+    Release highlights 1.12.3-1.14.1 (#2939)
+
+diff --git a/docs/website/docs/release-notes/1.13-1.14.md b/docs/website/docs/release-notes/1.13-1.14.md
+new file mode 100644
+index 000000000..b2f17de6d
+--- /dev/null
++++ b/docs/website/docs/release-notes/1.13-1.14.md
+@@ -0,0 +1,273 @@
++---
++title: "Release highlights: 1.12.3 - 1.14.1"
++description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
++keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
++---
++
++
++# Release highlights: 1.12.3 & 1.13.0 & 1.14.1
++
++## Breaking change: Ibis dataset/relation functionality + new non-Ibis relation features
++
++**What changed**
++
++Accessing Ibis relations using `dataset["table_name"]` or `dataset.table_name` no longer works.
++
++**Migration required**
++
++To get an Ibis table relation, explicitly set the table type to get the *table expression first*, then convert it to a *table relation:*
++
++```py
++# Previously: dataset["customers"]  # now returns a regular relation
++customers_expression = dataset.table("customers", table_type="ibis")
++customers_relation = dataset(customers_expression)
++
++df = customers_relation.df()  # fetch as DataFrame
++```
++
++Check out the [updated docs](../general-usage/dataset-access/dataset#modifying-queries-with-ibis-expressions) and [migration guide](../general-usage/dataset-access/dataset#migrating-from-the-previous-dlt--ibis-implementation) for full details and examples.
++
++:::note
++If you were using `dataset` without having Ibis installed, or without using any Ibis features, no changes are needed.
++:::
++---
++
++**New: non-Ibis relation enhancements**
++
++You can now use a more SQL-like interface on regular relations:
++
++```py
++customers = dataset.table("customers")
++
++# Sort
++customers.order_by("created_at").fetchall()
++
++# Filter
++customers.filter("id = 1").fetchall()
++
++# Aggregation
++customers.select("id").max().scalar()
++```
++
++---
++
++## Marimo playground: Try dlt in your browser
++
++**PR: #2832**
++
++**Overview**
++
++We now host an interactive **Marimo notebook playground** on GitHub Pages:
++
++🔗 https://dlt-hub.github.io/dlt/playground/
++
++This lets you test dlt code **directly in your browser** using Pyodide/WASM, no installation needed.
++
++**What’s included**
++
++The first notebook walks through a **simple example of loading a Python data structure into DuckDB** using dlt. It’s a quick and friendly way to understand how dlt pipelines work without setting up any environment.
++
++**Docs integration**
++
++We’ve also embedded the notebook directly into our docs:
++
++[Playground tutorial page →](../tutorial/playground.mdx)
++
++This makes it easier to **read and run** the code side by side.
++
++![marimo-playground](https://storage.googleapis.com/dlt-blog-images/marimo-playground.png)
++
++---
++
++## REST API: New paginator for header-based cursors
++
++**PR: #2798**
++
++**Overview**
++
++The new `header_cursor` paginator enables pagination for APIs that return the next page cursor in the **response headers**, such as those using custom headers like `NextPageToken`.
++
++**Use case**
++
++Some REST APIs respond like this:
++
++```text
++# response header
++Content-Type: application/json
++NextPageToken: 123456
++```
++
++```text
++# response JSON
++[
++  {"id": 1, "name": "item1"},
++  {"id": 2, "name": "item2"}
++]
++```
++
++To fetch the next page:
++
++```text
++https://api.example.com/items?page=123456
++```
++
++**Example configuration**
++
++```py
++{
++  "path": "items",
++  "paginator": {
++    "type": "header_cursor",
++    "cursor_key": "NextPageToken",  # name of the response header
++    "cursor_param": "page"          # query parameter used to pass the token
++  }
++}
++```
++
++You can now extract cursors from headers just like from JSON paths in the response body.
++
++---
++
++## Autocompletion in Notebooks: Dataset and relation
++
++**PR: #2891**
++
++**Overview**
++
++Working in notebooks just got smoother. We’ve added **tab autocompletion** for `dlt.Dataset` and `dlt.Relation` objects.
++
++Now you can:
++
++- Use `dataset.<TAB>` to see available tables
++- Use `relation.<TAB>` to explore available columns
++
++**How it works**
++
++The feature overrides `_ipython_key_completions_` to inspect dataset/relation structure and return available names.
++
++**Example**
++
++```py
++dataset  # <TAB> will suggest all table names
++dataset.customers  # <TAB> will suggest column names like id, email, created_at
++```
++
++---
++
++## DuckLake setup guide for MotherDuck
++
++**PR: #2842**
++
++**Overview**
++
++We’ve added a dedicated section in the docs for setting up **DuckLake**, a powerful way to persist **MotherDuck** databases on external storage like S3.
++
++**The guide includes:**
++
++1. Creating a DuckLake-managed database on S3
++2. Storing S3 credentials securely in MotherDuck
++3. Connecting dlt to DuckLake via `secrets.toml`
++
++**Why use DuckLake?**
++
++- Offload MotherDuck data to **S3**
++- Control over **storage location** and **retention**
++- Load data via dlt like with any DuckDB destination
++
++[DuckLake setup in docs →](../dlt-ecosystem/destinations/motherduck#ducklake-setup)
++
++---
++
++## Athena + Iceberg + Lake Formation tags and table properties
++
++**PR: #2808**
++
++**Overview**
++
++You can now apply **Lake Formation tags** to the Glue database used by the Athena destination. All tables created by dlt will inherit these tags.
++
++**Example configuration**
++
++```toml
++[destination.athena.lakeformation_config]
++enabled = true
++
++[destination.athena.lakeformation_config.tags]
++Environment = "prod"
++Team = "analytics"
++```
++
++---
++
++## Add post-create SQL statements
++
++**PR: #2791**
++
++You can now run **custom SQL statements** *after* tables are created or altered during schema migration. Useful for foreign keys, constraints, etc.
++
++**Example usage**
++
++Override `_get_table_post_update_sql` in your `SqlJobClientBase`:
++
++```py
++def _get_table_post_update_sql(self, partial_table):
++    if partial_table["name"] == "orders":
++        return [
++            "ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id)"
++        ]
++    return []
++```
++
++These run **after all tables are updated**, allowing dependency-safe logic.
++
++---
++
++## CLI: Friendly `drop` command 🐕‍🦺
++
++**PR: #2720**
++
++**Overview**
++
++The `dlt drop` command now includes smarter validation and warnings to avoid accidental misconfigurations.
++
++**Warning types**
++
++1. **Run directory validation**
++    ```text
++    You should run this from the same directory as the pipeline script...
++    ```
++
++2. **Misaligned config context detection**
++    ```text
++    WARNING: Active pipeline `my_pipeline` used `/home/user/project/.dlt`...
++    ```
++
++3. **Pipeline script vs. run dir mismatch**
++    ```text
++    WARNING: Your run dir (/home/user/tmp) is different from the pipeline script...
++    ```
++
++4. **Credential visibility notice**
++    ```text
++    WARNING: When accessing data from the command line, dlt does not execute your pipeline code...
++    ```
++
++5. **Table drop preview**
++    Lists tables that will be deleted before performing the drop.
++
++---
++
++## Shout-out to new contributors
++
++Big thanks to our newest contributors:
++
++- @AyushPatel101 (#2803)
++- @nicob3y (#2755)
++- @kaliole (#2849)
++- @franloza (#2869)
++
++---
++
++**Full release notes**
++
++[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index a79258093..879d441fd 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -55,6 +55,7 @@ const sidebars = {
+       },
+       items: [
+         'release-notes/1.12.1',
++        'release-notes/1.13-1.14',
+       ]
+     },
+     {
+
+
+===== COMMIT 8aea9499 =====
+
+
+commit 8aea94997
+Author: rudolfix
+Date: 2025-07-30
+
+    skips inferring incomplete column when already incomplete (#2935)
+
+diff --git a/dlt/common/schema/schema.py b/dlt/common/schema/schema.py
+index ec3082454..64963eb7e 100644
+--- a/dlt/common/schema/schema.py
++++ b/dlt/common/schema/schema.py
+@@ -833,12 +833,17 @@ class Schema:
+         if existing_column and utils.is_complete_column(existing_column):
+             if not utils.is_nullable_column(existing_column):
+                 raise CannotCoerceNullException(self.name, table_name, col_name)
+-            return None
+         else:
+-            inferred_unbounded_col = self._infer_column(
+-                k=col_name, v=None, data_type=None, table_name=table_name
+-            )
+-            return inferred_unbounded_col
++            # generate unbounded column only if it does not exist or it does not
++            # contain seen null
++            if not existing_column or not existing_column.get("x-normalizer", {}).get(
++                "seen-null-first"
++            ):
++                inferred_unbounded_col = self._infer_column(
++                    k=col_name, v=None, data_type=None, table_name=table_name
++                )
++                return inferred_unbounded_col
++        return None
+ 
+     def _coerce_non_null_value(
+         self,
+diff --git a/tests/common/schema/test_inference.py b/tests/common/schema/test_inference.py
+index 95ea9cf8f..d1423b6bf 100644
+--- a/tests/common/schema/test_inference.py
++++ b/tests/common/schema/test_inference.py
+@@ -396,10 +396,37 @@ def test_coerce_null_value_over_existing(schema: Schema) -> None:
+     new_row, new_table = schema.coerce_row("event_user", None, row)
+     schema.update_table(new_table)
+     row = {"timestamp": None}
+-    new_row, _ = schema.coerce_row("event_user", None, row)
++    new_row, new_table = schema.coerce_row("event_user", None, row)
++    # do not generate table update on existing column
++    assert new_table is None
+     assert "timestamp" not in new_row
+ 
+ 
++def test_coerce_null_value_over_existing_incomplete(schema: Schema) -> None:
++    row = {"timestamp": 82178.1298812, "null_col": None}
++    _, new_table = schema.coerce_row("event_user_2", None, row)
++    schema.update_table(new_table)
++    # same row again
++    _, new_table = schema.coerce_row("event_user_2", None, row)
++    # do not generate table update on existing column
++    assert new_table is None
++
++
++def test_coerce_null_value_over_existing_predefined(schema: Schema) -> None:
++    # create "null_col" upfront
++    new_table = utils.new_table("event_user_2", columns=[{"name": "null_col"}])
++    schema.update_table(new_table)
++    # we should get new table with "seen-null-first"
++    row = {"timestamp": 82178.1298812, "null_col": None}
++    _, new_table = schema.coerce_row("event_user_2", None, row)
++    assert new_table["columns"]["null_col"]["x-normalizer"]["seen-null-first"] is True
++    schema.update_table(new_table)
++    # same row again
++    _, new_table = schema.coerce_row("event_user_2", None, row)
++    # do not generate table update on existing column
++    assert new_table is None
++
++
+ def test_coerce_null_value_over_not_null(schema: Schema) -> None:
+     row = {"timestamp": 82178.1298812}
+     _, new_table = schema.coerce_row("event_user", None, row)
+
+
+===== COMMIT 9a3f6ef6 =====
+
+
+commit 9a3f6ef63
+Author: adrianbr
+Date: 2025-07-30
+
+    adjust cursor docs to new flow (#2885)
+

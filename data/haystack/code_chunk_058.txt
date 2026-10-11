@@ -1,0 +1,3248 @@
+# enable signal handling for graceful shutdowns - it is disabled for pipelines running
+# in threads
+with signals.intercepted_signals():
+    # load data
+    asyncio.run(_run_async())
+# activate pipelines before they are used
+pipeline_1.activate()
+pipeline_1_count = pipeline_1.last_trace.last_normalize_info.row_counts["async_table"]  # ty: ignore
+print(pipeline_1_count)
+#> 10
+
+pipeline_2.activate()
+pipeline_2_count = pipeline_2.last_trace.last_normalize_info.row_counts["defer_table"]  # ty: ignore
+print(pipeline_2_count)
+#> 5
+```
+
+:::tip
+Please note the following:
+
+1. When running in multiple threads and using [parallel normalize step](#normalize), use the **spawn**
+process start method.
+2. If you created the `Pipeline` object in the worker thread and you use it from another (i.e., the main thread),
+call `pipeline.activate()` to inject the right context into the current thread.
+3. Note how `with signals.intercepted_signals():` was used to [enable graceful shutdown](../running-in-production/running.md#allow-a-graceful-shutdown) of pipelines running in a thread pool.
+:::
+
+### Parallelism across processes or machines
+
+You can also run pipelines in parallel across multiple machines. Please consult our [deployment guides](../walkthroughs/deploy-a-pipeline) for more information. Please take note of the pitfalls listed below.
+
+### Pitfalls
+
+Due to the way `dlt` works, there are a few general pitfalls to be aware of:
+
+1. Do not run pipelines with the same name and working dir in parallel on the same machine. dlt will not be able to manage state and temporary files properly if you do this.
+
+2. If you're running multiple pipelines in parallel that write to the same destination dataset and use a staging area, make sure to do one of the following:
+
+  - Assign a unique subfolder in the staging destination bucket for each pipeline, or
+  - [Disable automatic cleanup of the staging area](../dlt-ecosystem/staging#how-to-prevent-staging-files-truncation) after each load for all pipelines.
+
+    If you do not, files might be deleted by one pipeline that are still required to be loaded by another pipeline running in parallel.
+
+3. If you are using a write disposition that requires a staging dataset on the final destination, you should provide a unique staging dataset name for each pipeline, otherwise similar problems as noted above may occur. You can do this with the
+[`staging_dataset_name_layout` setting.](../dlt-ecosystem/staging#staging-dataset)
+
+## Keep pipeline working folder in a bucket on constrained environments
+
+`dlt` stores extracted data in load packages in order to load them atomically. In case you extract a lot of data at once (i.e. backfill) or
+your runtime env has constrained local storage (i.e. cloud functions) you can keep your data on a bucket by using [FUSE](https://github.com/libfuse/libfuse) or
+any other option which your cloud provider supplies.
+
+`dlt` users rename when saving files and  "committing" packages (folder rename). Those may be not supported on bucket filesystems. Often
+`rename` is translated into `copy` automatically. In other cases `dlt` will fallback to copy itself.
+
+In case of cloud function and gs bucket mounts, increasing the rename limit for folders is possible:
+
+```hcl
+volume_mounts {
+    mount_path = "/usr/src/ingestion/pipeline_storage"
+    name       = "pipeline_bucket"
+  }
+volumes {
+  name = "pipeline_bucket"
+  gcs {
+    bucket    = google_storage_bucket.dlt_pipeline_data_bucket.name
+    read_only = false
+    mount_options = [
+      "rename-dir-limit=100000"
+    ]
+  }
+}
+```
+
+## Handling storage limits
+
+If your storage reaches its limit, you are likely running dlt in a cloud environment with restricted disk space. To prevent issues, mount an external cloud storage location and set the `DLT_DATA_DIR` environment variable to point to it. This ensures that dlt uses the mounted storage as its data directory instead of local disk space.
+
+### Setting `DLT_DATA_DIR`
+
+You can configure `DLT_DATA_DIR` in your environment setup as follows:
+
+```py
+import os
+
+# Define the path to your mounted external storage
+data_dir = "/path/to/mounted/bucket/dlt_pipeline_data"
+
+# Set the DLT_DATA_DIR environment variable
+os.environ["DLT_DATA_DIR"] = data_dir
+
+# Rest of your pipeline code
+```
+
+This directs dlt to use the specified external storage for all data operations, preventing local storage constraints.
+
+
+===== FILE: docs/website/docs/reference/telemetry.md =====
+
+---
+title: Telemetry
+description: Anonymous usage information with dlt telemetry
+keywords: [telemetry, usage information, opt out]
+---
+# Telemetry
+
+`dlt` collects and reports **anonymous** usage information. This information is essential to figuring out how we should improve the library. Telemetry does not send any personal data. We create a random tracking cookie that is stored in your `~/.dlt` directory. You can disable telemetry at any moment or send it to your own servers instead.
+
+## How to opt out
+
+You can disable telemetry by adding `--disable-telemetry` to any dlt [command](command-line-interface.md).
+
+This command will disable telemetry both in the current project and globally for the whole machine:
+
+```sh
+dlt --disable-telemetry
+```
+
+While this command will also permanently disable telemetry and then initialize the `chess` pipeline:
+
+```sh
+dlt --disable-telemetry init chess duckdb
+```
+
+You can check the current telemetry status with this command:
+
+```sh
+dlt telemetry
+```
+
+Another way to disable telemetry is to set the `runtime.dlthub_telemetry` option in the `config.toml` file in the `.dlt` folder.
+
+```toml
+[runtime]
+
+dlthub_telemetry=false
+```
+
+## What we send when
+
+Anonymous telemetry is sent when:
+
+- Any `dlt` command is executed from the command line. The data contains the command name. In the case of the `dlt init` command, we also send the requested destination and data source names.
+- When `pipeline.run` is called, we send information when the [extract, normalize, and load](explainers/how-dlt-works.md) steps are completed. The data contains the destination name (e.g., `duckdb`), hashes of the dataset name, pipeline name, default schema name, destination fingerprint (which is a hash of selected destination configuration fields), elapsed time, and whether the step succeeded or not.
+- When `pipeline.dataset` is called, we send information about dataset access attempts. The data contains the destination name and type (e.g., `duckdb`), hashes of the dataset name, default and requested schema names, as well as whether the access attempt succeeded.
+- When `dbt` and `airflow` helpers are used
+
+Here is an example `dlt init` telemetry message:
+
+```json
+{
+  "anonymousId": "933dd165453d196a58adaf49444e9b4c",
+  "context": {
+    "ci_run": false,
+    "cpu": 8,
+    "exec_info": [],
+    "library": {
+      "name": "dlt",
+      "version": "0.2.0a25"
+    },
+    "os": {
+      "name": "Linux",
+      "version": "4.19.128-microsoft-standard"
+    },
+    "python": "3.8.11",
+    "run_context": {
+      "name": "dlt"
+    }
+  },
+  "event": "command_init",
+  "properties": {
+    "destination_name": "bigquery",
+    "elapsed": 3.1720383167266846,
+    "event_category": "command",
+    "event_name": "init",
+    "pipeline_name": "pipedrive",
+    "success": true
+  }
+}
+```
+
+Example for `load` pipeline run step:
+
+```json
+{
+  "anonymousId": "570816b273a41d16caacc26a797204d9",
+  "context": {
+    "ci_run": false,
+    "cpu": 3,
+    "exec_info": [],
+    "library": {
+      "name": "dlt",
+      "version": "0.2.0a26"
+    },
+    "os": {
+      "name": "Darwin",
+      "version": "21.6.0"
+    },
+    "python": "3.10.10",
+    "run_context": {
+      "name": "my_workspace",
+      "profile": "dev"
+    }
+  },
+  "event": "pipeline_load",
+  "properties": {
+    "destination_name": "duckdb",
+    "destination_fingerprint": "",
+    "pipeline_name_hash": "OpVShb3cX7qQAmOZSbV8",
+    "dataset_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
+    "default_schema_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
+    "elapsed": 2.234885,
+    "event_category": "pipeline",
+    "event_name": "load",
+    "success": true,
+    "transaction_id": "39c3b69c858836c36b9b7c6e046eb391"
+  }
+}
+```
+
+Example for data access telemetry:
+
+```json
+{
+  "anonymousId": "570816b273a41d16caacc26a797204d9",
+  "context": {
+    "ci_run": false,
+    "cpu": 3,
+    "exec_info": [],
+    "library": {
+      "name": "dlt",
+      "version": "1.15.0"
+    },
+    "os": {
+      "name": "Darwin",
+      "version": "21.6.0"
+    },
+    "python": "3.10.10",
+    "run_context": {
+      "name": "dlt"
+    }
+  },
+  "event": "data_access_connect",
+  "properties": {
+    "destination_name": "duckdb",
+    "destination_type": "duckdb",
+    "dataset_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
+    "default_schema_name_hash": "Hqk0a3Ov5AD55KjSg2rC",
+    "requested_schema_name_hash": "49ShjWp8x9h+rmyqjP6G",
+    "event_category": "data_access",
+    "event_name": "connect",
+    "success": true
+  }
+}
+```
+
+## The message `context`
+
+The message `context` contains the following information:
+
+- `anonymousId`: a random tracking cookie stored in `~/.dlt/.anonymous_id`.
+- `ci_run`: a flag indicating if the message was sent from a CI environment (e.g., `GitHub Actions`, `Travis CI`).
+- `cpu`: contains the number of cores.
+- `exec_info`: contains a list of strings that identify the execution environment: (e.g., `kubernetes`, `docker`, `airflow`).
+- `run_context`: the name of the active run context (`dlt` for the default one) and, if the context supports profiles, the active profile name.
+- The `library`, `os`, and `python` give us some understanding of the runtime environment of the `dlt`.
+
+## Send telemetry data to your own tracker
+
+You can set up your own tracker to receive telemetry events. You can create a scalable, globally distributed edge service [using `dlt` and Cloudflare](https://dlthub.com/blog/dlt-segment-migration).
+
+Once your tracker is running, point `dlt` to it. You can use the global `config.toml` to redirect all pipelines on a given machine.
+
+```toml
+[runtime]
+dlthub_telemetry_endpoint="telemetry-tracker.services4745.workers.dev"
+```
+
+### Track events with Segment
+
+You can send anonymous telemetry to your own [Segment](https://segment.com/) account. You need to create an HTTP Server source and generate a WRITE KEY, which you then pass to the `config.toml` like this:
+
+```toml
+[runtime]
+dlthub_telemetry_endpoint="https://api.segment.io/v1/track"
+dlthub_telemetry_segment_write_key="<write_key>"
+```
+
+
+===== FILE: docs/website/docs/release-notes/1.12.1.md =====
+
+---
+title: "Release highlights: 1.12.1"
+description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.12.1
+
+This update includes substantial improvements to developer experience and stability, as well as bug fixes. Here's a breakdown of what's new:
+
+---
+
+## Placeholder config & secret warning system
+
+**PR:** [#2636](https://github.com/dlt-hub/dlt/pull/2636)
+
+**Overview**
+
+* dlt now detects placeholder values during **config and secret resolution** (e.g., `"<configure me>"`, or timestamps like `1768-07-21T02:56:00Z`).
+* A **detailed warning** is emitted when placeholders are detected, helping users identify incomplete configuration.
+* Prevents confusing errors during pipeline runs and catches misconfigured values early in the development cycle.
+
+**Example placeholders**
+
+```toml
+[credentials]
+token = "<configure me>"
+started_at = "1768-07-21T02:56:73Z"  # random date
+```
+
+**Example warning**
+
+```text
+Placeholder value encountered when resolving config or secret:
+resolved_key: host, value: <configure me>, section: sources.sql_database.credentials.host
+Most likely, this comes from init-command, which creates basic templates for non-complex configs and secrets. The provider to adjust is secrets.toml at one of these locations:
+- /home/me/project/.dlt/secrets.toml
+- /home/me/.dlt/secrets.toml
+```
+
+---
+
+## Warning for `None`-only columns
+
+**PR:** [#2633](https://github.com/dlt-hub/dlt/pull/2633)
+
+**Overview**
+
+* When normalizing data, if a column contains only `None`, dlt can’t infer its type.
+* This PR adds a **clear warning message** to help users fix this by providing an explicit type hint.
+* If no type hint is given, the column will be **excluded** from the destination table.
+
+**Example warning**
+
+```text
+The column `my_column` in table `my_table` did not receive any data during this load. Therefore, its type couldn't be inferred.
+
+Unless a type hint is provided, the column will not be materialized in the destination.
+```
+
+**Recommended fix**
+
+```py
+@dlt.resource(columns={"my_column": {"data_type": "text"}})
+def my_data():
+    yield {"my_column": None}
+```
+
+---
+
+## Regular and standalone resources are now the same thing
+
+**Before**
+
+* Inner resources could not receive secrets or configs properly.
+* Required the `standalone=True` argument.
+
+```py notype
+@dlt.resource(standalone=True)
+def foo(access_token=dlt.secrets.value):
+    yield from generate_json_like_data(access_token)
+```
+
+```toml
+[sources.foo]
+access_token = "your_token"
+```
+
+**Now**
+
+* All `@dlt.resource` functions behave identically.
+* `standalone=True` is **ignored** and no longer required.
+* Inner resources adopt the config section from the source they are in: `sources.source_module.resource_name` this is canonical form.
+
+**Cleaner usage**
+
+```py notype
+@dlt.resource
+def foo(access_token=dlt.secrets.value):
+    yield from generate_json_like_data(access_token)
+```
+
+For inner resources:
+
+```py notype
+@dlt.source
+def bar():
+    @dlt.resource
+    def foo(access_token=dlt.secrets.value):
+        yield from generate_json_like_data(access_token)
+
+    return foo
+```
+
+```toml
+[sources.bar.foo]
+access_token = "your_token"
+```
+
+---
+
+## Resources can `return` data (instead of `yield`)
+
+**Overview**
+
+* You can now return values instead of yielding.
+* Useful for static data or short lists.
+
+**Example**
+
+```py
+@dlt.resource
+def numbers():
+    return [{"key1": 1, "key2": 2}]
+```
+
+> `return` is automatically wrapped into a generator internally.
+
+:::warning
+Not recommended for large-scale use due to readability and stream control.
+:::
+
+---
+
+## Performance and stability fixes
+
+**PR:** [#2756](https://github.com/dlt-hub/dlt/pull/2756)
+
+### 1. Snowflake: extremely slow merge query due to `OR` condition (n² complexity)
+
+* In **merge** write disposition with `delete-insert` strategy, the generated SQL used:
+
+```sql
+DELETE FROM main_table WHERE EXISTS (
+  SELECT 1 FROM staging_table
+  WHERE main.pk1 = staging.pk1 AND main.pk2 = staging.pk2
+     OR main.merge_key = staging.merge_key
+);
+```
+
+* This caused **very slow** performance due to `OR` logic in `EXISTS`, especially on large datasets.
+
+**New approach**
+
+* Rewrites the logic to two separate `DELETE` queries, executed in the same transaction:
+
+```sql
+DELETE ... WHERE EXISTS (JOIN ON primary_key);
+DELETE ... WHERE EXISTS (JOIN ON merge_key);
+```
+
+:::info
+⚡ Improves performance from **18 hours → 4 seconds** on large datasets.
+:::
+
+### 2. Skip deduplication option
+
+* New flag allows users to **disable deduplication** during `delete-insert` operations, further reducing merge cost.
+* Useful for **append-heavy** workloads with upstream deduplication.
+* Works for any destination that supports `delete-insert`.
+
+```py
+@dlt.resource(
+    primary_key="id",
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "delete-insert",
+        "deduplicated": False
+    }
+)
+def data_resource():
+    yield from iter(())  # your data generator
+```
+
+---
+
+## Iceberg: `upsert` merge strategy added
+
+**PR:** [#2671](https://github.com/dlt-hub/dlt/pull/2671)
+
+**Overview**
+
+* Iceberg now supports `merge` with **upsert** semantics, similar to Delta Lake.
+* Enables row-level updates using **primary and merge keys**.
+
+:::warning
+Known limitations due to current pyiceberg behavior:
+
+* Nested fields and struct joins are not fully supported in Arrow joins (required by upsert).
+* Non-unique keys in input data will raise hard errors — Iceberg enforces strict uniqueness.
+* Some failing tests stem from current pyiceberg limitations (e.g., recursion limits, Arrow type mismatches).
+:::
+
+---
+
+## Bonus: Postgres now supports `parquet` via ADBC
+
+**PR:** [#2685](https://github.com/dlt-hub/dlt/pull/2685)
+
+```py
+@dlt.source  # your source
+def crm():
+    yield ...
+
+pipeline = dlt.pipeline(destination="postgres")
+pipeline.run(crm, loader_file_format="parquet")
+```
+
+---
+
+## Full release notes
+
+[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
+
+
+===== FILE: docs/website/docs/release-notes/1.13-1.14.md =====
+
+---
+title: "Release highlights: 1.12.3 - 1.14.1"
+description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.12.3 & 1.13.0 & 1.14.1
+
+## Breaking change: Ibis dataset/relation functionality + new non-Ibis relation features
+
+**What changed**
+
+Accessing Ibis relations using `dataset["table_name"]` or `dataset.table_name` no longer works.
+
+**Migration required**
+
+To get an Ibis table relation, explicitly set the table type to get the *table expression first*, then convert it to a *table relation:*
+
+```py
+# Previously: dataset["customers"]  # now returns a regular relation
+dataset: dlt.Dataset = pipeline.dataset() # or `dlt.dataset(destination, dataset_name)`
+
+customers_expression = dataset.table("customers", table_type="ibis")
+customers_relation = dataset(customers_expression)  # ty: ignore[invalid-argument-type]
+
+df = customers_relation.df()  # fetch as DataFrame
+```
+
+Check out the [updated docs](../general-usage/dataset-access/dataset#modifying-queries-with-ibis-expressions) and [migration guide](../general-usage/dataset-access/dataset#migrating-from-the-previous-dlt--ibis-implementation) for full details and examples.
+
+:::note
+If you were using `dataset` without having Ibis installed, or without using any Ibis features, no changes are needed.
+:::
+
+---
+
+**New: non-Ibis relation enhancements**
+
+You can now use a more SQL-like interface on regular relations:
+
+```py notype
+customers = dataset.table("customers")
+
+# Sort
+customers.order_by("created_at").fetchall()
+
+# Filter
+customers.filter("id = 1").fetchall()
+
+# Aggregation
+customers.select("id").max().scalar()
+```
+
+---
+
+## REST API: New paginator for header-based cursors
+
+**PR: #2798**
+
+**Overview**
+
+The new `header_cursor` paginator enables pagination for APIs that return the next page cursor in the **response headers**, such as those using custom headers like `NextPageToken`.
+
+**Use case**
+
+Some REST APIs respond like this:
+
+```text
+# response header
+Content-Type: application/json
+NextPageToken: 123456
+```
+
+```text
+# response JSON
+[
+  {"id": 1, "name": "item1"},
+  {"id": 2, "name": "item2"}
+]
+```
+
+To fetch the next page:
+
+```text
+https://api.example.com/items?page=123456
+```
+
+**Example configuration**
+
+```py
+{
+  "path": "items",
+  "paginator": {
+    "type": "header_cursor",
+    "cursor_key": "NextPageToken",  # name of the response header
+    "cursor_param": "page"          # query parameter used to pass the token
+  }
+}
+```
+
+You can now extract cursors from headers just like from JSON paths in the response body.
+
+---
+
+## Autocompletion in Notebooks: Dataset and relation
+
+**PR: #2891**
+
+**Overview**
+
+Working in notebooks just got smoother. We’ve added **tab autocompletion** for `dlt.Dataset` and `dlt.Relation` objects.
+
+Now you can:
+
+- Use `dataset.<TAB>` to see available tables
+- Use `relation.<TAB>` to explore available columns
+
+**How it works**
+
+The feature overrides `_ipython_key_completions_` to inspect dataset/relation structure and return available names.
+
+**Example**
+
+```py
+dataset: dlt.Dataset = pipeline.dataset() # or `dlt.dataset(destination, dataset_name)`
+
+dataset  # <TAB> will suggest all table names
+dataset.customers  # <TAB> will suggest column names like id, email, created_at
+```
+
+---
+
+## DuckLake setup guide for MotherDuck
+
+**PR: #2842**
+
+**Overview**
+
+We’ve added a dedicated section in the docs for setting up **DuckLake**, a powerful way to persist **MotherDuck** databases on external storage like S3.
+
+**The guide includes:**
+
+1. Creating a DuckLake-managed database on S3
+2. Storing S3 credentials securely in MotherDuck
+3. Connecting dlt to DuckLake via `secrets.toml`
+
+**Why use DuckLake?**
+
+- Offload MotherDuck data to **S3**
+- Control over **storage location** and **retention**
+- Load data via dlt like with any DuckDB destination
+
+[DuckLake setup in docs →](../dlt-ecosystem/destinations/motherduck#ducklake-setup)
+
+---
+
+## Athena + Iceberg + Lake Formation tags and table properties
+
+**PR: #2808**
+
+**Overview**
+
+You can now apply **Lake Formation tags** to the Glue database used by the Athena destination. All tables created by dlt will inherit these tags.
+
+**Example configuration**
+
+```toml
+[destination.athena.lakeformation_config]
+enabled = true
+
+[destination.athena.lakeformation_config.tags]
+Environment = "prod"
+Team = "analytics"
+```
+
+---
+
+## Add post-create SQL statements
+
+**PR: #2791**
+
+You can now run **custom SQL statements** *after* tables are created or altered during schema migration. Useful for foreign keys, constraints, etc.
+
+**Example usage**
+
+Override `_get_table_post_update_sql` in your `SqlJobClientBase`:
+
+```py
+def _get_table_post_update_sql(self, partial_table):
+    if partial_table["name"] == "orders":
+        return [
+            "ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id)"
+        ]
+    return []
+```
+
+These run **after all tables are updated**, allowing dependency-safe logic.
+
+---
+
+## CLI: Friendly `drop` command 🐕‍🦺
+
+**PR: #2720**
+
+**Overview**
+
+The `dlt drop` command now includes smarter validation and warnings to avoid accidental misconfigurations.
+
+**Warning types**
+
+1. **Run directory validation**
+
+    ```text
+    You should run this from the same directory as the pipeline script...
+    ```
+
+2. **Misaligned config context detection**
+
+    ```text
+    WARNING: Active pipeline `my_pipeline` used `/home/user/project/.dlt`...
+    ```
+
+3. **Pipeline script vs. run dir mismatch**
+
+    ```text
+    WARNING: Your run dir (/home/user/tmp) is different from the pipeline script...
+    ```
+
+4. **Credential visibility notice**
+
+    ```text
+    WARNING: When accessing data from the command line, dlt does not execute your pipeline code...
+    ```
+
+5. **Table drop preview**
+    Lists tables that will be deleted before performing the drop.
+
+---
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+- @AyushPatel101 (#2803)
+- @nicob3y (#2755)
+- @kaliole (#2849)
+- @franloza (#2869)
+
+---
+
+## Full release notes
+
+[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
+
+
+===== FILE: docs/website/docs/release-notes/1.15.md =====
+
+---
+title: "Release highlights: 1.15"
+description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.15
+
+## ⚠️ Breaking changes: `.gz` extensions now added to compressed files
+
+**PR: #2835**
+
+Starting with v1.15, all compressed files will include the `.gz` extension by default. This applies to:
+
+- Filesystem destinations
+- Internal working directories
+- Staging locations (feeding downstream destinations like Redshift, BigQuery)
+
+**Notes**
+
+- Does **not apply** to `.parquet` files
+- Existing filesystem destination will keep the old behavior (no `.gz`) for backward compatibility
+- Compressed files uploaded to staging destinations will now have the `.gz` extension, also if `dlt` is configured to keep data in stage.
+
+[More details → File Compression in Filesystem Destination](../dlt-ecosystem/destinations/filesystem#file-compression)
+
+---
+
+## Export schemas in DBML format
+
+**PR: #2929**
+
+You can now export your pipeline schema in **DBML format**, ready for visualization in DBML frontends.
+
+```py
+# Generate a string that can be rendered in a DBML frontend
+dbml_str = pipeline.default_schema.to_dbml()
+```
+
+This includes:
+
+- Data and dlt tables
+- Table/column metadata
+- User-defined/root-child/parent-child references
+- Grouping by resources
+- etc.
+
+![schema-diagram](https://storage.googleapis.com/dlt-blog-images/release-highlights/470492597-cc6882ec-d08a-46a0-b268-cda8a6c6bf70.png)
+
+---
+
+## REST API Client Enhancements
+
+### 1. `has_more` flag in paginators
+
+**PR: #2817**
+
+Some APIs provide a `has_more` boolean instead of `total` or `offset` limits.
+
+You can now configure paginators to use that flag.
+
+```py
+from dlt.sources.helpers.rest_client.paginators import OffsetPaginator, PageNumberPaginator
+
+# Paginator starts at offset=0, increments by `limit`
+# Stops automatically when response["has_more"] == False
+offset_paginator = OffsetPaginator(
+    offset=0,
+    limit=2,
+    has_more_path="has_more"   # JSONPath to the boolean flag
+)
+
+# Paginator starts at page=1, increments by page
+# Stops automatically when response["has_more"] == False
+pn_paginator = PageNumberPaginator(
+    page=1,
+    has_more_path="has_more"  # JSONPath to the boolean in response
+)
+```
+
+### 2. JSON body pagination support
+
+**PR: #2917**
+
+Pagination parameters can now be placed in the **request body** (e.g., for `POST` requests).
+
+```py
+from dlt.sources.helpers.rest_client.paginators import OffsetPaginator, PageNumberPaginator
+
+# We tell dlt to place pagination values INSIDE the request JSON body
+offset_paginator = OffsetPaginator(
+    offset=0,
+    limit=3,
+    offset_body_path="offset",     # put 'offset' in request.json["offset"]
+    limit_body_path="limit",       # put 'limit'  in request.json["limit"]
+)
+
+pn_paginator = PageNumberPaginator(
+    page=1,
+    page_body_path="page",           # put 'page'      in request.json["page"]
+)
+```
+
+---
+
+## Databricks + Unity Catalog enhancement
+
+**PR: #2674**
+
+New support for **comments, tags, and constraints** in Databricks Unity Catalog tables.
+
+- Add **table comments** and **tags**
+- Add **column comments** and **tags**
+- Apply **primary/foreign key constraints**
+
+```toml
+[destination.databricks]
+# Add PRIMARY KEY and FOREIGN KEY constraints to tables
+create_indexes = true
+```
+
+Use the adapter for column- and table-level hints:
+
+```py
+from dlt.destinations.adapters import databricks_adapter
+
+databricks_adapter(
+    my_resource,
+    table_comment="Event data",
+    table_tags=["pii", {"cost_center": "12345"}],
+    column_hints={
+        "user_id": {
+            "column_comment": "User ID",
+            "column_tags": ["pii"]
+        }
+    },
+)
+```
+
+---
+
+## SQLAlchemy destination: MSSQL + Trino support
+
+**PR: #2951**
+
+- **MSSQL** fully supported (including JSON fields)
+- **Trino** partially supported (with limitations: no merge/SCD2, JSON casted to string)
+- Fixes for ClickHouse temp tables and BigQuery numeric handling
+
+[Example of customizing a type mapper for Trino →](../dlt-ecosystem/destinations/sqlalchemy#adapting-destination-for-a-dialect)
+
+---
+
+## Delta Lake: control over streamed execution
+
+**PR: #2961**
+
+By default, dlt runs **Delta Lake upserts in *streamed mode***.
+
+- Streamed execution = the source table is read **row by row**, which **reduces memory pressure** and works well for large datasets.
+- But in streamed mode, **table statistics and pruning predicates are not used** — meaning Delta can’t skip irrelevant partitions efficiently.
+
+**New option: `deltalake_streamed_exec`**
+
+Now you can explicitly choose whether to run Delta merge operations in streamed mode or not.
+
+- **`true` (default):** safe for very large datasets, lower memory usage.
+- **`false`:** enables Delta to use table statistics and pruning (better performance when partitions and stats exist).
+
+```toml
+[destination.filesystem]
+deltalake_streamed_exec = false
+```
+
+---
+
+## Python 3.14 support
+
+**PR: #2789**
+
+Python `3.14` is currently in `beta4`. We now provide experimental support for Python `3.14` to make it easier for projects depending on dlt to prepare for the upgrade.
+
+---
+
+## Switched ConnectorX backend from `arrow2` to `arrow`
+
+**PR: #2933**
+
+ConnectorX dropped the `arrow2` backend in v0.4.2, which was dlt’s default.
+
+dlt now defaults to the `arrow` backend, with minor adjustments for behavioral differences, and relaxed ConnectorX version constraints.
+
+---
+
+## AI Command IDE integration: now works with all major IDEs (Cursor, Copilot, Windsurf, etc.)
+
+**PR: #2937**
+
+[The AI command](../hub/command-line-interface.md#dlthub-ai) now supports all major IDEs, automatically creating the correct rule files for each AI editor/agent. This ensures seamless integration whether you’re using Cursor, Copilot, Windsurf, Claude, or other supported editors.
+
+---
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+- [@bayees](https://github.com/bayees) — #2674
+- [@7amza79](https://github.com/7amza79) — #2783
+- [@michaelconan](https://github.com/michaelconan) — #2817
+- [@Giackgamba](https://github.com/Giackgamba) — #2917
+
+---
+
+## Full release notes
+
+[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
+
+
+===== FILE: docs/website/docs/release-notes/1.16.md =====
+
+---
+title: "Release highlights: 1.16"
+description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.16
+
+## dlt Education now in docs
+
+Our free **[education courses](../tutorial/education)** are now part of the official documentation and can be launched directly in **Google Colab**.
+
+Try them [here](../tutorial/education)!
+
+---
+
+## Smarter timestamp handling
+
+This release brings a major cleanup and unification of how dlt handles timestamps and timezones. Both **tz-aware** and **naive** timestamps are now processed consistently across normalizers and destinations. dlt now also preserves **the exact timestamp type** when using incremental cursors, preventing subtle mismatches during reloads.
+
+It also fixes several tricky edge cases — such as **nanosecond precision** in MSSQL — and ensures that all `time` types behave as documented (always naive, in UTC). Destinations now explicitly declare which timestamp formats they support, so dlt adjusts automatically.
+
+Example:
+
+```py
+@dlt.resource(
+   name='my_table',
+   columns={
+      "my_column": {
+          "data_type": "timestamp",
+          "timezone": True}}
+)
+def my_resource():
+    ...
+
+# Output:
+# naive timestamp → UTC tz-aware
+# "2024-05-01 12:00:00" → "2024-05-01 12:00:00+00:00"
+
+# tz-aware timestamp with timezone=False → UTC converted, then naive
+# "2024-05-01 12:00:00+02:00" → "2024-05-01 10:00:00"
+```
+
+The result: predictable, precise timestamp behavior across all sources, transformations, and destinations.
+
+[Read more →](../general-usage/schema#handling-of-timestamp-and-time-zones)
+
+---
+
+## Visualization updates
+
+- New beta dashboard
+
+    The Streamlit app is now replaced by the **dlt Dashboard**. Run `dlt dashboard` to explore your pipelines with an improved interface and real-time insights. Learn more [here](../hub/ingestion/dashboard.md).
+
+    ![dashboard-overview.png](https://storage.googleapis.com/dlt-blog-images/release-highlights/dashboard-overview.png)
+
+- Export schema graphs with `dlt.Schema.to_dot()`. More about schema export [here](../general-usage/dataset-access/view-dlt-schema#export-to-graphviz).
+
+    ![477615341-202f1937-8697-4bc9-acf1-e7b6ac7e9970.png](https://storage.googleapis.com/dlt-blog-images/release-highlights/477615341-202f1937-8697-4bc9-acf1-e7b6ac7e9970.png)
+
+---
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@Jinso-o](https://github.com/Jinso-o) — [#2986](https://github.com/dlt-hub/dlt/pull/2986)
+* [@tpulmano](https://github.com/tpulmano) — [#2978](https://github.com/dlt-hub/dlt/pull/2978)
+
+---
+
+## Full release notes
+
+[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
+
+
+===== FILE: docs/website/docs/release-notes/1.17.md =====
+
+---
+title: "Release highlights: 1.17"
+description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.17
+
+## New: DuckLake destination
+
+You can now use the **DuckLake** destination — supporting all bucket and catalog combinations. It’s a great fit for lightweight data lakes and local development setups.
+
+[Read the docs →](../dlt-ecosystem/destinations/ducklake)
+
+---
+
+## Custom metrics in pipelines
+
+You can now **collect custom metrics** directly inside your resources and transform steps. This makes it easy to track things like page counts, skipped rows, or API calls — right where the data is extracted.
+
+Use `dlt.current.resource_metrics()` to store custom values while your resource runs. These metrics are automatically merged into the pipeline trace and visible in the run summary.
+
+Example:
+
+```py
+import dlt
+from dlt.sources.helpers.rest_client import RESTClient
+from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
+
+client = RESTClient(
+    base_url="https://pokeapi.co/api/v2",
+    paginator=JSONLinkPaginator(next_url_path="next"),
+    data_selector="results",
+)
+
+@dlt.resource
+def get_pokemons():
+    metrics = dlt.current.resource_metrics()
+    metrics["page_count"] = 0
+    for page in client.paginate("/pokemon", params={"limit": 100}):
+        metrics["page_count"] += 1
+        yield page
+
+pipeline = dlt.pipeline("get_pokemons", destination="duckdb")
+load_info = pipeline.run(get_pokemons)
+print("Custom metrics:", pipeline.last_trace.last_extract_info.metrics)  # ty: ignore
+```
+
+Custom metrics are grouped together with performance and transform stats under `resource_metrics`, so you can view them easily in traces or dashboards.
+
+[Read more →](../general-usage/resource#collect-custom-metrics)
+
+---
+
+## Limit your data loads for testing
+
+When working with large datasets, you can now **limit how much data a resource loads** using the upgraded `add_limit` method. This is perfect for sampling a few records to preview your data or test transformations faster.
+
+Example:
+
+```py
+import itertools
+import dlt
+
+# Load only the first 10 items from an infinite stream
+r = dlt.resource(itertools.count(), name="infinity").add_limit(10)
+```
+
+You can also:
+
+- Count **rows** instead of yields:
+
+    ```py
+    my_resource().add_limit(10, count_rows=True)
+    ```
+
+- Or stop extraction after a **specific time in seconds**:
+
+    ```py
+    my_resource().add_limit(max_time=10)
+    ```
+
+It’s a simple but powerful way to test pipelines quickly without pulling millions of rows.
+
+[Read more about `add_limit` →](../general-usage/resource#sample-from-large-data)
+
+---
+
+## Incremental loading for filesystem
+
+You can now use **incremental loading** with the `filesystem` source even easier — ideal for tracking updated or newly added files in S3 or local folders.
+dlt detects file changes (using fields like `modification_date`) and loads only what’s new.
+
+Example:
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_parquet
+
+filesystem_resource = filesystem(
+    bucket_url="s3://my-bucket/files",
+    file_glob="**/*.parquet",
+    incremental=dlt.sources.incremental("modification_date")
+)
+pipeline = dlt.pipeline("my_pipeline", destination="duckdb")
+pipeline.run((filesystem_resource | read_parquet()).with_name("table_name"))
+```
+
+You can also **split large incremental loads** into smaller chunks:
+
+- **Partition loading** – divide your files into ranges and load each independently (even in parallel).
+- **Split loading** – process files sequentially in small batches using `row_order`, `files_per_page`, or `add_limit()`.
+
+This makes it easy to backfill large file collections efficiently and resume incremental updates without reloading everything.
+
+[Learn more →](../dlt-ecosystem/verified-sources/filesystem#5-incremental-loading)
+
+---
+
+## Split and partition large SQL loads
+
+When working with huge tables, you can now **split incremental loads into smaller chunks** or **partition backfills** into defined ranges.
+This makes data appear faster and allows you to retry only failed chunks instead of reloading everything.
+
+### Split loading
+
+If your source returns data in a deterministic order (for example, ordered by `created_at`), you can combine `incremental` with `add_limit()` to process batches sequentially:
+
+```py
+import dlt
+from dlt.sources.sql_database import sql_table
+
+pipeline = dlt.pipeline("split_load", destination="duckdb")
+
+messages = sql_table(
+    table="chat_message",
+    incremental=dlt.sources.incremental(
+        "created_at",
+        row_order="asc",  # required for split loading
+        range_start="open"  # disables deduplication
+    ),
+)
+
+# Load one-minute chunks until done
+while not pipeline.run(messages.add_limit(max_time=60)).is_empty:
+    pass
+
+```
+
+### Partitioned backfills
+
+You can also load large datasets in **parallel partitions** using `initial_value` and `end_value`. Each range runs independently, helping you rebuild large tables safely and efficiently.
+
+Together, these methods make incremental loading more flexible and robust for both testing and production-scale pipelines.
+
+[Read more →](../dlt-ecosystem/verified-sources/sql_database/advanced#split-or-partition-long-incremental-loads)
+
+---
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@rik-adegeest](https://github.com/rik-adegeest) — [#3070](https://github.com/dlt-hub/dlt/pull/3070)
+* [@AndreiBondarenko](https://github.com/AndreiBondarenko) — [#3086](https://github.com/dlt-hub/dlt/pull/3086)
+* [@alkaline-0](https://github.com/alkaline-0) — [#3096](https://github.com/dlt-hub/dlt/pull/3096)
+* [@ianedmundson1](https://github.com/ianedmundson1) — [#3043](https://github.com/dlt-hub/dlt/pull/3043)
+* [@chulkilee](https://github.com/chulkilee) — [#3120](https://github.com/dlt-hub/dlt/pull/3120)
+
+---
+
+## Full release notes
+
+[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
+
+
+===== FILE: docs/website/docs/release-notes/1.18.md =====
+
+---
+title: "Release highlights: 1.18"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
+keywords: [dlt, data-pipelines, etl, databricks, iceberg, release-notes, data-engineering]
+---
+# Release highlights: 1.18
+
+## New: Named destinations and the `@dlt.destination` factory
+
+You can now reference destinations **by name** directly from your workspace configuration. This makes it easy to switch between development, staging, and production environments without changing pipeline code.
+
+If your `.dlt/config.toml` contains:
+
+```toml
+[destination.custom_name]
+destination_type = "duckdb"
+```
+
+You can activate it like this:
+
+```py
+import dlt
+
+@dlt.resource
+def my_data():
+    yield {"id": 1}
+
+pipeline = dlt.pipeline(destination="custom_name")
+
+pipeline.run(my_data)
+```
+
+The destination type and all related settings are resolved automatically from the configuration.
+
+---
+
+## Databricks destination with Iceberg and partitioning support
+
+The Databricks destination now supports the **Iceberg table format**, along with full support for **partitioning** and **clustering** hints.
+
+Previously, these hints were silently ignored. With dlt 1.18, they are now **enforced**, and invalid combinations (such as mixing partitioning with clustering) are rejected early to prevent incorrect table layouts.
+
+Example:
+
+```py
+import dlt
+from dlt.destinations.adapters import databricks_adapter
+
+pipeline = dlt.pipeline(pipeline_name="to_databricks", destination="databricks")
+
+@dlt.resource
+def my_data():
+    for i in range(10):
+        yield {
+            "event_id": i,
+            "year": 2024,
+            "month": (i % 3) + 1,
+            "customer_id": i % 5,
+        }
+
+# Enable clustering
+databricks_adapter(my_data, cluster="AUTO")
+
+# Enable partitioning
+databricks_adapter(my_data, partition=["year", "month"])
+
+# Use Iceberg table format
+databricks_adapter(my_data, table_format="ICEBERG")
+
+pipeline.run(my_data)
+```
+
+[Read more →](../dlt-ecosystem/destinations/databricks#advanced-examples)
+
+---
+
+## Graceful shutdowns for pipelines
+
+Signal handling in pipelines has been fully reworked. Pipelines now **shut down gracefully** when interrupted, instead of raising exceptions.
+
+- The first `Ctrl+C` triggers a clean shutdown
+- A second interrupt forces an immediate exit
+
+This applies to both **process-based** and **threaded** loaders and makes running long or production workloads much safer.
+
+[Read more →](../running-in-production/running#allow-a-graceful-shutdown)
+
+---
+
+## Collect custom metrics with `add_metrics()`
+
+You can now attach **custom metric collectors** directly to resources. This allows you to track things like batch counts, API pages, or any other extraction-level signal without modifying the data itself.
+
+Example: counting how many batches a resource produces:
+
+```py
+import dlt
+
+def batch_counter(items, meta, metrics):
+    metrics["batch_count"] = metrics.get("batch_count", 0) + 1
+
+@dlt.resource
+def purchases():
+    for i in range(3):
+        yield [{"id": i}]
+
+purchases = purchases.add_metrics(batch_counter)
+
+pipeline = dlt.pipeline("metrics_demo", destination="duckdb")
+load_info = pipeline.run(purchases)
+
+trace = pipeline.last_trace
+load_id = load_info.loads_ids[0]
+resource_metrics = trace.last_extract_info.metrics[load_id][0]["resource_metrics"]["purchases"]  # ty: ignore
+
+print("Custom metrics:", resource_metrics.custom_metrics)
+```
+
+Output:
+
+```text
+Custom metrics: {'batch_count': 3}
+```
+
+Custom metrics are stored alongside performance and transform statistics under `resource_metrics` and are available in traces and dashboards.
+
+---
+
+## HTTP-based filesystem resources
+
+The `filesystem` source can now read files directly from **HTTP URLs**, in addition to local paths and object storage such as S3.
+
+This makes it easy to load publicly hosted datasets without setting up extra infrastructure.
+
+Example:
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_csv
+
+pipeline = dlt.pipeline("metrics_demo", destination="duckdb")
+fs = filesystem(bucket_url="https://example.com/data/", file_glob="*.csv")
+pipeline.run(fs | read_csv())
+```
+
+[Read more →](../dlt-ecosystem/verified-sources/filesystem/index.md#quick-example)
+
+---
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@and2reak](https://github.com/and2reak) — [#3164](https://github.com/dlt-hub/dlt/pull/3164)
+* [@ivasio](https://github.com/ivasio) — [#3185](https://github.com/dlt-hub/dlt/pull/3185)
+* [@Magicbeanbuyer](https://github.com/Magicbeanbuyer) — [#3217](https://github.com/dlt-hub/dlt/pull/3217)
+* [@TheLazzziest](https://github.com/TheLazzziest) — [#3029](https://github.com/dlt-hub/dlt/pull/3029)
+* [@adrian-173](https://github.com/adrian-173) — [#3239](https://github.com/dlt-hub/dlt/pull/3239)
+
+---
+
+## Full release notes
+
+[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
+
+
+===== FILE: docs/website/docs/release-notes/1.19.md =====
+
+---
+title: "Release highlights: 1.19"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
+keywords: [dlt, data-pipelines, etl, snowflake, cluster, release-notes, data-engineering]
+---
+# Release highlights: 1.19
+
+## New: Arrow streaming with ConnectorX
+
+You can now return results from `sql_database` queries as an **Arrow stream** when using the ConnectorX backend.
+
+This allows large query results to be processed incrementally, avoiding loading the full result set into memory.
+
+Example:
+
+```py
+from dlt.sources.sql_database import sql_database
+
+db = sql_database(
+    backend="connectorx",
+    backend_kwargs={
+        "return_type": "arrow_stream",  # new in 1.19
+    },
+)
+```
+
+By default, ConnectorX returns PyArrow tables. Arrow streaming must be explicitly enabled.
+
+[Read more →](../dlt-ecosystem/verified-sources/sql_database/configuration#connectorx)
+
+---
+
+## Visual pipeline run history in the dashboard
+
+The dashboard now includes a **visual history of pipeline runs**, making it easier to inspect run status, duration, and changes over time.
+
+This provides a clearer overview of pipeline health and helps diagnose failures faster.
+
+![run_history](https://storage.googleapis.com/dlt-blog-images/release-highlights/run_history.png)
+
+[Read more ->](../hub/ingestion/dashboard.md)
+
+---
+
+## Faster Parquet ingestion into MSSQL, MySQL, and SQLite via ADBC
+
+dlt can now ingest **Parquet files into SQL databases** (MSSQL, MySQL, and SQLite) using **ADBC**.
+
+When an ADBC driver is available, Parquet loading is enabled automatically and becomes the preferred method. This delivers a **10×–100× speedup** compared to `INSERT`-based loading and is more reliable than CSV fallbacks.
+
+If needed, you can explicitly revert to `INSERT` loading:
+
+```py
+pipeline.run(
+    iter(()),  # your data generator
+    loader_file_format="insert_values",
+)
+```
+
+[Read more →](../dlt-ecosystem/destinations/mssql#fast-loading-with-parquet)
+
+---
+
+## Visualize schemas with `Schema.to_mermaid()`
+
+You can now export any dlt schema as a **Mermaid diagram** for quick visualization in documentation, pull requests, or onboarding materials.
+
+```py
+schema_mermaid = pipeline.default_schema.to_mermaid()
+```
+
+![mermaid](https://storage.googleapis.com/dlt-blog-images/release-highlights/mermaid.jpg)
+
+Schemas can also be exported from the CLI and rendered natively in tools like GitHub Markdown and Notion.
+
+[Read more →](../general-usage/dataset-access/view-dlt-schema#export-to-mermaid)
+
+---
+
+## Snowflake clustering key improvements
+
+Snowflake destinations now support **updating clustering keys** using column hints.
+
+Clustering changes are applied when a table alteration is triggered (for example, when a new column is added), making it easier to tune clustering for large tables without recreating them.
+
+Example:
+
+```py
+@dlt.resource(table_name="events")
+def events():
+    yield {"event_id": 1, "country": "DE"}
+
+events.apply_hints(columns=[{"name": "event_id", "cluster": True}])
+pipeline.run(events())
+```
+
+[Read more →](../dlt-ecosystem/destinations/snowflake#supported-column-hints)
+
+---
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@zjacom](https://github.com/zjacom) — #3294
+* [@JayJai04](https://github.com/JayJai04) — #3300
+* [@anair123](https://github.com/anair123) — #3304
+* [@martinibach](https://github.com/martinibach) — #3309
+* [@hello-world-bfree](https://github.com/hello-world-bfree) — #3318
+* [@tahamuzammil100](https://github.com/tahamuzammil100) — #3314
+* [@timH6502](https://github.com/timH6502) — #3307
+* [@wrussell1999](https://github.com/wrussell1999) — #3331
+* [@luqmansen](https://github.com/luqmansen) — #3332
+
+---
+
+## Full release notes
+
+[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
+
+
+===== FILE: docs/website/docs/release-notes/1.21.2.md =====
+
+---
+title: "Release highlights: 1.21.2"
+description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.21.2
+
+## ⚠️ Breaking changes: Compound hints precedence and replacement behavior
+
+**PR: #3431**
+
+Starting with v1.21.2, compound hints (`primary_key`, `merge_key`, `cluster`, `partition`) now follow explicit precedence and replacement rules. This affects how hints are resolved.
+
+**What changed:**
+
+1. **Direct `merge_key` and `primary_key` hints now take precedence over column-level hints**
+
+  - When you specify `primary_key="col_1"` at the resource level and `columns={"col_2": {"primary_key": True}}`, only `col_1` will be treated as the primary key
+  - This also applies when using `apply_hints`
+
+2. **Redefining compound hints replaces previous configuration**
+
+  - If you redefine compound hints on a resource that was already extracted, the new properties completely replace the previous configuration
+  - Example: If you first set `partition` on `col_1`, then redefine the resource with `partition` on `col_2`, only `col_2` will remain partitioned
+
+3. **Direct `merge_key` and `primary_key` hints via `apply_hints` are authoritative**
+
+  - When calling `apply_hints` with direct key hints (`primary_key="col_1"`), they replace the existing key configuration instead of merging
+
+**Notes**
+
+- Previously, all compound hints were merged additively
+
+[More details → Compound Hints](../general-usage/schema.md#compound-hints)
+
+---
+
+
+===== FILE: docs/website/docs/release-notes/1.22.md =====
+
+---
+title: "Release highlights: 1.22"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.22
+
+## Breaking changes
+
+- **Pydantic v1 support removed.** All Pydantic v1 compatibility code has been removed and dlt now requires Pydantic v2 ([#3572](https://github.com/dlt-hub/dlt/pull/3572)). Update any models still using v1 APIs before upgrading.
+- **`data_type` contract now covers full column type.** The `data_type` schema contract now applies to changes in precision, scale, nullability, and timezone on existing complete columns, not only to variant columns ([#3572](https://github.com/dlt-hub/dlt/pull/3572)). Pipelines with `data_type` set to `freeze` that changed these properties on existing columns will now be blocked.
+- **Compound hints now replace instead of accumulate.** `merge_columns` previously merged additively, so compound hints like `merge_key` and `primary_key` were added rather than replaced ([#3431](https://github.com/dlt-hub/dlt/pull/3431)). Redefining these hints on an already extracted resource now replaces the previous configuration instead of accumulating old and new keys.
+
+## Validate event streams with Pydantic discriminated unions
+
+The Pydantic support was reworked ([#3572](https://github.com/dlt-hub/dlt/pull/3572)). A `RootModel` wrapping a discriminated union validates a single resource that emits different item types and dispatches each to its own table, resolving the variant by its discriminator field. Mark the model authoritative with `DltConfig`, then route items with `dlt.mark.with_table_name`.
+
+```py
+from typing import ClassVar, Literal, Union
+from typing_extensions import Annotated
+from pydantic import BaseModel, Field, RootModel
+from dlt.common.libs.pydantic import DltConfig
+import dlt
+
+
+class EventBase(BaseModel):
+    kind: str
+    id: int
+
+class ClickEvent(EventBase):
+    kind: Literal["click"]
+    element_id: str
+
+class PurchaseEvent(EventBase):
+    kind: Literal["purchase"]
+    amount: float
+
+EventUnion = Annotated[Union[ClickEvent, PurchaseEvent], Field(discriminator="kind")]
+
+class Event(RootModel[EventUnion]):
+    dlt_config: ClassVar[DltConfig] = {"is_authoritative_model": True}
+
+
+TABLE_MAP = {"click": "click_events", "purchase": "purchase_events"}
+
+@dlt.resource(name="events", columns=Event, schema_contract={"data_type": "discard_row"})
+def event_stream(items):
+    for item in items:
+        yield dlt.mark.with_table_name(item, TABLE_MAP[item["kind"]])
+```
+
+## Parallelize dependent resources in `rest_api`
+
+Set `parallelized` to `True` on a dependent resource (transformer) so child fetches for many parent items run concurrently in dlt's thread pool instead of one after another ([#3574](https://github.com/dlt-hub/dlt/pull/3574)). All pages for a single parent are collected in memory before being yielded, so expect higher memory use for parents with many child pages.
+
+```py
+import dlt
+from dlt.sources.rest_api import rest_api_source
+
+source = rest_api_source({
+    "client": {"base_url": "https://api.example.com"},
+    "resources": [
+        "posts",
+        {
+            "name": "post_comments",
+            "parallelized": True,
+            "endpoint": {"path": "posts/{resources.posts.id}/comments"},
+        },
+    ],
+})
+```
+
+## Filter dataset relations by load ID
+
+`dataset.table()` now takes a `load_ids` argument to return only rows from specific loads, joining nested tables back to their root when needed ([#3547](https://github.com/dlt-hub/dlt/pull/3547)). List available loads with `dataset.load_ids()` and get the newest with `dataset.latest_load_id()`. The feature is experimental.
+
+```py
+import dlt
+
+pipeline = dlt.pipeline("my_pipeline", destination="duckdb")
+dataset = pipeline.dataset()
+
+all_loads = dataset.load_ids()            # every load id in the dataset
+recent_users = dataset.table("users", load_ids=all_loads[-1:])
+df = recent_users.df()
+```
+
+## Zero-downtime replace on Snowflake with atomic swap
+
+With `enable_atomic_swap` set on the Snowflake destination, the `staging-optimized` replace strategy swaps production and staging tables using `ALTER TABLE ... SWAP WITH` instead of cloning them ([#3540](https://github.com/dlt-hub/dlt/pull/3540)). The swap is near-instant, so tables stay available during replacement. Each table keeps its existing permissions, and dlt does not drop the old staging table.
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline",
+    destination=dlt.destinations.snowflake(enable_atomic_swap=True),
+)
+```
+
+## Compact config layout for renamed sources
+
+When a source's section differs from its name, for example after `.clone(name=..., section=...)`, dlt now accepts a compact `sources.<name>.<key>` config path in addition to the full `sources.<section>.<name>.<key>` ([#3664](https://github.com/dlt-hub/dlt/pull/3664)). The full path and the section path still take precedence.
+
+```toml
+# compact layout: just the source name
+[sources.my_db.credentials]
+password = "..."
+
+# full layout: section + name, takes precedence
+[sources.my_db_module.my_db.credentials]
+password = "..."
+```
+
+## Load to Hugging Face with the `hf://` protocol
+
+The `filesystem` destination now supports the `hf://` protocol, loading directly to Hugging Face dataset repositories ([#3669](https://github.com/dlt-hub/dlt/pull/3669)). Install `dlt[hf]`, point `bucket_url` at `hf://datasets/<namespace>`, and dlt creates one repo per dataset, commits each table atomically, and writes a dataset card with per-table subsets ([#3689](https://github.com/dlt-hub/dlt/pull/3689)) for the dataset viewer.
+
+```toml
+[destination.filesystem]
+bucket_url = "hf://datasets/my-org"
+
+[destination.filesystem.credentials]
+hf_token = "hf_..."
+```
+
+```py
+import dlt
+
+@dlt.resource
+def my_data():
+    yield [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_pipeline",
+    destination="filesystem",
+    dataset_name="my_dataset",
+)
+pipeline.run(my_data(), write_disposition="append")
+```
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@Shadesfear](https://github.com/Shadesfear)
+* [@ShreyasGS](https://github.com/ShreyasGS)
+* [@arel](https://github.com/arel)
+* [@karlanka](https://github.com/karlanka)
+* [@kien-truong](https://github.com/kien-truong)
+* [@thecaptain789](https://github.com/thecaptain789)
+
+## Full release notes
+
+[View the 1.22.0 release notes](https://github.com/dlt-hub/dlt/releases/tag/1.22.0)
+
+
+===== FILE: docs/website/docs/release-notes/1.24.md =====
+
+---
+title: "Release highlights: 1.24"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.24
+
+## Breaking changes
+
+- **Incremental metrics moved in the pipeline trace.** Incremental metrics are now stored in table format in the trace. Counters like `unfiltered_items_count` and `initial_unique_hashes_count` no longer sit as scalar keys under a resource's `custom_metrics`. They now live in an `incremental` child table of the extract `resource_metrics`. Update code that reads them from the trace ([#3718](https://github.com/dlt-hub/dlt/pull/3718)).
+
+## New `insert-only` merge strategy
+
+A fourth merge strategy joins delete-insert, scd2, and upsert. `insert-only` inserts a record when its primary key is not yet in the destination and skips the record when the key already exists, never updating or deleting. It suits append-only data like events, logs, and transactions, and gives idempotent, faster loads by skipping UPDATE operations. Works on all SQL destinations, Delta, Iceberg, and LanceDB ([#3741](https://github.com/dlt-hub/dlt/pull/3741)).
+
+```py
+import dlt
+
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "insert-only"},
+    primary_key="event_id",
+)
+def events():
+    yield [{"event_id": 1, "name": "login"}, {"event_id": 2, "name": "click"}]
+```
+
+## Native deduplication on ClickHouse
+
+ClickHouse tables can now use the `replacing_merge_tree` engine to deduplicate and soft-delete at the storage layer, without dlt's merge write disposition. Select it through `clickhouse_adapter` and load with `append`. The `dedup_sort` column hint picks the version to keep and `hard_delete` marks rows for removal, and dlt wires both into the engine parameters ([#3366](https://github.com/dlt-hub/dlt/pull/3366)).
+
+```py
+import dlt
+from dlt.destinations.adapters import clickhouse_adapter
+
+@dlt.resource(
+    write_disposition="append",
+    primary_key="id",
+    columns={
+        "version": {"dedup_sort": "desc", "nullable": False},
+        "is_deleted": {"hard_delete": True, "nullable": False},
+    },
+)
+def events(data):
+    yield from data
+
+clickhouse_adapter(
+    events,
+    table_engine_type="replacing_merge_tree",
+    settings={"clean_deleted_rows": "Always"},
+)
+```
+
+## Parallelize every Airflow source task
+
+`PipelineTasksGroup.add_run` gains a `serialize_first_task` argument for the `parallel` and `parallel-isolated` decompose modes. Set it to `False` to fan out every decomposed source component concurrently from a shared start node, rather than waiting for the first component to finish. The default `True` keeps the old behavior, running the first component first to create the schema. This release also adds basic Airflow 3 support ([#3652](https://github.com/dlt-hub/dlt/pull/3652)).
+
+```py
+import dlt
+from dlt.helpers.airflow_helper import PipelineTasksGroup
+
+@dlt.source
+def smoke_source():
+    @dlt.resource
+    def users():
+        yield [{"id": 1, "name": "Alice"}]
+
+    return users
+
+tasks = PipelineTasksGroup("dlt_smoke_tasks", wipe_local_data=True)
+pipeline = dlt.pipeline(pipeline_name="dlt_smoke", destination="duckdb")
+
+tasks.add_run(
+    pipeline,
+    smoke_source(),
+    decompose="parallel",
+    serialize_first_task=False,
+)
+```
+
+## Handle Arrow schema mismatches across batches
+
+When a resource yields several Arrow tables or pandas DataFrames, dlt concatenates them and by default requires identical schemas, so any type difference across batches raises an error. Set `arrow_concat_promote_options` to `"default"` to fill missing columns with nulls, or `"permissive"` to also promote across type families such as int64 to double ([#3701](https://github.com/dlt-hub/dlt/pull/3701)).
+
+```toml
+[data_writer]
+arrow_concat_promote_options = "permissive"
+```
+
+```sh
+DATA_WRITER__ARROW_CONCAT_PROMOTE_OPTIONS=permissive
+```
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@prevostc](https://github.com/prevostc)
+* [@veeceey](https://github.com/veeceey)
+* [@JustinSobayo](https://github.com/JustinSobayo)
+* [@shnhdan](https://github.com/shnhdan)
+* [@YuF-9468](https://github.com/YuF-9468)
+
+## Full release notes
+
+[View the 1.24.0 release notes](https://github.com/dlt-hub/dlt/releases/tag/1.24.0)
+
+
+===== FILE: docs/website/docs/release-notes/1.25.md =====
+
+---
+title: "Release highlights: 1.25"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.25
+
+## Breaking changes
+
+- **`pipeline.dataset()` now includes every schema.** `pipeline.dataset()` without a `schema` argument used to return only the default schema's tables. With multiple schemas it now includes them all by default, so queries may see extra tables or rows in shared table names. Restore the old behavior with `pipeline.dataset(schema=pipeline.default_schema_name)` ([#3770](https://github.com/dlt-hub/dlt/pull/3770)).
+
+## New `lance` destination
+
+Load data into the [Lance](https://lance.org) columnar format on local disk or `s3`, `gs`, and `az` object storage, with optional vector embeddings generated through `lancedb` ([#3810](https://github.com/dlt-hub/dlt/pull/3810)). It uses the Lance Directory Namespace V2 catalog and supports branching. Install with `pip install "dlt[lance]"`, then point a pipeline at it. This complements the existing `lancedb` destination, which targets LanceDB Cloud.
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="movies",
+    destination="lance",
+    dataset_name="movies_db",
+)
+
+info = pipeline.run(
+    [{"id": 1, "title": "Blade Runner", "year": 1982}],
+    table_name="movies",
+)
+```
+
+## Query every schema from one dataset
+
+A pipeline that loads several sources now exposes all their tables through one `pipeline.dataset()`, so you can query across sources together ([#3770](https://github.com/dlt-hub/dlt/pull/3770)). Tables that share a name across schemas have their columns merged and rows combined, with missing columns filled as `NULL`. Pass a schema name to scope to one source, and read its load history per schema.
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+
+# includes tables from every schema the pipeline loaded
+dataset = pipeline.dataset()
+
+# scope to a single schema (the pre-1.25.0 default)
+one_source = pipeline.dataset(schema="github")
+
+# load history is tracked per schema
+load_ids = dataset.load_ids(schema_name="github")
+```
+
+## Load metrics persist and record follow-up jobs
+
+Load metrics are now persisted to the load package, so a load that is interrupted and resumed keeps the metrics of already-completed jobs instead of losing them, and each job records the follow-up jobs it creates. That follow-up graph is saved into the pipeline trace, closing the long-standing [#853](https://github.com/dlt-hub/dlt/issues/853) ([#3768](https://github.com/dlt-hub/dlt/pull/3768)).
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@Pawansingh3889](https://github.com/Pawansingh3889)
+* [@biefan](https://github.com/biefan)
+* [@julien-c](https://github.com/julien-c)
+* [@serl](https://github.com/serl)
+* [@sangwookWoo](https://github.com/sangwookWoo)
+* [@njaltran](https://github.com/njaltran)
+
+## Full release notes
+
+[View the 1.25.0 release notes](https://github.com/dlt-hub/dlt/releases/tag/1.25.0)
+
+
+===== FILE: docs/website/docs/release-notes/1.26.md =====
+
+---
+title: "Release highlights: 1.26"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.26
+
+## Breaking changes
+
+- **External schedulers now raise instead of warning.** Resources with `allow_external_schedulers=True` no longer fall back to dlt state when a scheduler interval is missing. dlt raises `ExternalSchedulerNotAvailable` when no interval resolves, and `JoinSchedulerError` when the cursor type cannot coerce to a timestamp. Provide an interval, or drop the flag ([#3877](https://github.com/dlt-hub/dlt/pull/3877)).
+
+## Join related tables with `Relation.join()`
+
+`Relation.join()` composes a SQL join from a dataset's schema references, so you navigate parent/child tables (or annotated relationships) without writing the ON clause. Call it on a base-table relation and name the table to join. Columns from the joined table are prefixed with its name, or with the `alias` you pass ([#3590](https://github.com/dlt-hub/dlt/pull/3590)).
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="shop", destination="duckdb", dataset_name="shop_data"
+)
+dataset = pipeline.dataset()
+
+# join uses the schema's parent/child references, no ON clause needed
+users_with_orders = dataset["users"].join("users__orders", alias="orders")
+df = users_with_orders.select("name", "orders__order_id", "orders__total").df()
+```
+
+## Read the scheduler interval with `dlt.current.interval()`
+
+`dlt.current.interval()` returns the active `(start, end)` window from an external scheduler, or `None` when none is set. Any resource can read it, even ones not using `Incremental`, to scope requests, validation, or logging. Drive it from Airflow, the `DLT_INTERVAL_START` and `DLT_INTERVAL_END` env vars, or by injecting a `TimeIntervalContext` yourself ([#3877](https://github.com/dlt-hub/dlt/pull/3877)).
+
+```py
+import dlt
+
+@dlt.resource
+def my_resource():
+    interval = dlt.current.interval()
+    if interval is not None:
+        start, end = interval
+        # scope your requests to the [start, end) window
+    yield {}
+```
+
+## Snowflake query tags cover more operations
+
+Snowflake query tagging now runs beyond load jobs. dlt tags sessions for storage setup, schema and state reads, schema updates, load completion, and table drops, each carrying a new `operation` field. Add `{operation}` to your `query_tag` template to see which dlt step a session is running ([#3759](https://github.com/dlt-hub/dlt/pull/3759)).
+
+```toml
+[destination.snowflake]
+query_tag='{{"operation":"{operation}", "source":"{source}", "resource":"{resource}", "table": "{table}", "load_id":"{load_id}", "pipeline_name":"{pipeline_name}"}}'
+```
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@bjoaquinc](https://github.com/bjoaquinc)
+
+## Full release notes
+
+[View the 1.26.0 release notes](https://github.com/dlt-hub/dlt/releases/tag/1.26.0)
+
+
+===== FILE: docs/website/docs/release-notes/1.27.md =====
+
+---
+title: "Release highlights: 1.27"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.27
+
+## Breaking changes
+
+- **`workspace` extra removed and dev tooling split into a plugin.** The `workspace` extra is gone. Install `marimo`, `pyarrow`, `ibis`, `fastmcp`, and other dependencies directly. `dlt dashboard`, `dlt pipeline ... show`, and `dlt pipeline ... mcp` now require `pip install dlt[hub]`, and `dlt ai` moved to `dlthub ai` ([#3929](https://github.com/dlt-hub/dlt/pull/3929)).
+
+## Yield Polars frames from resources
+
+Resources can now yield `polars.DataFrame` and `polars.LazyFrame` objects directly, with no manual conversion ([#3837](https://github.com/dlt-hub/dlt/pull/3837)). dlt auto-detects them and routes them through the Arrow extraction path, collecting LazyFrames first, so Parquet loading and schema inference apply. Install with `pip install dlt[polars]`.
+
+```py
+import dlt
+import polars as pl
+
+@dlt.resource
+def orders():
+    yield pl.DataFrame({"order_id": [1, 2, 3], "amount": [100.0, 200.0, 300.0]})
+
+pipeline = dlt.pipeline("orders", destination="duckdb")
+pipeline.run(orders())
+```
+
+## Load into Databricks via Zerobus
+
+The Databricks destination can now ingest into Delta tables through the Zerobus SDK instead of `COPY INTO`. Set `insert_api="zerobus"` on the destination or per resource with `databricks_adapter`, for the `append` write disposition ([#3904](https://github.com/dlt-hub/dlt/pull/3904)). Configure the endpoint under `[destination.databricks.zerobus]`.
+
+```py
+import dlt
+from dlt.destinations.adapters import databricks_adapter
+
+@dlt.resource(write_disposition="append")
+def events():
+    yield from [{"id": 1}, {"id": 2}]
+
+databricks_adapter(events, insert_api="zerobus")
+
+pipeline = dlt.pipeline("events", destination="databricks")
+pipeline.run(events())
+```
+
+## Incremental filters on datasets
+
+`Relation.incremental()` turns a `dlt.sources.incremental` cursor into a `WHERE` clause, so you read only rows in the cursor window straight from a dataset ([#3889](https://github.com/dlt-hub/dlt/pull/3889)). Pass a `column` or `table.column` cursor path. A dotted path auto-joins the referenced table. It also works via `dataset.table(..., incremental=...)`.
+
+```py
+import dlt
+from dlt.common.pendulum import pendulum
+
+pipeline = dlt.pipeline("events", destination="duckdb")
+dataset = pipeline.dataset()
+
+cursor = dlt.sources.incremental(
+    "created_at",
+    initial_value=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    end_value=pendulum.datetime(2026, 2, 1, tz="UTC"),
+)
+rows = dataset.table("events", incremental=cursor).fetchall()
+```
+
+## Auto-accept CLI confirmations with `-y`
+
+A global `-y`/`--yes` flag auto-accepts every `confirm()` prompt, so destructive commands like `pipeline drop` and `sync` run unattended in CI ([#3910](https://github.com/dlt-hub/dlt/pull/3910)). It differs from `--non-interactive`, which only picks prompt defaults and so skips actions that default to no.
+
+```sh
+dlt -y pipeline chess_pipeline drop players_games
+```
+
+## Empty data no longer truncates the destination table
+
+Running `merge` with empty data after a `replace` on an incremental resource could silently truncate the destination table, a regression introduced in 1.27.0. 1.27.2 reverts the change ([#3999](https://github.com/dlt-hub/dlt/pull/3999)). Anyone on 1.27.0 or 1.27.1 should upgrade.
+
+## Cleaner float to `decimal` coercion
+
+Coercing a Python `float` into a `decimal` or `wei` column now converts through `str()` first, so `34.7` stores as `34.7` instead of a long IEEE 754 tail like `34.700000000000003` ([#3928](https://github.com/dlt-hub/dlt/pull/3928)). For exact values, keep source data as `Decimal` or strings rather than floats.
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@xodn348](https://github.com/xodn348)
+* [@RedZapdos123](https://github.com/RedZapdos123)
+* [@deschman](https://github.com/deschman)
+
+## Full release notes
+
+[View the 1.27.0 release notes](https://github.com/dlt-hub/dlt/releases/tag/1.27.0)
+
+
+===== FILE: docs/website/docs/release-notes/1.28.md =====
+
+---
+title: "Release highlights: 1.28"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.28
+
+## Breaking changes
+
+- **Python 3.9 support dropped.** Python 3.9 reached end of life, so dlt no longer supports it. The minimum is now Python 3.10 ([#4074](https://github.com/dlt-hub/dlt/pull/4074)). Install this release on Python 3.10 or newer, and stay on an earlier dlt version if you cannot upgrade the interpreter (since 1.28.1).
+- **`refresh="drop_data"` keeps files on Delta and Iceberg.** Truncating a Delta or persistent-catalog Iceberg table is now a transactional delete ([#4051](https://github.com/dlt-hub/dlt/pull/4051)) that keeps its files for time travel, so `refresh="drop_data"` no longer frees storage. Pipelines that relied on it to reclaim disk must now run `vacuum` explicitly.
+- **`replace` truncates empty and orphaned tables.** Tables of a `replace` resource that receive no data in a run, including nested, dynamic-name, and variant tables, are now consistently truncated ([#4010](https://github.com/dlt-hub/dlt/pull/4010)). Previously they could keep stale rows across reloads, so pipelines relying on that leftover data will now see those tables emptied.
+
+## Configurable CSV encoding
+
+You can now set the encoding of the CSV files dlt writes with a new `encoding` option (default `utf-8`) under `[normalize.data_writer]` ([#4045](https://github.com/dlt-hub/dlt/pull/4045)). Use `utf-8-sig` for an Excel BOM or `latin-1`/`cp1252` for legacy importers, and `encoding_errors` to control how unrepresentable characters are handled.
+
+```toml
+[normalize.data_writer]
+encoding="utf-8-sig"
+encoding_errors="replace"
+```
+
+## Reliable full refresh with the `refresh` option
+
+`refresh` is now the recommended way to fully reload data. Set `refresh="drop_data"` to truncate the selected resources' tables and reset their incremental state, leaving other tables intact ([#4010](https://github.com/dlt-hub/dlt/pull/4010)). The old `write_disposition="replace"` switch for a full refresh is deprecated. Truncation now reliably covers nested, dynamic-name, and variant tables.
+
+```py
+import dlt
+
+@dlt.resource
+def users():
+    yield {"id": 1, "name": "alice"}
+
+pipeline = dlt.pipeline("app", destination="duckdb")
+# full refresh: truncate the resource's tables and reset incremental state
+pipeline.run(users(), refresh="drop_data")
+```
+
+## Refreshable cloud credentials on long-running loads
+
+Default cloud credential chains (AWS, Azure, GCP) are now handed to the underlying access libraries, fsspec, the object_store crate, pyiceberg, and DuckDB, so each refreshes tokens through its own provider chain instead of a frozen snapshot ([#4056](https://github.com/dlt-hub/dlt/pull/4056), [#4021](https://github.com/dlt-hub/dlt/pull/4021)). This stops `ExpiredToken` failures on long reads and loads that use temporary credentials, while static keys and explicit sessions stay frozen.
+
+## NUL characters stripped from insert-values string literals
+
+String values containing a NUL byte (the ASCII null character, `0x00`), common in data from MongoDB, previously produced invalid INSERT statements on Postgres, Redshift, and DuckDB. dlt now strips NUL from escaped string literals so those rows load ([#4086](https://github.com/dlt-hub/dlt/pull/4086)), and splits multi-row inserts on newlines only so values holding other line separators stay intact.
+
+## Correct temporal precision from newer connectorx
+
+With a newer connectorx, the `sql_database` connectorx backend returns timestamps and times at nanosecond precision through its `arrow_stream` type instead of the older millisecond `date64`. dlt now normalizes every connectorx temporal column to the microsecond precision destinations expect, truncating losslessly ([#3996](https://github.com/dlt-hub/dlt/pull/3996)).
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@0ywfe](https://github.com/0ywfe)
+* [@Analect](https://github.com/Analect)
+* [@wtfashwin](https://github.com/wtfashwin)
+* [@nuetu](https://github.com/nuetu)
+* [@tderk](https://github.com/tderk)
+
+## Full release notes
+
+[View the 1.28.0 release notes](https://github.com/dlt-hub/dlt/releases/tag/1.28.0)
+
+
+===== FILE: docs/website/docs/release-notes/1.29.md =====
+
+---
+title: "Release highlights: 1.29"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.29
+
+## Explicit joins in the dataset API
+
+`Relation.join()` now takes an `on=` predicate, so you write the join condition yourself instead of relying on dlt schema references ([#3868](https://github.com/dlt-hub/dlt/pull/3868)). This covers joins between unrelated top-level tables, self-joins, and joins across two datasets. Passing a `Relation` from another `dlt.Dataset` joins across datasets, and destination configs now declare which relations can be joined together ([#3905](https://github.com/dlt-hub/dlt/pull/3905)).
+
+```py
+import dlt
+
+crm = dlt.pipeline("crm", destination="duckdb", dataset_name="crm_data")
+sales = dlt.pipeline("sales", destination="duckdb", dataset_name="sales_data")
+
+# explicit predicate between two tables without a dlt schema reference
+by_email = crm.dataset()["users"].join(
+    "logins", on="users.email = logins.email", kind="left"
+)
+
+# pass a Relation from another dataset to join across datasets
+users_purchases = crm.dataset()["users"].join(
+    sales.dataset()["purchases"], on="users.id = purchases.user_id"
+)
+```
+
+## AWS Secrets Manager config provider
+
+dlt can now resolve config and secrets from AWS Secrets Manager, alongside the existing Google Secret Manager provider ([#4162](https://github.com/dlt-hub/dlt/pull/4162)). Enable it with `enable_aws_secrets`. By default dlt looks up secrets under the `dlt/` name prefix so they stay namespaced in a shared vault. The change also stops re-creating the Google secrets client on every lookup.
+
+```toml
+[providers]
+enable_aws_secrets = true
+
+[providers.aws_secrets.credentials]
+aws_access_key_id = "..."
+aws_secret_access_key = "..."
+region_name = "eu-central-1"
+```
+
+## ClickHouse `staging-optimized` replace strategy
+
+ClickHouse now supports the `staging-optimized` replace strategy ([#3927](https://github.com/dlt-hub/dlt/pull/3927)). It swaps the destination and staging tables with `EXCHANGE TABLES`, so a full replace is atomic and never leaves the table half-loaded. The database must use the Atomic or Shared engine, otherwise the load fails fast before any data is extracted.
+
+```toml
+[destination.clickhouse]
+replace_strategy = "staging-optimized"
+```
+
+## Atomic, metadata-preserving replace on BigQuery
+
+Turn on `enable_atomic_replace` and the `truncate-and-insert` strategy replaces a table with a single `WRITE_TRUNCATE_DATA` load job from GCS staging ([#4130](https://github.com/dlt-hub/dlt/pull/4130)). The data is swapped in place, so descriptions, labels, column policy tags, primary keys, and dependent materialized views survive the refresh with no empty-table window. It requires a GCS staging destination.
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    "bq_pipeline",
+    destination=dlt.destinations.bigquery(enable_atomic_replace=True),
+    staging="filesystem",
+)
+```
+
+## Cross-batch schema evolution for Arrow sources
+
+Safe Arrow type promotions such as `float32` to `float64` now work across flush batches instead of crashing once the data spans more than one flush ([#3896](https://github.com/dlt-hub/dlt/pull/3896)). Set `arrow_concat_promote_options` to `default` to rotate a new parquet file on a type change, or `permissive` to cast batches into the first schema. The default `none` still requires identical schemas but now fails with a clearer error.
+
+```toml
+[sources.data_writer]
+arrow_concat_promote_options = "default"
+```
+
+## Runner instance size for platform jobs
+
+Declare a job's runner resources with `require.instance`, an open dict the platform reads (today `size`) ([#4262](https://github.com/dlt-hub/dlt/pull/4262)). The legacy `machine` key still works but now emits a deprecation warning pointing to `instance`.
+
+```py
+from dlt.hub.run import job
+
+@job(require={"instance": {"size": "medium"}})
+def train():
+    ...
+```
+
+## REST paginators respect their stop conditions
+
+A REST source paginator that has already hit a stop condition (`maximum_offset`, `maximum_page`, the response total, or a missing cursor) is no longer restarted when the API also returns `has_more=true` ([#4227](https://github.com/dlt-hub/dlt/pull/4227)). Configured page limits and cursor checks now act as hard stops.
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@filipesilva](https://github.com/filipesilva)
+* [@cbility](https://github.com/cbility)
+* [@DRACULA1729](https://github.com/DRACULA1729)
+* [@oystersuki](https://github.com/oystersuki)
+* [@davidmyriel](https://github.com/davidmyriel)
+* [@nizar-zerrad](https://github.com/nizar-zerrad)
+
+## Full release notes
+
+[View the 1.29.0 release notes](https://github.com/dlt-hub/dlt/releases/tag/1.29.0)
+
+
+===== FILE: docs/website/docs/release-notes/1.30.md =====
+
+---
+title: "Release highlights: 1.30"
+description: Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update.
+keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
+---
+# Release highlights: 1.30
+
+## Breaking changes
+
+- **Failed load packages no longer auto-abort.** `auto_abort_on_terminal_error` now defaults to `False`. With `raise_on_failed_jobs=True` a terminally failed job is retried and raises `LoadClientJobTerminalRetry` instead of `LoadClientJobFailed`, and the package stays pending. `drop_pending_packages` is deprecated in favour of `abort_packages`. Set the flag back to `True` to restore the old behavior ([#3557](https://github.com/dlt-hub/dlt/pull/3557)).
+- **Filesystem layouts without `{ext}` now append the extension.** A layout that omits `{ext}` previously wrote extension-less files because the documented fallback was unreachable. dlt now appends the job extension, so a table writes `mocked-table.jsonl` and `.jsonl.gz` stays intact for compressed jobs. Pipelines already running an ext-less layout will start writing different file names ([#4220](https://github.com/dlt-hub/dlt/pull/4220)).
+- **Table prefix keeps its separator.** With `layout="{table_name}"` the table prefix is now `event.` rather than `event`, which stops a `replace` of `event` from deleting `events`. Delta and iceberg tables move to the new location. A new `warn_unsafe_layout_separators` option (default `True`) warns when a separator around the table name can occur inside table names ([#4283](https://github.com/dlt-hub/dlt/pull/4283)).
+
+## Join datasets across destinations
+
+dlt can now join two datasets that live on different destinations ([#4286](https://github.com/dlt-hub/dlt/pull/4286)). It attaches the foreign dataset into the query engine of the destination you read from, so the join runs in one engine. Supported for `duckdb`, `motherduck`, `ducklake`, `lance`, `lancedb` and `filesystem`, with eager and lazy materialization. A cross-destination join needs an explicit `on`.
+
+```py
+import dlt
+
+crm = dlt.pipeline("crm", destination="duckdb", dataset_name="crm")
+events = dlt.pipeline("events", destination="filesystem", dataset_name="events")
+
+# dlt attaches the filesystem dataset into duckdb and runs the join there
+joined = crm.dataset().table("users").join(
+    events.dataset().table("events"),
+    on="users.id = events.user_id",
+)
+df = joined.df()
+```
+
+## Native nested types on Snowflake
+
+Set `use_nested_types` on the Snowflake destination to store nested (`json`) columns as native ARRAY, OBJECT and MAP types instead of a single VARIANT ([#4276](https://github.com/dlt-hub/dlt/pull/4276)). dlt derives the structured type from the column's Arrow type, automatically for parquet or from a pyarrow schema you declare for jsonl. Schema and type evolution both work. The interface is experimental for now.
+
+```py
+import dlt
+import pyarrow as pa
+
+@dlt.resource(
+    columns=pa.schema([
+        pa.field("payload", pa.struct([("tags", pa.list_(pa.int64())), ("city", pa.string())])),
+    ])
+)
+def items():
+    yield {"id": 1, "payload": {"tags": [1, 2], "city": "Berlin"}}
+
+snow = dlt.destinations.snowflake(use_nested_types=True)
+pipeline = dlt.pipeline("my_pipeline", destination=snow)
+pipeline.run(items(), loader_file_format="jsonl")
+```
+
+## Inspect and recover failed load packages
+
+A terminally failed job no longer silently deletes its package ([#3557](https://github.com/dlt-hub/dlt/pull/3557)). `abort_packages` records what happened and lets you inspect or retry a job first, and new `Pipeline` methods `list_pending_retry_jobs_in_package`, `fail_pending_job` and `retry_failed_job` plus a `dlt pipeline <name> abort-packages` CLI command drive recovery. Every retry's exception is saved in the package's `.exceptions` folder.
+
+```py
+import os
+import dlt
+
+pipeline = dlt.attach("my_pipeline")
+load_id = pipeline.list_normalized_load_packages()[0]
+jobs = pipeline.list_pending_retry_jobs_in_package(load_id)
+job_file, folder = jobs[0]
+# give up on a job, keep its exception, then retry the rest
+pipeline.fail_pending_job(load_id, os.path.basename(job_file))
+pipeline.load()
+```
+
+## Retry racing schema migrations with tenacity
+
+Parallel runs against one dataset can race on `CREATE TABLE` and `ALTER TABLE` and fail. The new `retry_schema_update` helper marks that failure as retryable ([#4266](https://github.com/dlt-hub/dlt/pull/4266)), so wrapping the run in tenacity retries the schema migration with backoff and jitter instead of failing the load. dlt re-reads the destination on each attempt and applies only what is still missing.
+
+```py
+import dlt
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
+from dlt.pipeline.helpers import retry_schema_update
+
+pipeline = dlt.pipeline(pipeline_name="chess", destination="duckdb", dataset_name="games")
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_random_exponential(multiplier=1, max=30),
+    retry=retry_if_exception(retry_schema_update()),
+    reraise=True,
+)
+def load():
+    return pipeline.run([{"id": 1}], table_name="games")
+```
+
+## Input and output lineage in traces
+
+Traces now carry input and output lineage, in a relational form close to OpenLineage but ingestible by dlt itself ([#4289](https://github.com/dlt-hub/dlt/pull/4289)). The `sql_database`, `rest_api` and `filesystem` sources record what each resource read onto the extract step, and dlt derives the tables written per resource onto the load step, so a run's read and write sides are captured automatically. Custom sources can record their own reads with `resource.add_input()`.
+
+## Shout-out to new contributors
+
+Big thanks to our newest contributors:
+
+* [@sohamwaghe](https://github.com/sohamwaghe)
+* [@anxkhn](https://github.com/anxkhn)
+* [@maxtaran2010](https://github.com/maxtaran2010)
+* [@mattfaltyn](https://github.com/mattfaltyn)
+* [@richacode007-byte](https://github.com/richacode007-byte)
+* [@axelray-dev](https://github.com/axelray-dev)
+* [@chuenchen309](https://github.com/chuenchen309)
+* [@bartcode](https://github.com/bartcode)
+* [@AkhilTrivediX](https://github.com/AkhilTrivediX)
+
+## Full release notes
+
+[View the 1.30.0 release notes](https://github.com/dlt-hub/dlt/releases/tag/1.30.0)
+
+
+===== FILE: docs/website/docs/running-in-production/running.md =====
+
+---
+title: Running
+description: Running a dlt pipeline in production
+keywords: [running, production, tips]
+---
+# Adjust a pipeline to run in production
+
+When running the pipeline in production, you may consider a few additions to your script. We'll use the script below as a starting point.
+
+```py
+import dlt
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(pipeline_name="chess_pipeline", destination='duckdb', dataset_name="games_data")
+    # get data for a few famous players
+    data = chess_source(['magnuscarlsen', 'vincentkeymer', 'dommarajugukesh', 'rpragchess'], start_month="2022/11", end_month="2022/12")
+    load_info = pipeline.run(data)
+```
+
+## Inspect and save the load info and trace
+
+The `load_info` contains plenty of useful information on the recently loaded data. It contains the pipeline and dataset name, the destination information (without secrets), and a list of loaded packages. Package information contains its state (`COMPLETED/PROCESSED`) and a list of all jobs with their statuses, file sizes, types, and in case of failed jobs, the error messages from the destination.
+
+```py
+    # see when load was started
+    print(load_info.started_at)
+    # print the information on the first load package and all jobs inside
+    print(load_info.load_packages[0])
+    # print the information on the first completed job in the first load package
+    print(load_info.load_packages[0].jobs["completed_jobs"][0])
+    # see the refresh mode the package was extracted with (None if refresh was not requested)
+    print(load_info.load_packages[0].refresh)
+    # see the tables that were dropped and truncated in the destination, e.g. by refresh,
+    # or the drop command
+    print(load_info.load_packages[0].dropped_tables)
+    print(load_info.load_packages[0].truncated_tables)
+```
+
+`load_info` may also be loaded into the destinations as below:
+
+```py
+    # we reuse the pipeline instance below and load to the same dataset as data
+    pipeline.run([load_info], table_name="_load_info")
+```
+
+You can also get the runtime trace from the pipeline. It contains timing information on `extract`, `normalize`, and `load` steps and also all the config and secret values with full information from where they were obtained. You can display and load trace info as shown below. Use your code editor to explore the `trace` object further. The `normalize` step information contains the counts of rows per table of data that was normalized and then loaded.
+
+```py
+# print human-friendly trace information
+print(pipeline.last_trace)
+# save trace to destination, sensitive data will be removed
+pipeline.run([pipeline.last_trace], table_name="_trace")
+```
+
+You can also access the last `extract`, `normalize`, and `load` infos directly:
+
+```py notype
+# print human-friendly extract information
+print(pipeline.last_trace.last_extract_info)
+# print human-friendly normalization information
+print(pipeline.last_trace.last_normalize_info)
+# access row counts dictionary of normalize info
+print(pipeline.last_trace.last_normalize_info.row_counts)  # ty: ignore
+# print human-friendly load information
+print(pipeline.last_trace.last_load_info)
+```
+
+Please note that you can inspect the pipeline using [command line](../reference/command-line-interface.md#dlt-pipeline).
+
+### Inspect, save, and alert on schema changes
+
+In the package information, you can also see the list of all tables and columns created at the destination during the loading of that package. The code below displays all tables and schemas. Note that those objects are Typed Dictionaries; use your code editor to explore.
+
+```py
+    # print all the new tables/columns in
+    for package in load_info.load_packages:
+        for table_name, table in package.schema_update.items():
+            print(f"Table {table_name}: {table.get('description')}")
+            for column_name, column in table["columns"].items():
+                print(f"\tcolumn {column_name}: {column['data_type']}")
+```
+
+You can save only the new tables and column schemas to the destination. Note that the code above that saves `load_info` saves this data as well.
+
+```py
+    # save just the new tables
+    table_updates = [p.asdict()["tables"] for p in load_info.load_packages]
+    pipeline.run(table_updates, table_name="_new_tables")
+```
+
+## Data left behind
+
+By default, `dlt` leaves the loaded packages intact so they may be fully queried and inspected after loading. This behavior may be changed so that the successfully completed jobs are deleted from the loaded package. In that case, for a correctly behaving pipeline, only a minimum amount of data will be left behind. In `config.toml`:
+
+```toml
+[load]
+delete_completed_jobs=true
+```
+
+Also, by default, `dlt` leaves data in the [staging dataset](../dlt-ecosystem/staging.md#staging-dataset), used during merge and replace load for deduplication. In order to clear it, put the following line in `config.toml`:
+
+```toml
+[load]
+truncate_staging_dataset=true
+```
+
+## Using Slack to send messages
+
+`dlt` provides basic support for sending Slack messages. You can configure the Slack incoming hook via [secrets.toml or environment variables](../general-usage/credentials/setup). Please note that **the Slack incoming hook is considered a secret and will be immediately blocked when pushed to a GitHub repository**. In `secrets.toml`:
+
+```toml
+[runtime]
+slack_incoming_hook="https://hooks.slack.com/services/T04DHMAF13Q/B04E7B1MQ1H/TDHEI123WUEE"
+```
+
+or
+
+```sh
+RUNTIME__SLACK_INCOMING_HOOK="https://hooks.slack.com/services/T04DHMAF13Q/B04E7B1MQ1H/TDHEI123WUEE"
+```
+
+Then, the configured hook is available via the pipeline object. We also provide a convenience method to send Slack messages:
+
+```py notype
+from dlt.common.runtime.slack import send_slack_message
+
+message = "..."
+send_slack_message(pipeline.runtime_config.slack_incoming_hook, message)
+
+```
+
+### Send schema migration info to Slack
+
+The code snippet below demonstrates automated Slack notifications for database table updates using the `send_slack_message` function.
+
+```py
+# Import the send_slack_message function from the dlt library
+from dlt.common.runtime.slack import send_slack_message
+
+# Define the URL for your Slack webhook
+hook = "https://hooks.slack.com/services/xxx/xxx/xxx"
+
+# Iterate over each package in the load_info object
+for package in load_info.load_packages:
+    # Iterate over each table in the schema_update of the current package
+    for table_name, table in package.schema_update.items():
+        # Iterate over each column in the current table
+        for column_name, column in table["columns"].items():
+            # Send a message to the Slack channel with the table
+            # and column update information
+            send_slack_message(
+                hook,
+                message=(
+                    f"\tTable updated: {table_name}: "
+                    f"Column changed: {column_name}: "
+                    f"{column['data_type']}"
+                )
+            )
+```
+
+Refer to this [example](../examples/chess_production/) for a practical application of the method in a production environment.
+
+## Enable Sentry tracing
+
+`dlt` users can configure [Sentry](https://sentry.io) DSN to start receiving rich information on
+executed pipelines, including encountered errors and exceptions. **Sentry tracing is disabled by
+default.**
+
+### When and what we send
+
+An exception trace is sent when:
+
+- Any Python logger (including `dlt`) logs an error.
+- Any Python logger (including `dlt`) logs a warning (enabled only if the `dlt` logging level is
+  `WARNING` or below).
+- On unhandled exceptions.
+
+A transaction trace is sent when the `pipeline.run` is called. We send information when
+[extract, normalize, and load](../reference/explainers/how-dlt-works.md) steps are completed.
+
+The data available in Sentry makes finding and documenting bugs easy, allowing you to easily find
+bottlenecks and profile data extraction, normalization, and loading.
+
+`dlt` adds a set of additional tags (e.g., pipeline name, destination name) to the Sentry data.
+
+Please refer to the Sentry [documentation](https://docs.sentry.io/platforms/python/data-collected/).
+
+### Enable pipeline tracing
+
+To enable Sentry, you should configure the
+[DSN](https://docs.sentry.io/product/sentry-basics/dsn-explainer/) in the `config.toml`:
+
+```toml
+[runtime]
+
+sentry_dsn="https:///<...>"
+```
+
+Alternatively, you can use environment variables:
+
+```sh
+RUNTIME__SENTRY_DSN="https:///<...>"
+```
+
+The Sentry client is configured after the first pipeline is created with `dlt.pipeline()`. Feel free
+to use `sentry_sdk` init again to cover your specific needs.
+
+:::info
+`dlt` does not have Sentry client as a dependency. Remember to install it with `pip install sentry-sdk`.
+:::
+
+### Disable all tracing
+
+`dlt` allows you to completely disable pipeline tracing, including the anonymous telemetry and
+Sentry. Using `config.toml`:
+
+```toml
+enable_runtime_trace=false
+```
+
+## Set the log level and format
+
+You can set the log level and switch logging to JSON format.
+
+```toml
+[runtime]
+log_level="INFO"
+log_format="JSON"
+```
+
+`log_level` accepts the [Python standard logging level names](https://docs.python.org/3/library/logging.html#logging-levels).
+
+- The default log level is `WARNING`.
+- The `INFO` log level is useful when diagnosing problems in production.
+- `CRITICAL` will disable logging.
+- `DEBUG` should not be used in production.
+
+`log_format` accepts:
+
+- `json` to get the log in JSON format.
+- [Python standard log format specifier](https://docs.python.org/3/library/logging.html#logrecord-attributes).
+
+As with any other configuration, you can use environment variables instead of the TOML file.
+
+- `RUNTIME__LOG_LEVEL` to set the log level.
+- `LOG_FORMAT` to set the log format.
+
+`dlt` logs to a logger named **dlt**. `dlt` logger uses a regular Python logger, so you can configure the handlers as per your requirement.
+
+For example, to put logs to the file:
+
+```py
+import logging
+
+# Create a logger
+logger = logging.getLogger('dlt')
+
+# Set the log level
+logger.setLevel(logging.INFO)
+
+# Create a file handler
+handler = logging.FileHandler('dlt.log')
+
+# Add the handler to the logger
+logger.addHandler(handler)
+```
+
+You can intercept logs by using [loguru](https://loguru.readthedocs.io/en/stable/api/logger.html). To do so, follow the instructions below:
+
+```py
+import logging
+import sys
+
+import dlt
+from loguru import logger as loguru_logger
+
+
+class InterceptHandler(logging.Handler):
+
+    @loguru_logger.catch(default=True, onerror=lambda _: sys.exit(1))
+    def emit(self, record):
+        # Get the corresponding Loguru level if it exists.
+        try:
+            level = loguru_logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+
+        # Find the caller from where the logged message originated.
+        frame, depth = sys._getframe(6), 6
+        while frame and frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+
+        loguru_logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+logger_dlt = logging.getLogger("dlt")
+logger_dlt.addHandler(InterceptHandler())
+
+loguru_logger.add("dlt_loguru.log")
+```
+
+## Handle exceptions, failed jobs, and retry the pipeline
+
+When any of the steps of the pipeline fails, an exception of type `PipelineStepFailed` is raised.
+Such an exception contains the pipeline step name, the pipeline object itself, and the step info, i.e.,
+`LoadInfo`. It provides general information about where the problem occurred. In most cases,
+you can and should obtain the causing exception using the standard Python exception chaining
+(`__context__`).
+
+There are two different types of exceptions in `__context__`:
+
+1. **Terminal exceptions** are exceptions that **should not be retried** because the error
+   situation will never recover without intervention. Examples include missing config and secret
+   values, most of the `40x` HTTP errors, and several database errors (i.e., missing relations like
+   tables). Each destination has its own set of terminal exceptions that `dlt` tries to
+   preserve.
+2. **Transient exceptions** are exceptions that may be retried.
+
+The code below tells one exception type from another. Note that we provide retry strategy helpers that
+do that for you.
+
+```py
+from dlt.common.exceptions import TerminalException
+
+def check(ex: Exception):
+    if isinstance(ex, TerminalException) or (ex.__context__ is not None and isinstance(ex.__context__, TerminalException)):
+        return False
+    return True
+```
+
+If pipeline fails, your best course of action is to retry as described [below](#retry-helpers-and-tenacity). You also have tools to
+investigate the incident, fix it or start from scratch.
+
+* in `extract` and `normalize` steps you can just abort the package and start from scratch - `dlt` will rollback state and schema changes. Read the section below for details (`load` step abort procedure applies).
+* in `load` step you have more options - read the section below to understand how `dlt` deals with partial loads and inconsistent data.
+
+### Handle problems in `load` step
+
+Dealing with problems during `load` step is more complicated because `dlt` could already modified data in the destination.
+
+1. [Retry the load](#retry-the-load) — still your best option.
+2. [Fail particular jobs](#fail-or-retry-individual-jobs) (both terminal and not terminal) and then retry the rest of the package.
+3. [Abort the package](#abort-the-package).
+
+Whichever you pick, until a package is fully loaded its load id is not added to the `_dlt_loads`
+table and the pipeline state at the destination stays at the point the package was created, so
+incremental cursors are not advanced past data that did not load.
+
+:::warning
+Some jobs of a pending package may have already written to the destination and neither failing
+jobs nor aborting the package reverts that. Before you act, check what was already written — see
+[partially loaded packages](#partially-loaded-packages).
+:::
+
+#### How `dlt` reacts to a failed job
+
+A job that fails with a **transient** error (network problems, overloaded destination) is retried
+in place while the load runs: it is moved back to `new_jobs` with an increased retry count and
+picked up again — see [how to configure the internal retry](#configure-the-internal-job-retry).
+
+A job that fails with a **terminal** error (permission denied, malformed data) will not recover on
+retry. Two options control what happens then: `raise_on_failed_jobs` (default `true`) and
+`auto_abort_on_terminal_error` (default `false`).
+
+By default, on the first failed job the job is queued for retry (moved back to `new_jobs` with an
+increased retry count), the load package stays **pending** and `LoadClientJobTerminalRetry`
+(terminal exception) is raised. All the jobs that were running in parallel are completed before
+raising. You can then retry the package, give up on the job, or abort the whole package as
+described in the sections below.
+
+The exception message of every retry (terminal and transient) is saved in the `.exceptions` folder
+of the load package, with the first line indicating `retry: terminal` or `retry: transient`.
+
+The full behavior matrix:
+
+| `auto_abort_on_terminal_error` | `raise_on_failed_jobs` | job                    | package                                                                 | exception                                     |
+| ------------------------------ | ---------------------- | ---------------------- | ----------------------------------------------------------------------- | --------------------------------------------- |
+| `false`                        | `true`                 | queued for retry       | stays pending                                                           | `LoadClientJobTerminalRetry` raised (default) |
+| `false`                        | `false`                | moved to `failed_jobs` | completed as loaded                                                     | none                                          |
+| `true`                         | `true`                 | moved to `failed_jobs` | [aborted](#abort-the-package), pending packages deleted, state restored | `LoadClientJobFailed` raised                  |
+| `true`                         | `false`                | moved to `failed_jobs` | [aborted](#abort-the-package), pending packages deleted, state restored | none                                          |
+
+If you prefer that packages with terminally failed jobs complete as loaded (the failed jobs move
+to `failed_jobs` and no exception is raised):
+
+```toml
+# I hope you know what you are doing by setting this to false
+load.raise_on_failed_jobs=false
+```
+
+In that mode, check for failed jobs yourself:
+
+```py
+# returns True if there are failed jobs in any of the load packages
+print(load_info.has_failed_jobs)
+# raises terminal exception if there are any failed jobs
+load_info.raise_on_failed_jobs()
+```
+
+:::caution Breaking change (from `dlt` 1.30)
+Previously a terminally failed job aborted the load package and raised `LoadClientJobFailed`; such a
+package could not be retried. Now dlt keeps the package pending, queues the failed job for retry and
+raises `LoadClientJobTerminalRetry`.
+:::
+
+Before deciding how to resolve an incident, inspect it:
+
+```sh
+# pending packages and their load ids
+dlt pipeline <pipeline_name> info
+# jobs matching a name fragment, with the full exception history across retries
+dlt pipeline <pipeline_name> load-package <load_id> job <pattern>
+# rows the package already wrote to the destination
+dlt pipeline <pipeline_name> load-package <load_id> row-counts
+```
+
+#### Configure the internal job retry
+
+Jobs that fail transiently are retried inside the running load step, without involving your code:
+
+```toml
+[load]
+# stop the load when a job keeps failing and its retry count reaches a multiple of this value,
+# 0 disables the limit and retries indefinitely
+raise_on_max_retries=5
+```
+
+A retried job is restarted on the next pass of the load loop, right after its failure is detected —
+there is no backoff between attempts of the same job. When a job fails `raise_on_max_retries` times,
+the load stops with `LoadClientJobRetry` (a transient exception) and the package stays pending. A
+subsequent `load()` resumes the package and grants the job another round of retries. If your
+destination needs time to recover, let the load stop and pace the whole pipeline from the outside:
+the [retry helpers](#retry-helpers-and-tenacity) treat `LoadClientJobRetry` as retryable and back
+off exponentially.
+
+#### Retry the load
+
+Retrying is the safest option: run the pipeline (or just the load step) again and `dlt` resumes
+the pending package. Completed jobs are never executed again, retried jobs keep their retry counts
+and recorded exceptions, and jobs interrupted by a crash are resolved from their recorded outcomes
+without re-execution — so a retry is safe also for
+[partially loaded](#partially-loaded-packages) packages.
+
+```py
+import dlt
+
+pipeline = dlt.attach("my_pipeline")
+# resumes pending packages, completed jobs are not executed again
+pipeline.load()
+```
+
+Note that `pipeline.run()` also loads pending packages first, but it warns and ignores new data
+passed to it until the pending packages are processed. Retry resolves the incident when the cause
+was fixed outside of the pipeline: a transient outage passed, permissions were granted, or the
+destination schema was corrected. Wrap your production runs in the
+[retry helpers](#retry-helpers-and-tenacity) to retry transient errors automatically.
+
+#### Fail or retry individual jobs
+
+When a particular job can never succeed — for example, it carries malformed data — move it to
+`failed_jobs` and retry the rest of the package. Any job pending a retry can be failed, whether
+its error was terminal or transient. Failing a job copies its exception message along, so it stays
+visible after the package completes. Once the problematic jobs are failed, retry: the package
+completes as loaded with the failed jobs recorded in it.
+
+List the jobs of the pending package first to pick the ones to fail:
+
+```sh
+# all jobs of a package grouped by state, including those pending a retry
+dlt pipeline <pipeline_name> load-package <load_id>
+# jobs matching a name fragment, with the full exception history across retries
+dlt pipeline <pipeline_name> load-package <load_id> job <pattern>
+# failed jobs of all packages with their error messages
+dlt pipeline <pipeline_name> failed-jobs
+```
+
+Then fail a job by its job id or full file name — the exception and the retry count are shown
+before you confirm:
+
+```sh
+dlt pipeline <pipeline_name> load-package <load_id> fail-job <job_id>
+```
+
+The same from Python:
+
+```py
+import os
+import dlt
+
+pipeline = dlt.attach("my_pipeline")
+load_id = pipeline.list_normalized_load_packages()[0]
+# list (job file, folder) tuples of retried jobs. folder is "new_jobs", or "started_jobs"
+# for jobs interrupted by a crashed load
+jobs = pipeline.list_pending_retry_jobs_in_package(load_id)
+job_file, folder = jobs[0]
+# give up on a job: move it to failed_jobs together with its exception message
+pipeline.fail_pending_job(load_id, os.path.basename(job_file))
+# or move a failed job back for another retry
+# pipeline.retry_failed_job(load_id, os.path.basename(job_file))
+# retry the package: run load again
+pipeline.load()
+```
+
+Jobs listed in `started_jobs` were interrupted by a crashed load and cannot be failed directly:
+run the pipeline (their recorded outcomes are resolved without re-execution) or abort the package.
+A job failed by mistake can be brought back for another retry with
+`pipeline.retry_failed_job(load_id, job_file_name)`.
+
+#### Abort the package
+
+:::tip
+If your pipeline is running on ephemeral storage ie. Airflow or dltHub where pipeline working folder
+is wiped out after run - and your pipeline failed - you can consider load packages in that pipeline to be
+effectively aborted and move to [investigating partially loaded packages](#partially-loaded-packages).
+:::
+
+To discard pending packages, abort them with `pipeline.abort_packages()` or the
+[CLI command](../reference/command-line-interface.md#dlt-pipeline-abort-packages):
+
+```sh
+dlt pipeline <pipeline_name> abort-packages
+```
+
+The CLI shows the abort plan — which jobs will be failed and which packages deleted — and asks for
+confirmation; `abort_packages(dry_run=True)` returns the same plan programmatically.
+
+The oldest pending package (the one being loaded) is aborted with a record: its retried jobs are
+moved to `failed_jobs` (so they stay visible in `failed-jobs` output) and the package is completed
+as aborted (its load id is not added to `_dlt_loads`). All other pending packages, extracted ones
+included, are deleted. Finally, the local pipeline state and schemas are restored from the
+snapshot each package carries in its `.restore` folder — rewinding them (including incremental
+cursors) to the point at which the aborted package started, so you can safely re-extract and
+re-run. The whole operation works without destination access and the aborted package stays in the
+local `loaded` storage together with its failed jobs and exception messages. Pass
+`abort_packages(load_id=...)` to abort at a specific package: packages older than it are left
+intact and stay loadable. The abort intent is persisted in the package state, so an abort
+interrupted e.g. by a crash is finished by the next `load()` or `run()`.
+
+:::tip Abort on terminal failures automatically
+Set `auto_abort_on_terminal_error=true` to make `dlt` run exactly this abort on the first terminal
+failure (and raise `LoadClientJobFailed`), as it did before `dlt` 1.30. Note that the abort is more
+thorough than in previous versions: the old behavior left newer pending packages and the local
+state inconsistent with the destination, while now they are cleaned up and restored.
+
+```toml
+[load]
+auto_abort_on_terminal_error=true
+```
+
+:::
+
+The `drop-pending-packages` CLI command and `Pipeline.drop_pending_packages` are deprecated aliases
+that now abort: they emit a deprecation warning and otherwise behave like `abort_packages`.
+
+### Partially loaded packages
+
+A load package is *partially loaded* when some of its jobs committed data to the destination while others did not — for example, one table of a multi-table load succeeded, the destination schema was migrated, or a job was retried after an earlier attempt may already have written. When this happens, `dlt` flags the raised `PipelineStepFailed` with a `WARNING` that the package is partially loaded and the destination may be in an inconsistent state.
+
+To inspect a suspected package, count its rows in the destination and check whether it completed:
+
+```sh
+dlt pipeline <pipeline_name> load-package <load_id> row-counts
+```
+
+:::tip
+Load package does not need to be present locally - if you are investigating remore pipeline ie. running on Airflow, sync the newest
+destination state with
+
+```sh
+dlt pipeline <name> sync
+```
+
+first.
+:::
+
+This reports the row count per table for that `load_id` (including `_dlt` tables) and whether the package is recorded as completed in `_dlt_loads`. It works even after the package is gone from the working directory. If there are rows for the `load_id` but the package is **not** in `_dlt_loads`, the load did not finish and your data is inconsistent.
+
+Retrying the load is always the safest remedy: run the pipeline again (ideally wrapped in `tenacity`, see below) and `dlt` resumes the pending package and completes it. If retrying is not possible, the remedy depends on the write disposition. For `merge` and `replace` tables, do not delete rows by hand — abort the package with `pipeline.abort_packages()`, which restores the local checkpoint the package was created from, then run the pipeline again. For `append` tables you can instead remove the partially-loaded rows yourself. Attach the pipeline, take the `load_id` of the partially-loaded package, and set `root_table` to the affected append table. The root table carries `_dlt_load_id`, while nested tables link to it through `_dlt_parent_id`, so rows are deleted deepest-first with a subquery that walks up to the root:
+
+```py execute notype
+import dlt
+from dlt.common.schema.utils import get_nested_tables
+from dlt.common.utils import uniq_id
+
+pipeline = dlt.pipeline(
+    "delete_demo_" + uniq_id(), destination="duckdb", dev_mode=True
+)
+# load append data with nested tables twice; delete the first package, keep the second
+load_info = pipeline.run(
+    [{"id": 1, "items": [{"x": 1}, {"x": 2}]}], table_name="my_table"
+)
+other_info = pipeline.run([{"id": 2, "items": [{"x": 3}]}], table_name="my_table")
+load_id = load_info.loads_ids[0]
+other_load_id = other_info.loads_ids[0]
+
+root_table = "my_table"
+schema = pipeline.default_schema
+
+with pipeline.sql_client() as client:
+
+    def load_id_filter(table_name: str) -> str:
+        table = schema.tables[table_name]
+        load_id_col = client.escape_column_name("_dlt_load_id")
+        row_key = client.escape_column_name("_dlt_id")
+        parent_key = client.escape_column_name("_dlt_parent_id")
+        if table.get("parent") is None:
+            return f"{load_id_col} = {client.capabilities.escape_literal(load_id)}"
+        parent = client.make_qualified_table_name(table["parent"])
+        return (
+            f"{parent_key} IN (SELECT {row_key} FROM {parent}"
+            f" WHERE {load_id_filter(table['parent'])})"
+        )
+
+    # delete the deepest nested tables first so parent links still resolve
+    for table in reversed(get_nested_tables(schema.tables, root_table)):
+        table_name = client.make_qualified_table_name(table["name"])
+        client.execute_sql(
+            f"DELETE FROM {table_name} WHERE {load_id_filter(table['name'])}"
+        )
+
+# the deleted package has no rows left, the other package is intact
+dataset = pipeline.dataset()
+
+first_load_count = dict(dataset.row_counts(load_id=load_id).fetchall())
+print(first_load_count["my_table"])
+#> 0
+
+second_load_count = dict(dataset.row_counts(load_id=other_load_id).fetchall())
+print(second_load_count["my_table"])
+#> 1
+
+# nested tables carry no _dlt_load_id, so only the other load's nested row remains
+print(len(dataset["my_table__items"].fetchall()))
+#> 1
+```
+
+:::tip
+Here's how to lower the chances of having your destination dataset in
+inconsistent state.
+
+1. `replace` write disposition with the default `truncate-and-insert` [strategy](../general-usage/full-loading.md) will truncate tables before loading.
+2. `merge` write disposition will merge staging dataset tables into the destination dataset. This will happen only when all data for this table (and nested tables) got loaded.
+
+Here's what you can do to deal with partially loaded packages:
+
+1. Retry the load step in case of transient errors.
+2. Use replace strategy with staging dataset so replace happens only when data for the table (and all nested tables) was fully loaded and is an atomic operation (if possible).
+3. Use only "append" write disposition. When your load package fails, you are able to use `_dlt_load_id` to remove all unprocessed data.
+4. Use "staging append" (`merge` disposition without primary key and merge key defined).
+
+:::
+
+### What `run` does inside
+
+Before adding retry to pipeline steps, note how the `run` method actually works:
+
+1. The `run` method will first use the `sync_destination` method to synchronize pipeline state and
+   schemas with the destination. Obviously, at this point, a connection to the destination is
+   established (which may fail and be retried).
+2. Next, it will make sure that data from the previous runs is fully processed. If not, the `run` method
+   normalizes, loads pending data items, and **exits**.
+3. If there was no pending data, new data from the `data` argument is extracted, normalized, and loaded.
+
+### Retry helpers and `tenacity`
+
+By default, `dlt` does not retry any of the pipeline steps. This is left to the included helpers and
+the [tenacity](https://tenacity.readthedocs.io/en/latest/) library. The snippet below will retry the
+`load` stage with the `retry_load` strategy and define back-off or re-raise exceptions for any other
+steps (`extract`, `normalize`) and for terminal exceptions.
+
+```py notype
+from tenacity import stop_after_attempt, retry_if_exception, Retrying, retry, wait_exponential
+from dlt.common.runtime.slack import send_slack_message
+from dlt.pipeline.helpers import retry_load
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(pipeline_name="chess_pipeline", destination='duckdb', dataset_name="games_data")
+    # get data for a few famous players
+    data = chess_source(['magnuscarlsen', 'rpragchess'], start_month="2022/11", end_month="2022/12")
+    try:
+
+        for attempt in Retrying(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1.5, min=4, max=10), retry=retry_if_exception(retry_load()), reraise=True):
+            with attempt:
+                load_info = pipeline.run(data)
+                send_slack_message(pipeline.runtime_config.slack_incoming_hook, "HOORAY 😄")
+    except Exception:
+        # we get here after all the retries
+        send_slack_message(pipeline.runtime_config.slack_incoming_hook, "BOOO 🤯")
+        raise
+```
+
+You can also use `tenacity` to decorate functions. This example additionally retries on `extract`:
+
+```py notype
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(pipeline_name="chess_pipeline", destination='duckdb', dataset_name="games_data")
+
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1.5, min=4, max=10), retry=retry_if_exception(retry_load(("extract", "load"))), reraise=True)
+    def load():
+        data = chess_source(['magnuscarlsen', 'vincentkeymer', 'dommarajugukesh', 'rpragchess'], start_month="2022/11", end_month="2022/12")
+        return pipeline.run(data)
+
+    load_info = load()
+```
+
+#### Retrying only the schema update (evolution)
+
+When several pipelines run **in parallel against the same dataset**, they can collide on DDL. This collision
+happens with parallel Airflow tasks, partitioned backfills, or several processes that share one schema.
+
+Each run reads the destination and sees that the dataset, a table, or a column does not exist yet. Each run then
+emits its own `CREATE SCHEMA`, `CREATE TABLE`, or `ALTER TABLE ... ADD COLUMN`. The first run succeeds. The others
+fail, because the dataset, table, or column already exists. The same happens during schema evolution, when two
+runs add the same new column at once.
+
+`dlt` wraps such a failure in a `SchemaUpdateError`. A retry is safe. On the next attempt, `dlt` reads the
+destination again and applies only what is still missing. Parallel runs converge. Use `retry_schema_update` to
+retry this part:
+
+```py
+from tenacity import retry, stop_after_attempt, retry_if_exception, wait_random_exponential
+from dlt.pipeline.helpers import retry_schema_update
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(pipeline_name="chess_pipeline", destination="duckdb", dataset_name="games_data")
+
+    @retry(
+        stop=stop_after_attempt(5),
+        # random jitter spreads retries so colliding parallel runs do not wake up and retry in lockstep
+        wait=wait_random_exponential(multiplier=1, max=30),
+        retry=retry_if_exception(retry_schema_update()),
+        reraise=True,
+    )
+    def load():
+        data = chess_source(["magnuscarlsen", "rpragchess"], start_month="2022/11", end_month="2022/12")
+        return pipeline.run(data)
+
+    load_info = load()
+```
+
+The **random jitter** matters. When many parallel runs collide on the same DDL and all wait the same fixed time,
+they retry together and collide again. This effect is a "thundering herd". `wait_random_exponential` adds
+randomness to each wait. The runs then spread over time and converge.
+
+`retry_schema_update` retries a schema-update failure, whether its cause is transient or terminal.
+`retry_schema_update` assumes that other updates run in parallel, and that the next run reconciles the invalid
+migration. `retry_schema_update` composes with `retry_load`. Retry the schema evolution here. Defer every other
+load failure to `retry_load`:
+
+```py
+from tenacity import retry, stop_after_attempt, retry_if_exception, wait_random_exponential
+from dlt.pipeline.helpers import retry_load, retry_schema_update
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(pipeline_name="chess_pipeline", destination="duckdb", dataset_name="games_data")
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_random_exponential(multiplier=1, max=30),
+        retry=retry_if_exception(retry_schema_update()) | retry_if_exception(retry_load()),
+        reraise=True,
+    )
+    def load():
+        data = chess_source(["magnuscarlsen", "rpragchess"], start_month="2022/11", end_month="2022/12")
+        return pipeline.run(data)
+
+    load_info = load()
+```
+
+### Allow a graceful shutdown
+
+`dlt` attempts a graceful shutdown of a running pipeline by installing custom signal handlers. In those handlers SIGINT (Ctrl-C) and SIGTERM
+are intercepted. Handlers are activated when pipeline runs and have the following effect:
+
+- `normalize` step: raises `SignalReceivedException` at certain checkpoints, typically immediately.
+- `load` step: on the first received signal, it attempts to drain the job pool by not accepting new load jobs and waiting for executing jobs to complete.
+   On a second signal, the default handler is called, resulting in a `KeyboardInterrupt` or immediate process termination (SIGTERM).
+- `extract` step does not intercept signals and uses default handlers.
+
+`normalize` and `extract` steps are atomic and can be terminated at any point without data loss. The `load` step [requires more attention](#partially-loaded-packages). Most production environments will try to terminate processes/jobs/pods gracefully by sending SIGTERM, waiting,
+and then killing the process if it does not stop. Below are examples for common environments:
+
+- Kubernetes:
+  - Set a long `terminationGracePeriodSeconds` (e.g., 300s) so `dlt` can drain load jobs.
+  - Optionally add a preStop hook to give the app a short head start before termination.
+
+- Docker / Docker Compose:
+  - Use a long `--stop-timeout` or `stop_grace_period`.
+
+- GitHub Actions:
+  - Choose a `timeout-minutes` large enough for graceful draining.
+
+We recommend increasing those timeouts to a few minutes so that load jobs can be drained properly. Note that in this case **you can still end up with
+a partially loaded package that should be retried without wiping out the pipeline working directory**. In that case, make sure the pipeline working directory (.dlt) is on persistent storage.
+
+You can also opt to run the load step until completion after a signal is received. This gives `dlt` a chance to complete the current load package and then
+terminate:
+
+```toml
+[load]
+start_new_jobs_on_signal=true
+```
+
+Obviously, this requires a very long grace period to be defined in your production environment.
+
+#### Signals in thread pools and orchestrators
+
+:::warning
+Note that signal interception is possible only in the main Python thread. If you offload pipeline runs to a thread pool ([or async pool with thread executors](../reference/performance.md#parallelism-within-a-single-process)), intercept signal handling before any pipeline runs in the pool:
+
+```py notype
+import asyncio
+
+from dlt.common.runtime import signals
+
+with signals.intercepted_signals():
+    # load data
+    asyncio.run(_run_async())
+```
+
+Signal interception works in orchestrators that run your code in a separate process and propagate SIGTERM/SIGINT:
+
+- Dagster: default multiprocess and Kubernetes executors start a process per op/run; Kubernetes will send SIGTERM, respect the Pod grace period. Avoid thread-based executors for the pipeline step or wrap with `intercepted_signals` as shown above.
+- Airflow: task runners execute each task in its own process (Local/Celery/Kubernetes executors). On cancel/timeout, the task process receives SIGTERM then SIGKILL; if using KubernetesExecutor, rely on the Pod grace period.
+- Prefect: Subprocess flow/task runners and Kubernetes jobs deliver SIGTERM to your process; if you use thread-based concurrency inside a task, wrap the outermost entrypoint with intercepted_signals.
+
+:::
+
+#### Write custom signal handler
+
+You can disable dlt signal handlers and prevent interception of SIGINT and SIGTERM: for all or for a selected pipeline:
+
+```toml
+[runtime]
+intercept_signals=false
+```
+
+or
+
+```toml
+[pipelines.my_pipeline.runtime]
+intercept_signals=false
+```
+
+and then install your own handlers.
+
+Note that `signals.py` is a pretty simple module and you can call its methods from your own handler to plug into `dlt` signal handling machinery. We are working on making the `signals.py` pluggable to make it straightforward.
+
+
+===== FILE: docs/website/docs/tutorial/advanced-course.md =====
+
+---
+title: dlt Advanced Course
+description: Master advanced dlt concepts with this comprehensive course covering custom sources, destinations, transformations, data contracts and performance optimization.
+keywords: [dlt, advanced, tutorial, pipeline, python, data engineering, custom sources, custom destinations, transformations, data contracts, logging, tracing, performance optimization]
+---
+# `dlt` Advanced Course
+
+In this course, you'll go far beyond the basics. You’ll build production-grade data pipelines with custom implementations, advanced patterns, and performance optimizations.
+
+## Lessons
+
+### **Lesson 1: Custom Sources – REST APIs & RESTClient** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_1_custom_sources_restapi_source_and_restclient.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_1_custom_sources_restapi_source_and_restclient.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_1_custom_sources_restapi_source_and_restclient.ipynb)
+
+Learn how to build flexible REST API connectors from scratch using `@dlt.resource` and the powerful `RESTClient`.
+
+### **Lesson 2: Custom Sources – SQL Databases** [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_2_custom_sources_sql_databases_.py) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_2_custom_sources_sql_databases_.ipynb) [![GitHub badge](https://img.shields.io/badge/github-view_source-2b3137?logo=github)](https://github.com/dlt-hub/dlt/blob/master/docs/education/dlt-advanced-course/lesson_2_custom_sources_sql_databases_.ipynb)
+

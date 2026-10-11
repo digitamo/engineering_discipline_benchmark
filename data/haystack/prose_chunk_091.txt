@@ -1,0 +1,2881 @@
+   Values to be added to this namespace require IETF Review (see
+   Section 4.8 of [RFC8126]) and MUST conform to the purpose of transfer
+   coding defined in this specification.
+
+   Use of program names for the identification of encoding formats is
+   not desirable and is discouraged for future encodings.
+
+7.4.  Negotiating Transfer Codings
+
+   The TE field (Section 10.1.4 of [HTTP]) is used in HTTP/1.1 to
+   indicate what transfer codings, besides chunked, the client is
+   willing to accept in the response and whether the client is willing
+   to preserve trailer fields in a chunked transfer coding.
+
+   A client MUST NOT send the chunked transfer coding name in TE;
+   chunked is always acceptable for HTTP/1.1 recipients.
+
+   Three examples of TE use are below.
+
+   TE: deflate
+   TE:
+   TE: trailers, deflate;q=0.5
+
+   When multiple transfer codings are acceptable, the client MAY rank
+   the codings by preference using a case-insensitive "q" parameter
+   (similar to the qvalues used in content negotiation fields; see
+   Section 12.4.2 of [HTTP]).  The rank value is a real number in the
+   range 0 through 1, where 0.001 is the least preferred and 1 is the
+   most preferred; a value of 0 means "not acceptable".
+
+   If the TE field value is empty or if no TE field is present, the only
+   acceptable transfer coding is chunked.  A message with no transfer
+   coding is always acceptable.
+
+   The keyword "trailers" indicates that the sender will not discard
+   trailer fields, as described in Section 6.5 of [HTTP].
+
+   Since the TE header field only applies to the immediate connection, a
+   sender of TE MUST also send a "TE" connection option within the
+   Connection header field (Section 7.6.1 of [HTTP]) in order to prevent
+   the TE header field from being forwarded by intermediaries that do
+   not support its semantics.
+
+8.  Handling Incomplete Messages
+
+   A server that receives an incomplete request message, usually due to
+   a canceled request or a triggered timeout exception, MAY send an
+   error response prior to closing the connection.
+
+   A client that receives an incomplete response message, which can
+   occur when a connection is closed prematurely or when decoding a
+   supposedly chunked transfer coding fails, MUST record the message as
+   incomplete.  Cache requirements for incomplete responses are defined
+   in Section 3.3 of [CACHING].
+
+   If a response terminates in the middle of the header section (before
+   the empty line is received) and the status code might rely on header
+   fields to convey the full meaning of the response, then the client
+   cannot assume that meaning has been conveyed; the client might need
+   to repeat the request in order to determine what action to take next.
+
+   A message body that uses the chunked transfer coding is incomplete if
+   the zero-sized chunk that terminates the encoding has not been
+   received.  A message that uses a valid Content-Length is incomplete
+   if the size of the message body received (in octets) is less than the
+   value given by Content-Length.  A response that has neither chunked
+   transfer coding nor Content-Length is terminated by closure of the
+   connection and, if the header section was received intact, is
+   considered complete unless an error was indicated by the underlying
+   connection (e.g., an "incomplete close" in TLS would leave the
+   response incomplete, as described in Section 9.8).
+
+9.  Connection Management
+
+   HTTP messaging is independent of the underlying transport- or
+   session-layer connection protocol(s).  HTTP only presumes a reliable
+   transport with in-order delivery of requests and the corresponding
+   in-order delivery of responses.  The mapping of HTTP request and
+   response structures onto the data units of an underlying transport
+   protocol is outside the scope of this specification.
+
+   As described in Section 7.3 of [HTTP], the specific connection
+   protocols to be used for an HTTP interaction are determined by client
+   configuration and the target URI.  For example, the "http" URI scheme
+   (Section 4.2.1 of [HTTP]) indicates a default connection of TCP over
+   IP, with a default TCP port of 80, but the client might be configured
+   to use a proxy via some other connection, port, or protocol.
+
+   HTTP implementations are expected to engage in connection management,
+   which includes maintaining the state of current connections,
+   establishing a new connection or reusing an existing connection,
+   processing messages received on a connection, detecting connection
+   failures, and closing each connection.  Most clients maintain
+   multiple connections in parallel, including more than one connection
+   per server endpoint.  Most servers are designed to maintain thousands
+   of concurrent connections, while controlling request queues to enable
+   fair use and detect denial-of-service attacks.
+
+9.1.  Establishment
+
+   It is beyond the scope of this specification to describe how
+   connections are established via various transport- or session-layer
+   protocols.  Each HTTP connection maps to one underlying transport
+   connection.
+
+9.2.  Associating a Response to a Request
+
+   HTTP/1.1 does not include a request identifier for associating a
+   given request message with its corresponding one or more response
+   messages.  Hence, it relies on the order of response arrival to
+   correspond exactly to the order in which requests are made on the
+   same connection.  More than one response message per request only
+   occurs when one or more informational responses (1xx; see
+   Section 15.2 of [HTTP]) precede a final response to the same request.
+
+   A client that has more than one outstanding request on a connection
+   MUST maintain a list of outstanding requests in the order sent and
+   MUST associate each received response message on that connection to
+   the first outstanding request that has not yet received a final (non-
+   1xx) response.
+
+   If a client receives data on a connection that doesn't have
+   outstanding requests, the client MUST NOT consider that data to be a
+   valid response; the client SHOULD close the connection, since message
+   delimitation is now ambiguous, unless the data consists only of one
+   or more CRLF (which can be discarded per Section 2.2).
+
+9.3.  Persistence
+
+   HTTP/1.1 defaults to the use of "persistent connections", allowing
+   multiple requests and responses to be carried over a single
+   connection.  HTTP implementations SHOULD support persistent
+   connections.
+
+   A recipient determines whether a connection is persistent or not
+   based on the protocol version and Connection header field
+   (Section 7.6.1 of [HTTP]) in the most recently received message, if
+   any:
+
+   *  If the "close" connection option is present (Section 9.6), the
+      connection will not persist after the current response; else,
+
+   *  If the received protocol is HTTP/1.1 (or later), the connection
+      will persist after the current response; else,
+
+   *  If the received protocol is HTTP/1.0, the "keep-alive" connection
+      option is present, either the recipient is not a proxy or the
+      message is a response, and the recipient wishes to honor the
+      HTTP/1.0 "keep-alive" mechanism, the connection will persist after
+      the current response; otherwise,
+
+   *  The connection will close after the current response.
+
+   A client that does not support persistent connections MUST send the
+   "close" connection option in every request message.
+
+   A server that does not support persistent connections MUST send the
+   "close" connection option in every response message that does not
+   have a 1xx (Informational) status code.
+
+   A client MAY send additional requests on a persistent connection
+   until it sends or receives a "close" connection option or receives an
+   HTTP/1.0 response without a "keep-alive" connection option.
+
+   In order to remain persistent, all messages on a connection need to
+   have a self-defined message length (i.e., one not defined by closure
+   of the connection), as described in Section 6.  A server MUST read
+   the entire request message body or close the connection after sending
+   its response; otherwise, the remaining data on a persistent
+   connection would be misinterpreted as the next request.  Likewise, a
+   client MUST read the entire response message body if it intends to
+   reuse the same connection for a subsequent request.
+
+   A proxy server MUST NOT maintain a persistent connection with an
+   HTTP/1.0 client (see Appendix C.2.2 for information and discussion of
+   the problems with the Keep-Alive header field implemented by many
+   HTTP/1.0 clients).
+
+   See Appendix C.2.2 for more information on backwards compatibility
+   with HTTP/1.0 clients.
+
+9.3.1.  Retrying Requests
+
+   Connections can be closed at any time, with or without intention.
+   Implementations ought to anticipate the need to recover from
+   asynchronous close events.  The conditions under which a client can
+   automatically retry a sequence of outstanding requests are defined in
+   Section 9.2.2 of [HTTP].
+
+9.3.2.  Pipelining
+
+   A client that supports persistent connections MAY "pipeline" its
+   requests (i.e., send multiple requests without waiting for each
+   response).  A server MAY process a sequence of pipelined requests in
+   parallel if they all have safe methods (Section 9.2.1 of [HTTP]), but
+   it MUST send the corresponding responses in the same order that the
+   requests were received.
+
+   A client that pipelines requests SHOULD retry unanswered requests if
+   the connection closes before it receives all of the corresponding
+   responses.  When retrying pipelined requests after a failed
+   connection (a connection not explicitly closed by the server in its
+   last complete response), a client MUST NOT pipeline immediately after
+   connection establishment, since the first remaining request in the
+   prior pipeline might have caused an error response that can be lost
+   again if multiple requests are sent on a prematurely closed
+   connection (see the TCP reset problem described in Section 9.6).
+
+   Idempotent methods (Section 9.2.2 of [HTTP]) are significant to
+   pipelining because they can be automatically retried after a
+   connection failure.  A user agent SHOULD NOT pipeline requests after
+   a non-idempotent method, until the final response status code for
+   that method has been received, unless the user agent has a means to
+   detect and recover from partial failure conditions involving the
+   pipelined sequence.
+
+   An intermediary that receives pipelined requests MAY pipeline those
+   requests when forwarding them inbound, since it can rely on the
+   outbound user agent(s) to determine what requests can be safely
+   pipelined.  If the inbound connection fails before receiving a
+   response, the pipelining intermediary MAY attempt to retry a sequence
+   of requests that have yet to receive a response if the requests all
+   have idempotent methods; otherwise, the pipelining intermediary
+   SHOULD forward any received responses and then close the
+   corresponding outbound connection(s) so that the outbound user
+   agent(s) can recover accordingly.
+
+9.4.  Concurrency
+
+   A client ought to limit the number of simultaneous open connections
+   that it maintains to a given server.
+
+   Previous revisions of HTTP gave a specific number of connections as a
+   ceiling, but this was found to be impractical for many applications.
+   As a result, this specification does not mandate a particular maximum
+   number of connections but, instead, encourages clients to be
+   conservative when opening multiple connections.
+
+   Multiple connections are typically used to avoid the "head-of-line
+   blocking" problem, wherein a request that takes significant server-
+   side processing and/or transfers very large content would block
+   subsequent requests on the same connection.  However, each connection
+   consumes server resources.
+
+   Furthermore, using multiple connections can cause undesirable side
+   effects in congested networks.  Using larger numbers of connections
+   can also cause side effects in otherwise uncongested networks,
+   because their aggregate and initially synchronized sending behavior
+   can cause congestion that would not have been present if fewer
+   parallel connections had been used.
+
+   Note that a server might reject traffic that it deems abusive or
+   characteristic of a denial-of-service attack, such as an excessive
+   number of open connections from a single client.
+
+9.5.  Failures and Timeouts
+
+   Servers will usually have some timeout value beyond which they will
+   no longer maintain an inactive connection.  Proxy servers might make
+   this a higher value since it is likely that the client will be making
+   more connections through the same proxy server.  The use of
+   persistent connections places no requirements on the length (or
+   existence) of this timeout for either the client or the server.
+
+   A client or server that wishes to time out SHOULD issue a graceful
+   close on the connection.  Implementations SHOULD constantly monitor
+   open connections for a received closure signal and respond to it as
+   appropriate, since prompt closure of both sides of a connection
+   enables allocated system resources to be reclaimed.
+
+   A client, server, or proxy MAY close the transport connection at any
+   time.  For example, a client might have started to send a new request
+   at the same time that the server has decided to close the "idle"
+   connection.  From the server's point of view, the connection is being
+   closed while it was idle, but from the client's point of view, a
+   request is in progress.
+
+   A server SHOULD sustain persistent connections, when possible, and
+   allow the underlying transport's flow-control mechanisms to resolve
+   temporary overloads rather than terminate connections with the
+   expectation that clients will retry.  The latter technique can
+   exacerbate network congestion or server load.
+
+   A client sending a message body SHOULD monitor the network connection
+   for an error response while it is transmitting the request.  If the
+   client sees a response that indicates the server does not wish to
+   receive the message body and is closing the connection, the client
+   SHOULD immediately cease transmitting the body and close its side of
+   the connection.
+
+9.6.  Tear-down
+
+   The "close" connection option is defined as a signal that the sender
+   will close this connection after completion of the response.  A
+   sender SHOULD send a Connection header field (Section 7.6.1 of
+   [HTTP]) containing the "close" connection option when it intends to
+   close a connection.  For example,
+
+   Connection: close
+
+   as a request header field indicates that this is the last request
+   that the client will send on this connection, while in a response,
+   the same field indicates that the server is going to close this
+   connection after the response message is complete.
+
+   Note that the field name "Close" is reserved, since using that name
+   as a header field might conflict with the "close" connection option.
+
+   A client that sends a "close" connection option MUST NOT send further
+   requests on that connection (after the one containing the "close")
+   and MUST close the connection after reading the final response
+   message corresponding to this request.
+
+   A server that receives a "close" connection option MUST initiate
+   closure of the connection (see below) after it sends the final
+   response to the request that contained the "close" connection option.
+   The server SHOULD send a "close" connection option in its final
+   response on that connection.  The server MUST NOT process any further
+   requests received on that connection.
+
+   A server that sends a "close" connection option MUST initiate closure
+   of the connection (see below) after it sends the response containing
+   the "close" connection option.  The server MUST NOT process any
+   further requests received on that connection.
+
+   A client that receives a "close" connection option MUST cease sending
+   requests on that connection and close the connection after reading
+   the response message containing the "close" connection option; if
+   additional pipelined requests had been sent on the connection, the
+   client SHOULD NOT assume that they will be processed by the server.
+
+   If a server performs an immediate close of a TCP connection, there is
+   a significant risk that the client will not be able to read the last
+   HTTP response.  If the server receives additional data from the
+   client on a fully closed connection, such as another request sent by
+   the client before receiving the server's response, the server's TCP
+   stack will send a reset packet to the client; unfortunately, the
+   reset packet might erase the client's unacknowledged input buffers
+   before they can be read and interpreted by the client's HTTP parser.
+
+   To avoid the TCP reset problem, servers typically close a connection
+   in stages.  First, the server performs a half-close by closing only
+   the write side of the read/write connection.  The server then
+   continues to read from the connection until it receives a
+   corresponding close by the client, or until the server is reasonably
+   certain that its own TCP stack has received the client's
+   acknowledgement of the packet(s) containing the server's last
+   response.  Finally, the server fully closes the connection.
+
+   It is unknown whether the reset problem is exclusive to TCP or might
+   also be found in other transport connection protocols.
+
+   Note that a TCP connection that is half-closed by the client does not
+   delimit a request message, nor does it imply that the client is no
+   longer interested in a response.  In general, transport signals
+   cannot be relied upon to signal edge cases, since HTTP/1.1 is
+   independent of transport.
+
+9.7.  TLS Connection Initiation
+
+   Conceptually, HTTP/TLS is simply sending HTTP messages over a
+   connection secured via TLS [TLS13].
+
+   The HTTP client also acts as the TLS client.  It initiates a
+   connection to the server on the appropriate port and sends the TLS
+   ClientHello to begin the TLS handshake.  When the TLS handshake has
+   finished, the client may then initiate the first HTTP request.  All
+   HTTP data MUST be sent as TLS "application data" but is otherwise
+   treated like a normal connection for HTTP (including potential reuse
+   as a persistent connection).
+
+9.8.  TLS Connection Closure
+
+   TLS uses an exchange of closure alerts prior to (non-error)
+   connection closure to provide secure connection closure; see
+   Section 6.1 of [TLS13].  When a valid closure alert is received, an
+   implementation can be assured that no further data will be received
+   on that connection.
+
+   When an implementation knows that it has sent or received all the
+   message data that it cares about, typically by detecting HTTP message
+   boundaries, it might generate an "incomplete close" by sending a
+   closure alert and then closing the connection without waiting to
+   receive the corresponding closure alert from its peer.
+
+   An incomplete close does not call into question the security of the
+   data already received, but it could indicate that subsequent data
+   might have been truncated.  As TLS is not directly aware of HTTP
+   message framing, it is necessary to examine the HTTP data itself to
+   determine whether messages are complete.  Handling of incomplete
+   messages is defined in Section 8.
+
+   When encountering an incomplete close, a client SHOULD treat as
+   completed all requests for which it has received either
+
+   1.  as much data as specified in the Content-Length header field or
+
+   2.  the terminal zero-length chunk (when Transfer-Encoding of chunked
+       is used).
+
+   A response that has neither chunked transfer coding nor Content-
+   Length is complete only if a valid closure alert has been received.
+   Treating an incomplete message as complete could expose
+   implementations to attack.
+
+   A client detecting an incomplete close SHOULD recover gracefully.
+
+   Clients MUST send a closure alert before closing the connection.
+   Clients that do not expect to receive any more data MAY choose not to
+   wait for the server's closure alert and simply close the connection,
+   thus generating an incomplete close on the server side.
+
+   Servers SHOULD be prepared to receive an incomplete close from the
+   client, since the client can often locate the end of server data.
+
+   Servers MUST attempt to initiate an exchange of closure alerts with
+   the client before closing the connection.  Servers MAY close the
+   connection after sending the closure alert, thus generating an
+   incomplete close on the client side.
+
+10.  Enclosing Messages as Data
+
+10.1.  Media Type message/http
+
+   The "message/http" media type can be used to enclose a single HTTP
+   request or response message, provided that it obeys the MIME
+   restrictions for all "message" types regarding line length and
+   encodings.  Because of the line length limitations, field values
+   within "message/http" are allowed to use line folding (obs-fold), as
+   described in Section 5.2, to convey the field value over multiple
+   lines.  A recipient of "message/http" data MUST replace any obsolete
+   line folding with one or more SP characters when the message is
+   consumed.
+
+   Type name:  message
+
+   Subtype name:  http
+
+   Required parameters:  N/A
+
+   Optional parameters:  version, msgtype
+
+      version:  The HTTP-version number of the enclosed message (e.g.,
+         "1.1").  If not present, the version can be determined from the
+         first line of the body.
+
+      msgtype:  The message type -- "request" or "response".  If not
+         present, the type can be determined from the first line of the
+         body.
+
+   Encoding considerations:  only "7bit", "8bit", or "binary" are
+      permitted
+
+   Security considerations:  see Section 11
+
+   Interoperability considerations:  N/A
+
+   Published specification:  RFC 9112 (see Section 10.1).
+
+   Applications that use this media type:  N/A
+
+   Fragment identifier considerations:  N/A
+
+   Additional information:  Magic number(s):  N/A
+
+                            Deprecated alias names for this type:  N/A
+
+                            File extension(s):  N/A
+
+                            Macintosh file type code(s):  N/A
+
+   Person and email address to contact for further information:  See Aut
+      hors' Addresses section.
+
+   Intended usage:  COMMON
+
+   Restrictions on usage:  N/A
+
+   Author:  See Authors' Addresses section.
+
+   Change controller:  IESG
+
+10.2.  Media Type application/http
+
+   The "application/http" media type can be used to enclose a pipeline
+   of one or more HTTP request or response messages (not intermixed).
+
+   Type name:  application
+
+   Subtype name:  http
+
+   Required parameters:  N/A
+
+   Optional parameters:  version, msgtype
+
+      version:  The HTTP-version number of the enclosed messages (e.g.,
+         "1.1").  If not present, the version can be determined from the
+         first line of the body.
+
+      msgtype:  The message type -- "request" or "response".  If not
+         present, the type can be determined from the first line of the
+         body.
+
+   Encoding considerations:  HTTP messages enclosed by this type are in
+      "binary" format; use of an appropriate Content-Transfer-Encoding
+      is required when transmitted via email.
+
+   Security considerations:  see Section 11
+
+   Interoperability considerations:  N/A
+
+   Published specification:  RFC 9112 (see Section 10.2).
+
+   Applications that use this media type:  N/A
+
+   Fragment identifier considerations:  N/A
+
+   Additional information:  Deprecated alias names for this type:  N/A
+
+                            Magic number(s):  N/A
+
+                            File extension(s):  N/A
+
+                            Macintosh file type code(s):  N/A
+
+   Person and email address to contact for further information:  See Aut
+      hors' Addresses section.
+
+   Intended usage:  COMMON
+
+   Restrictions on usage:  N/A
+
+   Author:  See Authors' Addresses section.
+
+   Change controller:  IESG
+
+11.  Security Considerations
+
+   This section is meant to inform developers, information providers,
+   and users about known security considerations relevant to HTTP
+   message syntax and parsing.  Security considerations about HTTP
+   semantics, content, and routing are addressed in [HTTP].
+
+11.1.  Response Splitting
+
+   Response splitting (a.k.a. CRLF injection) is a common technique,
+   used in various attacks on Web usage, that exploits the line-based
+   nature of HTTP message framing and the ordered association of
+   requests to responses on persistent connections [Klein].  This
+   technique can be particularly damaging when the requests pass through
+   a shared cache.
+
+   Response splitting exploits a vulnerability in servers (usually
+   within an application server) where an attacker can send encoded data
+   within some parameter of the request that is later decoded and echoed
+   within any of the response header fields of the response.  If the
+   decoded data is crafted to look like the response has ended and a
+   subsequent response has begun, the response has been split, and the
+   content within the apparent second response is controlled by the
+   attacker.  The attacker can then make any other request on the same
+   persistent connection and trick the recipients (including
+   intermediaries) into believing that the second half of the split is
+   an authoritative answer to the second request.
+
+   For example, a parameter within the request-target might be read by
+   an application server and reused within a redirect, resulting in the
+   same parameter being echoed in the Location header field of the
+   response.  If the parameter is decoded by the application and not
+   properly encoded when placed in the response field, the attacker can
+   send encoded CRLF octets and other content that will make the
+   application's single response look like two or more responses.
+
+   A common defense against response splitting is to filter requests for
+   data that looks like encoded CR and LF (e.g., "%0D" and "%0A").
+   However, that assumes the application server is only performing URI
+   decoding rather than more obscure data transformations like charset
+   transcoding, XML entity translation, base64 decoding, sprintf
+   reformatting, etc.  A more effective mitigation is to prevent
+   anything other than the server's core protocol libraries from sending
+   a CR or LF within the header section, which means restricting the
+   output of header fields to APIs that filter for bad octets and not
+   allowing application servers to write directly to the protocol
+   stream.
+
+11.2.  Request Smuggling
+
+   Request smuggling ([Linhart]) is a technique that exploits
+   differences in protocol parsing among various recipients to hide
+   additional requests (which might otherwise be blocked or disabled by
+   policy) within an apparently harmless request.  Like response
+   splitting, request smuggling can lead to a variety of attacks on HTTP
+   usage.
+
+   This specification has introduced new requirements on request
+   parsing, particularly with regard to message framing in Section 6.3,
+   to reduce the effectiveness of request smuggling.
+
+11.3.  Message Integrity
+
+   HTTP does not define a specific mechanism for ensuring message
+   integrity, instead relying on the error-detection ability of
+   underlying transport protocols and the use of length or chunk-
+   delimited framing to detect completeness.  Historically, the lack of
+   a single integrity mechanism has been justified by the informal
+   nature of most HTTP communication.  However, the prevalence of HTTP
+   as an information access mechanism has resulted in its increasing use
+   within environments where verification of message integrity is
+   crucial.
+
+   The mechanisms provided with the "https" scheme, such as
+   authenticated encryption, provide protection against modification of
+   messages.  Care is needed, however, to ensure that connection closure
+   cannot be used to truncate messages (see Section 9.8).  User agents
+   might refuse to accept incomplete messages or treat them specially.
+   For example, a browser being used to view medical history or drug
+   interaction information needs to indicate to the user when such
+   information is detected by the protocol to be incomplete, expired, or
+   corrupted during transfer.  Such mechanisms might be selectively
+   enabled via user agent extensions or the presence of message
+   integrity metadata in a response.
+
+   The "http" scheme provides no protection against accidental or
+   malicious modification of messages.
+
+   Extensions to the protocol might be used to mitigate the risk of
+   unwanted modification of messages by intermediaries, even when the
+   "https" scheme is used.  Integrity might be assured by using message
+   authentication codes or digital signatures that are selectively added
+   to messages via extensible metadata fields.
+
+11.4.  Message Confidentiality
+
+   HTTP relies on underlying transport protocols to provide message
+   confidentiality when that is desired.  HTTP has been specifically
+   designed to be independent of the transport protocol, such that it
+   can be used over many forms of encrypted connection, with the
+   selection of such transports being identified by the choice of URI
+   scheme or within user agent configuration.
+
+   The "https" scheme can be used to identify resources that require a
+   confidential connection, as described in Section 4.2.2 of [HTTP].
+
+12.  IANA Considerations
+
+   The change controller for the following registrations is: "IETF
+   (iesg@ietf.org) - Internet Engineering Task Force".
+
+12.1.  Field Name Registration
+
+   IANA has added the following field names to the "Hypertext Transfer
+   Protocol (HTTP) Field Name Registry" at
+   <https://www.iana.org/assignments/http-fields>, as described in
+   Section 18.4 of [HTTP].
+
+   +===================+===========+=========+============+
+   | Field Name        | Status    | Section | Comments   |
+   +===================+===========+=========+============+
+   | Close             | permanent | 9.6     | (reserved) |
+   +-------------------+-----------+---------+------------+
+   | MIME-Version      | permanent | B.1     |            |
+   +-------------------+-----------+---------+------------+
+   | Transfer-Encoding | permanent | 6.1     |            |
+   +-------------------+-----------+---------+------------+
+
+                           Table 1
+
+12.2.  Media Type Registration
+
+   IANA has updated the "Media Types" registry at
+   <https://www.iana.org/assignments/media-types> with the registration
+   information in Sections 10.1 and 10.2 for the media types "message/
+   http" and "application/http", respectively.
+
+12.3.  Transfer Coding Registration
+
+   IANA has updated the "HTTP Transfer Coding Registry" at
+   <https://www.iana.org/assignments/http-parameters/> with the
+   registration procedure of Section 7.3 and the content coding names
+   summarized in the table below.
+
+   +============+===========================================+=========+
+   | Name       | Description                               | Section |
+   +============+===========================================+=========+
+   | chunked    | Transfer in a series of chunks            | 7.1     |
+   +------------+-------------------------------------------+---------+
+   | compress   | UNIX "compress" data format [Welch]       | 7.2     |
+   +------------+-------------------------------------------+---------+
+   | deflate    | "deflate" compressed data ([RFC1951])     | 7.2     |
+   |            | inside the "zlib" data format ([RFC1950]) |         |
+   +------------+-------------------------------------------+---------+
+   | gzip       | GZIP file format [RFC1952]                | 7.2     |
+   +------------+-------------------------------------------+---------+
+   | trailers   | (reserved)                                | 12.3    |
+   +------------+-------------------------------------------+---------+
+   | x-compress | Deprecated (alias for compress)           | 7.2     |
+   +------------+-------------------------------------------+---------+
+   | x-gzip     | Deprecated (alias for gzip)               | 7.2     |
+   +------------+-------------------------------------------+---------+
+
+                                 Table 2
+
+      |  *Note:* the coding name "trailers" is reserved because its use
+      |  would conflict with the keyword "trailers" in the TE header
+      |  field (Section 10.1.4 of [HTTP]).
+
+12.4.  ALPN Protocol ID Registration
+
+   IANA has updated the "TLS Application-Layer Protocol Negotiation
+   (ALPN) Protocol IDs" registry at <https://www.iana.org/assignments/
+   tls-extensiontype-values/> with the registration below:
+
+          +==========+=============================+===========+
+          | Protocol | Identification Sequence     | Reference |
+          +==========+=============================+===========+
+          | HTTP/1.1 | 0x68 0x74 0x74 0x70 0x2f    | RFC 9112  |
+          |          | 0x31 0x2e 0x31 ("http/1.1") |           |
+          +----------+-----------------------------+-----------+
+
+                                 Table 3
+
+13.  References
+
+13.1.  Normative References
+
+   [CACHING]  Fielding, R., Ed., Nottingham, M., Ed., and J. Reschke,
+              Ed., "HTTP Caching", STD 98, RFC 9111,
+              DOI 10.17487/RFC9111, June 2022,
+              <https://www.rfc-editor.org/info/rfc9111>.
+
+   [HTTP]     Fielding, R., Ed., Nottingham, M., Ed., and J. Reschke,
+              Ed., "HTTP Semantics", STD 97, RFC 9110,
+              DOI 10.17487/RFC9110, June 2022,
+              <https://www.rfc-editor.org/info/rfc9110>.
+
+   [RFC1950]  Deutsch, P. and J-L. Gailly, "ZLIB Compressed Data Format
+              Specification version 3.3", RFC 1950,
+              DOI 10.17487/RFC1950, May 1996,
+              <https://www.rfc-editor.org/info/rfc1950>.
+
+   [RFC1951]  Deutsch, P., "DEFLATE Compressed Data Format Specification
+              version 1.3", RFC 1951, DOI 10.17487/RFC1951, May 1996,
+              <https://www.rfc-editor.org/info/rfc1951>.
+
+   [RFC1952]  Deutsch, P., "GZIP file format specification version 4.3",
+              RFC 1952, DOI 10.17487/RFC1952, May 1996,
+              <https://www.rfc-editor.org/info/rfc1952>.
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119,
+              DOI 10.17487/RFC2119, March 1997,
+              <https://www.rfc-editor.org/info/rfc2119>.
+
+   [RFC5234]  Crocker, D., Ed. and P. Overell, "Augmented BNF for Syntax
+              Specifications: ABNF", STD 68, RFC 5234,
+              DOI 10.17487/RFC5234, January 2008,
+              <https://www.rfc-editor.org/info/rfc5234>.
+
+   [RFC7405]  Kyzivat, P., "Case-Sensitive String Support in ABNF",
+              RFC 7405, DOI 10.17487/RFC7405, December 2014,
+              <https://www.rfc-editor.org/info/rfc7405>.
+
+   [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC
+              2119 Key Words", BCP 14, RFC 8174, DOI 10.17487/RFC8174,
+              May 2017, <https://www.rfc-editor.org/info/rfc8174>.
+
+   [TLS13]    Rescorla, E., "The Transport Layer Security (TLS) Protocol
+              Version 1.3", RFC 8446, DOI 10.17487/RFC8446, August 2018,
+              <https://www.rfc-editor.org/info/rfc8446>.
+
+   [URI]      Berners-Lee, T., Fielding, R., and L. Masinter, "Uniform
+              Resource Identifier (URI): Generic Syntax", STD 66,
+              RFC 3986, DOI 10.17487/RFC3986, January 2005,
+              <https://www.rfc-editor.org/info/rfc3986>.
+
+   [USASCII]  American National Standards Institute, "Coded Character
+              Set -- 7-bit American Standard Code for Information
+              Interchange", ANSI X3.4, 1986.
+
+   [Welch]    Welch, T., "A Technique for High-Performance Data
+              Compression", IEEE Computer 17(6),
+              DOI 10.1109/MC.1984.1659158, June 1984,
+              <https://ieeexplore.ieee.org/document/1659158/>.
+
+13.2.  Informative References
+
+   [HTTP/1.0] Berners-Lee, T., Fielding, R., and H. Frystyk, "Hypertext
+              Transfer Protocol -- HTTP/1.0", RFC 1945,
+              DOI 10.17487/RFC1945, May 1996,
+              <https://www.rfc-editor.org/info/rfc1945>.
+
+   [Klein]    Klein, A., "Divide and Conquer - HTTP Response Splitting,
+              Web Cache Poisoning Attacks, and Related Topics", March
+              2004, <https://packetstormsecurity.com/papers/general/
+              whitepaper_httpresponse.pdf>.
+
+   [Linhart]  Linhart, C., Klein, A., Heled, R., and S. Orrin, "HTTP
+              Request Smuggling", June 2005,
+              <https://www.cgisecurity.com/lib/HTTP-Request-
+              Smuggling.pdf>.
+
+   [RFC2045]  Freed, N. and N. Borenstein, "Multipurpose Internet Mail
+              Extensions (MIME) Part One: Format of Internet Message
+              Bodies", RFC 2045, DOI 10.17487/RFC2045, November 1996,
+              <https://www.rfc-editor.org/info/rfc2045>.
+
+   [RFC2046]  Freed, N. and N. Borenstein, "Multipurpose Internet Mail
+              Extensions (MIME) Part Two: Media Types", RFC 2046,
+              DOI 10.17487/RFC2046, November 1996,
+              <https://www.rfc-editor.org/info/rfc2046>.
+
+   [RFC2049]  Freed, N. and N. Borenstein, "Multipurpose Internet Mail
+              Extensions (MIME) Part Five: Conformance Criteria and
+              Examples", RFC 2049, DOI 10.17487/RFC2049, November 1996,
+              <https://www.rfc-editor.org/info/rfc2049>.
+
+   [RFC2068]  Fielding, R., Gettys, J., Mogul, J., Frystyk, H., and T.
+              Berners-Lee, "Hypertext Transfer Protocol -- HTTP/1.1",
+              RFC 2068, DOI 10.17487/RFC2068, January 1997,
+              <https://www.rfc-editor.org/info/rfc2068>.
+
+   [RFC2557]  Palme, J., Hopmann, A., and N. Shelness, "MIME
+              Encapsulation of Aggregate Documents, such as HTML
+              (MHTML)", RFC 2557, DOI 10.17487/RFC2557, March 1999,
+              <https://www.rfc-editor.org/info/rfc2557>.
+
+   [RFC5322]  Resnick, P., Ed., "Internet Message Format", RFC 5322,
+              DOI 10.17487/RFC5322, October 2008,
+              <https://www.rfc-editor.org/info/rfc5322>.
+
+   [RFC7230]  Fielding, R., Ed. and J. Reschke, Ed., "Hypertext Transfer
+              Protocol (HTTP/1.1): Message Syntax and Routing",
+              RFC 7230, DOI 10.17487/RFC7230, June 2014,
+              <https://www.rfc-editor.org/info/rfc7230>.
+
+   [RFC8126]  Cotton, M., Leiba, B., and T. Narten, "Guidelines for
+              Writing an IANA Considerations Section in RFCs", BCP 26,
+              RFC 8126, DOI 10.17487/RFC8126, June 2017,
+              <https://www.rfc-editor.org/info/rfc8126>.
+
+Appendix A.  Collected ABNF
+
+   In the collected ABNF below, list rules are expanded per
+   Section 5.6.1 of [HTTP].
+
+   BWS = <BWS, see [HTTP], Section 5.6.3>
+
+   HTTP-message = start-line CRLF *( field-line CRLF ) CRLF [
+    message-body ]
+   HTTP-name = %x48.54.54.50 ; HTTP
+   HTTP-version = HTTP-name "/" DIGIT "." DIGIT
+
+   OWS = <OWS, see [HTTP], Section 5.6.3>
+
+   RWS = <RWS, see [HTTP], Section 5.6.3>
+
+   Transfer-Encoding = [ transfer-coding *( OWS "," OWS transfer-coding
+    ) ]
+
+   absolute-URI = <absolute-URI, see [URI], Section 4.3>
+   absolute-form = absolute-URI
+   absolute-path = <absolute-path, see [HTTP], Section 4.1>
+   asterisk-form = "*"
+   authority = <authority, see [URI], Section 3.2>
+   authority-form = uri-host ":" port
+
+   chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF
+   chunk-data = 1*OCTET
+   chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val
+    ] )
+   chunk-ext-name = token
+   chunk-ext-val = token / quoted-string
+   chunk-size = 1*HEXDIG
+   chunked-body = *chunk last-chunk trailer-section CRLF
+
+   field-line = field-name ":" OWS field-value OWS
+   field-name = <field-name, see [HTTP], Section 5.1>
+   field-value = <field-value, see [HTTP], Section 5.5>
+
+   last-chunk = 1*"0" [ chunk-ext ] CRLF
+
+   message-body = *OCTET
+   method = token
+
+   obs-fold = OWS CRLF RWS
+   obs-text = <obs-text, see [HTTP], Section 5.6.4>
+   origin-form = absolute-path [ "?" query ]
+
+   port = <port, see [URI], Section 3.2.3>
+
+   query = <query, see [URI], Section 3.4>
+   quoted-string = <quoted-string, see [HTTP], Section 5.6.4>
+
+   reason-phrase = 1*( HTAB / SP / VCHAR / obs-text )
+   request-line = method SP request-target SP HTTP-version
+   request-target = origin-form / absolute-form / authority-form /
+    asterisk-form
+
+   start-line = request-line / status-line
+   status-code = 3DIGIT
+   status-line = HTTP-version SP status-code SP [ reason-phrase ]
+
+   token = <token, see [HTTP], Section 5.6.2>
+   trailer-section = *( field-line CRLF )
+   transfer-coding = <transfer-coding, see [HTTP], Section 10.1.4>
+
+   uri-host = <host, see [URI], Section 3.2.2>
+
+Appendix B.  Differences between HTTP and MIME
+
+   HTTP/1.1 uses many of the constructs defined for the Internet Message
+   Format [RFC5322] and Multipurpose Internet Mail Extensions (MIME)
+   [RFC2045] to allow a message body to be transmitted in an open
+   variety of representations and with extensible fields.  However, some
+   of these constructs have been reinterpreted to better fit the needs
+   of interactive communication, leading to some differences in how MIME
+   constructs are used within HTTP.  These differences were carefully
+   chosen to optimize performance over binary connections, allow greater
+   freedom in the use of new media types, ease date comparisons, and
+   accommodate common implementations.
+
+   This appendix describes specific areas where HTTP differs from MIME.
+   Proxies and gateways to and from strict MIME environments need to be
+   aware of these differences and provide the appropriate conversions
+   where necessary.
+
+B.1.  MIME-Version
+
+   HTTP is not a MIME-compliant protocol.  However, messages can include
+   a single MIME-Version header field to indicate what version of the
+   MIME protocol was used to construct the message.  Use of the MIME-
+   Version header field indicates that the message is in full
+   conformance with the MIME protocol (as defined in [RFC2045]).
+   Senders are responsible for ensuring full conformance (where
+   possible) when exporting HTTP messages to strict MIME environments.
+
+B.2.  Conversion to Canonical Form
+
+   MIME requires that an Internet mail body part be converted to
+   canonical form prior to being transferred, as described in Section 4
+   of [RFC2049], and that content with a type of "text" represents line
+   breaks as CRLF, forbidding the use of CR or LF outside of line break
+   sequences [RFC2046].  In contrast, HTTP does not care whether CRLF,
+   bare CR, or bare LF are used to indicate a line break within content.
+
+   A proxy or gateway from HTTP to a strict MIME environment ought to
+   translate all line breaks within text media types to the RFC 2049
+   canonical form of CRLF.  Note, however, this might be complicated by
+   the presence of a Content-Encoding and by the fact that HTTP allows
+   the use of some charsets that do not use octets 13 and 10 to
+   represent CR and LF, respectively.
+
+   Conversion will break any cryptographic checksums applied to the
+   original content unless the original content is already in canonical
+   form.  Therefore, the canonical form is recommended for any content
+   that uses such checksums in HTTP.
+
+B.3.  Conversion of Date Formats
+
+   HTTP/1.1 uses a restricted set of date formats (Section 5.6.7 of
+   [HTTP]) to simplify the process of date comparison.  Proxies and
+   gateways from other protocols ought to ensure that any Date header
+   field present in a message conforms to one of the HTTP/1.1 formats
+   and rewrite the date if necessary.
+
+B.4.  Conversion of Content-Encoding
+
+   MIME does not include any concept equivalent to HTTP's Content-
+   Encoding header field.  Since this acts as a modifier on the media
+   type, proxies and gateways from HTTP to MIME-compliant protocols
+   ought to either change the value of the Content-Type header field or
+   decode the representation before forwarding the message.  (Some
+   experimental applications of Content-Type for Internet mail have used
+   a media-type parameter of ";conversions=<content-coding>" to perform
+   a function equivalent to Content-Encoding.  However, this parameter
+   is not part of the MIME standards.)
+
+B.5.  Conversion of Content-Transfer-Encoding
+
+   HTTP does not use the Content-Transfer-Encoding field of MIME.
+   Proxies and gateways from MIME-compliant protocols to HTTP need to
+   remove any Content-Transfer-Encoding prior to delivering the response
+   message to an HTTP client.
+
+   Proxies and gateways from HTTP to MIME-compliant protocols are
+   responsible for ensuring that the message is in the correct format
+   and encoding for safe transport on that protocol, where "safe
+   transport" is defined by the limitations of the protocol being used.
+   Such a proxy or gateway ought to transform and label the data with an
+   appropriate Content-Transfer-Encoding if doing so will improve the
+   likelihood of safe transport over the destination protocol.
+
+B.6.  MHTML and Line Length Limitations
+
+   HTTP implementations that share code with MHTML [RFC2557]
+   implementations need to be aware of MIME line length limitations.
+   Since HTTP does not have this limitation, HTTP does not fold long
+   lines.  MHTML messages being transported by HTTP follow all
+   conventions of MHTML, including line length limitations and folding,
+   canonicalization, etc., since HTTP transfers message-bodies without
+   modification and, aside from the "multipart/byteranges" type
+   (Section 14.6 of [HTTP]), does not interpret the content or any MIME
+   header lines that might be contained therein.
+
+Appendix C.  Changes from Previous RFCs
+
+C.1.  Changes from HTTP/0.9
+
+   Since HTTP/0.9 did not support header fields in a request, there is
+   no mechanism for it to support name-based virtual hosts (selection of
+   resource by inspection of the Host header field).  Any server that
+   implements name-based virtual hosts ought to disable support for
+   HTTP/0.9.  Most requests that appear to be HTTP/0.9 are, in fact,
+   badly constructed HTTP/1.x requests caused by a client failing to
+   properly encode the request-target.
+
+C.2.  Changes from HTTP/1.0
+
+C.2.1.  Multihomed Web Servers
+
+   The requirements that clients and servers support the Host header
+   field (Section 7.2 of [HTTP]), report an error if it is missing from
+   an HTTP/1.1 request, and accept absolute URIs (Section 3.2) are among
+   the most important changes defined by HTTP/1.1.
+
+   Older HTTP/1.0 clients assumed a one-to-one relationship of IP
+   addresses and servers; there was no established mechanism for
+   distinguishing the intended server of a request other than the IP
+   address to which that request was directed.  The Host header field
+   was introduced during the development of HTTP/1.1 and, though it was
+   quickly implemented by most HTTP/1.0 browsers, additional
+   requirements were placed on all HTTP/1.1 requests in order to ensure
+   complete adoption.  At the time of this writing, most HTTP-based
+   services are dependent upon the Host header field for targeting
+   requests.
+
+C.2.2.  Keep-Alive Connections
+
+   In HTTP/1.0, each connection is established by the client prior to
+   the request and closed by the server after sending the response.
+   However, some implementations implement the explicitly negotiated
+   ("Keep-Alive") version of persistent connections described in
+   Section 19.7.1 of [RFC2068].
+
+   Some clients and servers might wish to be compatible with these
+   previous approaches to persistent connections, by explicitly
+   negotiating for them with a "Connection: keep-alive" request header
+   field.  However, some experimental implementations of HTTP/1.0
+   persistent connections are faulty; for example, if an HTTP/1.0 proxy
+   server doesn't understand Connection, it will erroneously forward
+   that header field to the next inbound server, which would result in a
+   hung connection.
+
+   One attempted solution was the introduction of a Proxy-Connection
+   header field, targeted specifically at proxies.  In practice, this
+   was also unworkable, because proxies are often deployed in multiple
+   layers, bringing about the same problem discussed above.
+
+   As a result, clients are encouraged not to send the Proxy-Connection
+   header field in any requests.
+
+   Clients are also encouraged to consider the use of "Connection: keep-
+   alive" in requests carefully; while they can enable persistent
+   connections with HTTP/1.0 servers, clients using them will need to
+   monitor the connection for "hung" requests (which indicate that the
+   client ought to stop sending the header field), and this mechanism
+   ought not be used by clients at all when a proxy is being used.
+
+C.2.3.  Introduction of Transfer-Encoding
+
+   HTTP/1.1 introduces the Transfer-Encoding header field (Section 6.1).
+   Transfer codings need to be decoded prior to forwarding an HTTP
+   message over a MIME-compliant protocol.
+
+C.3.  Changes from RFC 7230
+
+   Most of the sections introducing HTTP's design goals, history,
+   architecture, conformance criteria, protocol versioning, URIs,
+   message routing, and header fields have been moved to [HTTP].  This
+   document has been reduced to just the messaging syntax and connection
+   management requirements specific to HTTP/1.1.
+
+   Bare CRs have been prohibited outside of content.  (Section 2.2)
+
+   The ABNF definition of authority-form has changed from the more
+   general authority component of a URI (in which port is optional) to
+   the specific host:port format that is required by CONNECT.
+   (Section 3.2.3)
+
+   Recipients are required to avoid smuggling/splitting attacks when
+   processing an ambiguous message framing.  (Section 6.1)
+
+   In the ABNF for chunked extensions, (bad) whitespace around ";" and
+   "=" has been reintroduced.  Whitespace was removed in [RFC7230], but
+   that change was found to break existing implementations.
+   (Section 7.1.1)
+
+   Trailer field semantics now transcend the specifics of chunked
+   transfer coding.  The decoding algorithm for chunked (Section 7.1.3)
+   has been updated to encourage storage/forwarding of trailer fields
+   separately from the header section, to only allow merging into the
+   header section if the recipient knows the corresponding field
+   definition permits and defines how to merge, and otherwise to discard
+   the trailer fields instead of merging.  The trailer part is now
+   called the trailer section to be more consistent with the header
+   section and more distinct from a body part.  (Section 7.1.2)
+
+   Transfer coding parameters called "q" are disallowed in order to
+   avoid conflicts with the use of ranks in the TE header field.
+   (Section 7.3)
+
+Acknowledgements
+
+   See Appendix "Acknowledgements" of [HTTP], which applies to this
+   document as well.
+
+Index
+
+   A C D F G H M O R T X
+
+      A
+
+         absolute-form (of request-target)  Section 3.2.2
+         application/http Media Type  *_Section 10.2_*
+         asterisk-form (of request-target)  Section 3.2.4
+         authority-form (of request-target)  Section 3.2.3
+
+      C
+
+         chunked (Coding Format)  Section 6.1; Section 6.3
+         chunked (transfer coding)  *_Section 7.1_*
+         close  Section 9.3; *_Section 9.6_*
+         compress (transfer coding)  *_Section 7.2_*
+         Connection header field  Section 9.6
+         Content-Length header field  Section 6.2
+         Content-Transfer-Encoding header field  Appendix B.5
+
+      D
+
+         deflate (transfer coding)  *_Section 7.2_*
+
+      F
+
+         Fields
+            Close  *_Section 9.6, Paragraph 4_*
+            MIME-Version  *_Appendix B.1_*
+            Transfer-Encoding  *_Section 6.1_*
+
+      G
+
+         Grammar
+            ALPHA  *_Section 1.2_*
+            CR  *_Section 1.2_*
+            CRLF  *_Section 1.2_*
+            CTL  *_Section 1.2_*
+            DIGIT  *_Section 1.2_*
+            DQUOTE  *_Section 1.2_*
+            HEXDIG  *_Section 1.2_*
+            HTAB  *_Section 1.2_*
+            HTTP-message  *_Section 2.1_*
+            HTTP-name  *_Section 2.3_*
+            HTTP-version  *_Section 2.3_*
+            LF  *_Section 1.2_*
+            OCTET  *_Section 1.2_*
+            SP  *_Section 1.2_*
+            Transfer-Encoding  *_Section 6.1_*
+            VCHAR  *_Section 1.2_*
+            absolute-form  Section 3.2; *_Section 3.2.2_*
+            asterisk-form  Section 3.2; *_Section 3.2.4_*
+            authority-form  Section 3.2; *_Section 3.2.3_*
+            chunk  *_Section 7.1_*
+            chunk-data  *_Section 7.1_*
+            chunk-ext  Section 7.1; *_Section 7.1.1_*
+            chunk-ext-name  *_Section 7.1.1_*
+            chunk-ext-val  *_Section 7.1.1_*
+            chunk-size  *_Section 7.1_*
+            chunked-body  *_Section 7.1_*
+            field-line  *_Section 5_*; Section 7.1.2
+            field-name  Section 5
+            field-value  Section 5
+            last-chunk  *_Section 7.1_*
+            message-body  *_Section 6_*
+            method  *_Section 3.1_*
+            obs-fold  *_Section 5.2_*
+            origin-form  Section 3.2; *_Section 3.2.1_*
+            reason-phrase  *_Section 4_*
+            request-line  *_Section 3_*
+            request-target  *_Section 3.2_*
+            start-line  *_Section 2.1_*
+            status-code  *_Section 4_*
+            status-line  *_Section 4_*
+            trailer-section  Section 7.1; *_Section 7.1.2_*
+         gzip (transfer coding)  *_Section 7.2_*
+
+      H
+
+         Header Fields
+            MIME-Version  *_Appendix B.1_*
+            Transfer-Encoding  *_Section 6.1_*
+         header line  Section 2.1
+         header section  Section 2.1
+         headers  Section 2.1
+
+      M
+
+         Media Type
+            application/http  *_Section 10.2_*
+            message/http  *_Section 10.1_*
+         message/http Media Type  *_Section 10.1_*
+         method  *_Section 3.1_*
+         MIME-Version header field  *_Appendix B.1_*
+
+      O
+
+         origin-form (of request-target)  Section 3.2.1
+
+      R
+
+         request-target  *_Section 3.2_*
+
+      T
+
+         Transfer-Encoding header field  *_Section 6.1_*
+
+      X
+
+         x-compress (transfer coding)  *_Section 7.2_*
+         x-gzip (transfer coding)  *_Section 7.2_*
+
+Authors' Addresses
+
+   Roy T. Fielding (editor)
+   Adobe
+   345 Park Ave
+   San Jose, CA 95110
+   United States of America
+   Email: fielding@gbiv.com
+   URI:   https://roy.gbiv.com/
+
+
+   Mark Nottingham (editor)
+   Fastly
+   Prahran
+   Australia
+   Email: mnot@mnot.net
+   URI:   https://www.mnot.net/
+
+
+   Julian Reschke (editor)
+   greenbytes GmbH
+   Hafenweg 16
+   48155 Münster
+   Germany
+   Email: julian.reschke@greenbytes.de
+   URI:   https://greenbytes.de/tech/webdav/
+
+
+===== RFC9113 =====
+
+﻿
+
+
+
+Internet Engineering Task Force (IETF)                   M. Thomson, Ed.
+Request for Comments: 9113                                       Mozilla
+Obsoletes: 7540, 8740                                   C. Benfield, Ed.
+Category: Standards Track                                     Apple Inc.
+ISSN: 2070-1721                                                June 2022
+
+
+                                 HTTP/2
+
+Abstract
+
+   This specification describes an optimized expression of the semantics
+   of the Hypertext Transfer Protocol (HTTP), referred to as HTTP
+   version 2 (HTTP/2).  HTTP/2 enables a more efficient use of network
+   resources and a reduced latency by introducing field compression and
+   allowing multiple concurrent exchanges on the same connection.
+
+   This document obsoletes RFCs 7540 and 8740.
+
+Status of This Memo
+
+   This is an Internet Standards Track document.
+
+   This document is a product of the Internet Engineering Task Force
+   (IETF).  It represents the consensus of the IETF community.  It has
+   received public review and has been approved for publication by the
+   Internet Engineering Steering Group (IESG).  Further information on
+   Internet Standards is available in Section 2 of RFC 7841.
+
+   Information about the current status of this document, any errata,
+   and how to provide feedback on it may be obtained at
+   https://www.rfc-editor.org/info/rfc9113.
+
+Copyright Notice
+
+   Copyright (c) 2022 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (https://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Revised BSD License text as described in Section 4.e of the
+   Trust Legal Provisions and are provided without warranty as described
+   in the Revised BSD License.
+
+Table of Contents
+
+   1.  Introduction
+   2.  HTTP/2 Protocol Overview
+     2.1.  Document Organization
+     2.2.  Conventions and Terminology
+   3.  Starting HTTP/2
+     3.1.  HTTP/2 Version Identification
+     3.2.  Starting HTTP/2 for "https" URIs
+     3.3.  Starting HTTP/2 with Prior Knowledge
+     3.4.  HTTP/2 Connection Preface
+   4.  HTTP Frames
+     4.1.  Frame Format
+     4.2.  Frame Size
+     4.3.  Field Section Compression and Decompression
+       4.3.1.  Compression State
+   5.  Streams and Multiplexing
+     5.1.  Stream States
+       5.1.1.  Stream Identifiers
+       5.1.2.  Stream Concurrency
+     5.2.  Flow Control
+       5.2.1.  Flow-Control Principles
+       5.2.2.  Appropriate Use of Flow Control
+       5.2.3.  Flow-Control Performance
+     5.3.  Prioritization
+       5.3.1.  Background on Priority in RFC 7540
+       5.3.2.  Priority Signaling in This Document
+     5.4.  Error Handling
+       5.4.1.  Connection Error Handling
+       5.4.2.  Stream Error Handling
+       5.4.3.  Connection Termination
+     5.5.  Extending HTTP/2
+   6.  Frame Definitions
+     6.1.  DATA
+     6.2.  HEADERS
+     6.3.  PRIORITY
+     6.4.  RST_STREAM
+     6.5.  SETTINGS
+       6.5.1.  SETTINGS Format
+       6.5.2.  Defined Settings
+       6.5.3.  Settings Synchronization
+     6.6.  PUSH_PROMISE
+     6.7.  PING
+     6.8.  GOAWAY
+     6.9.  WINDOW_UPDATE
+       6.9.1.  The Flow-Control Window
+       6.9.2.  Initial Flow-Control Window Size
+       6.9.3.  Reducing the Stream Window Size
+     6.10. CONTINUATION
+   7.  Error Codes
+   8.  Expressing HTTP Semantics in HTTP/2
+     8.1.  HTTP Message Framing
+       8.1.1.  Malformed Messages
+     8.2.  HTTP Fields
+       8.2.1.  Field Validity
+       8.2.2.  Connection-Specific Header Fields
+       8.2.3.  Compressing the Cookie Header Field
+     8.3.  HTTP Control Data
+       8.3.1.  Request Pseudo-Header Fields
+       8.3.2.  Response Pseudo-Header Fields
+     8.4.  Server Push
+       8.4.1.  Push Requests
+       8.4.2.  Push Responses
+     8.5.  The CONNECT Method
+     8.6.  The Upgrade Header Field
+     8.7.  Request Reliability
+     8.8.  Examples
+       8.8.1.  Simple Request
+       8.8.2.  Simple Response
+       8.8.3.  Complex Request
+       8.8.4.  Response with Body
+       8.8.5.  Informational Responses
+   9.  HTTP/2 Connections
+     9.1.  Connection Management
+       9.1.1.  Connection Reuse
+     9.2.  Use of TLS Features
+       9.2.1.  TLS 1.2 Features
+       9.2.2.  TLS 1.2 Cipher Suites
+       9.2.3.  TLS 1.3 Features
+   10. Security Considerations
+     10.1.  Server Authority
+     10.2.  Cross-Protocol Attacks
+     10.3.  Intermediary Encapsulation Attacks
+     10.4.  Cacheability of Pushed Responses
+     10.5.  Denial-of-Service Considerations
+       10.5.1.  Limits on Field Block Size
+       10.5.2.  CONNECT Issues
+     10.6.  Use of Compression
+     10.7.  Use of Padding
+     10.8.  Privacy Considerations
+     10.9.  Remote Timing Attacks
+   11. IANA Considerations
+     11.1.  HTTP2-Settings Header Field Registration
+     11.2.  The h2c Upgrade Token
+   12. References
+     12.1.  Normative References
+     12.2.  Informative References
+   Appendix A.  Prohibited TLS 1.2 Cipher Suites
+   Appendix B.  Changes from RFC 7540
+   Acknowledgments
+   Contributors
+   Authors' Addresses
+
+1.  Introduction
+
+   The performance of applications using the Hypertext Transfer Protocol
+   (HTTP, [HTTP]) is linked to how each version of HTTP uses the
+   underlying transport, and the conditions under which the transport
+   operates.
+
+   Making multiple concurrent requests can reduce latency and improve
+   application performance.  HTTP/1.0 allowed only one request to be
+   outstanding at a time on a given TCP [TCP] connection.  HTTP/1.1
+   [HTTP/1.1] added request pipelining, but this only partially
+   addressed request concurrency and still suffers from application-
+   layer head-of-line blocking.  Therefore, HTTP/1.0 and HTTP/1.1
+   clients use multiple connections to a server to make concurrent
+   requests.
+
+   Furthermore, HTTP fields are often repetitive and verbose, causing
+   unnecessary network traffic as well as causing the initial TCP
+   congestion window to quickly fill.  This can result in excessive
+   latency when multiple requests are made on a new TCP connection.
+
+   HTTP/2 addresses these issues by defining an optimized mapping of
+   HTTP's semantics to an underlying connection.  Specifically, it
+   allows interleaving of messages on the same connection and uses an
+   efficient coding for HTTP fields.  It also allows prioritization of
+   requests, letting more important requests complete more quickly,
+   further improving performance.
+
+   The resulting protocol is more friendly to the network because fewer
+   TCP connections can be used in comparison to HTTP/1.x.  This means
+   less competition with other flows and longer-lived connections, which
+   in turn lead to better utilization of available network capacity.
+   Note, however, that TCP head-of-line blocking is not addressed by
+   this protocol.
+
+   Finally, HTTP/2 also enables more efficient processing of messages
+   through use of binary message framing.
+
+   This document obsoletes RFCs 7540 and 8740.  Appendix B lists notable
+   changes.
+
+2.  HTTP/2 Protocol Overview
+
+   HTTP/2 provides an optimized transport for HTTP semantics.  HTTP/2
+   supports all of the core features of HTTP but aims to be more
+   efficient than HTTP/1.1.
+
+   HTTP/2 is a connection-oriented application-layer protocol that runs
+   over a TCP connection ([TCP]).  The client is the TCP connection
+   initiator.
+
+   The basic protocol unit in HTTP/2 is a frame (Section 4.1).  Each
+   frame type serves a different purpose.  For example, HEADERS and DATA
+   frames form the basis of HTTP requests and responses (Section 8.1);
+   other frame types like SETTINGS, WINDOW_UPDATE, and PUSH_PROMISE are
+   used in support of other HTTP/2 features.
+
+   Multiplexing of requests is achieved by having each HTTP request/
+   response exchange associated with its own stream (Section 5).
+   Streams are largely independent of each other, so a blocked or
+   stalled request or response does not prevent progress on other
+   streams.
+
+   Effective use of multiplexing depends on flow control and
+   prioritization.  Flow control (Section 5.2) ensures that it is
+   possible to efficiently use multiplexed streams by restricting data
+   that is transmitted to what the receiver is able to handle.
+   Prioritization (Section 5.3) ensures that limited resources are used
+   most effectively.  This revision of HTTP/2 deprecates the priority
+   signaling scheme from [RFC7540].
+
+   Because HTTP fields used in a connection can contain large amounts of
+   redundant data, frames that contain them are compressed
+   (Section 4.3).  This has especially advantageous impact upon request
+   sizes in the common case, allowing many requests to be compressed
+   into one packet.
+
+   Finally, HTTP/2 adds a new, optional interaction mode whereby a
+   server can push responses to a client (Section 8.4).  This is
+   intended to allow a server to speculatively send data to a client
+   that the server anticipates the client will need, trading off some
+   network usage against a potential latency gain.  The server does this
+   by synthesizing a request, which it sends as a PUSH_PROMISE frame.
+   The server is then able to send a response to the synthetic request
+   on a separate stream.
+
+2.1.  Document Organization
+
+   The HTTP/2 specification is split into four parts:
+
+   *  Starting HTTP/2 (Section 3) covers how an HTTP/2 connection is
+      initiated.
+
+   *  The frame (Section 4) and stream (Section 5) layers describe the
+      way HTTP/2 frames are structured and formed into multiplexed
+      streams.
+
+   *  Frame (Section 6) and error (Section 7) definitions include
+      details of the frame and error types used in HTTP/2.
+
+   *  HTTP mappings (Section 8) and additional requirements (Section 9)
+      describe how HTTP semantics are expressed using frames and
+      streams.
+
+   While some of the frame- and stream-layer concepts are isolated from
+   HTTP, this specification does not define a completely generic frame
+   layer.  The frame and stream layers are tailored to the needs of
+   HTTP.
+
+2.2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+   "OPTIONAL" in this document are to be interpreted as described in
+   BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all
+   capitals, as shown here.
+
+   All numeric values are in network byte order.  Values are unsigned
+   unless otherwise indicated.  Literal values are provided in decimal
+   or hexadecimal as appropriate.  Hexadecimal literals are prefixed
+   with "0x" to distinguish them from decimal literals.
+
+   This specification describes binary formats using the conventions
+   described in Section 1.3 of RFC 9000 [QUIC].  Note that this format
+   uses network byte order and that high-valued bits are listed before
+   low-valued bits.
+
+   The following terms are used:
+
+   client:  The endpoint that initiates an HTTP/2 connection.  Clients
+      send HTTP requests and receive HTTP responses.
+
+   connection:  A transport-layer connection between two endpoints.
+
+   connection error:  An error that affects the entire HTTP/2
+      connection.
+
+   endpoint:  Either the client or server of the connection.
+
+   frame:  The smallest unit of communication within an HTTP/2
+      connection, consisting of a header and a variable-length sequence
+      of octets structured according to the frame type.
+
+   peer:  An endpoint.  When discussing a particular endpoint, "peer"
+      refers to the endpoint that is remote to the primary subject of
+      discussion.
+
+   receiver:  An endpoint that is receiving frames.
+
+   sender:  An endpoint that is transmitting frames.
+
+   server:  The endpoint that accepts an HTTP/2 connection.  Servers
+      receive HTTP requests and send HTTP responses.
+
+   stream:  A bidirectional flow of frames within the HTTP/2 connection.
+
+   stream error:  An error on the individual HTTP/2 stream.
+
+   Finally, the terms "gateway", "intermediary", "proxy", and "tunnel"
+   are defined in Section 3.7 of [HTTP].  Intermediaries act as both
+   client and server at different times.
+
+   The term "content" as it applies to message bodies is defined in
+   Section 6.4 of [HTTP].
+
+3.  Starting HTTP/2
+
+   Implementations that generate HTTP requests need to discover whether
+   a server supports HTTP/2.
+
+   HTTP/2 uses the "http" and "https" URI schemes defined in Section 4.2
+   of [HTTP], with the same default port numbers as HTTP/1.1 [HTTP/1.1].
+   These URIs do not include any indication about what HTTP versions an
+   upstream server (the immediate peer to which the client wishes to
+   establish a connection) supports.
+
+   The means by which support for HTTP/2 is determined is different for
+   "http" and "https" URIs.  Discovery for "https" URIs is described in
+   Section 3.2.  HTTP/2 support for "http" URIs can only be discovered
+   by out-of-band means and requires prior knowledge of the support as
+   described in Section 3.3.
+
+3.1.  HTTP/2 Version Identification
+
+   The protocol defined in this document has two identifiers.  Creating
+   a connection based on either implies the use of the transport,
+   framing, and message semantics described in this document.
+
+   *  The string "h2" identifies the protocol where HTTP/2 uses
+      Transport Layer Security (TLS); see Section 9.2.  This identifier
+      is used in the TLS Application-Layer Protocol Negotiation (ALPN)
+      extension [TLS-ALPN] field and in any place where HTTP/2 over TLS
+      is identified.
+
+      The "h2" string is serialized into an ALPN protocol identifier as
+      the two-octet sequence: 0x68, 0x32.
+
+   *  The "h2c" string was previously used as a token for use in the
+      HTTP Upgrade mechanism's Upgrade header field (Section 7.8 of
+      [HTTP]).  This usage was never widely deployed and is deprecated
+      by this document.  The same applies to the HTTP2-Settings header
+      field, which was used with the upgrade to "h2c".
+
+3.2.  Starting HTTP/2 for "https" URIs
+
+   A client that makes a request to an "https" URI uses TLS [TLS13] with
+   the ALPN extension [TLS-ALPN].
+
+   HTTP/2 over TLS uses the "h2" protocol identifier.  The "h2c"
+   protocol identifier MUST NOT be sent by a client or selected by a
+   server; the "h2c" protocol identifier describes a protocol that does
+   not use TLS.
+
+   Once TLS negotiation is complete, both the client and the server MUST
+   send a connection preface (Section 3.4).
+
+3.3.  Starting HTTP/2 with Prior Knowledge
+
+   A client can learn that a particular server supports HTTP/2 by other
+   means.  For example, a client could be configured with knowledge that
+   a server supports HTTP/2.
+
+   A client that knows that a server supports HTTP/2 can establish a TCP
+   connection and send the connection preface (Section 3.4) followed by
+   HTTP/2 frames.  Servers can identify these connections by the
+   presence of the connection preface.  This only affects the
+   establishment of HTTP/2 connections over cleartext TCP; HTTP/2
+   connections over TLS MUST use protocol negotiation in TLS [TLS-ALPN].
+
+   Likewise, the server MUST send a connection preface (Section 3.4).
+
+   Without additional information, prior support for HTTP/2 is not a
+   strong signal that a given server will support HTTP/2 for future
+   connections.  For example, it is possible for server configurations
+   to change, for configurations to differ between instances in
+   clustered servers, or for network conditions to change.
+
+3.4.  HTTP/2 Connection Preface
+
+   In HTTP/2, each endpoint is required to send a connection preface as
+   a final confirmation of the protocol in use and to establish the
+   initial settings for the HTTP/2 connection.  The client and server
+   each send a different connection preface.
+
+   The client connection preface starts with a sequence of 24 octets,
+   which in hex notation is:
+
+     0x505249202a20485454502f322e300d0a0d0a534d0d0a0d0a
+
+   That is, the connection preface starts with the string "PRI *
+   HTTP/2.0\r\n\r\nSM\r\n\r\n".  This sequence MUST be followed by a
+   SETTINGS frame (Section 6.5), which MAY be empty.  The client sends
+   the client connection preface as the first application data octets of
+   a connection.
+
+      |  Note: The client connection preface is selected so that a large
+      |  proportion of HTTP/1.1 or HTTP/1.0 servers and intermediaries
+      |  do not attempt to process further frames.  Note that this does
+      |  not address the concerns raised in [TALKING].
+
+   The server connection preface consists of a potentially empty
+   SETTINGS frame (Section 6.5) that MUST be the first frame the server
+   sends in the HTTP/2 connection.
+
+   The SETTINGS frames received from a peer as part of the connection
+   preface MUST be acknowledged (see Section 6.5.3) after sending the
+   connection preface.
+
+   To avoid unnecessary latency, clients are permitted to send
+   additional frames to the server immediately after sending the client
+   connection preface, without waiting to receive the server connection
+   preface.  It is important to note, however, that the server
+   connection preface SETTINGS frame might include settings that
+   necessarily alter how a client is expected to communicate with the
+   server.  Upon receiving the SETTINGS frame, the client is expected to
+   honor any settings established.  In some configurations, it is
+   possible for the server to transmit SETTINGS before the client sends
+   additional frames, providing an opportunity to avoid this issue.
+
+   Clients and servers MUST treat an invalid connection preface as a
+   connection error (Section 5.4.1) of type PROTOCOL_ERROR.  A GOAWAY
+   frame (Section 6.8) MAY be omitted in this case, since an invalid
+   preface indicates that the peer is not using HTTP/2.
+
+4.  HTTP Frames
+
+   Once the HTTP/2 connection is established, endpoints can begin
+   exchanging frames.
+
+4.1.  Frame Format
+
+   All frames begin with a fixed 9-octet header followed by a variable-
+   length frame payload.
+
+   HTTP Frame {
+     Length (24),
+     Type (8),
+
+     Flags (8),
+
+     Reserved (1),
+     Stream Identifier (31),
+
+     Frame Payload (..),
+   }
+
+                           Figure 1: Frame Layout
+
+   The fields of the frame header are defined as:
+
+   Length:  The length of the frame payload expressed as an unsigned
+      24-bit integer in units of octets.  Values greater than 2^14
+      (16,384) MUST NOT be sent unless the receiver has set a larger
+      value for SETTINGS_MAX_FRAME_SIZE.
+
+      The 9 octets of the frame header are not included in this value.
+
+   Type:  The 8-bit type of the frame.  The frame type determines the
+      format and semantics of the frame.  Frames defined in this
+      document are listed in Section 6.  Implementations MUST ignore and
+      discard frames of unknown types.
+
+   Flags:  An 8-bit field reserved for boolean flags specific to the
+      frame type.
+
+      Flags are assigned semantics specific to the indicated frame type.
+      Unused flags are those that have no defined semantics for a
+      particular frame type.  Unused flags MUST be ignored on receipt
+      and MUST be left unset (0x00) when sending.
+
+   Reserved:  A reserved 1-bit field.  The semantics of this bit are
+      undefined, and the bit MUST remain unset (0x00) when sending and
+      MUST be ignored when receiving.
+
+   Stream Identifier:  A stream identifier (see Section 5.1.1) expressed
+      as an unsigned 31-bit integer.  The value 0x00 is reserved for
+      frames that are associated with the connection as a whole as
+      opposed to an individual stream.
+
+   The structure and content of the frame payload are dependent entirely
+   on the frame type.
+
+4.2.  Frame Size
+
+   The size of a frame payload is limited by the maximum size that a
+   receiver advertises in the SETTINGS_MAX_FRAME_SIZE setting.  This
+   setting can have any value between 2^14 (16,384) and 2^24-1
+   (16,777,215) octets, inclusive.
+
+   All implementations MUST be capable of receiving and minimally
+   processing frames up to 2^14 octets in length, plus the 9-octet frame
+   header (Section 4.1).  The size of the frame header is not included
+   when describing frame sizes.
+
+      |  Note: Certain frame types, such as PING (Section 6.7), impose
+      |  additional limits on the amount of frame payload data allowed.
+
+   An endpoint MUST send an error code of FRAME_SIZE_ERROR if a frame
+   exceeds the size defined in SETTINGS_MAX_FRAME_SIZE, exceeds any
+   limit defined for the frame type, or is too small to contain
+   mandatory frame data.  A frame size error in a frame that could alter
+   the state of the entire connection MUST be treated as a connection
+   error (Section 5.4.1); this includes any frame carrying a field block
+   (Section 4.3) (that is, HEADERS, PUSH_PROMISE, and CONTINUATION), a
+   SETTINGS frame, and any frame with a stream identifier of 0.
+
+   Endpoints are not obligated to use all available space in a frame.
+   Responsiveness can be improved by using frames that are smaller than
+   the permitted maximum size.  Sending large frames can result in
+   delays in sending time-sensitive frames (such as RST_STREAM,
+   WINDOW_UPDATE, or PRIORITY), which, if blocked by the transmission of
+   a large frame, could affect performance.
+
+4.3.  Field Section Compression and Decompression
+
+   Field section compression is the process of compressing a set of
+   field lines (Section 5.2 of [HTTP]) to form a field block.  Field
+   section decompression is the process of decoding a field block into a
+   set of field lines.  Details of HTTP/2 field section compression and
+   decompression are defined in [COMPRESSION], which, for historical
+   reasons, refers to these processes as header compression and
+   decompression.
+
+   Each field block carries all of the compressed field lines of a
+   single field section.  Header sections also include control data
+   associated with the message in the form of pseudo-header fields
+   (Section 8.3) that use the same format as a field line.
+
+      |  Note: RFC 7540 [RFC7540] used the term "header block" in place
+      |  of the more generic "field block".
+
+   Field blocks carry control data and header sections for requests,
+   responses, promised requests, and pushed responses (see Section 8.4).
+   All these messages, except for interim responses and requests
+   contained in PUSH_PROMISE (Section 6.6) frames, can optionally
+   include a field block that carries a trailer section.
+
+   A field section is a collection of field lines.  Each of the field
+   lines in a field block carries a single value.  The serialized field
+   block is then divided into one or more octet sequences, called field
+   block fragments.  The first field block fragment is transmitted
+   within the frame payload of HEADERS (Section 6.2) or PUSH_PROMISE
+   (Section 6.6), each of which could be followed by CONTINUATION
+   (Section 6.10) frames to carry subsequent field block fragments.
+
+   The Cookie header field [COOKIE] is treated specially by the HTTP
+   mapping (see Section 8.2.3).
+
+   A receiving endpoint reassembles the field block by concatenating its
+   fragments and then decompresses the block to reconstruct the field
+   section.
+
+   A complete field section consists of either:
+
+   *  a single HEADERS or PUSH_PROMISE frame, with the END_HEADERS flag
+      set, or
+
+   *  a HEADERS or PUSH_PROMISE frame with the END_HEADERS flag unset
+      and one or more CONTINUATION frames, where the last CONTINUATION
+      frame has the END_HEADERS flag set.
+
+   Each field block is processed as a discrete unit.  Field blocks MUST
+   be transmitted as a contiguous sequence of frames, with no
+   interleaved frames of any other type or from any other stream.  The
+   last frame in a sequence of HEADERS or CONTINUATION frames has the
+   END_HEADERS flag set.  The last frame in a sequence of PUSH_PROMISE
+   or CONTINUATION frames has the END_HEADERS flag set.  This allows a
+   field block to be logically equivalent to a single frame.
+
+   Field block fragments can only be sent as the frame payload of
+   HEADERS, PUSH_PROMISE, or CONTINUATION frames because these frames
+   carry data that can modify the compression context maintained by a
+   receiver.  An endpoint receiving HEADERS, PUSH_PROMISE, or
+   CONTINUATION frames needs to reassemble field blocks and perform
+   decompression even if the frames are to be discarded.  A receiver
+   MUST terminate the connection with a connection error (Section 5.4.1)
+   of type COMPRESSION_ERROR if it does not decompress a field block.
+
+   A decoding error in a field block MUST be treated as a connection
+   error (Section 5.4.1) of type COMPRESSION_ERROR.
+
+4.3.1.  Compression State
+
+   Field compression is stateful.  Each endpoint has an HPACK encoder
+   context and an HPACK decoder context that are used for encoding and
+   decoding all field blocks on a connection.  Section 4 of
+   [COMPRESSION] defines the dynamic table, which is the primary state
+   for each context.
+
+   The dynamic table has a maximum size that is set by an HPACK decoder.
+   An endpoint communicates the size chosen by its HPACK decoder context
+   using the SETTINGS_HEADER_TABLE_SIZE setting; see Section 6.5.2.
+   When a connection is established, the dynamic table size for the
+   HPACK decoder and encoder at both endpoints starts at 4,096 bytes,
+   the initial value of the SETTINGS_HEADER_TABLE_SIZE setting.
+
+   Any change to the maximum value set using SETTINGS_HEADER_TABLE_SIZE
+   takes effect when the endpoint acknowledges settings (Section 6.5.3).
+   The HPACK encoder at that endpoint can set the dynamic table to any
+   size up to the maximum value set by the decoder.  An HPACK encoder
+   declares the size of the dynamic table with a Dynamic Table Size
+   Update instruction (Section 6.3 of [COMPRESSION]).
+
+   Once an endpoint acknowledges a change to SETTINGS_HEADER_TABLE_SIZE
+   that reduces the maximum below the current size of the dynamic table,
+   its HPACK encoder MUST start the next field block with a Dynamic
+   Table Size Update instruction that sets the dynamic table to a size
+   that is less than or equal to the reduced maximum; see Section 4.2 of
+   [COMPRESSION].  An endpoint MUST treat a field block that follows an
+   acknowledgment of the reduction to the maximum dynamic table size as
+   a connection error (Section 5.4.1) of type COMPRESSION_ERROR if it
+   does not start with a conformant Dynamic Table Size Update
+   instruction.
+
+      |  Implementers are advised that reducing the value of
+      |  SETTINGS_HEADER_TABLE_SIZE is not widely interoperable.  Use of
+      |  the connection preface to reduce the value below the initial
+      |  value of 4,096 is somewhat better supported, but this might
+      |  fail with some implementations.
+
+5.  Streams and Multiplexing
+
+   A "stream" is an independent, bidirectional sequence of frames
+   exchanged between the client and server within an HTTP/2 connection.
+   Streams have several important characteristics:
+
+   *  A single HTTP/2 connection can contain multiple concurrently open
+      streams, with either endpoint interleaving frames from multiple
+      streams.
+
+   *  Streams can be established and used unilaterally or shared by
+      either endpoint.
+
+   *  Streams can be closed by either endpoint.
+
+   *  The order in which frames are sent is significant.  Recipients
+      process frames in the order they are received.  In particular, the
+      order of HEADERS and DATA frames is semantically significant.
+
+   *  Streams are identified by an integer.  Stream identifiers are
+      assigned to streams by the endpoint initiating the stream.
+
+5.1.  Stream States
+
+   The lifecycle of a stream is shown in Figure 2.
+
+                                +--------+
+                        send PP |        | recv PP
+                       ,--------+  idle  +--------.
+                      /         |        |         \
+                     v          +--------+          v
+              +----------+          |           +----------+
+              |          |          | send H /  |          |
+       ,------+ reserved |          | recv H    | reserved +------.
+       |      | (local)  |          |           | (remote) |      |
+       |      +---+------+          v           +------+---+      |
+       |          |             +--------+             |          |
+       |          |     recv ES |        | send ES     |          |
+       |   send H |     ,-------+  open  +-------.     | recv H   |
+       |          |    /        |        |        \    |          |
+       |          v   v         +---+----+         v   v          |
+       |      +----------+          |           +----------+      |
+       |      |   half-  |          |           |   half-  |      |
+       |      |  closed  |          | send R /  |  closed  |      |
+       |      | (remote) |          | recv R    | (local)  |      |
+       |      +----+-----+          |           +-----+----+      |
+       |           |                |                 |           |
+       |           | send ES /      |       recv ES / |           |
+       |           |  send R /      v        send R / |           |
+       |           |  recv R    +--------+   recv R   |           |
+       | send R /  `----------->|        |<-----------'  send R / |
+       | recv R                 | closed |               recv R   |
+       `----------------------->|        |<-----------------------'
+                                +--------+
+
+                          Figure 2: Stream States
+
+   send:  endpoint sends this frame
+   recv:  endpoint receives this frame
+   H:  HEADERS frame (with implied CONTINUATION frames)
+   ES:  END_STREAM flag
+   R:  RST_STREAM frame
+   PP:  PUSH_PROMISE frame (with implied CONTINUATION frames); state
+      transitions are for the promised stream
+
+   Note that this diagram shows stream state transitions and the frames
+   and flags that affect those transitions only.  In this regard,
+   CONTINUATION frames do not result in state transitions; they are
+   effectively part of the HEADERS or PUSH_PROMISE that they follow.
+   For the purpose of state transitions, the END_STREAM flag is
+   processed as a separate event to the frame that bears it; a HEADERS
+   frame with the END_STREAM flag set can cause two state transitions.
+
+   Both endpoints have a subjective view of the state of a stream that
+   could be different when frames are in transit.  Endpoints do not
+   coordinate the creation of streams; they are created unilaterally by
+   either endpoint.  The negative consequences of a mismatch in states
+   are limited to the "closed" state after sending RST_STREAM, where
+   frames might be received for some time after closing.
+
+   Streams have the following states:
+
+   idle:  All streams start in the "idle" state.
+
+      The following transitions are valid from this state:
+
+      *  Sending a HEADERS frame as a client, or receiving a HEADERS
+         frame as a server, causes the stream to become "open".  The
+         stream identifier is selected as described in Section 5.1.1.
+         The same HEADERS frame can also cause a stream to immediately
+         become "half-closed".
+
+      *  Sending a PUSH_PROMISE frame on another stream reserves the
+         idle stream that is identified for later use.  The stream state
+         for the reserved stream transitions to "reserved (local)".
+         Only a server may send PUSH_PROMISE frames.
+
+      *  Receiving a PUSH_PROMISE frame on another stream reserves an
+         idle stream that is identified for later use.  The stream state
+         for the reserved stream transitions to "reserved (remote)".
+         Only a client may receive PUSH_PROMISE frames.
+
+      *  Note that the PUSH_PROMISE frame is not sent on the idle stream
+         but references the newly reserved stream in the Promised Stream
+         ID field.
+
+      *  Opening a stream with a higher-valued stream identifier causes
+         the stream to transition immediately to a "closed" state; note
+         that this transition is not shown in the diagram.
+
+      Receiving any frame other than HEADERS or PRIORITY on a stream in
+      this state MUST be treated as a connection error (Section 5.4.1)
+      of type PROTOCOL_ERROR.  If this stream is initiated by the
+      server, as described in Section 5.1.1, then receiving a HEADERS
+      frame MUST also be treated as a connection error (Section 5.4.1)
+      of type PROTOCOL_ERROR.
+
+   reserved (local):  A stream in the "reserved (local)" state is one
+      that has been promised by sending a PUSH_PROMISE frame.  A
+      PUSH_PROMISE frame reserves an idle stream by associating the
+      stream with an open stream that was initiated by the remote peer
+      (see Section 8.4).
+
+      In this state, only the following transitions are possible:
+
+      *  The endpoint can send a HEADERS frame.  This causes the stream
+         to open in a "half-closed (remote)" state.
+
+      *  Either endpoint can send a RST_STREAM frame to cause the stream
+         to become "closed".  This releases the stream reservation.
+
+      An endpoint MUST NOT send any type of frame other than HEADERS,
+      RST_STREAM, or PRIORITY in this state.
+
+      A PRIORITY or WINDOW_UPDATE frame MAY be received in this state.
+      Receiving any type of frame other than RST_STREAM, PRIORITY, or
+      WINDOW_UPDATE on a stream in this state MUST be treated as a
+      connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+   reserved (remote):  A stream in the "reserved (remote)" state has
+      been reserved by a remote peer.
+
+      In this state, only the following transitions are possible:
+
+      *  Receiving a HEADERS frame causes the stream to transition to
+         "half-closed (local)".
+
+      *  Either endpoint can send a RST_STREAM frame to cause the stream
+         to become "closed".  This releases the stream reservation.
+
+      An endpoint MUST NOT send any type of frame other than RST_STREAM,
+      WINDOW_UPDATE, or PRIORITY in this state.
+
+      Receiving any type of frame other than HEADERS, RST_STREAM, or
+      PRIORITY on a stream in this state MUST be treated as a connection
+      error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+   open:  A stream in the "open" state may be used by both peers to send
+      frames of any type.  In this state, sending peers observe
+      advertised stream-level flow-control limits (Section 5.2).
+
+      From this state, either endpoint can send a frame with an
+      END_STREAM flag set, which causes the stream to transition into
+      one of the "half-closed" states.  An endpoint sending an
+      END_STREAM flag causes the stream state to become "half-closed
+      (local)"; an endpoint receiving an END_STREAM flag causes the
+      stream state to become "half-closed (remote)".
+
+      Either endpoint can send a RST_STREAM frame from this state,
+      causing it to transition immediately to "closed".
+
+   half-closed (local):  A stream that is in the "half-closed (local)"
+      state cannot be used for sending frames other than WINDOW_UPDATE,
+      PRIORITY, and RST_STREAM.
+
+      A stream transitions from this state to "closed" when a frame is
+      received with the END_STREAM flag set or when either peer sends a
+      RST_STREAM frame.
+
+      An endpoint can receive any type of frame in this state.
+      Providing flow-control credit using WINDOW_UPDATE frames is
+      necessary to continue receiving flow-controlled frames.  In this
+      state, a receiver can ignore WINDOW_UPDATE frames, which might
+      arrive for a short period after a frame with the END_STREAM flag
+      set is sent.
+
+      PRIORITY frames can be received in this state.
+
+   half-closed (remote):  A stream that is "half-closed (remote)" is no
+      longer being used by the peer to send frames.  In this state, an
+      endpoint is no longer obligated to maintain a receiver flow-
+      control window.
+
+      If an endpoint receives additional frames, other than
+      WINDOW_UPDATE, PRIORITY, or RST_STREAM, for a stream that is in
+      this state, it MUST respond with a stream error (Section 5.4.2) of
+      type STREAM_CLOSED.
+
+      A stream that is "half-closed (remote)" can be used by the
+      endpoint to send frames of any type.  In this state, the endpoint
+      continues to observe advertised stream-level flow-control limits
+      (Section 5.2).
+
+      A stream can transition from this state to "closed" by sending a
+      frame with the END_STREAM flag set or when either peer sends a
+      RST_STREAM frame.
+
+   closed:  The "closed" state is the terminal state.
+
+      A stream enters the "closed" state after an endpoint both sends
+      and receives a frame with an END_STREAM flag set.  A stream also
+      enters the "closed" state after an endpoint either sends or
+      receives a RST_STREAM frame.
+
+      An endpoint MUST NOT send frames other than PRIORITY on a closed
+      stream.  An endpoint MAY treat receipt of any other type of frame
+      on a closed stream as a connection error (Section 5.4.1) of type
+      STREAM_CLOSED, except as noted below.
+
+      An endpoint that sends a frame with the END_STREAM flag set or a
+      RST_STREAM frame might receive a WINDOW_UPDATE or RST_STREAM frame
+      from its peer in the time before the peer receives and processes
+      the frame that closes the stream.
+
+      An endpoint that sends a RST_STREAM frame on a stream that is in
+      the "open" or "half-closed (local)" state could receive any type
+      of frame.  The peer might have sent or enqueued for sending these
+      frames before processing the RST_STREAM frame.  An endpoint MUST
+      minimally process and then discard any frames it receives in this
+      state.  This means updating header compression state for HEADERS
+      and PUSH_PROMISE frames.  Receiving a PUSH_PROMISE frame also
+      causes the promised stream to become "reserved (remote)", even
+      when the PUSH_PROMISE frame is received on a closed stream.
+      Additionally, the content of DATA frames counts toward the
+      connection flow-control window.
+
+      An endpoint can perform this minimal processing for all streams
+      that are in the "closed" state.  Endpoints MAY use other signals
+      to detect that a peer has received the frames that caused the
+      stream to enter the "closed" state and treat receipt of any frame
+      other than PRIORITY as a connection error (Section 5.4.1) of type
+      PROTOCOL_ERROR.  Endpoints can use frames that indicate that the
+      peer has received the closing signal to drive this.  Endpoints
+      SHOULD NOT use timers for this purpose.  For example, an endpoint
+      that sends a SETTINGS frame after closing a stream can safely
+      treat receipt of a DATA frame on that stream as an error after
+      receiving an acknowledgment of the settings.  Other things that
+      might be used are PING frames, receiving data on streams that were
+      created after closing the stream, or responses to requests created
+      after closing the stream.
+
+   In the absence of more specific rules, implementations SHOULD treat
+   the receipt of a frame that is not expressly permitted in the
+   description of a state as a connection error (Section 5.4.1) of type
+   PROTOCOL_ERROR.  Note that PRIORITY can be sent and received in any
+   stream state.
+
+   The rules in this section only apply to frames defined in this
+   document.  Receipt of frames for which the semantics are unknown
+   cannot be treated as an error, as the conditions for sending and
+   receiving those frames are also unknown; see Section 5.5.
+
+   An example of the state transitions for an HTTP request/response
+   exchange can be found in Section 8.8.  An example of the state
+   transitions for server push can be found in Sections 8.4.1 and 8.4.2.
+
+5.1.1.  Stream Identifiers
+
+   Streams are identified by an unsigned 31-bit integer.  Streams
+   initiated by a client MUST use odd-numbered stream identifiers; those
+   initiated by the server MUST use even-numbered stream identifiers.  A
+   stream identifier of zero (0x00) is used for connection control
+   messages; the stream identifier of zero cannot be used to establish a
+   new stream.
+
+   The identifier of a newly established stream MUST be numerically
+   greater than all streams that the initiating endpoint has opened or
+   reserved.  This governs streams that are opened using a HEADERS frame
+   and streams that are reserved using PUSH_PROMISE.  An endpoint that
+   receives an unexpected stream identifier MUST respond with a
+   connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+   A HEADERS frame will transition the client-initiated stream
+   identified by the stream identifier in the frame header from "idle"
+   to "open".  A PUSH_PROMISE frame will transition the server-initiated
+   stream identified by the Promised Stream ID field in the frame
+   payload from "idle" to "reserved (local)" or "reserved (remote)".
+   When a stream transitions out of the "idle" state, all streams in the
+   "idle" state that might have been opened by the peer with a lower-
+   valued stream identifier immediately transition to "closed".  That
+   is, an endpoint may skip a stream identifier, with the effect being
+   that the skipped stream is immediately closed.
+
+   Stream identifiers cannot be reused.  Long-lived connections can
+   result in an endpoint exhausting the available range of stream
+   identifiers.  A client that is unable to establish a new stream
+   identifier can establish a new connection for new streams.  A server
+   that is unable to establish a new stream identifier can send a GOAWAY
+   frame so that the client is forced to open a new connection for new
+   streams.
+
+5.1.2.  Stream Concurrency
+
+   A peer can limit the number of concurrently active streams using the
+   SETTINGS_MAX_CONCURRENT_STREAMS parameter (see Section 6.5.2) within
+   a SETTINGS frame.  The maximum concurrent streams setting is specific
+   to each endpoint and applies only to the peer that receives the
+   setting.  That is, clients specify the maximum number of concurrent
+   streams the server can initiate, and servers specify the maximum
+   number of concurrent streams the client can initiate.
+
+   Streams that are in the "open" state or in either of the "half-
+   closed" states count toward the maximum number of streams that an
+   endpoint is permitted to open.  Streams in any of these three states
+   count toward the limit advertised in the
+   SETTINGS_MAX_CONCURRENT_STREAMS setting.  Streams in either of the
+   "reserved" states do not count toward the stream limit.
+
+   Endpoints MUST NOT exceed the limit set by their peer.  An endpoint
+   that receives a HEADERS frame that causes its advertised concurrent
+   stream limit to be exceeded MUST treat this as a stream error
+   (Section 5.4.2) of type PROTOCOL_ERROR or REFUSED_STREAM.  The choice
+   of error code determines whether the endpoint wishes to enable
+   automatic retry (see Section 8.7 for details).
+
+   An endpoint that wishes to reduce the value of
+   SETTINGS_MAX_CONCURRENT_STREAMS to a value that is below the current
+   number of open streams can either close streams that exceed the new
+   value or allow streams to complete.
+
+5.2.  Flow Control
+
+   Using streams for multiplexing introduces contention over use of the
+   TCP connection, resulting in blocked streams.  A flow-control scheme
+   ensures that streams on the same connection do not destructively
+   interfere with each other.  Flow control is used for both individual
+   streams and the connection as a whole.
+
+   HTTP/2 provides for flow control through use of the WINDOW_UPDATE
+   frame (Section 6.9).
+
+5.2.1.  Flow-Control Principles
+
+   HTTP/2 stream flow control aims to allow a variety of flow-control
+   algorithms to be used without requiring protocol changes.  Flow
+   control in HTTP/2 has the following characteristics:
+
+   1.  Flow control is specific to a connection.  HTTP/2 flow control
+       operates between the endpoints of a single hop and not over the
+       entire end-to-end path.
+
+   2.  Flow control is based on WINDOW_UPDATE frames.  Receivers
+       advertise how many octets they are prepared to receive on a
+       stream and for the entire connection.  This is a credit-based
+       scheme.
+
+   3.  Flow control is directional with overall control provided by the
+       receiver.  A receiver MAY choose to set any window size that it
+       desires for each stream and for the entire connection.  A sender
+       MUST respect flow-control limits imposed by a receiver.  Clients,
+       servers, and intermediaries all independently advertise their
+       flow-control window as a receiver and abide by the flow-control
+       limits set by their peer when sending.
+
+   4.  The initial value for the flow-control window is 65,535 octets
+       for both new streams and the overall connection.
+
+   5.  The frame type determines whether flow control applies to a
+       frame.  Of the frames specified in this document, only DATA
+       frames are subject to flow control; all other frame types do not
+       consume space in the advertised flow-control window.  This
+       ensures that important control frames are not blocked by flow
+       control.
+
+   6.  An endpoint can choose to disable its own flow control, but an
+       endpoint cannot ignore flow-control signals from its peer.
+
+   7.  HTTP/2 defines only the format and semantics of the WINDOW_UPDATE
+       frame (Section 6.9).  This document does not stipulate how a
+       receiver decides when to send this frame or the value that it
+       sends, nor does it specify how a sender chooses to send packets.
+       Implementations are able to select any algorithm that suits their
+       needs.
+
+   Implementations are also responsible for prioritizing the sending of
+   requests and responses, choosing how to avoid head-of-line blocking
+   for requests, and managing the creation of new streams.  Algorithm
+   choices for these could interact with any flow-control algorithm.
+
+5.2.2.  Appropriate Use of Flow Control
+
+   Flow control is defined to protect endpoints that are operating under
+   resource constraints.  For example, a proxy needs to share memory
+   between many connections and also might have a slow upstream
+   connection and a fast downstream one.  Flow control addresses cases
+   where the receiver is unable to process data on one stream yet wants
+   to continue to process other streams in the same connection.
+
+   Deployments that do not require this capability can advertise a flow-
+   control window of the maximum size (2^31-1) and can maintain this
+   window by sending a WINDOW_UPDATE frame when any data is received.
+   This effectively disables flow control for that receiver.
+   Conversely, a sender is always subject to the flow-control window
+   advertised by the receiver.
+
+   Deployments with constrained resources (for example, memory) can
+   employ flow control to limit the amount of memory a peer can consume.
+   Note, however, that this can lead to suboptimal use of available
+   network resources if flow control is enabled without knowledge of the
+   bandwidth * delay product (see [RFC7323]).
+
+   Even with full awareness of the current bandwidth * delay product,
+   implementation of flow control can be difficult.  Endpoints MUST read
+   and process HTTP/2 frames from the TCP receive buffer as soon as data
+   is available.  Failure to read promptly could lead to a deadlock when
+   critical frames, such as WINDOW_UPDATE, are not read and acted upon.
+   Reading frames promptly does not expose endpoints to resource
+   exhaustion attacks, as HTTP/2 flow control limits resource
+   commitments.
+
+5.2.3.  Flow-Control Performance
+
+   If an endpoint cannot ensure that its peer always has available flow-
+   control window space that is greater than the peer's bandwidth *
+   delay product on this connection, its receive throughput will be
+   limited by HTTP/2 flow control.  This will result in degraded
+   performance.
+
+   Sending timely WINDOW_UPDATE frames can improve performance.
+   Endpoints will want to balance the need to improve receive throughput
+   with the need to manage resource exhaustion risks and should take
+   careful note of Section 10.5 in defining their strategy to manage
+   window sizes.
+
+5.3.  Prioritization
+
+   In a multiplexed protocol like HTTP/2, prioritizing allocation of
+   bandwidth and computation resources to streams can be critical to
+   attaining good performance.  A poor prioritization scheme can result
+   in HTTP/2 providing poor performance.  With no parallelism at the TCP
+   layer, performance could be significantly worse than HTTP/1.1.
+
+   A good prioritization scheme benefits from the application of
+   contextual knowledge such as the content of resources, how resources
+   are interrelated, and how those resources will be used by a peer.  In
+   particular, clients can possess knowledge about the priority of
+   requests that is relevant to server prioritization.  In those cases,
+   having clients provide priority information can improve performance.
+
+5.3.1.  Background on Priority in RFC 7540
+
+   RFC 7540 defined a rich system for signaling priority of requests.
+   However, this system proved to be complex, and it was not uniformly
+   implemented.
+
+   The flexible scheme meant that it was possible for clients to express
+   priorities in very different ways, with little consistency in the
+   approaches that were adopted.  For servers, implementing generic
+   support for the scheme was complex.  Implementation of priorities was
+   uneven in both clients and servers.  Many server deployments ignored
+   client signals when prioritizing their handling of requests.
+
+   In short, the prioritization signaling in RFC 7540 [RFC7540] was not
+   successful.
+
+5.3.2.  Priority Signaling in This Document
+
+   This update to HTTP/2 deprecates the priority signaling defined in
+   RFC 7540 [RFC7540].  The bulk of the text related to priority signals
+   is not included in this document.  The description of frame fields
+   and some of the mandatory handling is retained to ensure that
+   implementations of this document remain interoperable with
+   implementations that use the priority signaling described in RFC
+   7540.
+
+   A thorough description of the RFC 7540 priority scheme remains in
+   Section 5.3 of [RFC7540].
+
+   Signaling priority information is necessary to attain good
+   performance in many cases.  Where signaling priority information is
+   important, endpoints are encouraged to use an alternative scheme,
+   such as the scheme described in [HTTP-PRIORITY].
+
+   Though the priority signaling from RFC 7540 was not widely adopted,
+   the information it provides can still be useful in the absence of
+   better information.  Endpoints that receive priority signals in
+   HEADERS or PRIORITY frames can benefit from applying that
+   information.  In particular, implementations that consume these
+   signals would not benefit from discarding these priority signals in
+   the absence of alternatives.
+
+   Servers SHOULD use other contextual information in determining
+   priority of requests in the absence of any priority signals.  Servers
+   MAY interpret the complete absence of signals as an indication that
+   the client has not implemented the feature.  The defaults described
+   in Section 5.3.5 of [RFC7540] are known to have poor performance
+   under most conditions, and their use is unlikely to be deliberate.
+
+5.4.  Error Handling
+
+   HTTP/2 framing permits two classes of errors:
+
+   *  An error condition that renders the entire connection unusable is
+      a connection error.
+
+   *  An error in an individual stream is a stream error.
+
+   A list of error codes is included in Section 7.
+
+   It is possible that an endpoint will encounter frames that would
+   cause multiple errors.  Implementations MAY discover multiple errors
+   during processing, but they SHOULD report at most one stream and one
+   connection error as a result.
+
+   The first stream error reported for a given stream prevents any other
+   errors on that stream from being reported.  In comparison, the
+   protocol permits multiple GOAWAY frames, though an endpoint SHOULD
+   report just one type of connection error unless an error is
+   encountered during graceful shutdown.  If this occurs, an endpoint
+   MAY send an additional GOAWAY frame with the new error code, in
+   addition to any prior GOAWAY that contained NO_ERROR.
+
+   If an endpoint detects multiple different errors, it MAY choose to
+   report any one of those errors.  If a frame causes a connection
+   error, that error MUST be reported.  Additionally, an endpoint MAY
+   use any applicable error code when it detects an error condition; a
+   generic error code (such as PROTOCOL_ERROR or INTERNAL_ERROR) can
+   always be used in place of more specific error codes.
+
+5.4.1.  Connection Error Handling
+
+   A connection error is any error that prevents further processing of
+   the frame layer or corrupts any connection state.
+
+   An endpoint that encounters a connection error SHOULD first send a
+   GOAWAY frame (Section 6.8) with the stream identifier of the last
+   stream that it successfully received from its peer.  The GOAWAY frame
+   includes an error code (Section 7) that indicates why the connection
+   is terminating.  After sending the GOAWAY frame for an error
+   condition, the endpoint MUST close the TCP connection.
+
+   It is possible that the GOAWAY will not be reliably received by the
+   receiving endpoint.  In the event of a connection error, GOAWAY only
+   provides a best-effort attempt to communicate with the peer about why
+   the connection is being terminated.
+
+   An endpoint can end a connection at any time.  In particular, an
+   endpoint MAY choose to treat a stream error as a connection error.
+   Endpoints SHOULD send a GOAWAY frame when ending a connection,
+   providing that circumstances permit it.
+
+5.4.2.  Stream Error Handling
+
+   A stream error is an error related to a specific stream that does not
+   affect processing of other streams.
+
+   An endpoint that detects a stream error sends a RST_STREAM frame
+   (Section 6.4) that contains the stream identifier of the stream where
+   the error occurred.  The RST_STREAM frame includes an error code that
+   indicates the type of error.
+
+   A RST_STREAM is the last frame that an endpoint can send on a stream.
+   The peer that sends the RST_STREAM frame MUST be prepared to receive
+   any frames that were sent or enqueued for sending by the remote peer.
+   These frames can be ignored, except where they modify connection
+   state (such as the state maintained for field section compression
+   (Section 4.3) or flow control).
+
+   Normally, an endpoint SHOULD NOT send more than one RST_STREAM frame
+   for any stream.  However, an endpoint MAY send additional RST_STREAM
+   frames if it receives frames on a closed stream after more than a
+   round-trip time.  This behavior is permitted to deal with misbehaving
+   implementations.
+
+   To avoid looping, an endpoint MUST NOT send a RST_STREAM in response
+   to a RST_STREAM frame.
+
+5.4.3.  Connection Termination
+
+   If the TCP connection is closed or reset while streams remain in the
+   "open" or "half-closed" states, then the affected streams cannot be
+   automatically retried (see Section 8.7 for details).
+
+5.5.  Extending HTTP/2
+
+   HTTP/2 permits extension of the protocol.  Within the limitations
+   described in this section, protocol extensions can be used to provide
+   additional services or alter any aspect of the protocol.  Extensions
+   are effective only within the scope of a single HTTP/2 connection.
+
+   This applies to the protocol elements defined in this document.  This
+   does not affect the existing options for extending HTTP, such as
+   defining new methods, status codes, or fields (see Section 16 of
+   [HTTP]).
+
+   Extensions are permitted to use new frame types (Section 4.1), new
+   settings (Section 6.5), or new error codes (Section 7).  Registries
+   for managing these extension points are defined in Section 11 of
+   [RFC7540].
+
+   Implementations MUST ignore unknown or unsupported values in all
+   extensible protocol elements.  Implementations MUST discard frames
+   that have unknown or unsupported types.  This means that any of these
+   extension points can be safely used by extensions without prior
+   arrangement or negotiation.  However, extension frames that appear in
+   the middle of a field block (Section 4.3) are not permitted; these
+   MUST be treated as a connection error (Section 5.4.1) of type
+   PROTOCOL_ERROR.
+
+   Extensions SHOULD avoid changing protocol elements defined in this
+   document or elements for which no extension mechanism is defined.
+   This includes changes to the layout of frames, additions or changes
+   to the way that frames are composed into HTTP messages (Section 8.1),
+   the definition of pseudo-header fields, or changes to any protocol
+   element that a compliant endpoint might treat as a connection error
+   (Section 5.4.1).
+
+   An extension that changes existing protocol elements or state MUST be
+   negotiated before being used.  For example, an extension that changes
+   the layout of the HEADERS frame cannot be used until the peer has
+   given a positive signal that this is acceptable.  In this case, it
+   could also be necessary to coordinate when the revised layout comes
+   into effect.  For example, treating frames other than DATA frames as
+   flow controlled requires a change in semantics that both endpoints
+   need to understand, so this can only be done through negotiation.
+
+   This document doesn't mandate a specific method for negotiating the
+   use of an extension but notes that a setting (Section 6.5.2) could be
+   used for that purpose.  If both peers set a value that indicates
+   willingness to use the extension, then the extension can be used.  If
+   a setting is used for extension negotiation, the initial value MUST
+   be defined in such a fashion that the extension is initially
+   disabled.
+
+6.  Frame Definitions
+
+   This specification defines a number of frame types, each identified
+   by a unique 8-bit type code.  Each frame type serves a distinct
+   purpose in the establishment and management of either the connection
+   as a whole or individual streams.
+
+   The transmission of specific frame types can alter the state of a
+   connection.  If endpoints fail to maintain a synchronized view of the
+   connection state, successful communication within the connection will
+   no longer be possible.  Therefore, it is important that endpoints
+   have a shared comprehension of how the state is affected by the use
+   of any given frame.
+
+6.1.  DATA
+
+   DATA frames (type=0x00) convey arbitrary, variable-length sequences
+   of octets associated with a stream.  One or more DATA frames are
+   used, for instance, to carry HTTP request or response message
+   contents.
+
+   DATA frames MAY also contain padding.  Padding can be added to DATA
+   frames to obscure the size of messages.  Padding is a security
+   feature; see Section 10.7.
+
+   DATA Frame {
+     Length (24),
+     Type (8) = 0x00,
+
+     Unused Flags (4),
+     PADDED Flag (1),
+     Unused Flags (2),
+     END_STREAM Flag (1),
+
+     Reserved (1),
+     Stream Identifier (31),
+
+     [Pad Length (8)],
+     Data (..),
+     Padding (..2040),
+   }
+
+                        Figure 3: DATA Frame Format
+
+   The Length, Type, Unused Flag(s), Reserved, and Stream Identifier
+   fields are described in Section 4.  The DATA frame contains the
+   following additional fields:
+
+   Pad Length:  An 8-bit field containing the length of the frame
+      padding in units of octets.  This field is conditional and is only
+      present if the PADDED flag is set.
+
+   Data:  Application data.  The amount of data is the remainder of the
+      frame payload after subtracting the length of the other fields
+      that are present.
+
+   Padding:  Padding octets that contain no application semantic value.
+      Padding octets MUST be set to zero when sending.  A receiver is
+      not obligated to verify padding but MAY treat non-zero padding as
+      a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+   The DATA frame defines the following flags:
+
+   PADDED (0x08):  When set, the PADDED flag indicates that the Pad
+      Length field and any padding that it describes are present.
+
+   END_STREAM (0x01):  When set, the END_STREAM flag indicates that this
+      frame is the last that the endpoint will send for the identified
+      stream.  Setting this flag causes the stream to enter one of the
+      "half-closed" states or the "closed" state (Section 5.1).
+
+      |  Note: An endpoint that learns of stream closure after sending
+      |  all data can close a stream by sending a STREAM frame with a
+      |  zero-length Data field and the END_STREAM flag set.  This is
+      |  only possible if the endpoint does not send trailers, as the
+      |  END_STREAM flag appears on a HEADERS frame in that case; see
+      |  Section 8.1.
+
+   DATA frames MUST be associated with a stream.  If a DATA frame is
+   received whose Stream Identifier field is 0x00, the recipient MUST
+   respond with a connection error (Section 5.4.1) of type
+   PROTOCOL_ERROR.
+
+   DATA frames are subject to flow control and can only be sent when a
+   stream is in the "open" or "half-closed (remote)" state.  The entire
+   DATA frame payload is included in flow control, including the Pad
+   Length and Padding fields if present.  If a DATA frame is received
+   whose stream is not in the "open" or "half-closed (local)" state, the
+   recipient MUST respond with a stream error (Section 5.4.2) of type
+   STREAM_CLOSED.
+
+   The total number of padding octets is determined by the value of the
+   Pad Length field.  If the length of the padding is the length of the
+   frame payload or greater, the recipient MUST treat this as a
+   connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+      |  Note: A frame can be increased in size by one octet by
+      |  including a Pad Length field with a value of zero.
+
+6.2.  HEADERS
+
+   The HEADERS frame (type=0x01) is used to open a stream (Section 5.1),
+   and additionally carries a field block fragment.  Despite the name, a
+   HEADERS frame can carry a header section or a trailer section.
+   HEADERS frames can be sent on a stream in the "idle", "reserved
+   (local)", "open", or "half-closed (remote)" state.
+
+   HEADERS Frame {
+     Length (24),
+     Type (8) = 0x01,
+
+     Unused Flags (2),
+     PRIORITY Flag (1),
+     Unused Flag (1),
+     PADDED Flag (1),
+     END_HEADERS Flag (1),
+     Unused Flag (1),
+     END_STREAM Flag (1),
+
+     Reserved (1),
+     Stream Identifier (31),
+
+     [Pad Length (8)],
+     [Exclusive (1)],
+     [Stream Dependency (31)],
+     [Weight (8)],
+     Field Block Fragment (..),
+     Padding (..2040),
+   }
+
+                       Figure 4: HEADERS Frame Format
+
+   The Length, Type, Unused Flag(s), Reserved, and Stream Identifier
+   fields are described in Section 4.  The HEADERS frame payload has the
+   following additional fields:
+
+   Pad Length:  An 8-bit field containing the length of the frame
+      padding in units of octets.  This field is only present if the
+      PADDED flag is set.
+
+   Exclusive:  A single-bit flag.  This field is only present if the
+      PRIORITY flag is set.  Priority signals in HEADERS frames are
+      deprecated; see Section 5.3.2.
+
+   Stream Dependency:  A 31-bit stream identifier.  This field is only
+      present if the PRIORITY flag is set.
+
+   Weight:  An unsigned 8-bit integer.  This field is only present if
+      the PRIORITY flag is set.
+
+   Field Block Fragment:  A field block fragment (Section 4.3).
+
+   Padding:  Padding octets that contain no application semantic value.
+      Padding octets MUST be set to zero when sending.  A receiver is
+      not obligated to verify padding but MAY treat non-zero padding as
+      a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+   The HEADERS frame defines the following flags:
+
+   PRIORITY (0x20):  When set, the PRIORITY flag indicates that the
+      Exclusive, Stream Dependency, and Weight fields are present.
+
+   PADDED (0x08):  When set, the PADDED flag indicates that the Pad
+      Length field and any padding that it describes are present.
+
+   END_HEADERS (0x04):  When set, the END_HEADERS flag indicates that
+      this frame contains an entire field block (Section 4.3) and is not
+      followed by any CONTINUATION frames.
+
+      A HEADERS frame without the END_HEADERS flag set MUST be followed
+      by a CONTINUATION frame for the same stream.  A receiver MUST
+      treat the receipt of any other type of frame or a frame on a
+      different stream as a connection error (Section 5.4.1) of type
+      PROTOCOL_ERROR.
+
+   END_STREAM (0x01):  When set, the END_STREAM flag indicates that the
+      field block (Section 4.3) is the last that the endpoint will send
+      for the identified stream.
+
+      A HEADERS frame with the END_STREAM flag set signals the end of a
+      stream.  However, a HEADERS frame with the END_STREAM flag set can
+      be followed by CONTINUATION frames on the same stream.  Logically,
+      the CONTINUATION frames are part of the HEADERS frame.
+
+   The frame payload of a HEADERS frame contains a field block fragment
+   (Section 4.3).  A field block that does not fit within a HEADERS
+   frame is continued in a CONTINUATION frame (Section 6.10).
+
+   HEADERS frames MUST be associated with a stream.  If a HEADERS frame
+   is received whose Stream Identifier field is 0x00, the recipient MUST
+   respond with a connection error (Section 5.4.1) of type
+   PROTOCOL_ERROR.
+
+   The HEADERS frame changes the connection state as described in
+   Section 4.3.
+
+   The total number of padding octets is determined by the value of the
+   Pad Length field.  If the length of the padding is the length of the
+   frame payload or greater, the recipient MUST treat this as a
+   connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+      |  Note: A frame can be increased in size by one octet by
+      |  including a Pad Length field with a value of zero.
+
+6.3.  PRIORITY
+
+   The PRIORITY frame (type=0x02) is deprecated; see Section 5.3.2.  A
+   PRIORITY frame can be sent in any stream state, including idle or
+   closed streams.
+
+   PRIORITY Frame {
+     Length (24) = 0x05,
+     Type (8) = 0x02,
+
+     Unused Flags (8),
+
+     Reserved (1),
+     Stream Identifier (31),
+
+     Exclusive (1),
+     Stream Dependency (31),
+     Weight (8),
+   }
+
+                      Figure 5: PRIORITY Frame Format
+
+   The Length, Type, Unused Flag(s), Reserved, and Stream Identifier
+   fields are described in Section 4.  The frame payload of a PRIORITY
+   frame contains the following additional fields:
+
+   Exclusive:  A single-bit flag.
+
+   Stream Dependency:  A 31-bit stream identifier.
+
+   Weight:  An unsigned 8-bit integer.
+
+   The PRIORITY frame does not define any flags.
+
+   The PRIORITY frame always identifies a stream.  If a PRIORITY frame
+   is received with a stream identifier of 0x00, the recipient MUST
+   respond with a connection error (Section 5.4.1) of type
+   PROTOCOL_ERROR.
+
+   Sending or receiving a PRIORITY frame does not affect the state of
+   any stream (Section 5.1).  The PRIORITY frame can be sent on a stream
+   in any state, including "idle" or "closed".  A PRIORITY frame cannot
+   be sent between consecutive frames that comprise a single field block
+   (Section 4.3).
+
+   A PRIORITY frame with a length other than 5 octets MUST be treated as
+   a stream error (Section 5.4.2) of type FRAME_SIZE_ERROR.
+
+6.4.  RST_STREAM
+
+   The RST_STREAM frame (type=0x03) allows for immediate termination of
+   a stream.  RST_STREAM is sent to request cancellation of a stream or
+   to indicate that an error condition has occurred.
+
+   RST_STREAM Frame {
+     Length (24) = 0x04,
+     Type (8) = 0x03,
+
+     Unused Flags (8),
+
+     Reserved (1),
+     Stream Identifier (31),
+
+     Error Code (32),
+   }
+
+                     Figure 6: RST_STREAM Frame Format
+
+   The Length, Type, Unused Flag(s), Reserved, and Stream Identifier
+   fields are described in Section 4.  Additionally, the RST_STREAM
+   frame contains a single unsigned, 32-bit integer identifying the
+   error code (Section 7).  The error code indicates why the stream is
+   being terminated.
+
+   The RST_STREAM frame does not define any flags.
+
+   The RST_STREAM frame fully terminates the referenced stream and
+   causes it to enter the "closed" state.  After receiving a RST_STREAM
+   on a stream, the receiver MUST NOT send additional frames for that
+   stream, except for PRIORITY.  However, after sending the RST_STREAM,
+   the sending endpoint MUST be prepared to receive and process
+   additional frames sent on the stream that might have been sent by the
+   peer prior to the arrival of the RST_STREAM.
+
+   RST_STREAM frames MUST be associated with a stream.  If a RST_STREAM
+   frame is received with a stream identifier of 0x00, the recipient
+   MUST treat this as a connection error (Section 5.4.1) of type
+   PROTOCOL_ERROR.
+
+   RST_STREAM frames MUST NOT be sent for a stream in the "idle" state.
+   If a RST_STREAM frame identifying an idle stream is received, the
+   recipient MUST treat this as a connection error (Section 5.4.1) of
+   type PROTOCOL_ERROR.
+
+   A RST_STREAM frame with a length other than 4 octets MUST be treated
+   as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR.
+
+6.5.  SETTINGS
+
+   The SETTINGS frame (type=0x04) conveys configuration parameters that
+   affect how endpoints communicate, such as preferences and constraints
+   on peer behavior.  The SETTINGS frame is also used to acknowledge the
+   receipt of those settings.  Individually, a configuration parameter
+   from a SETTINGS frame is referred to as a "setting".
+
+   Settings are not negotiated; they describe characteristics of the
+   sending peer, which are used by the receiving peer.  Different values
+   for the same setting can be advertised by each peer.  For example, a
+   client might set a high initial flow-control window, whereas a server
+   might set a lower value to conserve resources.
+
+   A SETTINGS frame MUST be sent by both endpoints at the start of a
+   connection and MAY be sent at any other time by either endpoint over
+   the lifetime of the connection.  Implementations MUST support all of
+   the settings defined by this specification.
+
+   Each parameter in a SETTINGS frame replaces any existing value for
+   that parameter.  Settings are processed in the order in which they
+   appear, and a receiver of a SETTINGS frame does not need to maintain
+   any state other than the current value of each setting.  Therefore,
+   the value of a SETTINGS parameter is the last value that is seen by a
+   receiver.
+
+   SETTINGS frames are acknowledged by the receiving peer.  To enable
+   this, the SETTINGS frame defines the ACK flag:
+
+   ACK (0x01):  When set, the ACK flag indicates that this frame
+      acknowledges receipt and application of the peer's SETTINGS frame.
+      When this bit is set, the frame payload of the SETTINGS frame MUST
+      be empty.  Receipt of a SETTINGS frame with the ACK flag set and a
+      length field value other than 0 MUST be treated as a connection
+      error (Section 5.4.1) of type FRAME_SIZE_ERROR.  For more
+      information, see Section 6.5.3 ("Settings Synchronization").
+
+   SETTINGS frames always apply to a connection, never a single stream.
+   The stream identifier for a SETTINGS frame MUST be zero (0x00).  If
+   an endpoint receives a SETTINGS frame whose Stream Identifier field
+   is anything other than 0x00, the endpoint MUST respond with a
+   connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+   The SETTINGS frame affects connection state.  A badly formed or
+   incomplete SETTINGS frame MUST be treated as a connection error
+   (Section 5.4.1) of type PROTOCOL_ERROR.
+
+   A SETTINGS frame with a length other than a multiple of 6 octets MUST
+   be treated as a connection error (Section 5.4.1) of type
+   FRAME_SIZE_ERROR.
+
+6.5.1.  SETTINGS Format
+

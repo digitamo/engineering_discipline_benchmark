@@ -1,0 +1,2945 @@
+diff --git a/dlt/common/storages/fsspec_filesystem.py b/dlt/common/storages/fsspec_filesystem.py
+index fa7b3585e..a98dcdb9b 100644
+--- a/dlt/common/storages/fsspec_filesystem.py
++++ b/dlt/common/storages/fsspec_filesystem.py
+@@ -298,6 +298,8 @@ class FileItemDict(DictStrAny):
+                 bytes_io,
+                 **text_kwargs,
+             )
++        # `FileItemDict` kwarg `fsspec` is `Optional`. If `fsspec=None` this code branch
++        # will fail.
+         else:
+             if "file" in self.fsspec.protocol:
+                 # use native local file path to open file:// uris
+diff --git a/dlt/sources/filesystem/readers.py b/dlt/sources/filesystem/readers.py
+index 18dcd0405..f79daaf1f 100644
+--- a/dlt/sources/filesystem/readers.py
++++ b/dlt/sources/filesystem/readers.py
+@@ -1,4 +1,4 @@
+-from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional
++from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional
+ 
+ from dlt.common import json
+ from dlt.common.typing import copy_sig_any
+@@ -10,8 +10,10 @@ from .helpers import fetch_arrow, fetch_json
+ __source_name__ = "filesystem"
+ 
+ 
++# NOTE inconsistent kwarg convention across readers `chunk_size` vs. `chunksize`
++# snakecased `chunk_size` is the more appropriate Python convention
+ def _read_csv(
+-    items: Iterator[FileItemDict], chunksize: int = 10000, **pandas_kwargs: Any
++    items: Iterable[FileItemDict], chunksize: int = 10000, **pandas_kwargs: Any
+ ) -> Iterator[TDataItems]:
+     """Reads csv file with Pandas chunk by chunk.
+ 
+@@ -34,7 +36,9 @@ def _read_csv(
+                 yield df.to_dict(orient="records")
+ 
+ 
+-def _read_jsonl(items: Iterator[FileItemDict], chunksize: int = 1000) -> Iterator[TDataItems]:
++# NOTE inconsistent kwarg convention across readers `chunk_size` vs. `chunksize`
++# snakecased `chunk_size` is the more appropriate Python convention
++def _read_jsonl(items: Iterable[FileItemDict], chunksize: int = 1000) -> Iterator[TDataItems]:
+     """Reads jsonl file content and extract the data.
+ 
+     Args:
+@@ -55,9 +59,12 @@ def _read_jsonl(items: Iterator[FileItemDict], chunksize: int = 1000) -> Iterato
+             yield lines_chunk
+ 
+ 
++# NOTE inconsistent kwarg convention across readers `chunk_size` vs. `chunksize`
++# snakecased `chunk_size` is the more appropriate Python convention
+ def _read_parquet(
+-    items: Iterator[FileItemDict],
++    items: Iterable[FileItemDict],
+     chunksize: int = 1000,
++    use_pyarrow: bool = False,
+ ) -> Iterator[TDataItems]:
+     """Reads parquet file content and extract the data.
+ 
+@@ -72,12 +79,14 @@ def _read_parquet(
+     for file_obj in items:
+         with file_obj.open() as f:
+             parquet_file = pq.ParquetFile(f)
+-            for rows in parquet_file.iter_batches(batch_size=chunksize):
+-                yield rows.to_pylist()
++            for batch in parquet_file.iter_batches(batch_size=chunksize):
++                yield batch if use_pyarrow else batch.to_pylist()
+ 
+ 
++# NOTE inconsistent kwarg convention across readers `chunk_size` vs. `chunksize`
++# snakecased `chunk_size` is the more appropriate Python convention
+ def _read_csv_duckdb(
+-    items: Iterator[FileItemDict],
++    items: Iterable[FileItemDict],
+     chunk_size: Optional[int] = 5000,
+     use_pyarrow: bool = False,
+     **duckdb_kwargs: Any,
+@@ -87,7 +96,7 @@ def _read_csv_duckdb(
+     Uses DuckDB engine to import and cast CSV data.
+ 
+     Args:
+-        items (Iterator[FileItemDict]): CSV files to read.
++        items (Iterable[FileItemDict]): CSV files to read.
+         chunk_size (Optional[int]):
+             The number of rows to read at once. Defaults to 5000.
+         use_pyarrow (bool):
+diff --git a/tests/sources/filesystem/test_readers.py b/tests/sources/filesystem/test_readers.py
+new file mode 100644
+index 000000000..2acc5fc7e
+--- /dev/null
++++ b/tests/sources/filesystem/test_readers.py
+@@ -0,0 +1,164 @@
++import pathlib
++from typing import Any, Iterator
++
++import pytest
++import pandas as pd
++import pyarrow
++from fsspec import AbstractFileSystem
++
++from dlt.common import pendulum, json
++from dlt.common.storages import fsspec_filesystem
++from dlt.common.storages.fsspec_filesystem import FileItem
++from dlt.sources.filesystem import FileItemDict
++from dlt.sources.filesystem.readers import _read_csv, _read_csv_duckdb, _read_jsonl, _read_parquet
++
++
++@pytest.fixture(scope="module")
++def data() -> list[dict[str, Any]]:
++    return [
++        {"id": 1, "name": "Al"},
++        {"id": 2, "name": "Bob"},
++        {"id": 3, "name": "Charle"},
++        {"id": 4, "name": "Dave"},
++        {"id": 5, "name": "Eve"},
++    ]
++
++
++def _fsspec_client(tmp_path: pathlib.Path) -> AbstractFileSystem:
++    client, _ = fsspec_filesystem(
++        protocol=str(tmp_path), credentials=None, kwargs={}, client_kwargs={}
++    )
++    return client
++
++
++def _create_parquet_file(data: list[dict[str, Any]], tmp_path: pathlib.Path) -> FileItemDict:
++    file_name = "data.parquet"
++    full_file_path = tmp_path / file_name
++
++    df = pd.DataFrame(data)
++    df.to_parquet(full_file_path, engine="pyarrow")
++
++    file_item = FileItem(
++        file_name=file_name,
++        relative_path=file_name,
++        file_url=full_file_path.as_uri(),
++        mime_type="application/parquet",
++        modification_date=pendulum.DateTime(2025, 1, 1, 0, 0, 0, 0),
++        size_in_bytes=111,
++    )
++
++    return FileItemDict(mapping=file_item, fsspec=_fsspec_client(tmp_path))
++
++
++def _create_csv_file(data: list[dict[str, Any]], tmp_path: pathlib.Path) -> FileItemDict:
++    file_name = "data.csv"
++    full_file_path = tmp_path / file_name
++
++    df = pd.DataFrame(data)
++    df.to_csv(full_file_path, index=False)
++
++    file_item = FileItem(
++        file_name=file_name,
++        relative_path=file_name,
++        file_url=full_file_path.as_uri(),
++        mime_type="text/csv",
++        modification_date=pendulum.DateTime(2025, 1, 1, 0, 0, 0, 0),
++        size_in_bytes=111,
++    )
++    return FileItemDict(mapping=file_item, fsspec=_fsspec_client(tmp_path))
++
++
++def _create_jsonl_file(data: list[dict[str, Any]], tmp_path: pathlib.Path) -> FileItemDict:
++    file_name = "data.jsonl"
++    full_file_path = tmp_path / file_name
++
++    with open(full_file_path, "w", encoding="utf-8") as f:
++        for item in data:
++            f.write(json.dumps(item) + "\n")
++
++    file_item = FileItem(
++        file_name=file_name,
++        relative_path=file_name,
++        file_url=full_file_path.as_uri(),
++        mime_type="text/jsonl",
++        modification_date=pendulum.DateTime(2025, 1, 1, 0, 0, 0, 0),
++        size_in_bytes=111,
++    )
++
++    return FileItemDict(mapping=file_item, fsspec=_fsspec_client(tmp_path))
++
++
++# TODO rewrite the following tests as a parameterized test once `read_` functions
++# have a unified interface
++# see discussion for ibis: https://github.com/ibis-project/ibis/issues/11459
++# see discussion for narwhals: https://github.com/narwhals-dev/narwhals/issues/2930
++def test_read_parquet(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
++    file_ = _create_parquet_file(data=data, tmp_path=tmp_path)
++    iterator = _read_parquet([file_])
++    read_data = list(iterator)
++
++    assert isinstance(iterator, Iterator)
++    assert isinstance(read_data, list)  # list of batches
++    assert isinstance(read_data[0], list)  # batch of records
++    assert isinstance(read_data[0][0], dict)  # record
++    assert read_data == [data]
++
++
++def test_read_parquet_use_pyarrow(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
++    file_ = _create_parquet_file(data=data, tmp_path=tmp_path)
++    iterator = _read_parquet([file_], use_pyarrow=True)
++    read_data = list(iterator)
++
++    assert isinstance(iterator, Iterator)
++    assert isinstance(read_data, list)  # list of batches
++    assert isinstance(read_data[0], pyarrow.RecordBatch)  # batch of records
++    assert isinstance(read_data[0][0], pyarrow.Array)  # column
++    assert read_data == [pyarrow.RecordBatch.from_pylist(data)]
++
++
++def test_read_csv(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
++    file_ = _create_csv_file(data=data, tmp_path=tmp_path)
++    iterator = _read_csv([file_])
++    read_data = list(iterator)
++
++    assert isinstance(iterator, Iterator)
++    assert isinstance(read_data, list)  # list of batches
++    assert isinstance(read_data[0], list)  # batch of records
++    assert isinstance(read_data[0][0], dict)  # record
++    assert read_data == [data]
++
++
++def test_read_jsonl(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
++    file_ = _create_jsonl_file(data=data, tmp_path=tmp_path)
++    iterator = _read_jsonl([file_])
++    read_data = list(iterator)
++
++    assert isinstance(iterator, Iterator)
++    assert isinstance(read_data, list)  # list of batches
++    assert isinstance(read_data[0], list)  # batch of records
++    assert isinstance(read_data[0][0], dict)  # record
++    assert read_data == [data]
++
++
++def test_read_csv_duckdb(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
++    file_ = _create_csv_file(data=data, tmp_path=tmp_path)
++    iterator = _read_csv_duckdb([file_])
++    read_data = list(iterator)
++
++    assert isinstance(iterator, Iterator)
++    assert isinstance(read_data, list)  # list of batches
++    assert isinstance(read_data[0], list)  # batch of records
++    assert isinstance(read_data[0][0], dict)  # record
++    assert read_data == [data]
++
++
++def test_read_csv_duckdb_use_pyarrow(tmp_path: pathlib.Path, data: list[dict[str, Any]]) -> None:
++    file_ = _create_csv_file(data=data, tmp_path=tmp_path)
++    iterator = _read_csv_duckdb([file_], use_pyarrow=True)
++    read_data = list(iterator)
++
++    assert isinstance(iterator, Iterator)
++    assert isinstance(read_data, list)  # list of batches
++    assert isinstance(read_data[0], pyarrow.RecordBatch)  # batch of records
++    assert isinstance(read_data[0][0], pyarrow.Array)  # column
++    assert read_data == [pyarrow.RecordBatch.from_pylist(data)]
+
+
+===== COMMIT 3315d015 =====
+
+
+commit 3315d0153
+Author: rudolfix
+Date: 2025-09-30
+
+    patches requests session to prevent real tracker call in test (#3152)
+
+diff --git a/tests/common/runtime/test_telemetry.py b/tests/common/runtime/test_telemetry.py
+index a06e1e866..68c648207 100644
+--- a/tests/common/runtime/test_telemetry.py
++++ b/tests/common/runtime/test_telemetry.py
+@@ -147,7 +147,10 @@ def test_track_anon_event(
+     props = {"destination_name": "duckdb", "elapsed_time": 712.23123, "success": True}
+     with patch("dlt.common.runtime.anon_tracker.before_send", _mock_before_send):
+         start_test_telemetry(config)
+-        requests_post = mocker.spy(anon_tracker.requests, "post")
++        requests_post = mocker.patch(
++            "dlt.common.runtime.anon_tracker.requests.post",
++            return_value=Mock(status_code=204),
++        )
+         track("pipeline", "run", props)
+         # this will send stuff
+         disable_anon_tracker()
+@@ -161,7 +164,7 @@ def test_track_anon_event(
+         timeout=anon_tracker._REQUEST_TIMEOUT,
+     )
+     # was actually delivered
+-    assert requests_post.spy_return.status_code == 204
++    assert requests_post.return_value.status_code == 204
+ 
+     assert event["anonymousId"] == get_anonymous_id()
+     assert event["event"] == "pipeline_run"
+
+
+===== COMMIT 2cce583c =====
+
+
+commit 2cce583c4
+Author: rudolfix
+Date: 2025-09-30
+
+    closes sqlalchemy cursor in sql_database (#3136)
+
+diff --git a/dlt/sources/sql_database/helpers.py b/dlt/sources/sql_database/helpers.py
+index 54830f5a3..a4f67aad3 100644
+--- a/dlt/sources/sql_database/helpers.py
++++ b/dlt/sources/sql_database/helpers.py
+@@ -193,28 +193,31 @@ class TableLoader:
+     def _load_rows(self, query: SelectClause, backend_kwargs: Dict[str, Any]) -> TDataItem:
+         with self.engine.connect() as conn:
+             result = conn.execution_options(yield_per=self.chunk_size).execute(query)
+-            # NOTE: cursor returns not normalized column names! may be quite useful in case of Oracle dialect
+-            # that normalizes columns
+-            # columns = [c[0] for c in result.cursor.description]
+-            columns = list(result.keys())
+-            for partition in result.partitions(size=self.chunk_size):
+-                if self.backend == "sqlalchemy":
+-                    yield [dict(row._mapping) for row in partition]
+-                elif self.backend == "pandas":
+-                    from dlt.common.libs.pandas_sql import _wrap_result
+-
+-                    df = _wrap_result(
+-                        partition,
+-                        columns,
+-                        **{"dtype_backend": "pyarrow", **backend_kwargs},
+-                    )
+-                    yield df
+-                elif self.backend == "pyarrow":
+-                    yield row_tuples_to_arrow(
+-                        partition,
+-                        columns=_add_missing_columns(self.columns, columns),
+-                        tz=backend_kwargs.get("tz", "UTC"),
+-                    )
++            try:
++                # NOTE: cursor returns not normalized column names! may be quite useful in case of Oracle dialect
++                # that normalizes columns
++                # columns = [c[0] for c in result.cursor.description]
++                columns = list(result.keys())
++                for partition in result.partitions(size=self.chunk_size):
++                    if self.backend == "sqlalchemy":
++                        yield [dict(row._mapping) for row in partition]
++                    elif self.backend == "pandas":
++                        from dlt.common.libs.pandas_sql import _wrap_result
++
++                        df = _wrap_result(
++                            partition,
++                            columns,
++                            **{"dtype_backend": "pyarrow", **backend_kwargs},
++                        )
++                        yield df
++                    elif self.backend == "pyarrow":
++                        yield row_tuples_to_arrow(
++                            partition,
++                            columns=_add_missing_columns(self.columns, columns),
++                            tz=backend_kwargs.get("tz", "UTC"),
++                        )
++            finally:
++                result.close()
+ 
+     def _load_rows_connectorx(
+         self, query: SelectClause, backend_kwargs: Dict[str, Any]
+diff --git a/tests/load/sources/sql_database/test_sql_database_source_all_destinations.py b/tests/load/sources/sql_database/test_sql_database_source_all_destinations.py
+index 19d51a97e..852f74797 100644
+--- a/tests/load/sources/sql_database/test_sql_database_source_all_destinations.py
++++ b/tests/load/sources/sql_database/test_sql_database_source_all_destinations.py
+@@ -227,11 +227,12 @@ def test_load_mysql_data_load(
+         backend=backend,
+         reflection_level="minimal",
+         backend_kwargs=backend_kwargs,
++        chunk_size=100,
+         # table_adapter_callback=_double_as_decimal_adapter,
+     )
+ 
+     pipeline = destination_config.setup_pipeline("test_load_mysql_data_load", dev_mode=True)
+-    load_info = pipeline.run(family_table, write_disposition="merge")
++    load_info = pipeline.run(family_table.add_limit(1), write_disposition="merge")
+     assert_load_info(load_info)
+     counts_1 = load_table_counts(pipeline, "family")
+ 
+@@ -243,13 +244,14 @@ def test_load_mysql_data_load(
+         reflection_level="minimal",
+         # we also try to remove dialect automatically
+         backend_kwargs={},
++        chunk_size=100,
+         # table_adapter_callback=_double_as_decimal_adapter,
+     )
+-    load_info = pipeline.run(family_table, write_disposition="merge")
++    load_info = pipeline.run(family_table.add_limit(1), write_disposition="merge")
+     assert_load_info(load_info)
+     counts_2 = load_table_counts(pipeline, "family")
+     # no duplicates
+-    assert counts_1 == counts_2
++    assert counts_1 == counts_2 == {"family": 100}
+ 
+ 
+ @pytest.mark.parametrize(
+
+
+===== COMMIT 1667d73f =====
+
+
+commit 1667d73fc
+Author: Anton Burnashev
+Date: 2025-09-30
+
+    docs: snowflake: document stage url path matching; fix typo (remove Redshift) (#3108)
+
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+index 0fa444996..57e807834 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+@@ -253,7 +253,7 @@ Alternatively to Parquet files, you can also specify jsonl as the staging file f
+ 
+ ### Snowflake and Amazon S3
+ 
+-Please refer to the [S3 documentation](./filesystem.md#aws-s3) to learn how to set up your bucket with the bucket_url and credentials. For S3, the `dlt` Redshift loader will use the AWS credentials provided for S3 to access the S3 bucket if not specified otherwise (see config options below). Alternatively, you can create a stage for your S3 Bucket by following the instructions provided in the [Snowflake S3 documentation](https://docs.snowflake.com/en/user-guide/data-load-s3-config-storage-integration).
++Please refer to the [S3 documentation](./filesystem.md#aws-s3) to learn how to set up your bucket with the bucket_url and credentials. For S3, the `dlt` loader will use the AWS credentials provided for S3 to access the S3 bucket if not specified otherwise (see config options below). Alternatively, you can create a stage for your S3 Bucket by following the instructions provided in the [Snowflake S3 documentation](https://docs.snowflake.com/en/user-guide/data-load-s3-config-storage-integration).
+ The basic steps are as follows:
+ 
+ * Create a storage integration linked to GCS and the right bucket.
+@@ -269,6 +269,16 @@ To prevent `dlt` from forwarding the S3 bucket credentials on every command, and
+ stage_name="PUBLIC.my_s3_stage"
+ ```
+ 
++:::important Stage URL Path Matching
++When using `stage_name` with external staging, ensure that the stage URL path configured in Snowflake exactly matches the `bucket_url` path in your filesystem configuration:
++- Both paths should either end with a trailing slash (`/`) or both should have no trailing slash
++- If your stage includes a subfolder path (e.g., `/my_dlt_staging/`), this must be included in the Snowflake stage definition
++
++For example:
++- If your `bucket_url` is `s3://bucket` your Snowflake stage must also point to `s3://bucket`.
++- If your `bucket_url` is `s3://bucket/my_dlt_staging/` your Snowflake stage should be the same path exactly: `s3://bucket/my_dlt_staging/`.
++:::
++
+ To run Snowflake with S3 as the staging destination:
+ 
+ ```py
+@@ -298,6 +308,16 @@ Please refer to the [Google Storage filesystem documentation](./filesystem.md#go
+ stage_name="PUBLIC.my_gcs_stage"
+ ```
+ 
++:::important Stage URL Path Matching
++When using `stage_name` with external staging, ensure that the stage URL path configured in Snowflake exactly matches the `bucket_url` path in your filesystem configuration:
++- Both paths should either end with a trailing slash (`/`) or both should have no trailing slash
++- If your stage includes a subfolder path (e.g., `/my_dlt_staging/`), this must be included in the Snowflake stage definition
++
++For example:
++- If your `bucket_url` is `gs://bucket` your Snowflake stage must also point to `gs://bucket`.
++- If your `bucket_url` is `gs://bucket/my_dlt_staging/` your Snowflake stage should be the same path exactly: `gs://bucket/my_dlt_staging/`.
++:::
++
+ To run Snowflake with GCS as the staging destination:
+ 
+ ```py
+@@ -327,6 +347,17 @@ Please refer to the [Azure Blob Storage filesystem documentation](./filesystem.m
+ stage_name="PUBLIC.my_azure_stage"
+ ```
+ 
++:::important Stage URL Path Matching
++When using `stage_name` with external staging, ensure that the stage URL path configured in Snowflake exactly matches the `bucket_url` path in your filesystem configuration:
++- Both paths should either end with a trailing slash (`/`) or both should have no trailing slash
++- If your stage includes a subfolder path (e.g., `/my_dlt_staging/`), this must be included in the Snowflake stage definition
++- Snowflake does not normalize paths, so exact matching is required
++
++For example:
++- If your `bucket_url` is `az://container` your Snowflake stage must also point to `az://container`.
++- If your `bucket_url` is `az://container/my_dlt_staging/` your Snowflake stage should be the same path exactly: `az://container/my_dlt_staging/`.
++:::
++
+ To run Snowflake with Azure as the staging destination:
+ 
+ ```py
+
+
+===== COMMIT 79fc8916 =====
+
+
+commit 79fc89168
+Author: Chulki Lee
+Date: 2025-09-30
+
+    fix incorrect export (#3120)
+
+diff --git a/dlt/sources/helpers/requests/__init__.py b/dlt/sources/helpers/requests/__init__.py
+index cc92d2129..b5bbefa40 100644
+--- a/dlt/sources/helpers/requests/__init__.py
++++ b/dlt/sources/helpers/requests/__init__.py
+@@ -65,6 +65,6 @@ __all__ = [
+     "TooManyRedirects",
+     "URLRequired",
+     "ChunkedEncodingError",
+-    "RetryErrorClient",
++    "Client",
+     "RetryError",
+ ]
+
+
+===== COMMIT 4acdca7e =====
+
+
+commit 4acdca7e5
+Author: Thierry Jean
+Date: 2025-09-30
+
+    fix: 3139 ducklake handle SQLAlchemy credentials (#3150)
+
+diff --git a/dlt/destinations/impl/ducklake/ducklake.py b/dlt/destinations/impl/ducklake/ducklake.py
+index 11498ab56..6eb3eabe7 100644
+--- a/dlt/destinations/impl/ducklake/ducklake.py
++++ b/dlt/destinations/impl/ducklake/ducklake.py
+@@ -46,9 +46,11 @@ ATTACH 'ducklake:{catalog_database}' (DATA_PATH '{data_storage}');
+ 
+ adds the ducklake `Catalog` to your duckdb database
+ """
++from __future__ import annotations
++
+ import os
++import pathlib
+ from packaging.version import Version
+-import posixpath
+ from typing import Iterable, List, Optional, Sequence
+ 
+ import dlt
+@@ -68,17 +70,19 @@ from dlt.destinations.insert_job_client import InsertValuesJobClient
+ class DuckLakeCopyJob(DuckDbCopyJob):
+     def __init__(self, file_path: str) -> None:
+         super().__init__(file_path)
+-        self._job_client: "DuckLakeClient" = None
++        self._job_client: DuckLakeClient = None
+ 
+     def metrics(self) -> Optional[LoadJobMetrics]:
+         """Generate remote url metrics which point to the table in storage"""
+         m = super().metrics()
+         # TODO: read location from catalog. ducklake supports customized table layouts
+         return m._replace(
+-            remote_url=posixpath.join(
+-                self._job_client.config.credentials.storage.bucket_url,
+-                self._job_client.sql_client.dataset_name,
+-                self.load_table_name,
++            remote_url=str(
++                pathlib.Path().joinpath(
++                    self._job_client.config.credentials.storage.bucket_url,
++                    self._job_client.sql_client.dataset_name,
++                    self.load_table_name,
++                )
+             )
+         )
+ 
+diff --git a/dlt/destinations/impl/ducklake/sql_client.py b/dlt/destinations/impl/ducklake/sql_client.py
+index b3b3b6805..9d9f88028 100644
+--- a/dlt/destinations/impl/ducklake/sql_client.py
++++ b/dlt/destinations/impl/ducklake/sql_client.py
+@@ -1,10 +1,10 @@
+ from typing import ClassVar, Type
++
+ from duckdb import DuckDBPyConnection
+ 
+ from dlt.common import logger
+ from dlt.common.configuration.specs.connection_string_credentials import ConnectionStringCredentials
+ from dlt.common.destination.capabilities import DestinationCapabilitiesContext
+-
+ from dlt.common.storages.configuration import FileSystemCredentials
+ from dlt.common.storages.fsspec_filesystem import fsspec_from_config
+ from dlt.destinations.impl.duckdb.configuration import DuckDbCredentials
+@@ -129,9 +129,8 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+             if catalog.drivername == "postgresql":
+                 catalog.drivername = "postgres"
+ 
+-            attach_statement = (
+-                f"ATTACH IF NOT EXISTS 'ducklake:{catalog.drivername}:{catalog.to_url()}'"
+-            )
++            db_url = catalog.to_url().render_as_string(hide_password=False)
++            attach_statement = f"ATTACH IF NOT EXISTS 'ducklake:{catalog.drivername}:{db_url}'"
+             attach_params = f", METADATA_SCHEMA '{catalog_name}'"
+         elif catalog.drivername == "md":
+             logger.warning(
+diff --git a/tests/load/ducklake/test_ducklake_client.py b/tests/load/ducklake/test_ducklake_client.py
+index fc120c682..f803eca91 100644
+--- a/tests/load/ducklake/test_ducklake_client.py
++++ b/tests/load/ducklake/test_ducklake_client.py
+@@ -1,12 +1,14 @@
+ import os
+-import pytest
+ import pathlib
++
+ import duckdb
++import pytest
+ 
++import dlt
+ from dlt.common.configuration.exceptions import ConfigFieldMissingException, ConfigurationValueError
+ from dlt.common.configuration.resolve import resolve_configuration
+ from dlt.common.configuration.specs.connection_string_credentials import ConnectionStringCredentials
+-
++from dlt.destinations.impl.ducklake.sql_client import DuckLakeSqlClient
+ from dlt.destinations.impl.ducklake.configuration import (
+     DuckLakeCredentials,
+     DuckLakeClientConfiguration,
+@@ -190,7 +192,26 @@ def test_default_ducklake_configuration() -> None:
+     assert credentials.storage_url == str(local_dir / "ducklake_catalog.files")
+ 
+ 
+-def test_attach_statement_doesnt_use_postgresl() -> None:
++def test_ducklake_attach_statement() -> None:
++    """Low-level method to attach the ducklake catalog to the ducklake client.
++
++    A bug was found because of differences between sqlalchemy <2 and >=2.
++    """
++    expected_attach_statement = (
++        "ATTACH IF NOT EXISTS 'ducklake:postgres:postgres://loader:loader@localhost:5432/dlt_data'"
++        " AS foo (DATA_PATH '/path/to/storage', METADATA_SCHEMA 'foo')"
++    )
++
++    attach_statement = DuckLakeSqlClient.build_attach_statement(
++        catalog=ConnectionStringCredentials("postgres://loader:loader@localhost:5432/dlt_data"),
++        catalog_name="foo",
++        storage_url="/path/to/storage",
++    )
++
++    assert expected_attach_statement == attach_statement
++
++
++def test_attach_statement_doesnt_use_postgresql() -> None:
+     """`drivername="postgresql"` is supported by dlt / sqlalchemy, but it doesn't exist in duckdb.
+ 
+     Make sure that the produced ATTACH statement doesn't use postgresql
+@@ -249,8 +270,6 @@ def test_ducklake_conn_pool_always_open() -> None:
+ 
+ @pytest.mark.no_load
+ def test_ducklake_factory_instantiation() -> None:
+-    import dlt
+-
+     # force parallel loads on sqlite
+     ducklake = dlt.destinations.ducklake(loader_parallelism_strategy="parallel")
+     pipeline = dlt.pipeline("test_factory", destination=ducklake, dataset_name="foo")
+@@ -258,8 +277,6 @@ def test_ducklake_factory_instantiation() -> None:
+     with pipeline.destination_client() as client:
+         assert client.capabilities.loader_parallelism_strategy == "parallel"
+ 
+-    from dlt.destinations.impl.ducklake.configuration import DuckDbBaseCredentials
+-
+     # set ducklake credentials using shorthands, s3 bucket requires secrets in config
+     credentials = DuckLakeCredentials(
+         "lake_catalog",
+@@ -272,8 +289,7 @@ def test_ducklake_factory_instantiation() -> None:
+     with pytest.raises(ConfigFieldMissingException):
+         pipeline.destination_client()
+ 
+-    from dlt.sources.credentials import ConnectionStringCredentials
+-
++    # TODO what is being asserted in the next block?
+     # set catalog name using connection string credentials
+     catalog_credentials = ConnectionStringCredentials()
+     # use duckdb with the default name
+diff --git a/tests/load/ducklake/test_ducklake_pipeline.py b/tests/load/ducklake/test_ducklake_pipeline.py
+index 6cea3cd50..da276000d 100644
+--- a/tests/load/ducklake/test_ducklake_pipeline.py
++++ b/tests/load/ducklake/test_ducklake_pipeline.py
+@@ -5,7 +5,6 @@ import dlt
+ from dlt.common.destination.reference import TDestinationReferenceArg
+ 
+ from dlt.common.utils import uniq_id
+-from dlt.destinations.exceptions import DestinationConnectionError
+ from dlt.destinations.impl.ducklake.configuration import (
+     DuckLakeCredentials,
+     DUCKLAKE_STORAGE_PATTERN,
+
+
+===== COMMIT 940edd51 =====
+
+
+commit 940edd51b
+Author: Thierry Jean
+Date: 2025-09-30
+
+    fix: explicitly replace `postgresql` by `postgres` in ducklake `ATTACH` (#3148)
+
+diff --git a/dlt/destinations/impl/ducklake/sql_client.py b/dlt/destinations/impl/ducklake/sql_client.py
+index a983500db..b3b3b6805 100644
+--- a/dlt/destinations/impl/ducklake/sql_client.py
++++ b/dlt/destinations/impl/ducklake/sql_client.py
+@@ -125,6 +125,10 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+         if isinstance(catalog, DuckDbCredentials):
+             attach_statement = f"ATTACH IF NOT EXISTS 'ducklake:{catalog._conn_str()}'"
+         elif catalog.drivername in ("postgres", "postgresql", "mysql"):
++            # `drivername="postgresql"` is supported by dlt / sqlalchemy, but it doesn't exist in duckdb.
++            if catalog.drivername == "postgresql":
++                catalog.drivername = "postgres"
++
+             attach_statement = (
+                 f"ATTACH IF NOT EXISTS 'ducklake:{catalog.drivername}:{catalog.to_url()}'"
+             )
+diff --git a/tests/load/ducklake/test_ducklake_client.py b/tests/load/ducklake/test_ducklake_client.py
+index adb2f1427..fc120c682 100644
+--- a/tests/load/ducklake/test_ducklake_client.py
++++ b/tests/load/ducklake/test_ducklake_client.py
+@@ -12,6 +12,7 @@ from dlt.destinations.impl.ducklake.configuration import (
+     DuckLakeClientConfiguration,
+ )
+ 
++from dlt.destinations.impl.ducklake.sql_client import DuckLakeSqlClient
+ from tests.utils import TEST_STORAGE_ROOT
+ 
+ 
+@@ -189,6 +190,25 @@ def test_default_ducklake_configuration() -> None:
+     assert credentials.storage_url == str(local_dir / "ducklake_catalog.files")
+ 
+ 
++def test_attach_statement_doesnt_use_postgresl() -> None:
++    """`drivername="postgresql"` is supported by dlt / sqlalchemy, but it doesn't exist in duckdb.
++
++    Make sure that the produced ATTACH statement doesn't use postgresql
++    """
++    expected_attach_statement = (
++        "ATTACH IF NOT EXISTS 'ducklake:postgres:postgres://loader:loader@localhost:5432/dlt_data'"
++        " AS foo (DATA_PATH './path/to/storage', METADATA_SCHEMA 'foo')"
++    )
++    attach_statement = DuckLakeSqlClient.build_attach_statement(
++        catalog=ConnectionStringCredentials("postgresql://loader:loader@localhost:5432/dlt_data"),
++        catalog_name="foo",
++        storage_url="./path/to/storage",
++    )
++
++    assert expected_attach_statement == attach_statement
++    assert "postgresql" not in expected_attach_statement
++
++
+ def test_ducklake_conn_pool_always_open() -> None:
+     # connection pool is embedded in configuration, configuration is a singleton during loading
+     # phase which the pool needs. See DuckDbConnectionPool
+
+
+===== COMMIT 8e6af17c =====
+
+
+commit 8e6af17c7
+Author: Anton Burnashev
+Date: 2025-09-30
+
+    docs: rest_api: fix rest_api_source parameters (#3138)
+
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/advanced.md b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/advanced.md
+index 939306d27..79c993aa1 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/advanced.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/advanced.md
+@@ -11,8 +11,9 @@ keywords: [rest api, restful api, headers, response actions, advanced configurat
+ - `section`: An optional section name in the configuration file.
+ - `max_table_nesting`: Sets the maximum depth of nested tables above which the remaining nodes are loaded as structs or JSON.
+ - `root_key` (bool): Enables merging on all resources by propagating the root foreign key to nested tables. This option is most useful if you plan to change the write disposition of a resource to disable/enable merge. Defaults to False.
++- `schema`: An explicit `dlt.Schema` instance to be associated with the source. If not present, `dlt` creates a new `Schema` object with the provided `name`. If such `dlt.Schema` already exists in the same folder as the module containing the decorated function, such schema will be loaded from file.
+ - `schema_contract`: Schema contract settings that will be applied to this resource.
+-- `spec`: A specification of configuration and secret values required by the source.
++- `parallelized`: If `True`, resource generators will be extracted in parallel with other resources.
+ 
+ ### Headers configuration
+ 
+
+
+===== COMMIT c42ca688 =====
+
+
+commit c42ca688d
+Author: Anton Burnashev
+Date: 2025-09-30
+
+    rest_api: remove the unused exceptions file (#3143)
+
+diff --git a/dlt/sources/rest_api/exceptions.py b/dlt/sources/rest_api/exceptions.py
+deleted file mode 100644
+index 24fd5b31b..000000000
+--- a/dlt/sources/rest_api/exceptions.py
++++ /dev/null
+@@ -1,8 +0,0 @@
+-from dlt.common.exceptions import DltException
+-
+-
+-class RestApiException(DltException):
+-    pass
+-
+-
+-# class Paginator
+
+
+===== COMMIT 2f518dae =====
+
+
+commit 2f518dae4
+Author: djudjuu
+Date: 2025-09-29
+
+    docs/prefect integration (#3037)
+
+diff --git a/docs/website/docs/hub/production/prefect-integration.md b/docs/website/docs/hub/production/prefect-integration.md
+new file mode 100644
+index 000000000..0f4bdbaae
+--- /dev/null
++++ b/docs/website/docs/hub/production/prefect-integration.md
+@@ -0,0 +1,310 @@
++---
++title: "Prefect Integration"
++description: Run pipelines with Prefect
++keywords: ["prefect", "retry", "logs", "artifacts", "progress", "callbacks", "source decomposition", "parallelization"]
++---
++# Prefect Integration
++
++dlt+ offers a few tools and helpers to make running dlt pipelines in prefect a seamless experience.
++
++## Key features
++
++- **Prefect Collector:** a dedicated way to do real-time progress monitoring and summary reports after each pipeline stage
++- **Retry integration:** retries without losing intermediate results, execute custom code between retries
++- **Source decomposition flows:** Create tasks and flows that will execute your pipelines in parallel with the right settings
++
++## Prefect Collector
++
++The `PrefectCollector` creates rich [artifacts](https://docs.prefect.io/v3/concepts/artifacts#artifacts) in the Prefect UI to monitor dlt pipeline progress and results.
++Artifacts are one of Prefect's ways to visualize outputs or side effects that your runs produce, capture updates over time or attach metadata to your runs.
++`dlt` artifacts include information about the processed data, resource consumption, runtime environment and the pipeline configuration.
++
++Simply pass the `PrefectCollector` to your pipeline's `progress` parameter.
++
++```py
++from dlt_plus._runner.prefect_collector import PrefectCollector
++
++@task
++def my_dlt_task():
++    pipeline = dlt.pipeline(
++        pipeline_name="my_pipeline",
++        destination="duckdb",
++        dataset_name="my_dataset",
++        progress=PrefectCollector()
++    )
++    
++    load_info = pipeline.run(source)
++```
++
++### Progress and Summary Reports by pipeline stage
++
++If the task is executed the `PrefectCollector` will create progress artifacts that will update
++during a stage as well as summary report after a pipeline step has completed.
++For example during extract you will see how many resources have been extracted and once the extract 
++is completed you will see how many rows have been processed for each resource: 
++
++![Prefect Extract Artifacts](https://storage.googleapis.com/dlt-blog-images/docs-prefect-extract-artifact.png)
++
++Each summary report includes basic information about the pipeline, the destination, the execution, and system resource usage (CPU and memory).
++
++### Schema Change Reports
++
++The `PrefectCollector` will also create special artifacts when schema changes are detected.
++For example, if a new table is created or an existing table is updated, the `PrefectCollector` will create a markdown-report that includes the complete definition of the new table or the updated columns.
++
++This is useful to see which tables and columns have changed between runs.
++
++![Prefect Schema Change Detection](https://storage.googleapis.com/dlt-blog-images/docs-prefect-schema-change-artifact.png)
++
++### Logging
++
++Prefect has built-in functionality to [include logs from other libraries](https://docs.prefect.io/v3/advanced/logging-customization#include-logs-from-other-libraries) and display them as part of their UI.
++
++You can tell prefect to include `dlt`'s logs by setting the corresponding prefect configuration value:
++<Tabs
++  groupId="config-type"
++  defaultValue="prefect-cli"
++  values={[
++    {"label": ".env", "value": "env"},
++    {"label": "prefect-cli", "value": "prefect-cli"}
++  ]}>
++
++<TabItem value="env">
++```sh
++PREFECT_LOGGING_EXTRA_LOGGERS=dlt
++```
++</TabItem>
++<TabItem value="prefect-cli">
++```sh
++prefect config set PREFECT_LOGGING_EXTRA_LOGGERS=dlt
++```
++</TabItem>
++</Tabs>
++
++You should now see dlt's logs in the prefect UI and be able to [query them with the prefect CLI](https://docs.prefect.io/v3/how-to-guides/workflows/add-logging#access-logs-from-the-command-line).
++
++
++## Runner integration
++
++The `PrefectCollector` integrates seamlessly with the [dlt+ runner](../production/pipeline-runner.md). 
++
++If you are running your pipelines with the dlt+ runner, information about the pipeline's run configuration and the trace pipeline 
++will also be included in the artifacts in the `Run Configuration` section.
++
++### Pipeline Retries
++
++Both dlt+ and Prefect provide retry mechanisms, but they are not compatible out-of-the-box.
++Most importantly, the dlt+ Runner implements retries on the same filesystem as the original run.
++This is relevant because `dlt` generates intermediate files in the [pipeline working directory](../../general-usage/pipeline#pipeline-working-directory), which represent the intermediate results of the pipeline steps.
++With Prefect, whether or not a retry runs on the same filesystem depends on your infrastructure and your deployment.
++For example, if you are running code in ephemeral docker containers and your pipeline fails during the load-step, this working directory will be gone and the next retry will have to do the extraction and normalization steps again.
++
++If you use the dlt+ Runner the retry will pick up from where the previous run left off, saving you much time and compute.
++
++To do so, [define a retry policy](../production/pipeline-runner#retry-policies) and run your pipelines with the dlt+ runner inside your prefect tasks or flows.
++
++```py
++from dlt_plus import runner
++from tenacity import Retrying, stop_after_attempt
++from dlt.sources.sql_database import sql_database
++
++MY_RETRY_POLICY = Retrying(stop=stop_after_attempt(3), reraise=True)
++
++@task(log_prints=True) # use log_prints=True to see dlt.progress outputs in the logs of the prefect ui
++def resilient_pipeline_task():
++    pipeline = dlt.pipeline("my_pipeline", destination="duckdb", progress=PrefectCollector())
++    source = sql_database(table_names=["items"])
++    
++    load_info = runner(
++        pipeline, 
++        retry_policy=MY_RETRY_POLICY,
++        retry_pipeline_steps=["extract", "normalize", "load"]
++    ).run(source)
++    
++    return load_info
++```
++
++Detailed error artifacts with full tracebacks are automatically created for each retry attempt as well as a final report.
++
++![Prefect Retry Artifacts](https://storage.googleapis.com/dlt-blog-images/docs-prefect-retry-artifacts.png)
++
++## Custom Callbacks
++
++The `PrefectCollector` is a subclass of the `PlusLogCollector` class, which allows you to implement [custom callbacks](../production/observability.md).
++
++```py
++from dlt_plus._runner.prefect_collector import PrefectCollector
++from prefect.logging import get_run_logger
++from tenacity import Retrying, stop_after_attempt
++from dlt.sources.sql_database import sql_database
++
++MY_RETRY_POLICY = Retrying(stop=stop_after_attempt(3), reraise=True)
++
++class MyCustomCollector(PrefectCollector):
++    def on_retry(
++        self,
++        pipeline: SupportsPipeline,
++        trace: PipelineTrace,
++        retry_attempt: int,
++        last_attempt: bool,
++        exception: Exception,
++    ) -> None:
++        # your code here will be executed before a retry is attempted
++        ...
++
++@task
++def my_task():
++    # instantiate your collector with a task-aware logger from prefect
++    prefect_logger = get_run_logger()
++    my_collector = MyCustomCollector(1, logger=prefect_logger)
++
++    # pass your collector to the pipeline
++    pipeline = dlt.pipeline(
++        pipeline_name="my_pipeline",
++        destination="dummy", # use dummy destination to trigger failed load
++        progress=my_collector
++    )
++    # run your pipeline with the source in the dlt_plus.runner()
++    source = sql_database(table_names=["items"])
++    load_info = dlt_plus.runner(pipeline, retry_policy=MY_RETRY_POLICY).run(source)
++    return load_info
++```
++
++## Source decomposition
++
++dlt+ also provides helpers that you can use to create tasks and flows that you can drop 
++into your prefect code with the options to parameterize the runner and run the resources in your source
++in parallel tasks.
++
++```py
++import dlt
++import dlt_plus
++from dlt_plus._runner.prefect_helpers import create_run_pipeline_flow
++from prefect.task_runners import ThreadPoolTaskRunner
++from prefect import flow, task
++
++@flow(task_runner=ThreadPoolTaskRunner(max_workers=5))
++def my_main_flow():
++    # define your pipeline and source inside the flow
++    pipeline = dlt.pipeline(
++        pipeline_name="my_pipeline",
++        destination=dlt.destinations.duckdb(destination_name="my_destination"),
++        dataset_name="my_dataset",
++    )
++    source = sql_database(schema="my_schema")
++
++    # create a subflow that will run each resource in a dedicated pipeline
++    run_pipeline_with_parallel_tables = create_run_pipeline_flow(
++        pipeline=pipeline,
++        source=source,
++        decompose=True,
++        flow_name="my_parallelized_flow",
++    )
++
++    # run it, passing args that you would usually pass to the pipeline.run() method
++    run_pipeline_with_parallel_tables(write_disposition="append")
++
++if __name__ == "__main__":
++    my_main_flow()
++
++```
++
++This will derive a task-pipeline with a deterministic name for each resource in the source and run them in parallel.
++Because they have different names, pipelines can run in parallel without interfering with each other.
++
++You can read more about source decomposition and what to watch out for when using it on the [performance page](../../reference/performance#source-decomposition-for-serial-and-parallel-resource-execution).
++
++![Prefect Source Decomposition Flow](https://storage.googleapis.com/dlt-blog-images/docs-prefect-source-decomposition.png)
++
++:::note
++For stability reasons, this actually runs one resource alone and then all others in parallel.
++This prevents multiple resources from attempting to create the same dlt tables simultaneously during the initial run.
++:::
++## On parallelization
++
++Both `dlt` and Prefect are implementing parallelization in multiple ways and can complement each other.
++While `dlt` options can be used to optimize the execution of a single pipeline, Prefect's features can be used to run multiple pipelines at the same time.
++
++`dlt` will use different parallelism strategies for each stage, depending on the stage and the source, which you can read in detail about on the [performance page](../../reference/performance#parallelism-within-a-pipeline).
++These are the key facts that you need to be aware of if you want to parallelize your pipelines in prefect:
++During extraction, `dlt` can use multithreading to parallelize the extraction of resources and, if supported by the source, to evaluate each `yield` of the resource generator in a separate thread (`parallelized=True` in the resource decorator).
++During normalize, which is usually CPU intensive, `dlt` will use multiprocessing to normalize the data in separate processes. During load, `dlt` will use multithreading to parallelize the loading of resources, where each file can be loaded in a separate thread. The default behavior is to use a threadpool with 30 threads.
++Since version 1.13.0, `dlt` will detect automatically if it's executed inside prefect and spawn subprocesses with the correct method, so all parallelization features are available just like in your local environment.
++You can use the usual configuration options (env-vars or `config.toml`) or use the corresponding parameters of the prefect helpers.
++
++<Tabs
++  groupId="config-type"
++  defaultValue="env"
++  values={[
++    {"label": ".env", "value": "env"},
++    {"label": "config.toml", "value": "config.toml"},
++    {"label": "python", "value": "python"}
++  ]}>
++
++<TabItem value="env">
++
++```sh
++# for all pipelines
++EXTRACT__WORKERS=30
++
++# pipeline specific
++MY_PIPELINE_NAME__NORMALIZE__WORKERS=3  # 3 processes for normalization
++MY_PIPELINE_NAME__NORMALIZE__DATA_WRITER__FILE_MAX_ITEMS=10000  # max 10k items per file
++MY_PIPELINE_NAME__NORMALIZE__DATA_WRITER__FILE_MAX_BYTES=1000000  # max 1MB per file
++```
++
++</TabItem>
++<TabItem value="config.toml">
++```toml
++[extract]
++workers=30
++
++[my_pipeline_name.normalize]
++workers=3
++file_max_items=10000  # max 10k items per file
++file_max_bytes=1000000  # max 1MB per file
++```
++</TabItem>
++<TabItem value="python">
++```py
++from dlt_plus._runner.prefect_helpers import create_run_pipeline_flow
++from prefect.task_runners import ThreadPoolTaskRunner
++from prefect import flow, task
++
++@flow(task_runner=ThreadPoolTaskRunner(max_workers=5))
++def my_main_flow():
++    # define your pipeline and source inside the flow
++    pipeline = dlt.pipeline("my_pipeline", destination="duckdb", dataset_name="my_dataset")
++    source = sql_database(schema="my_schema").parallelize()
++
++    # create a subflow that will decompose the source and run each resource of it with an isolated
++    # task pipeline using the given parallelism settings
++    decompose_flow = create_run_pipeline_flow(
++        pipeline=pipeline,
++        source=source,
++        decompose=True,
++        extract_workers=10,      # 10 threads for extraction
++        normalize_workers=3,     # 3 processes for normalization
++        file_max_items=10000,    # max 10k items per file
++        file_max_bytes=1000000,  # max 1MB per file
++        flow_name="my_parallelized_flow",
++    )
++    # run the flow
++    load_info = decompose_flow()
++```
++
++</TabItem>
++</Tabs>
++
++The infrastructure you run your Prefect jobs on must have multiple cores in order to actually benefit from `dlt`'s multiprocessing.
++
++Prefect implements parallelization by using either a threadpool or a processpool to execute tasks in parallel, as controlled by the `task_runner` parameter of the flow.
++For `dlt`, we suggest that a task should be running one pipeline with one datasource (read [this](https://docs.prefect.io/v3/concepts/flows#why-both-flows-and-tasks) for more details on how to use tasks and flows).
++In the above example, we create a subflow with tasks for each resource in the source and run up to five task pipelines in parallel, each of which uses multiple threads and processes for extraction and normalization.
++
++:::note
++The flow and tasks created by these helpers must be executed with the `ThreadPoolTaskRunner`.
++Other runners, such as the `DaskRunner` from `prefect-dask` library, which distribute tasks across multiple machines won't work with these helpers, because they
++pass pipeline and source objects as arguments, which cannot be pickled or serialized in order to be sent to other machines.
++If you want to build tasks that run on multiple machines, you have to write your tasks in a way that both pipeline and sources can be initialized inside those tasks.
++:::
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index a45c0c1c9..ec8d95db7 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -561,6 +561,7 @@ const sidebars = {
+           items: [
+             'hub/production/pipeline-runner',
+             'hub/production/observability',
++            'hub/production/prefect-integration',
+           ]
+         },
+         'hub/reference',
+
+
+===== COMMIT 210dd378 =====
+
+
+commit 210dd3780
+Author: David Scharf
+Date: 2025-09-29
+
+    move test of newest lib version to macos (#3142)
+
+diff --git a/.github/workflows/test_tools_dashboard.yml b/.github/workflows/test_tools_dashboard.yml
+index 5de3b57a2..dcf00bb9b 100644
+--- a/.github/workflows/test_tools_dashboard.yml
++++ b/.github/workflows/test_tools_dashboard.yml
+@@ -46,8 +46,9 @@ jobs:
+             shell: bash
+             uv_sync_args: '--resolution lowest-direct' # could also be 'direct'
+ 
+-          # linux test with newest available allowed packages (will update lockfile, should not be committed if run locally)
+-          - os: ubuntu-latest
++          # mac test with newest available allowed packages (will update lockfile, should not be committed if run locally)
++          # TODO: revert to linux
++          - os: "macos-14"
+             python-version: "3.11"
+             shell: bash
+             uv_sync_args: '--upgrade' # could also be 'direct'
+
+
+===== COMMIT c1af1881 =====
+
+
+commit c1af18819
+Author: David Scharf
+Date: 2025-09-24
+
+    Fixes more links (#3127)
+
+diff --git a/docs/website/docs/dlt-ecosystem/transformations/index.md b/docs/website/docs/dlt-ecosystem/transformations/index.md
+index 6c51e8cd8..e59cf5a48 100644
+--- a/docs/website/docs/dlt-ecosystem/transformations/index.md
++++ b/docs/website/docs/dlt-ecosystem/transformations/index.md
+@@ -15,9 +15,9 @@ If you'd like to transform your data after a pipeline load, you have 3 options a
+ 
+ If you need to preprocess some of your data before it is loaded, you can learn about strategies to:
+ 
+-* [Rename columns.](../../general-usage/customising-pipelines/renaming_columns)
+-* [Pseudonymize columns.](../../general-usage/customising-pipelines/pseudonymizing_columns)
+-* [Remove columns.](../../general-usage/customising-pipelines/removing_columns)
++* [Rename columns.](../../general-usage/customising-pipelines/renaming_columns.md)
++* [Pseudonymize columns.](../../general-usage/customising-pipelines/pseudonymizing_columns.md)
++* [Remove columns.](../../general-usage/customising-pipelines/removing_columns.md)
+ 
+ This is particularly useful if you are trying to remove data related to PII or other sensitive data, you want to remove columns that are not needed for your use case or you are using a destination that does not support certain data types in your source data.
+ 
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/index.md b/docs/website/docs/dlt-ecosystem/verified-sources/index.md
+index 37bad9b3f..a0f1a4a84 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/index.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/index.md
+@@ -23,7 +23,7 @@ item => item.label === '30+ SQL databases' || item.label === 'REST APIs' || item
+ Choose from our collection of verified sources, developed and maintained by the `dlt` team and community. Each source is rigorously tested against a real API and provided as Python code for easy customization.
+ 
+ :::tip
+-If you couldn't find a source implementation, you can easily create your own. Check out the [resource page](../../general-usage/resource) to learn how!
++If you couldn't find a source implementation, you can easily create your own. Check out the [resource page](../../general-usage/resource.md) to learn how!
+ :::
+ 
+ 
+
+
+===== COMMIT 133b60a7 =====
+
+
+commit 133b60a7c
+Author: David Scharf
+Date: 2025-09-24
+
+    Fix remaining routing problems in cloudflare setup (#3124)
+
+diff --git a/docs/website/.dev.vars b/docs/website/.dev.vars
+deleted file mode 100644
+index 482e68fc0..000000000
+--- a/docs/website/.dev.vars
++++ /dev/null
+@@ -1 +0,0 @@
+-ENV=development
+\ No newline at end of file
+diff --git a/docs/website/docs/dlt-ecosystem/transformations/index.md b/docs/website/docs/dlt-ecosystem/transformations/index.md
+index 6c51e8cd8..e59cf5a48 100644
+--- a/docs/website/docs/dlt-ecosystem/transformations/index.md
++++ b/docs/website/docs/dlt-ecosystem/transformations/index.md
+@@ -15,9 +15,9 @@ If you'd like to transform your data after a pipeline load, you have 3 options a
+ 
+ If you need to preprocess some of your data before it is loaded, you can learn about strategies to:
+ 
+-* [Rename columns.](../../general-usage/customising-pipelines/renaming_columns)
+-* [Pseudonymize columns.](../../general-usage/customising-pipelines/pseudonymizing_columns)
+-* [Remove columns.](../../general-usage/customising-pipelines/removing_columns)
++* [Rename columns.](../../general-usage/customising-pipelines/renaming_columns.md)
++* [Pseudonymize columns.](../../general-usage/customising-pipelines/pseudonymizing_columns.md)
++* [Remove columns.](../../general-usage/customising-pipelines/removing_columns.md)
+ 
+ This is particularly useful if you are trying to remove data related to PII or other sensitive data, you want to remove columns that are not needed for your use case or you are using a destination that does not support certain data types in your source data.
+ 
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/index.md b/docs/website/docs/dlt-ecosystem/verified-sources/index.md
+index 00510243d..a0f1a4a84 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/index.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/index.md
+@@ -23,7 +23,7 @@ item => item.label === '30+ SQL databases' || item.label === 'REST APIs' || item
+ Choose from our collection of verified sources, developed and maintained by the `dlt` team and community. Each source is rigorously tested against a real API and provided as Python code for easy customization.
+ 
+ :::tip
+-If you couldn't find a source implementation, you can easily create your own. Check out the [resource page](../../general-usage/resource) to learn how!
++If you couldn't find a source implementation, you can easily create your own. Check out the [resource page](../../general-usage/resource.md) to learn how!
+ :::
+ 
+ 
+@@ -34,7 +34,7 @@ item => item.label !== '30+ SQL databases' && item.label !== 'REST APIs' && item
+ ### What's the difference between core and verified sources?
+ 
+ The main difference between the [core sources](#core-sources) and [verified sources](#verified-sources) lies in their structure.
+-Core sources are generic collections, meaning they can connect to a variety of systems. For example, the [SQL Database source](sql_database) can connect to any
++Core sources are generic collections, meaning they can connect to a variety of systems. For example, the [SQL Database source](./sql_database/index.md) can connect to any
+ database that supports SQLAlchemy.
+ 
+ According to our telemetry, core sources are the most widely used among our users!
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/index.md b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/index.md
+index 7ad3bc7b5..fe59a52c8 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/index.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/index.md
+@@ -34,13 +34,13 @@ Check out [dltHub Features](https://info.dlthub.com/waiting-list) for support of
+ We support all [SQLAlchemy dialects](https://docs.sqlalchemy.org/en/20/dialects/), which include, but are not limited to, the following database engines:
+ 
+ 
+-* [PostgreSQL](./troubleshooting#postgres--mssql)
+-* [MySQL](./troubleshooting#mysql)
++* [PostgreSQL](./troubleshooting.md#postgres--mssql)
++* [MySQL](./troubleshooting.md#mysql)
+ * SQLite
+-* [Oracle](./troubleshooting#oracle)
+-* [Microsoft SQL Server](./troubleshooting#postgres--mssql)
++* [Oracle](./troubleshooting.md#oracle)
++* [Microsoft SQL Server](./troubleshooting.md#postgres--mssql)
+ * MariaDB
+-* [IBM DB2 and Informix](./troubleshooting#db2)
++* [IBM DB2 and Informix](./troubleshooting.md#db2)
+ * Google BigQuery
+ * Snowflake
+ * Redshift
+diff --git a/docs/website/docusaurus.config.js b/docs/website/docusaurus.config.js
+index 28d899dfa..1c234ee26 100644
+--- a/docs/website/docusaurus.config.js
++++ b/docs/website/docusaurus.config.js
+@@ -55,6 +55,7 @@ const config = {
+   onBrokenAnchors: 'throw',
+   favicon: 'img/favicon.ico',
+   staticDirectories: ['public', 'static'],
++  trailingSlash: false,
+ 
+   // GitHub pages deployment config.
+   // If you aren't using GitHub pages, you don't need these.
+diff --git a/docs/website/worker.ts b/docs/website/worker.ts
+index 378c83d95..abb6fb569 100644
+--- a/docs/website/worker.ts
++++ b/docs/website/worker.ts
+@@ -5,8 +5,9 @@ import type { ReadableSpan } from '@opentelemetry/sdk-trace-base'
+ const REDIRECTS = [
+     // basic root redirects
+     {
++        // NOTE: We only ever hit the root path on dev previews, so we can redirect to the devel version
+         from: "/",
+-        to: "/docs/intro"
++        to: "/docs/devel/intro"
+     },
+     {
+         from: "/docs",
+@@ -79,25 +80,7 @@ const handler = {
+             }
+         }   
+ 
+-        // normalize urls prefixed with /docs, only needed locally
+-        if (env.ENV === "development" && url.pathname.startsWith("/docs/")) {
+-            url.pathname = url.pathname.replace(/^\/docs/, "");
+-        }
+-
+-        // always redirect away from trailing slashes
+-        if (url.pathname.endsWith("/")) {
+-            url.pathname = url.pathname.slice(0, -1);
+-            return Response.redirect(url.toString(), 301);
+-        }
+-        
+-        // here we try to fetch the asset and try again with a trailing slash
+-        // to hide redirects comming from cloudflare worker assets
+-        let res = await env.ASSETS.fetch(new Request(url.toString(), request));  
+-        if (res.status === 307 && !url.pathname.endsWith("/")) {
+-            url.pathname = url.pathname + "/";
+-            res = await env.ASSETS.fetch(new Request(url.toString(), request));
+-        }
+-
++        let res = await env.ASSETS.fetch(request);
+         if (res.status === 404) {
+             url.pathname = ROUTE_404;
+             return Response.redirect(url.toString(), 301);
+diff --git a/docs/website/wrangler.jsonc b/docs/website/wrangler.jsonc
+index 62b35a116..ee786f813 100644
+--- a/docs/website/wrangler.jsonc
++++ b/docs/website/wrangler.jsonc
+@@ -9,6 +9,7 @@
+     "assets": {
+         "directory": "./build",
+         "run_worker_first": ["/*"],
++        "html_handling": "drop-trailing-slash",
+         "binding": "ASSETS" // <-- creates env.ASSETS variable
+     },
+     "observability": {
+@@ -20,10 +21,6 @@
+       "AXIOM_URL": "https://api.axiom.co/v1/traces",
+     },
+     "routes": [
+-        {
+-          "pattern": "stage.dlthub.com/docs*",
+-          "zone_name": "dlthub.com"
+-        },
+         {
+           "pattern": "dlthub.com/docs*",
+           "zone_name": "dlthub.com"
+
+
+===== COMMIT 3765dd83 =====
+
+
+commit 3765dd83b
+Author: David Scharf
+Date: 2025-09-24
+
+    Fix remaining routing problems in cloudflare setup (#3126)
+
+diff --git a/docs/website/.dev.vars b/docs/website/.dev.vars
+deleted file mode 100644
+index 482e68fc0..000000000
+--- a/docs/website/.dev.vars
++++ /dev/null
+@@ -1 +0,0 @@
+-ENV=development
+\ No newline at end of file
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/index.md b/docs/website/docs/dlt-ecosystem/verified-sources/index.md
+index 00510243d..37bad9b3f 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/index.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/index.md
+@@ -34,7 +34,7 @@ item => item.label !== '30+ SQL databases' && item.label !== 'REST APIs' && item
+ ### What's the difference between core and verified sources?
+ 
+ The main difference between the [core sources](#core-sources) and [verified sources](#verified-sources) lies in their structure.
+-Core sources are generic collections, meaning they can connect to a variety of systems. For example, the [SQL Database source](sql_database) can connect to any
++Core sources are generic collections, meaning they can connect to a variety of systems. For example, the [SQL Database source](./sql_database/index.md) can connect to any
+ database that supports SQLAlchemy.
+ 
+ According to our telemetry, core sources are the most widely used among our users!
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/index.md b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/index.md
+index 7ad3bc7b5..fe59a52c8 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/index.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/index.md
+@@ -34,13 +34,13 @@ Check out [dltHub Features](https://info.dlthub.com/waiting-list) for support of
+ We support all [SQLAlchemy dialects](https://docs.sqlalchemy.org/en/20/dialects/), which include, but are not limited to, the following database engines:
+ 
+ 
+-* [PostgreSQL](./troubleshooting#postgres--mssql)
+-* [MySQL](./troubleshooting#mysql)
++* [PostgreSQL](./troubleshooting.md#postgres--mssql)
++* [MySQL](./troubleshooting.md#mysql)
+ * SQLite
+-* [Oracle](./troubleshooting#oracle)
+-* [Microsoft SQL Server](./troubleshooting#postgres--mssql)
++* [Oracle](./troubleshooting.md#oracle)
++* [Microsoft SQL Server](./troubleshooting.md#postgres--mssql)
+ * MariaDB
+-* [IBM DB2 and Informix](./troubleshooting#db2)
++* [IBM DB2 and Informix](./troubleshooting.md#db2)
+ * Google BigQuery
+ * Snowflake
+ * Redshift
+diff --git a/docs/website/docusaurus.config.js b/docs/website/docusaurus.config.js
+index 28d899dfa..1c234ee26 100644
+--- a/docs/website/docusaurus.config.js
++++ b/docs/website/docusaurus.config.js
+@@ -55,6 +55,7 @@ const config = {
+   onBrokenAnchors: 'throw',
+   favicon: 'img/favicon.ico',
+   staticDirectories: ['public', 'static'],
++  trailingSlash: false,
+ 
+   // GitHub pages deployment config.
+   // If you aren't using GitHub pages, you don't need these.
+diff --git a/docs/website/worker.ts b/docs/website/worker.ts
+index 378c83d95..abb6fb569 100644
+--- a/docs/website/worker.ts
++++ b/docs/website/worker.ts
+@@ -5,8 +5,9 @@ import type { ReadableSpan } from '@opentelemetry/sdk-trace-base'
+ const REDIRECTS = [
+     // basic root redirects
+     {
++        // NOTE: We only ever hit the root path on dev previews, so we can redirect to the devel version
+         from: "/",
+-        to: "/docs/intro"
++        to: "/docs/devel/intro"
+     },
+     {
+         from: "/docs",
+@@ -79,25 +80,7 @@ const handler = {
+             }
+         }   
+ 
+-        // normalize urls prefixed with /docs, only needed locally
+-        if (env.ENV === "development" && url.pathname.startsWith("/docs/")) {
+-            url.pathname = url.pathname.replace(/^\/docs/, "");
+-        }
+-
+-        // always redirect away from trailing slashes
+-        if (url.pathname.endsWith("/")) {
+-            url.pathname = url.pathname.slice(0, -1);
+-            return Response.redirect(url.toString(), 301);
+-        }
+-        
+-        // here we try to fetch the asset and try again with a trailing slash
+-        // to hide redirects comming from cloudflare worker assets
+-        let res = await env.ASSETS.fetch(new Request(url.toString(), request));  
+-        if (res.status === 307 && !url.pathname.endsWith("/")) {
+-            url.pathname = url.pathname + "/";
+-            res = await env.ASSETS.fetch(new Request(url.toString(), request));
+-        }
+-
++        let res = await env.ASSETS.fetch(request);
+         if (res.status === 404) {
+             url.pathname = ROUTE_404;
+             return Response.redirect(url.toString(), 301);
+diff --git a/docs/website/wrangler.jsonc b/docs/website/wrangler.jsonc
+index 62b35a116..ee786f813 100644
+--- a/docs/website/wrangler.jsonc
++++ b/docs/website/wrangler.jsonc
+@@ -9,6 +9,7 @@
+     "assets": {
+         "directory": "./build",
+         "run_worker_first": ["/*"],
++        "html_handling": "drop-trailing-slash",
+         "binding": "ASSETS" // <-- creates env.ASSETS variable
+     },
+     "observability": {
+@@ -20,10 +21,6 @@
+       "AXIOM_URL": "https://api.axiom.co/v1/traces",
+     },
+     "routes": [
+-        {
+-          "pattern": "stage.dlthub.com/docs*",
+-          "zone_name": "dlthub.com"
+-        },
+         {
+           "pattern": "dlthub.com/docs*",
+           "zone_name": "dlthub.com"
+
+
+===== COMMIT c4d365c1 =====
+
+
+commit c4d365c10
+Author: David Scharf
+Date: 2025-09-23
+
+    filter out assets from tracked spans (#3116)
+
+diff --git a/docs/website/package-lock.json b/docs/website/package-lock.json
+index 6fbe0fee6..2592051c8 100644
+--- a/docs/website/package-lock.json
++++ b/docs/website/package-lock.json
+@@ -13,7 +13,7 @@
+         "@docusaurus/preset-classic": "^3.7.0",
+         "@docusaurus/theme-common": "^3.7.0",
+         "@mdx-js/react": "^3.1.0",
+-        "@microlabs/otel-cf-workers": "^1.0.0-rc.52",
++        "@microlabs/otel-cf-workers": "1.0.0-rc.49",
+         "clsx": "^1.2.1",
+         "dedent": "^1.5.1",
+         "dotenv": "^16.3.1",
+@@ -5265,18 +5265,18 @@
+       }
+     },
+     "node_modules/@microlabs/otel-cf-workers": {
+-      "version": "1.0.0-rc.52",
+-      "resolved": "https://registry.npmjs.org/@microlabs/otel-cf-workers/-/otel-cf-workers-1.0.0-rc.52.tgz",
+-      "integrity": "sha512-7jf4sBNoaZCz2RSayefcvc/CZX0PDVA9aVk44bHpUebLrap+xjzDDw4T03klcYrBl/FdC7NamwvqjUMCtYdBvQ==",
++      "version": "1.0.0-rc.49",
++      "resolved": "https://registry.npmjs.org/@microlabs/otel-cf-workers/-/otel-cf-workers-1.0.0-rc.49.tgz",
++      "integrity": "sha512-wPfaHxFAOOHlLxvWVGhdsMf+lcSsjtysfHOwk7hnTdUdim1f3trTVxaa0fl7xF/AdZ1LgGbLI9xbCEz14qSzNw==",
+       "license": "BSD-3-Clause",
+       "dependencies": {
+-        "@opentelemetry/core": "^2.0.0",
+-        "@opentelemetry/exporter-trace-otlp-http": "^0.200.0",
+-        "@opentelemetry/otlp-exporter-base": "^0.200.0",
+-        "@opentelemetry/otlp-transformer": "^0.200.0",
+-        "@opentelemetry/resources": "^2.0.0",
+-        "@opentelemetry/sdk-trace-base": "^2.0.0",
+-        "@opentelemetry/semantic-conventions": "^1.33.0"
++        "@opentelemetry/core": "^1.26.0",
++        "@opentelemetry/exporter-trace-otlp-http": "^0.53.0",
++        "@opentelemetry/otlp-exporter-base": "^0.53.0",
++        "@opentelemetry/otlp-transformer": "^0.53.0",
++        "@opentelemetry/resources": "^1.26.0",
++        "@opentelemetry/sdk-trace-base": "^1.26.0",
++        "@opentelemetry/semantic-conventions": "^1.27.0"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": "~1.9.0"
+@@ -5392,325 +5392,397 @@
+       }
+     },
+     "node_modules/@opentelemetry/api-logs": {
+-      "version": "0.200.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/api-logs/-/api-logs-0.200.0.tgz",
+-      "integrity": "sha512-IKJBQxh91qJ+3ssRly5hYEJ8NDHu9oY/B1PXVSCWf7zytmYO9RNLB0Ox9XQ/fJ8m6gY6Q6NtBWlmXfaXt5Uc4Q==",
++      "version": "0.53.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/api-logs/-/api-logs-0.53.0.tgz",
++      "integrity": "sha512-8HArjKx+RaAI8uEIgcORbZIPklyh1YLjPSBus8hjRmvLi6DeFzgOcdZ7KwPabKj8mXF8dX0hyfAyGfycz0DbFw==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/api": "^1.3.0"
++        "@opentelemetry/api": "^1.0.0"
+       },
+       "engines": {
+-        "node": ">=8.0.0"
++        "node": ">=14"
+       }
+     },
+     "node_modules/@opentelemetry/core": {
+-      "version": "2.1.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-2.1.0.tgz",
+-      "integrity": "sha512-RMEtHsxJs/GiHHxYT58IY57UXAQTuUnZVco6ymDEqTNlJKTimM4qPUPVe8InNFyBjhHBEAx4k3Q8LtNayBsbUQ==",
++      "version": "1.30.1",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-1.30.1.tgz",
++      "integrity": "sha512-OOCM2C/QIURhJMuKaekP3TRBxBKxG/TWWA0TL2J6nXUtDnuCtccy49LUJF8xPFXMX+0LMcxFpCo8M9cGY1W6rQ==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/semantic-conventions": "1.28.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": ">=1.0.0 <1.10.0"
+       }
+     },
++    "node_modules/@opentelemetry/core/node_modules/@opentelemetry/semantic-conventions": {
++      "version": "1.28.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/semantic-conventions/-/semantic-conventions-1.28.0.tgz",
++      "integrity": "sha512-lp4qAiMTD4sNWW4DbKLBkfiMZ4jbAboJIGOQr5DvciMRI494OapieI9qiODpOt0XBr1LjIDy1xAGAnVs5supTA==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=14"
++      }
++    },
+     "node_modules/@opentelemetry/exporter-trace-otlp-http": {
+-      "version": "0.200.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/exporter-trace-otlp-http/-/exporter-trace-otlp-http-0.200.0.tgz",
+-      "integrity": "sha512-Goi//m/7ZHeUedxTGVmEzH19NgqJY+Bzr6zXo1Rni1+hwqaksEyJ44gdlEMREu6dzX1DlAaH/qSykSVzdrdafA==",
++      "version": "0.53.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/exporter-trace-otlp-http/-/exporter-trace-otlp-http-0.53.0.tgz",
++      "integrity": "sha512-m7F5ZTq+V9mKGWYpX8EnZ7NjoqAU7VemQ1E2HAG+W/u0wpY1x0OmbxAXfGKFHCspdJk8UKlwPGrpcB8nay3P8A==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/otlp-exporter-base": "0.200.0",
+-        "@opentelemetry/otlp-transformer": "0.200.0",
+-        "@opentelemetry/resources": "2.0.0",
+-        "@opentelemetry/sdk-trace-base": "2.0.0"
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/otlp-exporter-base": "0.53.0",
++        "@opentelemetry/otlp-transformer": "0.53.0",
++        "@opentelemetry/resources": "1.26.0",
++        "@opentelemetry/sdk-trace-base": "1.26.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": "^1.3.0"
++        "@opentelemetry/api": "^1.0.0"
+       }
+     },
+     "node_modules/@opentelemetry/exporter-trace-otlp-http/node_modules/@opentelemetry/core": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-2.0.0.tgz",
+-      "integrity": "sha512-SLX36allrcnVaPYG3R78F/UZZsBsvbc7lMCLx37LyH5MJ1KAAZ2E3mW9OAD3zGz0G8q/BtoS5VUrjzDydhD6LQ==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-1.26.0.tgz",
++      "integrity": "sha512-1iKxXXE8415Cdv0yjG3G6hQnB5eVEsJce3QaawX8SjDn0mAS0ZM8fAbZZJD4ajvhC15cePvosSCut404KrIIvQ==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": ">=1.0.0 <1.10.0"
+       }
+     },
+     "node_modules/@opentelemetry/exporter-trace-otlp-http/node_modules/@opentelemetry/resources": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-2.0.0.tgz",
+-      "integrity": "sha512-rnZr6dML2z4IARI4zPGQV4arDikF/9OXZQzrC01dLmn0CZxU5U5OLd/m1T7YkGRj5UitjeoCtg/zorlgMQcdTg==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-1.26.0.tgz",
++      "integrity": "sha512-CPNYchBE7MBecCSVy0HKpUISEeJOniWqcHaAHpmasZ3j9o6V3AyBzhRc90jdmemq0HOxDr6ylhUbDhBqqPpeNw==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": ">=1.3.0 <1.10.0"
++        "@opentelemetry/api": ">=1.0.0 <1.10.0"
+       }
+     },
+     "node_modules/@opentelemetry/exporter-trace-otlp-http/node_modules/@opentelemetry/sdk-trace-base": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-trace-base/-/sdk-trace-base-2.0.0.tgz",
+-      "integrity": "sha512-qQnYdX+ZCkonM7tA5iU4fSRsVxbFGml8jbxOgipRGMFHKaXKHQ30js03rTobYjKjIfnOsZSbHKWF0/0v0OQGfw==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-trace-base/-/sdk-trace-base-1.26.0.tgz",
++      "integrity": "sha512-olWQldtvbK4v22ymrKLbIcBi9L2SpMO84sCPY54IVsJhP9fRsxJT194C/AVaAuJzLE30EdhhM1VmvVYR7az+cw==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/resources": "2.0.0",
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/resources": "1.26.0",
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": ">=1.3.0 <1.10.0"
++        "@opentelemetry/api": ">=1.0.0 <1.10.0"
++      }
++    },
++    "node_modules/@opentelemetry/exporter-trace-otlp-http/node_modules/@opentelemetry/semantic-conventions": {
++      "version": "1.27.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/semantic-conventions/-/semantic-conventions-1.27.0.tgz",
++      "integrity": "sha512-sAay1RrB+ONOem0OZanAR1ZI/k7yDpnOQSQmTMuGImUQb2y8EbSaCJ94FQluM74xoU03vlb2d2U90hZluL6nQg==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=14"
+       }
+     },
+     "node_modules/@opentelemetry/otlp-exporter-base": {
+-      "version": "0.200.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/otlp-exporter-base/-/otlp-exporter-base-0.200.0.tgz",
+-      "integrity": "sha512-IxJgA3FD7q4V6gGq4bnmQM5nTIyMDkoGFGrBrrDjB6onEiq1pafma55V+bHvGYLWvcqbBbRfezr1GED88lacEQ==",
++      "version": "0.53.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/otlp-exporter-base/-/otlp-exporter-base-0.53.0.tgz",
++      "integrity": "sha512-UCWPreGQEhD6FjBaeDuXhiMf6kkBODF0ZQzrk/tuQcaVDJ+dDQ/xhJp192H9yWnKxVpEjFrSSLnpqmX4VwX+eA==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/otlp-transformer": "0.200.0"
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/otlp-transformer": "0.53.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": "^1.3.0"
++        "@opentelemetry/api": "^1.0.0"
+       }
+     },
+     "node_modules/@opentelemetry/otlp-exporter-base/node_modules/@opentelemetry/core": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-2.0.0.tgz",
+-      "integrity": "sha512-SLX36allrcnVaPYG3R78F/UZZsBsvbc7lMCLx37LyH5MJ1KAAZ2E3mW9OAD3zGz0G8q/BtoS5VUrjzDydhD6LQ==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-1.26.0.tgz",
++      "integrity": "sha512-1iKxXXE8415Cdv0yjG3G6hQnB5eVEsJce3QaawX8SjDn0mAS0ZM8fAbZZJD4ajvhC15cePvosSCut404KrIIvQ==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": ">=1.0.0 <1.10.0"
+       }
+     },
++    "node_modules/@opentelemetry/otlp-exporter-base/node_modules/@opentelemetry/semantic-conventions": {
++      "version": "1.27.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/semantic-conventions/-/semantic-conventions-1.27.0.tgz",
++      "integrity": "sha512-sAay1RrB+ONOem0OZanAR1ZI/k7yDpnOQSQmTMuGImUQb2y8EbSaCJ94FQluM74xoU03vlb2d2U90hZluL6nQg==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=14"
++      }
++    },
+     "node_modules/@opentelemetry/otlp-transformer": {
+-      "version": "0.200.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/otlp-transformer/-/otlp-transformer-0.200.0.tgz",
+-      "integrity": "sha512-+9YDZbYybOnv7sWzebWOeK6gKyt2XE7iarSyBFkwwnP559pEevKOUD8NyDHhRjCSp13ybh9iVXlMfcj/DwF/yw==",
++      "version": "0.53.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/otlp-transformer/-/otlp-transformer-0.53.0.tgz",
++      "integrity": "sha512-rM0sDA9HD8dluwuBxLetUmoqGJKSAbWenwD65KY9iZhUxdBHRLrIdrABfNDP7aiTjcgK8XFyTn5fhDz7N+W6DA==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/api-logs": "0.200.0",
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/resources": "2.0.0",
+-        "@opentelemetry/sdk-logs": "0.200.0",
+-        "@opentelemetry/sdk-metrics": "2.0.0",
+-        "@opentelemetry/sdk-trace-base": "2.0.0",
++        "@opentelemetry/api-logs": "0.53.0",
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/resources": "1.26.0",
++        "@opentelemetry/sdk-logs": "0.53.0",
++        "@opentelemetry/sdk-metrics": "1.26.0",
++        "@opentelemetry/sdk-trace-base": "1.26.0",
+         "protobufjs": "^7.3.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": "^1.3.0"
+       }
+     },
+     "node_modules/@opentelemetry/otlp-transformer/node_modules/@opentelemetry/core": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-2.0.0.tgz",
+-      "integrity": "sha512-SLX36allrcnVaPYG3R78F/UZZsBsvbc7lMCLx37LyH5MJ1KAAZ2E3mW9OAD3zGz0G8q/BtoS5VUrjzDydhD6LQ==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-1.26.0.tgz",
++      "integrity": "sha512-1iKxXXE8415Cdv0yjG3G6hQnB5eVEsJce3QaawX8SjDn0mAS0ZM8fAbZZJD4ajvhC15cePvosSCut404KrIIvQ==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": ">=1.0.0 <1.10.0"
+       }
+     },
+     "node_modules/@opentelemetry/otlp-transformer/node_modules/@opentelemetry/resources": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-2.0.0.tgz",
+-      "integrity": "sha512-rnZr6dML2z4IARI4zPGQV4arDikF/9OXZQzrC01dLmn0CZxU5U5OLd/m1T7YkGRj5UitjeoCtg/zorlgMQcdTg==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-1.26.0.tgz",
++      "integrity": "sha512-CPNYchBE7MBecCSVy0HKpUISEeJOniWqcHaAHpmasZ3j9o6V3AyBzhRc90jdmemq0HOxDr6ylhUbDhBqqPpeNw==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": ">=1.3.0 <1.10.0"
++        "@opentelemetry/api": ">=1.0.0 <1.10.0"
+       }
+     },
+     "node_modules/@opentelemetry/otlp-transformer/node_modules/@opentelemetry/sdk-trace-base": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-trace-base/-/sdk-trace-base-2.0.0.tgz",
+-      "integrity": "sha512-qQnYdX+ZCkonM7tA5iU4fSRsVxbFGml8jbxOgipRGMFHKaXKHQ30js03rTobYjKjIfnOsZSbHKWF0/0v0OQGfw==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-trace-base/-/sdk-trace-base-1.26.0.tgz",
++      "integrity": "sha512-olWQldtvbK4v22ymrKLbIcBi9L2SpMO84sCPY54IVsJhP9fRsxJT194C/AVaAuJzLE30EdhhM1VmvVYR7az+cw==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/resources": "2.0.0",
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/resources": "1.26.0",
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": ">=1.3.0 <1.10.0"
++        "@opentelemetry/api": ">=1.0.0 <1.10.0"
++      }
++    },
++    "node_modules/@opentelemetry/otlp-transformer/node_modules/@opentelemetry/semantic-conventions": {
++      "version": "1.27.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/semantic-conventions/-/semantic-conventions-1.27.0.tgz",
++      "integrity": "sha512-sAay1RrB+ONOem0OZanAR1ZI/k7yDpnOQSQmTMuGImUQb2y8EbSaCJ94FQluM74xoU03vlb2d2U90hZluL6nQg==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=14"
+       }
+     },
+     "node_modules/@opentelemetry/resources": {
+-      "version": "2.1.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-2.1.0.tgz",
+-      "integrity": "sha512-1CJjf3LCvoefUOgegxi8h6r4B/wLSzInyhGP2UmIBYNlo4Qk5CZ73e1eEyWmfXvFtm1ybkmfb2DqWvspsYLrWw==",
++      "version": "1.30.1",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-1.30.1.tgz",
++      "integrity": "sha512-5UxZqiAgLYGFjS4s9qm5mBVo433u+dSPUFWVWXmLAD4wB65oMCoXaJP1KJa9DIYYMeHu3z4BZcStG3LC593cWA==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.1.0",
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/core": "1.30.1",
++        "@opentelemetry/semantic-conventions": "1.28.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": ">=1.3.0 <1.10.0"
++        "@opentelemetry/api": ">=1.0.0 <1.10.0"
++      }
++    },
++    "node_modules/@opentelemetry/resources/node_modules/@opentelemetry/semantic-conventions": {
++      "version": "1.28.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/semantic-conventions/-/semantic-conventions-1.28.0.tgz",
++      "integrity": "sha512-lp4qAiMTD4sNWW4DbKLBkfiMZ4jbAboJIGOQr5DvciMRI494OapieI9qiODpOt0XBr1LjIDy1xAGAnVs5supTA==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=14"
+       }
+     },
+     "node_modules/@opentelemetry/sdk-logs": {
+-      "version": "0.200.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-logs/-/sdk-logs-0.200.0.tgz",
+-      "integrity": "sha512-VZG870063NLfObmQQNtCVcdXXLzI3vOjjrRENmU37HYiPFa0ZXpXVDsTD02Nh3AT3xYJzQaWKl2X2lQ2l7TWJA==",
++      "version": "0.53.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-logs/-/sdk-logs-0.53.0.tgz",
++      "integrity": "sha512-dhSisnEgIj/vJZXZV6f6KcTnyLDx/VuQ6l3ejuZpMpPlh9S1qMHiZU9NMmOkVkwwHkMy3G6mEBwdP23vUZVr4g==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/api-logs": "0.200.0",
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/resources": "2.0.0"
++        "@opentelemetry/api-logs": "0.53.0",
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/resources": "1.26.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": ">=1.4.0 <1.10.0"
+       }
+     },
+     "node_modules/@opentelemetry/sdk-logs/node_modules/@opentelemetry/core": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-2.0.0.tgz",
+-      "integrity": "sha512-SLX36allrcnVaPYG3R78F/UZZsBsvbc7lMCLx37LyH5MJ1KAAZ2E3mW9OAD3zGz0G8q/BtoS5VUrjzDydhD6LQ==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-1.26.0.tgz",
++      "integrity": "sha512-1iKxXXE8415Cdv0yjG3G6hQnB5eVEsJce3QaawX8SjDn0mAS0ZM8fAbZZJD4ajvhC15cePvosSCut404KrIIvQ==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": ">=1.0.0 <1.10.0"
+       }
+     },
+     "node_modules/@opentelemetry/sdk-logs/node_modules/@opentelemetry/resources": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-2.0.0.tgz",
+-      "integrity": "sha512-rnZr6dML2z4IARI4zPGQV4arDikF/9OXZQzrC01dLmn0CZxU5U5OLd/m1T7YkGRj5UitjeoCtg/zorlgMQcdTg==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-1.26.0.tgz",
++      "integrity": "sha512-CPNYchBE7MBecCSVy0HKpUISEeJOniWqcHaAHpmasZ3j9o6V3AyBzhRc90jdmemq0HOxDr6ylhUbDhBqqPpeNw==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": ">=1.3.0 <1.10.0"
++        "@opentelemetry/api": ">=1.0.0 <1.10.0"
++      }
++    },
++    "node_modules/@opentelemetry/sdk-logs/node_modules/@opentelemetry/semantic-conventions": {
++      "version": "1.27.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/semantic-conventions/-/semantic-conventions-1.27.0.tgz",
++      "integrity": "sha512-sAay1RrB+ONOem0OZanAR1ZI/k7yDpnOQSQmTMuGImUQb2y8EbSaCJ94FQluM74xoU03vlb2d2U90hZluL6nQg==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=14"
+       }
+     },
+     "node_modules/@opentelemetry/sdk-metrics": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-metrics/-/sdk-metrics-2.0.0.tgz",
+-      "integrity": "sha512-Bvy8QDjO05umd0+j+gDeWcTaVa1/R2lDj/eOvjzpm8VQj1K1vVZJuyjThpV5/lSHyYW2JaHF2IQ7Z8twJFAhjA==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-metrics/-/sdk-metrics-1.26.0.tgz",
++      "integrity": "sha512-0SvDXmou/JjzSDOjUmetAAvcKQW6ZrvosU0rkbDGpXvvZN+pQF6JbK/Kd4hNdK4q/22yeruqvukXEJyySTzyTQ==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/resources": "2.0.0"
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/resources": "1.26.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": ">=1.9.0 <1.10.0"
++        "@opentelemetry/api": ">=1.3.0 <1.10.0"
+       }
+     },
+     "node_modules/@opentelemetry/sdk-metrics/node_modules/@opentelemetry/core": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-2.0.0.tgz",
+-      "integrity": "sha512-SLX36allrcnVaPYG3R78F/UZZsBsvbc7lMCLx37LyH5MJ1KAAZ2E3mW9OAD3zGz0G8q/BtoS5VUrjzDydhD6LQ==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/core/-/core-1.26.0.tgz",
++      "integrity": "sha512-1iKxXXE8415Cdv0yjG3G6hQnB5eVEsJce3QaawX8SjDn0mAS0ZM8fAbZZJD4ajvhC15cePvosSCut404KrIIvQ==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+         "@opentelemetry/api": ">=1.0.0 <1.10.0"
+       }
+     },
+     "node_modules/@opentelemetry/sdk-metrics/node_modules/@opentelemetry/resources": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-2.0.0.tgz",
+-      "integrity": "sha512-rnZr6dML2z4IARI4zPGQV4arDikF/9OXZQzrC01dLmn0CZxU5U5OLd/m1T7YkGRj5UitjeoCtg/zorlgMQcdTg==",
++      "version": "1.26.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/resources/-/resources-1.26.0.tgz",
++      "integrity": "sha512-CPNYchBE7MBecCSVy0HKpUISEeJOniWqcHaAHpmasZ3j9o6V3AyBzhRc90jdmemq0HOxDr6ylhUbDhBqqPpeNw==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.0.0",
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/core": "1.26.0",
++        "@opentelemetry/semantic-conventions": "1.27.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": ">=1.3.0 <1.10.0"
++        "@opentelemetry/api": ">=1.0.0 <1.10.0"
++      }
++    },
++    "node_modules/@opentelemetry/sdk-metrics/node_modules/@opentelemetry/semantic-conventions": {
++      "version": "1.27.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/semantic-conventions/-/semantic-conventions-1.27.0.tgz",
++      "integrity": "sha512-sAay1RrB+ONOem0OZanAR1ZI/k7yDpnOQSQmTMuGImUQb2y8EbSaCJ94FQluM74xoU03vlb2d2U90hZluL6nQg==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=14"
+       }
+     },
+     "node_modules/@opentelemetry/sdk-trace-base": {
+-      "version": "2.1.0",
+-      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-trace-base/-/sdk-trace-base-2.1.0.tgz",
+-      "integrity": "sha512-uTX9FBlVQm4S2gVQO1sb5qyBLq/FPjbp+tmGoxu4tIgtYGmBYB44+KX/725RFDe30yBSaA9Ml9fqphe1hbUyLQ==",
++      "version": "1.30.1",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/sdk-trace-base/-/sdk-trace-base-1.30.1.tgz",
++      "integrity": "sha512-jVPgBbH1gCy2Lb7X0AVQ8XAfgg0pJ4nvl8/IiQA6nxOsPvS+0zMJaFSs2ltXe0J6C8dqjcnpyqINDJmU30+uOg==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@opentelemetry/core": "2.1.0",
+-        "@opentelemetry/resources": "2.1.0",
+-        "@opentelemetry/semantic-conventions": "^1.29.0"
++        "@opentelemetry/core": "1.30.1",
++        "@opentelemetry/resources": "1.30.1",
++        "@opentelemetry/semantic-conventions": "1.28.0"
+       },
+       "engines": {
+-        "node": "^18.19.0 || >=20.6.0"
++        "node": ">=14"
+       },
+       "peerDependencies": {
+-        "@opentelemetry/api": ">=1.3.0 <1.10.0"
++        "@opentelemetry/api": ">=1.0.0 <1.10.0"
++      }
++    },
++    "node_modules/@opentelemetry/sdk-trace-base/node_modules/@opentelemetry/semantic-conventions": {
++      "version": "1.28.0",
++      "resolved": "https://registry.npmjs.org/@opentelemetry/semantic-conventions/-/semantic-conventions-1.28.0.tgz",
++      "integrity": "sha512-lp4qAiMTD4sNWW4DbKLBkfiMZ4jbAboJIGOQr5DvciMRI494OapieI9qiODpOt0XBr1LjIDy1xAGAnVs5supTA==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=14"
+       }
+     },
+     "node_modules/@opentelemetry/semantic-conventions": {
+diff --git a/docs/website/package.json b/docs/website/package.json
+index 3ccf979bb..4058ee9ae 100644
+--- a/docs/website/package.json
++++ b/docs/website/package.json
+@@ -29,7 +29,7 @@
+     "@docusaurus/preset-classic": "^3.7.0",
+     "@docusaurus/theme-common": "^3.7.0",
+     "@mdx-js/react": "^3.1.0",
+-    "@microlabs/otel-cf-workers": "^1.0.0-rc.52",
++    "@microlabs/otel-cf-workers": "1.0.0-rc.49",
+     "clsx": "^1.2.1",
+     "dedent": "^1.5.1",
+     "dotenv": "^16.3.1",
+diff --git a/docs/website/worker.js b/docs/website/worker.ts
+similarity index 75%
+rename from docs/website/worker.js
+rename to docs/website/worker.ts
+index 4bd4ed34d..378c83d95 100644
+--- a/docs/website/worker.js
++++ b/docs/website/worker.ts
+@@ -1,5 +1,6 @@
+ // cloudflare worker implementation to serve the website docs
+-import { instrument } from '@microlabs/otel-cf-workers';
++import { instrument, ResolveConfigFn } from '@microlabs/otel-cf-workers';
++import type { ReadableSpan } from '@opentelemetry/sdk-trace-base'
+ 
+ const REDIRECTS = [
+     // basic root redirects
+@@ -100,22 +101,34 @@ const handler = {
+         if (res.status === 404) {
+             url.pathname = ROUTE_404;
+             return Response.redirect(url.toString(), 301);
+-        }
+-    
++        }    
+         return res; // unchanged response (transparent externally)
+     }
+   };
+ 
+ 
+-const config = (env) => ({
+-exporter: {
+-    url: `${env.AXIOM_URL}`,
+-    headers: {
+-    'Authorization': `Bearer ${env.AXIOM_API_TOKEN}`,
+-    'X-Axiom-Dataset': `${env.AXIOM_DATASET}`
++
++// tracking post processor to remove static assets
++const postProcessor = (spans: ReadableSpan[]): ReadableSpan[] => {
++    return spans.filter((span) => {
++        const attrs = span.attributes ?? {}
++        const url = attrs['url.full'] || '' as string;
++        // Keep non-static only
++        let keep =  !/\.(?:css|js|mjs|map|png|jpg|jpeg|gif|svg|ico|webp|woff2?|ttf|eot)(?:$|\?)/i.test(url);
++        return keep
++    })
++}
++
++const config: ResolveConfigFn = (env) => ({
++    exporter: {
++        url: `${env.AXIOM_URL}`,
++        headers: {
++        'Authorization': `Bearer ${env.AXIOM_API_TOKEN}`,
++        'X-Axiom-Dataset': `${env.AXIOM_DATASET}`
++        },
+     },
+-},
+-service: { name: 'axiom-cloudflare-workers' },
++    service: { name: 'axiom-cloudflare-workers' },
++    postProcessor: postProcessor,
+ });
+ 
+-export default instrument(handler, (env) => config(env));
++export default instrument(handler, config);
+diff --git a/docs/website/wrangler.jsonc b/docs/website/wrangler.jsonc
+index 144efea89..62b35a116 100644
+--- a/docs/website/wrangler.jsonc
++++ b/docs/website/wrangler.jsonc
+@@ -1,7 +1,7 @@
+ {
+     "name": "docs",
+     "compatibility_date": "2025-09-19",
+-    "main": "worker.js",
++    "main": "worker.ts",
+     "preview_urls": true,
+   	"compatibility_flags": [
+ 		"nodejs_compat_v2"
+@@ -17,7 +17,7 @@
+     },
+   	"vars": {
+       "AXIOM_DATASET": "vibes",
+-      "AXIOM_URL": "https://api.axiom.co/v1/traces"
++      "AXIOM_URL": "https://api.axiom.co/v1/traces",
+     },
+     "routes": [
+         {
+
+
+===== COMMIT 6de404d2 =====
+
+
+commit 6de404d23
+Author: anuunchin
+Date: 2025-09-22
+
+    Feat: allowing custom metrics to be added to dlt resources and transform steps (#3078)
+
+diff --git a/dlt/common/metrics.py b/dlt/common/metrics.py
+index 7cccf4726..707f84240 100644
+--- a/dlt/common/metrics.py
++++ b/dlt/common/metrics.py
+@@ -23,6 +23,31 @@ class DataWriterMetrics(NamedTuple):
+         return NotImplemented
+ 
+ 
++class DataWriterAndCustomMetrics(DataWriterMetrics):
++    custom_metrics: Dict[str, Any]
++
++    def __new__(
++        cls,
++        file_path: str,
++        items_count: int,
++        file_size: int,
++        created: float,
++        last_modified: float,
++        custom_metrics: Dict[str, Any] = None,
++    ) -> "DataWriterAndCustomMetrics":
++        self = super(DataWriterAndCustomMetrics, cls).__new__(
++            cls, file_path, items_count, file_size, created, last_modified
++        )
++        self.custom_metrics = custom_metrics or {}
++        return self
++
++    def _asdict(self) -> Dict[str, Any]:
++        """Override _asdict to include custom_metrics in serialization"""
++        result = super()._asdict()
++        result["custom_metrics"] = self.custom_metrics
++        return result
++
++
+ class StepMetrics(TypedDict):
+     """Metrics for particular package processed in particular pipeline step"""
+ 
+@@ -43,7 +68,7 @@ class ExtractMetrics(StepMetrics):
+     """Metrics collected per job id during writing of job file"""
+     table_metrics: Dict[str, DataWriterMetrics]
+     """Job metrics aggregated by table"""
+-    resource_metrics: Dict[str, DataWriterMetrics]
++    resource_metrics: Dict[str, DataWriterAndCustomMetrics]
+     """Job metrics aggregated by resource"""
+     dag: List[Tuple[str, str]]
+     """A resource dag where elements of the list are graph edges"""
+diff --git a/dlt/common/pipeline.py b/dlt/common/pipeline.py
+index 094e6cd15..4a158d2b6 100644
+--- a/dlt/common/pipeline.py
++++ b/dlt/common/pipeline.py
+@@ -17,6 +17,8 @@ from typing import (
+     TypeVar,
+     Mapping,
+     Literal,
++    Union,
++    Mapping,
+ )
+ from typing_extensions import NotRequired
+ 
+@@ -43,6 +45,7 @@ from dlt.common.metrics import (
+     LoadMetrics,
+     NormalizeMetrics,
+     StepMetrics,
++    DataWriterAndCustomMetrics,
+ )
+ from dlt.common.schema import Schema
+ from dlt.common.schema.typing import (
+@@ -158,7 +161,9 @@ class StepInfo(SupportsHumanize, Generic[TStepMetricsCo]):
+ 
+     @staticmethod
+     def writer_metrics_asdict(
+-        job_metrics: Dict[str, DataWriterMetrics], key_name: str = "job_id", extend: StrAny = None
++        job_metrics: Mapping[str, Union[DataWriterMetrics, DataWriterAndCustomMetrics]],
++        key_name: str = "job_id",
++        extend: StrAny = None,
+     ) -> List[DictStrAny]:
+         entities = []
+         for entity_id, metrics in job_metrics.items():
+diff --git a/dlt/extract/decorators.py b/dlt/extract/decorators.py
+index 57aec5730..0edb63a4f 100644
+--- a/dlt/extract/decorators.py
++++ b/dlt/extract/decorators.py
+@@ -1022,6 +1022,15 @@ def get_resource() -> DltResource:
+     return source.resources.with_pipe(get_current_pipe())
+ 
+ 
++def get_resource_metrics() -> Dict[str, Any]:
++    """Should be executed from inside the function decorated with @dlt.resource
++
++    Returns:
++        Dict[str, Any]: The customizable metrics dictionary
++    """
++    return get_resource().custom_metrics
++
++
+ TBoundItems = TypeVar("TBoundItems", bound=TDataItems)
+ TDeferred = Callable[[], TBoundItems]
+ TDeferredFunParams = ParamSpec("TDeferredFunParams")
+diff --git a/dlt/extract/extract.py b/dlt/extract/extract.py
+index 3b1f8966e..48bbf94f0 100644
+--- a/dlt/extract/extract.py
++++ b/dlt/extract/extract.py
+@@ -34,7 +34,12 @@ from dlt.common.storages.load_package import (
+     TLoadPackageState,
+     commit_load_package_state,
+ )
+-from dlt.common.utils import get_callable_name, get_full_obj_class_name, group_dict_of_lists
++from dlt.common.utils import (
++    get_callable_name,
++    get_full_obj_class_name,
++    group_dict_of_lists,
++    update_dict_nested,
++)
+ 
+ from dlt.extract.decorators import (
+     _DltSingleSource,
+@@ -43,6 +48,8 @@ from dlt.extract.decorators import (
+ )
+ from dlt.extract.exceptions import UnknownSourceReference
+ from dlt.extract.incremental import IncrementalResourceWrapper
++from dlt.extract.items_transform import ItemTransform
++from dlt.common.metrics import DataWriterAndCustomMetrics
+ from dlt.extract.pipe_iterator import PipeIterator
+ from dlt.extract.source import DltSource
+ from dlt.extract.reference import SourceReference
+@@ -249,9 +256,20 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
+                 job_metrics.items(), lambda pair: pair[0].table_name
+             )
+         }
++
+         # aggregate by resource name
++        def _get_all_resource_custom_metrics(resource_name: str) -> Dict[str, Any]:
++            all_custom_metrics = source.resources[resource_name].custom_metrics
++            for step in source.resources[resource_name]._pipe.steps:
++                if isinstance(step, ItemTransform):
++                    all_custom_metrics = update_dict_nested(all_custom_metrics, step.custom_metrics)
++            return all_custom_metrics
++
+         resource_metrics = {
+-            resource_name: sum(map(lambda pair: pair[1], metrics), EMPTY_DATA_WRITER_METRICS)
++            resource_name: DataWriterAndCustomMetrics(
++                *sum(map(lambda pair: pair[1], metrics), EMPTY_DATA_WRITER_METRICS),
++                custom_metrics=_get_all_resource_custom_metrics(resource_name),
++            )
+             for resource_name, metrics in itertools.groupby(
+                 table_metrics.items(), lambda pair: source.schema.get_table(pair[0])["resource"]
+             )
+diff --git a/dlt/extract/incremental/__init__.py b/dlt/extract/incremental/__init__.py
+index 7a0a9d028..401972acf 100644
+--- a/dlt/extract/incremental/__init__.py
++++ b/dlt/extract/incremental/__init__.py
+@@ -43,7 +43,7 @@ from dlt.common.incremental.typing import (
+     TIncrementalRange,
+ )
+ from dlt.extract.items import SupportsPipe, TTableHintTemplate
+-from dlt.extract.items_transform import ItemTransform
++from dlt.extract.items_transform import BaseItemTransform, ItemTransform
+ from dlt.extract.state import resource_state
+ from dlt.extract.incremental.transform import (
+     JsonIncremental,
+@@ -644,6 +644,7 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem]):
+         Args:
+             primary_key (TTableHintTemplate[TColumnKey], optional): A primary key to be passed to Incremental Instance at execution. Defaults to None.
+         """
++        BaseItemTransform.__init__(self)
+         self.primary_key = primary_key
+         self.incremental_state: IncrementalColumnState = None
+         self._allow_external_schedulers: bool = None
+diff --git a/dlt/extract/items_transform.py b/dlt/extract/items_transform.py
+index be42cc7d2..355020eea 100644
+--- a/dlt/extract/items_transform.py
++++ b/dlt/extract/items_transform.py
+@@ -10,6 +10,7 @@ from typing import (
+     Iterator,
+     Optional,
+     Union,
++    Dict,
+ )
+ 
+ from dlt.common.data_writers.writers import count_rows_in_items
+@@ -31,7 +32,16 @@ ItemTransformFunctionNoMeta = Callable[[TDataItem], TAny]
+ ItemTransformFunc = Union[ItemTransformFunctionWithMeta[TAny], ItemTransformFunctionNoMeta[TAny]]
+ 
+ 
+-class ItemTransform(ABC, Generic[TAny]):
++class BaseItemTransform:
++    def __init__(self) -> None:
++        self._custom_metrics: Dict[str, Any] = {}
++
++    @property
++    def custom_metrics(self) -> Dict[str, Any]:
++        return self._custom_metrics
++
++
++class ItemTransform(BaseItemTransform, ABC, Generic[TAny]):
+     _f_meta: ItemTransformFunctionWithMeta[TAny] = None
+     _f: ItemTransformFunctionNoMeta[TAny] = None
+ 
+@@ -39,6 +49,7 @@ class ItemTransform(ABC, Generic[TAny]):
+     """Tell how strongly an item sticks to start (-1) or end (+1) of pipe."""
+ 
+     def __init__(self, transform_f: ItemTransformFunc[TAny]) -> None:
++        super().__init__()
+         # inspect the signature
+         sig = inspect.signature(transform_f)
+         # TODO: use TypeGuard here to get rid of type ignore
+@@ -149,6 +160,7 @@ class LimitItem(ItemTransform[TDataItem]):
+     def __init__(
+         self, max_items: Optional[int], max_time: Optional[float], count_rows: bool
+     ) -> None:
++        BaseItemTransform.__init__(self)
+         self.max_items = max_items if max_items is not None else -1
+         self.max_time = max_time
+         self.count_rows = count_rows
+diff --git a/dlt/extract/resource.py b/dlt/extract/resource.py
+index 50f517ea8..3e5574ac9 100644
+--- a/dlt/extract/resource.py
++++ b/dlt/extract/resource.py
+@@ -15,6 +15,7 @@ from typing import (
+     Mapping,
+     List,
+     Tuple,
++    Dict,
+ )
+ 
+ from dlt.common import logger
+@@ -140,6 +141,7 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
+         self._explicit_args: DictStrAny = None
+         self.source_name = None
+         self._parent: DltResource = None
++        self._custom_metrics: Dict[str, Any] = {}
+         super().__init__(hints)
+         self._update_wrapper()
+ 
+@@ -221,6 +223,11 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
+             r_.pipe_data_from(data_from)
+         return r_
+ 
++    @property
++    def custom_metrics(self) -> Dict[str, Any]:
++        """Customizable resource metrics"""
++        return self._custom_metrics
++
+     @property
+     def name(self) -> str:
+         """Resource name inherited from the pipe"""
+@@ -724,7 +731,9 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
+     def _clone(
+         self, *, new_name: str = None, new_section: str = None, with_parent: bool = False
+     ) -> Self:
+-        """Creates a deep copy of a current resource, optionally renaming the resource. The clone will not be part of the source."""
++        """Creates a deep copy of a current resource, optionally renaming the resource.
++        The clone will not be part of the source and will not include the custom resource metrics.
++        """
+         pipe = self._pipe
+         if pipe and not pipe.is_empty:
+             pipe = pipe._clone(new_name=new_name)
+diff --git a/dlt/extract/validation.py b/dlt/extract/validation.py
+index d9fe70a90..096f0dcaf 100644
+--- a/dlt/extract/validation.py
++++ b/dlt/extract/validation.py
+@@ -9,7 +9,7 @@ except ModuleNotFoundError:
+ from dlt.common.typing import TDataItems
+ from dlt.common.schema.typing import TAnySchemaColumns, TSchemaContract, TSchemaEvolutionMode
+ from dlt.extract.items import TTableHintTemplate
+-from dlt.extract.items_transform import ValidateItem
++from dlt.extract.items_transform import BaseItemTransform, ValidateItem
+ 
+ 
+ _TPydanticModel = TypeVar("_TPydanticModel", bound=PydanticBaseModel)
+@@ -26,6 +26,7 @@ class PydanticValidator(ValidateItem, Generic[_TPydanticModel]):
+     ) -> None:
+         from dlt.common.libs.pydantic import apply_schema_contract_to_model, create_list_model
+ 
++        BaseItemTransform.__init__(self)
+         self.column_mode: TSchemaEvolutionMode = column_mode
+         self.data_mode: TSchemaEvolutionMode = data_mode
+         self.model = apply_schema_contract_to_model(model, column_mode, data_mode)
+diff --git a/dlt/pipeline/current.py b/dlt/pipeline/current.py
+index 41a01e158..0ef173276 100644
+--- a/dlt/pipeline/current.py
++++ b/dlt/pipeline/current.py
+@@ -8,6 +8,7 @@ from dlt.common.runtime.run_context import active as _run_context
+ 
+ from dlt.extract.decorators import (
+     get_resource,
++    get_resource_metrics,
+     get_source_schema as _get_source_schema,
+     get_source as _get_source,
+ )
+@@ -35,6 +36,7 @@ resource = get_resource
+ pipe = _get_current_pipe
+ resource_name = _get_current_pipe_name
+ run_context = _run_context
++resource_metrics = get_resource_metrics
+ 
+ __all__ = [
+     "load_package_state",
+@@ -47,4 +49,5 @@ __all__ = [
+     "run_context",
+     "source",
+     "resource",
++    "resource_metrics",
+ ]
+diff --git a/docs/website/docs/general-usage/resource.md b/docs/website/docs/general-usage/resource.md
+index 574ebfca3..83214d224 100644
+--- a/docs/website/docs/general-usage/resource.md
++++ b/docs/website/docs/general-usage/resource.md
+@@ -700,6 +700,52 @@ pipeline.run(
+ 
+ The `with_name` method returns a deep copy of the original resource, its data pipe, and the data pipes of a parent resource. A renamed clone is fully separated from the original resource (and other clones) when loading: it maintains a separate [resource state](state.md#read-and-write-pipeline-state-in-a-resource) and will load to a table.
+ 
++## Collect custom metrics
++
++You can track custom statistics during resource extraction with `dlt.current.resource_metrics()`, which might otherwise be lost:
++
++```py
++import dlt
++from dlt.sources.helpers.rest_client import RESTClient
++from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
++
++github_client = RESTClient(
++    base_url="https://pokeapi.co/api/v2",
++    paginator=JSONLinkPaginator(next_url_path="next"),
++    data_selector="results",
++)
++
++@dlt.resource
++def get_pokemons():
++    custom_metrics = dlt.current.resource_metrics()
++    custom_metrics["page_count"] = 0
++    for page in github_client.paginate(
++        "/pokemon",
++        params={
++            "limit": 100,
++        },
++    ):
++        custom_metrics["page_count"] += 1
++        yield page
++
++pipeline = dlt.pipeline(
++    pipeline_name="get_pokemons",
++    destination="duckdb",
++    dataset_name="github_data",
++)
++load_info = pipeline.run(get_pokemons)
++print(load_info)
++
++# Access custom metrics from last trace
++trace = pipeline.last_trace
++load_id = load_info.loads_ids[0]
++resource_metrics = trace.last_extract_info.metrics[load_id][0]["resource_metrics"]["get_pokemons"]
++
++print(f"Custom metrics: {resource_metrics.custom_metrics}")
++```
++
++As shown above, custom metrics are included in pipeline traces. Refer to [pipeline trace loading](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) for more details.
++
+ ## Load resources
+ 
+ You can pass individual resources or a list of resources to the `dlt.pipeline` object. The resources loaded outside the source context will be added to the [default schema](schema.md) of the pipeline.
+diff --git a/tests/extract/test_extract.py b/tests/extract/test_extract.py
+index d85b84b50..401fec537 100644
+--- a/tests/extract/test_extract.py
++++ b/tests/extract/test_extract.py
+@@ -582,7 +582,7 @@ def test_materialize_table_schema_with_pipe_items():
+ 
+     class LazyValidator(ValidateItem):
+         def __init__(self):
+-            pass
++            super().__init__(lambda x: x)
+ 
+         def __call__(self, item: TDataItems, meta: Any = None) -> Optional[TDataItems]:
+             return item
+@@ -609,3 +609,121 @@ def test_materialize_table_schema_with_pipe_items():
+         if job.job_file_info.table_name == "empty_list":
+             found_empty_list = True
+     assert found_empty_list
++
++
++@pytest.mark.parametrize(
++    "with_custom_metrics", [True, False], ids=["with_custom_metrics", "without_custom_metrics"]
++)
++def test_resource_custom_metrics(extract_step: Extract, with_custom_metrics: bool) -> None:
++    """Ensure that custom metrics from resources are collected and transform steps are available in extract info"""
++
++    if with_custom_metrics:
++        expected_custom_metrics = {
++            "resource_with_metrics": {
++                "custom_count": 42,
++                "random_constant": 1.5,
++                "random_nested": {"value": 100, "unit": "items"},
++                "items_count": 90,
++            },
++            "resource_with_other_metrics": {
++                "custom_count": 3,
++                "random_constant": 251.3,
++                "random_nested": {"value": 4, "unit": None},
++            },
++        }
++    else:
++        expected_custom_metrics = {"resource_with_metrics": {}, "resource_with_other_metrics": {}}
++
++    @dlt.resource
++    def resource_with_metrics():
++        custom_metrics = dlt.current.resource_metrics()
++        for metric, value in expected_custom_metrics["resource_with_metrics"].items():
++            custom_metrics[metric] = value
++        yield [{"id": 1}, {"id": 2}]
++
++    resource_with_metrics.add_limit(10)
++    resource_with_metrics.add_map(lambda x: x)
++    resource_with_metrics.add_yield_map(lambda x: (yield from x))
++
++    @dlt.resource
++    def resource_with_other_metrics():
++        custom_metrics = dlt.current.resource_metrics()
++        for metric, value in expected_custom_metrics["resource_with_other_metrics"].items():
++            custom_metrics[metric] = value
++        yield [{"id": 1}, {"id": 2}]
++
++    source = DltSource(
++        dlt.Schema("metrics"), "module", [resource_with_metrics(), resource_with_other_metrics()]
++    )
++    load_id = extract_step.extract(source, 20, 1)
++
++    assert (
++        expected_custom_metrics["resource_with_metrics"]
++        == source.resources["resource_with_metrics"].custom_metrics
++    )
++    assert (
++        expected_custom_metrics["resource_with_other_metrics"]
++        == source.resources["resource_with_other_metrics"].custom_metrics
++    )
++
++    step_info = extract_step.get_step_info(MockPipeline("buba", first_run=False))  # type: ignore[abstract]
++
++    all_resource_metrics = step_info.metrics[load_id][0]["resource_metrics"]
++    assert "resource_with_metrics" in all_resource_metrics
++    assert "resource_with_other_metrics" in all_resource_metrics
++
++    assert (
++        expected_custom_metrics["resource_with_metrics"]
++        == all_resource_metrics["resource_with_metrics"].custom_metrics
++    )
++    assert (
++        expected_custom_metrics["resource_with_other_metrics"]
++        == all_resource_metrics["resource_with_other_metrics"].custom_metrics
++    )
++
++
++@pytest.mark.parametrize(
++    "with_custom_metrics", [True, False], ids=["with_custom_metrics", "without_custom_metrics"]
++)
++def test_resource_step_custom_metrics(extract_step: Extract, with_custom_metrics: bool) -> None:
++    """Ensure that custom metrics from both resources and their transform steps are collected and merged"""
++
++    class SimpleStep(ValidateItem):
++        def __init__(self):
++            super().__init__(lambda x: x)
++
++        def __call__(self, item: TDataItems, meta: Any = None) -> Optional[TDataItems]:
++            if with_custom_metrics:
++                self.custom_metrics["from_step"] = "hi"
++                self.custom_metrics["overrided"] = 2
++            return item
++
++    @dlt.resource
++    def resource_with_step_metrics():
++        if with_custom_metrics:
++            custom_metrics = dlt.current.resource_metrics()
++            custom_metrics["from_resource"] = "hey"
++            # Overlapping metrics will be overrided by those in steps
++            custom_metrics["overrided"] = 1
++        yield {"id": 1}
++
++    resource = resource_with_step_metrics()
++    resource._pipe._steps.append(SimpleStep())
++
++    source = DltSource(dlt.Schema("step_metrics"), "module", [resource])
++    load_id = extract_step.extract(source, 20, 1)
++
++    step_info = extract_step.get_step_info(MockPipeline("test", first_run=False))  # type: ignore[abstract]
++    resource_metrics = step_info.metrics[load_id][0]["resource_metrics"][
++        "resource_with_step_metrics"
++    ]
++
++    if with_custom_metrics:
++        expected_metrics = {
++            "from_resource": "hey",
++            "from_step": "hi",
++            "overrided": 2,
++        }
++        assert resource_metrics.custom_metrics == expected_metrics
++    else:
++        assert resource_metrics.custom_metrics == {}
+diff --git a/tests/extract/utils.py b/tests/extract/utils.py
+index f1de3de09..a5a91863c 100644
+--- a/tests/extract/utils.py
++++ b/tests/extract/utils.py
+@@ -6,7 +6,7 @@ from dlt.common.storages import PackageStorage, ParsedLoadJobFileName
+ from dlt.common.typing import TDataItem, TDataItems
+ 
+ from dlt.extract.extract import ExtractStorage
+-from dlt.extract.items_transform import ItemTransform
++from dlt.extract.items_transform import BaseItemTransform, ItemTransform
+ 
+ from tests.utils import TestDataItemFormat
+ 
+@@ -49,6 +49,7 @@ class AssertItems(ItemTransform[TDataItem]):
+     placement_affinity = 2.0  # even more sticky than incremental so gathers data after it
+ 
+     def __init__(self, expected_items: Any, item_type: TestDataItemFormat = "object") -> None:
++        BaseItemTransform.__init__(self)
+         self.expected_items = expected_items
+         self.item_type = item_type
+ 
+diff --git a/tests/pipeline/cases/contracts/trace.schema.yaml b/tests/pipeline/cases/contracts/trace.schema.yaml
+index ea01342ad..2def22987 100644
+--- a/tests/pipeline/cases/contracts/trace.schema.yaml
++++ b/tests/pipeline/cases/contracts/trace.schema.yaml
+@@ -300,6 +300,9 @@ tables:
+       resource_name:
+         data_type: text
+         nullable: true
++      custom_metrics__good_old_github:
++        data_type: bool
++        nullable: true
+       _dlt_parent_id:
+         data_type: text
+         nullable: false
+diff --git a/tests/pipeline/test_pipeline_trace.py b/tests/pipeline/test_pipeline_trace.py
+index 2b33ccb9f..aa619e4c5 100644
+--- a/tests/pipeline/test_pipeline_trace.py
++++ b/tests/pipeline/test_pipeline_trace.py
+@@ -33,6 +33,7 @@ from dlt.pipeline.track import slack_notify_load_success
+ from dlt.extract import DltResource, DltSource
+ from dlt.extract.extract import describe_extract_data
+ from dlt.extract.pipe import Pipe
++from dlt.extract.items_transform import ItemTransform
+ 
+ from tests.pipeline.utils import PIPELINE_TEST_CASES_PATH
+ from tests.utils import TEST_STORAGE_ROOT, start_test_telemetry, temporary_telemetry
+@@ -290,6 +291,9 @@ def test_trace_schema() -> None:
+     def github():
+         @dlt.resource
+         def get_shuffled_events():
++            # Add a custom metric
++            custom_metrics = dlt.current.resource_metrics()
++            custom_metrics["good_old_github"] = True
+             for _ in range(1):
+                 with open(
+                     "tests/normalize/cases/github.events.load_page_1_duck.json",
+@@ -714,6 +718,53 @@ def test_last_pipeline_step_trace_returns_latest() -> None:
+     assert p.last_trace.last_load_info.loads_ids == third_load_info.loads_ids
+ 
+ 
++def test_trace_custom_metrics_schema() -> None:
++    """Test that custom metrics are properly included in trace data"""
++
++    @dlt.resource
++    def resource_with_metrics():
++        custom_metrics = dlt.current.resource_metrics()
++        custom_metrics["custom_count"] = 42
++        custom_metrics["random_constant"] = 1.5
++        custom_metrics["random_nested"] = {"value": 100, "unit": "items"}
++        custom_metrics["list_metric"] = [1, 2, 3]
++        yield [{"id": 1}, {"id": 2}]
++
++    resource_with_metrics.add_limit(10)
++    resource_with_metrics.add_map(lambda x: x)
++    resource_with_metrics.add_yield_map(lambda x: (yield from x))
++
++    # force metrics in transform steps
++    for step in resource_with_metrics._pipe.steps:
++        if isinstance(step, ItemTransform):
++            step.custom_metrics["transformation_type"] = "anything"
++
++    pipeline = dlt.pipeline(
++        pipeline_name="test_custom_metrics_trace", destination=dummy(completed_prob=1.0)
++    )
++
++    pipeline.run(resource_with_metrics())
++    trace = pipeline.last_trace
++
++    trace_pipeline = dlt.pipeline(
++        pipeline_name="test_custom_metrics_trace_schema", destination=dummy(completed_prob=1.0)
++    )
++    trace_pipeline.run([trace], table_name="trace")
++    inferred_schema = trace_pipeline.default_schema
++    resource_metrics_table_cols = inferred_schema.get_table(
++        "trace__steps__extract_info__resource_metrics"
++    )["columns"]
++
++    assert "custom_metrics__custom_count" in resource_metrics_table_cols
++    assert "custom_metrics__random_constant" in resource_metrics_table_cols
++    assert "custom_metrics__random_nested__value" in resource_metrics_table_cols
++    assert "custom_metrics__random_nested__unit" in resource_metrics_table_cols
++    assert (
++        "trace__steps__extract_info__resource_metrics__custom_metrics__list_metric"
++        in inferred_schema.tables
++    )
++
++
+ def _find_resolved_value(
+     resolved: List[SerializableResolvedValueTrace], key: str, sections: List[str]
+ ) -> SerializableResolvedValueTrace:
+
+
+===== COMMIT 3879f144 =====
+
+
+commit 3879f144a
+Author: anuunchin
+Date: 2025-09-22
+
+    no circular error cause (#3111)
+
+diff --git a/dlt/destinations/sql_client.py b/dlt/destinations/sql_client.py
+index fb06a0bea..be4f27968 100644
+--- a/dlt/destinations/sql_client.py
++++ b/dlt/destinations/sql_client.py
+@@ -446,7 +446,10 @@ def raise_database_error(f: TFun) -> TFun:
+             return (yield from f(self, *args, **kwargs))
+         except Exception as ex:
+             db_ex = self._make_database_exception(ex)
+-            raise db_ex.with_traceback(ex.__traceback__) from ex
++            if db_ex is ex:
++                raise db_ex.with_traceback(ex.__traceback__)
++            else:
++                raise db_ex.with_traceback(ex.__traceback__) from ex
+ 
+     @wraps(f)
+     def _wrap(self: SqlClientBase[Any], *args: Any, **kwargs: Any) -> Any:
+@@ -454,7 +457,10 @@ def raise_database_error(f: TFun) -> TFun:
+             return f(self, *args, **kwargs)
+         except Exception as ex:
+             db_ex = self._make_database_exception(ex)
+-            raise db_ex.with_traceback(ex.__traceback__) from ex
++            if db_ex is ex:
++                raise db_ex.with_traceback(ex.__traceback__)
++            else:
++                raise db_ex.with_traceback(ex.__traceback__) from ex
+ 
+     if inspect.isgeneratorfunction(f):
+         return _wrap_gen  # type: ignore[return-value]
+diff --git a/tests/load/test_sql_client.py b/tests/load/test_sql_client.py
+index b43a2be15..fbc069dbc 100644
+--- a/tests/load/test_sql_client.py
++++ b/tests/load/test_sql_client.py
+@@ -17,7 +17,7 @@ from dlt.destinations.exceptions import (
+     DatabaseTransientException,
+     DatabaseUndefinedRelation,
+ )
+-from dlt.destinations.sql_client import DBApiCursor, SqlClientBase
++from dlt.destinations.sql_client import DBApiCursor, SqlClientBase, raise_database_error
+ from dlt.destinations.job_client_impl import SqlJobClientBase
+ from dlt.destinations.typing import TNativeConn
+ from dlt.common.time import ensure_pendulum_datetime_utc, to_py_datetime
+@@ -722,6 +722,30 @@ def test_recover_on_explicit_tx(client: SqlJobClientBase) -> None:
+     assert_load_id(client.sql_client, "LMN")
+ 
+ 
++def test_raise_database_error_no_circular_dependency():
++    """Test that raise_database_error decorator doesn't create circular __cause__ dependencies"""
++
++    class MockSqlClient:
++        @staticmethod
++        def _make_database_exception(ex):
++            # simulate problematic destinations that return original exception
++            return ex
++
++        @raise_database_error
++        def execute_query(self):
++            raise ValueError("Database connection failed because it failed.")
++
++    client = MockSqlClient()
++
++    with pytest.raises(Exception) as exc_info:
++        client.execute_query()
++
++    exception = exc_info.value
++
++    # exception should not cause itself
++    assert exception is not exception.__cause__
++
++
+ def assert_load_id(sql_client: SqlClientBase[TNativeConn], load_id: str) -> None:
+     # and data is actually committed when connection reopened
+     sql_client.close_connection()
+
+
+===== COMMIT 20c44851 =====
+
+
+commit 20c44851c
+Author: Anton Burnashev
+Date: 2025-09-22
+
+    cli: updated error in the dlt pipeline show command (#3095)
+
+diff --git a/dlt/helpers/dashboard/runner.py b/dlt/helpers/dashboard/runner.py
+index de5c3df99..b85315da1 100644
+--- a/dlt/helpers/dashboard/runner.py
++++ b/dlt/helpers/dashboard/runner.py
+@@ -6,6 +6,17 @@ from typing import Any
+ from pathlib import Path
+ from dlt.common.exceptions import MissingDependencyException
+ 
++
++def _detect_dashboard_command() -> str:
++    command = sys.argv[1]
++    if command == "pipeline":
++        return f"dlt pipeline {sys.argv[2]} show"
++    elif command == "dashboard":
++        return "dlt dashboard"
++    else:
++        raise ValueError(f"Invalid command: {command}")
++
++
+ # keep this, will raise if user tries to run dashboard without dependencies
+ try:
+     import marimo
+@@ -13,10 +24,9 @@ try:
+     import ibis
+ except ModuleNotFoundError:
+     raise MissingDependencyException(
+-        "dlt pipeline dashboard",
++        _detect_dashboard_command(),
+         ['dlt["workspace"]'],
+-        "the dlt dashboard requires additional dependencies which you may install with the dlt"
+-        " workspace extra.",
++        "to install the dlt workspace extra.",
+     )
+ 
+ EJECTED_APP_FILE_NAME = "dlt_dashboard.py"
+
+
+===== COMMIT 855536ca =====
+
+
+commit 855536cab
+Author: ianedmundson1
+Date: 2025-09-19
+
+    fix: fixed error in import of BaseOperator in airflow_helper.py (#2601) (#3043)
+
+diff --git a/dlt/helpers/airflow_helper.py b/dlt/helpers/airflow_helper.py
+index 69292166a..245534162 100644
+--- a/dlt/helpers/airflow_helper.py
++++ b/dlt/helpers/airflow_helper.py
+@@ -16,10 +16,10 @@ from dlt.common.exceptions import MissingDependencyException, ValueErrorWithKnow
+ 
+ try:
+     from airflow.configuration import conf
+-    from airflow.models import TaskInstance
++    from airflow.models import TaskInstance, BaseOperator
+     from airflow.utils.task_group import TaskGroup
+     from airflow.operators.empty import EmptyOperator
+-    from airflow.operators.python import BaseOperator, PythonOperator, get_current_context
++    from airflow.operators.python import PythonOperator, get_current_context
+ except ModuleNotFoundError:
+     raise MissingDependencyException("Airflow", ["apache-airflow>=2.5"])
+ 
+
+
+===== COMMIT 58ae6303 =====
+
+
+commit 58ae6303c
+Author: David Scharf
+Date: 2025-09-19
+
+    Run common and dashboard tests also with newest available allowed packages for all deps (#3100)
+

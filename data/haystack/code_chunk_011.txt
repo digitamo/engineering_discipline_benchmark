@@ -1,0 +1,2913 @@
+diff --git a/docs/docs_tools/examples/prepare_examples_tests.py b/docs/docs_tools/examples/prepare_examples_tests.py
+index 3939c9044..e2ef6eff4 100644
+--- a/docs/docs_tools/examples/prepare_examples_tests.py
++++ b/docs/docs_tools/examples/prepare_examples_tests.py
+@@ -20,6 +20,7 @@ SKIP_EXAMPLES: List[str] = [
+     "qdrant_zendesk",
+     "incremental_loading",
+     "logfire_telemetry_export",
++    "arize_phoenix_export",
+ ]
+ # Examples will be skipped from forked subprocesses
+ SKIP_FORK_EXAMPLES: List[str] = ["custom_destination_lancedb"]
+diff --git a/docs/examples/arize_phoenix_export/__init__.py b/docs/examples/arize_phoenix_export/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/docs/examples/arize_phoenix_export/arize_phoenix_export.py b/docs/examples/arize_phoenix_export/arize_phoenix_export.py
+new file mode 100644
+index 000000000..5d4e9cfca
+--- /dev/null
++++ b/docs/examples/arize_phoenix_export/arize_phoenix_export.py
+@@ -0,0 +1,412 @@
++"""
++---
++title: Export Arize Phoenix Telemetry
++description: Export traces, spans, and evaluations from Arize Phoenix to your data lake
++keywords: [arize, phoenix, opentelemetry, traces, spans, evaluations, observability, llm, export]
++---
++
++[Arize Phoenix](https://phoenix.arize.com/) is an open-source observability platform for AI and LLM
++applications. It captures traces, spans, and evaluations (e.g. relevance scores, hallucination checks)
++that are sent via the OpenTelemetry (OTel) protocol.
++
++To enable analytics, reporting, and offline evaluation, this telemetry needs to be exported to a
++data lakehouse or warehouse. Arize Phoenix persists data in a relational database — either **PostgreSQL**
++(recommended for production) or **SQLite** (the default for single-node deployments).
++
++The `dlt` library's built-in `sql_database()` source makes extraction straightforward:
++
++* Connect directly to Phoenix's Postgres or SQLite backend with a connection string.
++* Use `resolve_foreign_keys=True` so dlt automatically links child tables (e.g. spans → traces).
++* Load to **DuckDB** for zero-config local analytics, or swap to any other dlt destination.
++
++## Credentials
++
++### PostgreSQL
++
++Add the following block to `.dlt/secrets.toml`, filling in the values from your deployment:
++
++```toml
++# .dlt/secrets.toml
++[sources.sql_database.credentials]
++drivername = "postgresql"
++host = "localhost"
++port = 5432
++database = "phoenix"
++username = "phoenix"
++password = "phoenix"
++```
++
++You also need the psycopg2 driver installed:
++
++```bash
++pip install psycopg2-binary
++```
++
++Where to find these values:
++- **Docker Compose**: look for the `db` service in your `docker-compose.yml`. The credentials are
++  set via `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` environment variables. The host
++  is the service name (or `localhost` if the port is published to the host).
++- **Helm chart**: check `values.yaml` under `postgresql.auth` or the `PHOENIX_SQL_DATABASE_URL`
++  environment variable on the Phoenix deployment.
++
++### SQLite
++
++Add the following block to `.dlt/secrets.toml`, pointing `database` at the `.db` file on disk:
++
++```toml
++# .dlt/secrets.toml
++[sources.sql_database.credentials]
++drivername = "sqlite"
++database = "/path/to/phoenix.db"
++```
++
++Where to find the file:
++- **Docker Compose**: the SQLite file lives at `/phoenix/storage/phoenix.db` inside the container.
++  Volume-mount it to a host path so the pipeline can read it directly:
++  ```yaml
++  volumes:
++    - ./data/phoenix.db:/phoenix/storage/phoenix.db
++  ```
++  Then set `database` to the host-side path (e.g. `./data/phoenix.db`).
++- **No volume mount**: copy the file out first with
++  `docker cp <container>:/phoenix/storage/phoenix.db ./phoenix.db`, then point `database` at the
++  copied file.
++
++NOTE. You need the `dlt[sql-database]` extra installed:
++
++```bash
++pip install "dlt[sql-database]"
++```
++
++## Data model
++
++dlt automatically discovers every table in the Phoenix database and infers their relationships from
++foreign keys — no schema configuration required. The exact set of tables you get depends on which
++Phoenix features you have used: tables are only created in the database once the corresponding
++feature is exercised. For example, the `datasets` and `dataset_examples` tables do not exist until
++you create a dataset through the Phoenix web UI.
++
++The tables most relevant for AI observability are:
++
++- **`projects`** — top-level containers; each project groups a set of traces.
++- **`traces`** — a trace is a complete request or workflow, identified by a `trace_id`.
++- **`spans`** — the core table. Every OTEL span belongs to a trace. Spans carry timing, status,
++  LLM token counts, input/output values, and arbitrary OpenInference attributes.
++- **`span_annotations`** — evaluations attached to individual spans (e.g. relevance score,
++  hallucination label), produced by human raters or automated LLM judges.
++- **`trace_annotations`** — same as `span_annotations` but scoped to a full trace.
++- **`datasets`** — curated collections of examples, created via the Phoenix web UI or SDK.
++- **`dataset_examples`** — the individual rows inside a dataset, each linked back to a source span.
++- **`dataset_versions`** — snapshot history of a dataset, enabling reproducible evaluations.
++- **`experiments`** — prompt playground runs executed against a dataset version.
++- **`experiment_runs`** — individual outputs produced by an experiment for each dataset example.
++
++Some tables are internal to Phoenix (e.g. migration tracking, internal job queues).
++You can explicitly select a subset of tables to load via the parameter `sql_database(..., table_names=...)`.
++
++```mermaid
++erDiagram
++    alembic_version{
++    text version_num PK
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    users{
++    bigint id PK
++    bigint user_role_id
++    text username
++    text email
++    text profile_picture_url
++    binary password_hash
++    binary password_salt
++    bool reset_password
++    text oauth2_client_id
++    text oauth2_user_id
++    timestamp created_at
++    timestamp updated_at
++    text auth_method
++    text ldap_unique_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    user_roles{
++    bigint id PK
++    text name
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    projects{
++    bigint id PK
++    text name
++    text description
++    text gradient_start_color
++    text gradient_end_color
++    timestamp created_at
++    timestamp updated_at
++    bigint trace_retention_policy_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    project_trace_retention_policies{
++    bigint id PK
++    text name
++    text cron_expression
++    json rule
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    generative_models{
++    bigint id PK
++    text name
++    text provider
++    text name_pattern
++    bool is_built_in
++    timestamp start_time
++    timestamp created_at
++    timestamp updated_at
++    timestamp deleted_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    token_prices{
++    bigint id PK
++    bigint model_id
++    text token_type
++    bool is_prompt
++    double base_rate
++    json customization
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    evaluators{
++    bigint id PK
++    text name
++    text description
++    json metadata
++    text kind
++    bigint user_id
++    timestamp created_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    builtin_evaluators{
++    bigint id PK
++    text kind
++    text key
++    json input_schema
++    json output_configs
++    timestamp synced_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    dataset_examples{
++    bigint id PK
++    bigint dataset_id
++    bigint span_rowid
++    timestamp created_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    datasets{
++    bigint id PK
++    text name
++    text description
++    json metadata
++    timestamp created_at
++    timestamp updated_at
++    bigint user_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    spans{
++    bigint id PK
++    bigint trace_rowid
++    text span_id
++    text parent_id
++    text name
++    text span_kind
++    timestamp start_time
++    timestamp end_time
++    json attributes
++    json events
++    text status_code
++    text status_message
++    bigint cumulative_error_count
++    bigint cumulative_llm_token_count_prompt
++    bigint cumulative_llm_token_count_completion
++    bigint llm_token_count_prompt
++    bigint llm_token_count_completion
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    traces{
++    bigint id PK
++    bigint project_rowid
++    text trace_id
++    timestamp start_time
++    timestamp end_time
++    bigint project_session_rowid
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    project_sessions{
++    bigint id PK
++    text session_id
++    bigint project_id
++    timestamp start_time
++    timestamp end_time
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    dataset_example_revisions{
++    bigint id PK
++    bigint dataset_example_id
++    bigint dataset_version_id
++    json input
++    json output
++    json metadata
++    text revision_kind
++    timestamp created_at
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    dataset_versions{
++    bigint id PK
++    bigint dataset_id
++    text description
++    json metadata
++    timestamp created_at
++    bigint user_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    span_annotations{
++    bigint id PK
++    bigint span_rowid
++    text name
++    text label
++    double score
++    text explanation
++    json metadata
++    text annotator_kind
++    timestamp created_at
++    timestamp updated_at
++    bigint user_id
++    text identifier
++    text source
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    project_annotation_configs{
++    bigint id PK
++    bigint project_id
++    bigint annotation_config_id
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    annotation_configs{
++    bigint id PK
++    text name
++    json config
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    span_costs{
++    bigint id PK
++    bigint span_rowid
++    bigint trace_rowid
++    bigint model_id
++    timestamp span_start_time
++    double total_cost
++    double total_tokens
++    double prompt_cost
++    double prompt_tokens
++    double completion_cost
++    double completion_tokens
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    span_cost_details{
++    bigint id PK
++    bigint span_cost_id
++    text token_type
++    bool is_prompt
++    double cost
++    double tokens
++    double cost_per_token
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    users ||--|{ user_roles : ""
++    projects ||--|{ project_trace_retention_policies : ""
++    token_prices ||--|{ generative_models : ""
++    evaluators ||--|{ users : ""
++    builtin_evaluators ||--|{ evaluators : ""
++    dataset_examples ||--|{ datasets : ""
++    dataset_examples ||--|{ spans : ""
++    datasets ||--|{ users : ""
++    spans ||--|{ traces : ""
++    traces ||--|{ projects : ""
++    traces ||--|{ project_sessions : ""
++    project_sessions ||--|{ projects : ""
++    dataset_example_revisions ||--|{ dataset_versions : ""
++    dataset_example_revisions ||--|{ dataset_examples : ""
++    dataset_versions ||--|{ datasets : ""
++    dataset_versions ||--|{ users : ""
++    span_annotations ||--|{ users : ""
++    span_annotations ||--|{ spans : ""
++    project_annotation_configs ||--|{ projects : ""
++    project_annotation_configs ||--|{ annotation_configs : ""
++    span_costs ||--|{ traces : ""
++    span_costs ||--|{ spans : ""
++    span_costs ||--|{ generative_models : ""
++    span_cost_details ||--|{ span_costs : ""
++```
++
++"""
++
++import dlt
++from dlt.sources.sql_database import sql_database
++
++
++@dlt.source
++def arize_phoenix_source(credentials=dlt.secrets.value):
++    """Returns all Arize Phoenix tables as a dlt source.
++
++    Reads directly from Phoenix's relational backend (PostgreSQL or SQLite) using
++    dlt's built-in `sql_database` source. Foreign key relationships are resolved
++    automatically so destination tables reference each other correctly.
++
++    The primary tables of interest are:
++
++    - **spans**: Every OTEL span recorded by Phoenix — the core unit of telemetry.
++      Each row represents one span with timing, attributes, status, and token counts.
++    - **traces**: Groups of related spans sharing the same `trace_id`.
++    - **projects**: Phoenix projects that spans are assigned to.
++    - **span_annotations**: Human or model-generated evaluations attached to spans
++      (e.g. relevance score, hallucination label).
++    - **trace_annotations**: Evaluations at the trace level.
++    - **datasets / dataset_examples**: Curated examples used in prompt playgrounds
++      or regression test suites.
++
++    Args:
++        credentials: SQLAlchemy-compatible connection string or credential dict,
++            loaded from `secrets.toml`. Supports both PostgreSQL and SQLite URIs.
++
++    Returns:
++        A list of dlt resources — one per Phoenix database table.
++    """
++    return sql_database(
++        credentials=credentials,
++        resolve_foreign_keys=True,
++    )
++
++
++if __name__ == "__main__":
++    pipeline = dlt.pipeline(
++        pipeline_name="arize_phoenix",
++        # can be configure to any dlt destination
++        destination="duckdb",
++    )
++    load_info = pipeline.run(arize_phoenix_source())
++    print(load_info)
+
+
+===== COMMIT 88bd3437 =====
+
+
+commit 88bd34377
+Author: djudjuu
+Date: 2026-05-05
+
+    control section opening from url (#3686)
+
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index ca9b58464..7c169d086 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -792,33 +792,47 @@ def ui_controls(mo_cli_arg_with_test_identifiers: bool):
+         label=utils.ui.small(strings.app_refresh_button),
+     )
+ 
++    # read sections from query params to allow navigation via URL
++    try:
++        _open_sections = (cast(str, mo.query_params().get("sections")) or "").split(",")
++    except Exception:
++        _open_sections = []
++
+     # page switches
+     dlt_section_sync_switch: mo.ui.switch = mo.ui.switch(
+         value=True, label="sync" if mo_cli_arg_with_test_identifiers else ""
+     )
+     dlt_section_info_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="overview" if mo_cli_arg_with_test_identifiers else ""
++        value="overview" in _open_sections,
++        label="overview" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_schema_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="schema" if mo_cli_arg_with_test_identifiers else ""
++        value="schema" in _open_sections,
++        label="schema" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_browse_data_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="data" if mo_cli_arg_with_test_identifiers else ""
++        value="data" in _open_sections,
++        label="data" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_state_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="state" if mo_cli_arg_with_test_identifiers else ""
++        value="state" in _open_sections,
++        label="state" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_trace_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="trace" if mo_cli_arg_with_test_identifiers else ""
++        value="trace" in _open_sections,
++        label="trace" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_loads_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="loads" if mo_cli_arg_with_test_identifiers else ""
++        value="loads" in _open_sections,
++        label="loads" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_ibis_browser_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="ibis" if mo_cli_arg_with_test_identifiers else ""
++        value="ibis" in _open_sections,
++        label="ibis" if mo_cli_arg_with_test_identifiers else "",
+     )
+     dlt_section_data_quality_switch: mo.ui.switch = mo.ui.switch(
+-        value=False, label="data_quality" if mo_cli_arg_with_test_identifiers else ""
++        value="data_quality" in _open_sections,
++        label="data_quality" if mo_cli_arg_with_test_identifiers else "",
+     )
+ 
+     # other switches
+diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
+index 8c5b9f45e..d63aa8f1d 100644
+--- a/tests/e2e/helpers/dashboard/test_e2e.py
++++ b/tests/e2e/helpers/dashboard/test_e2e.py
+@@ -396,3 +396,42 @@ def test_broken_trace_pipeline(page: Page, broken_trace_pipeline: Any, pipelines
+     # should also render the trace section, but there should be an error message
+     _open_section(page, "trace")
+     expect(page.get_by_text("Error while building trace section:")).to_be_visible()
++
++
++def test_sections_query_param(page: Page, fruit_pipeline: Any):
++    """Sections specified in ?sections= query param should be pre-opened."""
++    # navigate with sections=trace,loads in the URL
++    page.goto("http://localhost:2718/?pipeline=fruit_pipeline&sections=trace,loads")
++
++    # wait for the pipeline to load
++    expect(page.get_by_role("switch", name="trace")).to_be_visible(timeout=20000)
++
++    # trace and loads switches should be checked (verifies URL params are parsed correctly)
++    expect(page.get_by_role("switch", name="trace")).to_be_checked()
++    expect(page.get_by_role("switch", name="loads")).to_be_checked()
++
++    # other sections should NOT be checked
++    expect(page.get_by_role("switch", name="overview")).not_to_be_checked()
++    expect(page.get_by_role("switch", name="schema")).not_to_be_checked()
++    expect(page.get_by_role("switch", name="data")).not_to_be_checked()
++    expect(page.get_by_role("switch", name="state")).not_to_be_checked()
++
++    # navigate away to release the DuckDB lock before the next test's fixture
++    _go_home(page)
++
++
++def test_sections_query_param_all(page: Page, fruit_pipeline: Any):
++    """All sections should open when all are specified in ?sections= query param."""
++    page.goto(
++        "http://localhost:2718/?pipeline=fruit_pipeline"
++        "&sections=overview,schema,data,state,trace,loads"
++    )
++
++    # wait for the pipeline to load
++    expect(page.get_by_role("switch", name="overview")).to_be_visible(timeout=20000)
++
++    # all specified switches should be checked
++    for section in ["overview", "schema", "data", "state", "trace", "loads"]:
++        expect(page.get_by_role("switch", name=section)).to_be_checked()
++
++    _go_home(page)
+
+
+===== COMMIT f191e724 =====
+
+
+commit f191e7248
+Author: Anuun Chinbat
+Date: 2026-05-05
+
+    Fix/3592 bypass non interactive flag prompts (#3910)
+
+diff --git a/dlt/_workspace/cli/_dlt.py b/dlt/_workspace/cli/_dlt.py
+index 27fef889c..a244ff4fc 100644
+--- a/dlt/_workspace/cli/_dlt.py
++++ b/dlt/_workspace/cli/_dlt.py
+@@ -88,11 +88,29 @@ class NonInteractiveAction(argparse.Action):
+         option_string: str = None,
+     ) -> None:
+         fmt.ALWAYS_CHOOSE_DEFAULT = True
+-        fmt.note(
+-            "Non interactive mode. Default choices are automatically made for confirmations and"
+-            " prompts."
++
++
++class YesAction(argparse.Action):
++    def __init__(
++        self,
++        option_strings: Sequence[str],
++        dest: Any = argparse.SUPPRESS,
++        default: Any = argparse.SUPPRESS,
++        help: str = None,  # noqa
++    ) -> None:
++        super(YesAction, self).__init__(
++            option_strings=option_strings, dest=dest, default=default, nargs=0, help=help
+         )
+ 
++    def __call__(
++        self,
++        parser: argparse.ArgumentParser,
++        namespace: argparse.Namespace,
++        values: Any,
++        option_string: str = None,
++    ) -> None:
++        fmt.ALWAYS_CONFIRM = True
++
+ 
+ class DebugAction(argparse.Action):
+     def __init__(
+@@ -145,6 +163,12 @@ def _create_parser() -> Tuple[argparse.ArgumentParser, Dict[str, SupportsCliComm
+             " prompts."
+         ),
+     )
++    parser.add_argument(
++        "-y",
++        "--yes",
++        action=YesAction,
++        help="Automatically accept all confirmations.",
++    )
+     parser.add_argument(
+         "--debug",
+         action=DebugAction,
+diff --git a/dlt/_workspace/cli/echo.py b/dlt/_workspace/cli/echo.py
+index b28e6fffb..969c9ed46 100644
+--- a/dlt/_workspace/cli/echo.py
++++ b/dlt/_workspace/cli/echo.py
+@@ -6,26 +6,36 @@ import click
+ 
+ ALWAYS_CHOOSE_DEFAULT = False
+ ALWAYS_CHOOSE_VALUE: Any = None
++ALWAYS_CONFIRM = False
+ 
+ 
+ @contextlib.contextmanager
+-def always_choose(always_choose_default: bool, always_choose_value: Any) -> Iterator[None]:
++def always_choose(
++    always_choose_default: bool,
++    always_choose_value: Any,
++    always_confirm: bool = False,
++) -> Iterator[None]:
+     """Temporarily answer all confirmations and prompts with preset values.
+ 
+     Args:
+         always_choose_default: When True, confirm/prompt calls return their default.
+         always_choose_value: When set, confirm/prompt calls return this value instead.
++        always_confirm: When True, confirm calls always return True, regardless of
++            `always_choose_default` and `always_choose_value`.
+     """
+-    global ALWAYS_CHOOSE_DEFAULT, ALWAYS_CHOOSE_VALUE
++    global ALWAYS_CHOOSE_DEFAULT, ALWAYS_CHOOSE_VALUE, ALWAYS_CONFIRM
+     _always_choose_default = ALWAYS_CHOOSE_DEFAULT
+     _always_choose_value = ALWAYS_CHOOSE_VALUE
++    _always_confirm = ALWAYS_CONFIRM
+     ALWAYS_CHOOSE_DEFAULT = always_choose_default
+     ALWAYS_CHOOSE_VALUE = always_choose_value
++    ALWAYS_CONFIRM = always_confirm
+     try:
+         yield
+     finally:
+         ALWAYS_CHOOSE_DEFAULT = _always_choose_default
+         ALWAYS_CHOOSE_VALUE = _always_choose_value
++        ALWAYS_CONFIRM = _always_confirm
+ 
+ 
+ @contextlib.contextmanager
+@@ -49,7 +59,9 @@ def suppress_echo() -> Iterator[None]:
+ def maybe_no_stdin() -> ContextManager[None]:
+     """Automatically choose default values if stdin not connected"""
+     return always_choose(
+-        True if not sys.stdin.isatty() else ALWAYS_CHOOSE_DEFAULT, ALWAYS_CHOOSE_VALUE
++        True if not sys.stdin.isatty() else ALWAYS_CHOOSE_DEFAULT,
++        ALWAYS_CHOOSE_VALUE,
++        ALWAYS_CONFIRM,
+     )
+ 
+ 
+@@ -79,6 +91,8 @@ def note(msg: str) -> None:
+ 
+ 
+ def confirm(text: str, default: Optional[bool] = None) -> bool:
++    if ALWAYS_CONFIRM:
++        return True
+     if ALWAYS_CHOOSE_VALUE:
+         return bool(ALWAYS_CHOOSE_VALUE)
+     if ALWAYS_CHOOSE_DEFAULT:
+diff --git a/docs/website/docs/reference/command-line-interface.md b/docs/website/docs/reference/command-line-interface.md
+index 837499135..165ddc10e 100644
+--- a/docs/website/docs/reference/command-line-interface.md
++++ b/docs/website/docs/reference/command-line-interface.md
+@@ -30,7 +30,7 @@ Creates, adds, inspects and deploys dlt pipelines. Further help is available at
+ **Usage**
+ ```sh
+ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+-    [--non-interactive] [--debug] [--no-pwd]
++    [--non-interactive] [-y] [--debug] [--no-pwd]
+     {telemetry,schema,pipeline,init,deploy,dashboard,ai} ...
+ ```
+ 
+@@ -44,6 +44,7 @@ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+ * `--disable-telemetry` - Disables telemetry before command is executed
+ * `--enable-telemetry` - Enables telemetry before command is executed
+ * `--non-interactive` - Non interactive mode. default choices are automatically made for confirmations and prompts.
++* `-y, --yes` - Automatically accept all confirmations.
+ * `--debug` - Displays full stack traces on exceptions. useful for debugging if the output is not clear enough.
+ * `--no-pwd` - Do not add current working directory to sys.path. by default $pwd is added to reproduce python behavior when running scripts.
+ 
+diff --git a/tests/workspace/cli/common/test_cli_invoke.py b/tests/workspace/cli/common/test_cli_invoke.py
+index 33c6edc1a..f0e7f6b2f 100644
+--- a/tests/workspace/cli/common/test_cli_invoke.py
++++ b/tests/workspace/cli/common/test_cli_invoke.py
+@@ -3,9 +3,11 @@ import sys
+ import pytest
+ import shutil
+ from pathlib import Path
++from typing import Iterator
+ from pytest_console_scripts import ScriptRunner
+ from unittest.mock import patch
+ 
++import dlt
+ from dlt.common.runners.venv import Venv
+ from dlt.common.utils import custom_environ
+ 
+@@ -16,6 +18,15 @@ from tests.utils import get_test_storage_root
+ BASE_COMMANDS = ["init", "deploy", "pipeline", "telemetry", "schema"]
+ 
+ 
++@pytest.fixture(autouse=True)
++def reset_echo_globals() -> Iterator[None]:
++    """Reset echo globals to their default values."""
++    yield
++    fmt.ALWAYS_CHOOSE_DEFAULT = False
++    fmt.ALWAYS_CHOOSE_VALUE = None
++    fmt.ALWAYS_CONFIRM = False
++
++
+ @pytest.fixture(autouse=True)
+ def disable_debug() -> None:
+     # reset debug flag so other tests may pass
+@@ -222,6 +233,61 @@ def test_invoke_deploy_mock(script_runner: ScriptRunner) -> None:
+         }
+ 
+ 
++@pytest.mark.parametrize(
++    "flags,confirms",
++    [
++        (["-y"], True),
++        (["--yes"], True),
++        (["--yes", "--non-interactive"], True),
++        (["-y", "--non-interactive"], True),
++        (["--non-interactive"], False),
++    ],
++    ids=[
++        "short",
++        "long",
++        "yes-and-non-interactive",
++        "y-and-non-interactive",
++        "non-interactive-only",
++    ],
++)
++def test_yes_flag_auto_confirms(
++    script_runner: ScriptRunner, flags: list[str], confirms: bool
++) -> None:
++    """Destructive commands like sync and drop ask for confirmation with default=False.
++    --non-interactive uses the default, so nothing happens. -y/--yes overrides to True, so the commands actually execute.
++    """
++    result = script_runner.run(["dlt", "init", "chess", "duckdb"])
++    assert result.returncode == 0
++
++    os.environ.pop("DESTINATION__DUCKDB__CREDENTIALS", None)
++    venv = Venv.restore_current()
++    venv.run_script("chess_pipeline.py")
++
++    # sync
++    result = script_runner.run(["dlt", *flags, "pipeline", "chess_pipeline", "sync"])
++    assert result.returncode == 0, f"STDERR: {result.stderr}"
++    if confirms:
++        assert "Dropping local state" in result.stdout
++        assert "Restoring from destination" in result.stdout
++    else:
++        assert "Dropping local state" not in result.stdout
++
++    pipeline = dlt.attach(pipeline_name="chess_pipeline")
++    assert "players_games" in pipeline.default_schema.tables
++
++    # drop
++    result = script_runner.run(
++        ["dlt", *flags, "pipeline", "chess_pipeline", "drop", "players_games"]
++    )
++    assert result.returncode == 0, f"STDERR: {result.stderr}"
++    pipeline = dlt.attach(pipeline_name="chess_pipeline")
++    if confirms:
++        assert "Selected resource(s): ['players_games']" in result.stdout
++        assert "players_games" not in pipeline.default_schema.tables
++    else:
++        assert "players_games" in pipeline.default_schema.tables
++
++
+ @pytest.mark.skipif(sys.stdin.isatty(), reason="stdin connected, test skipped")
+ def test_no_tty() -> None:
+     with fmt.maybe_no_stdin():
+diff --git a/tests/workspace/cli/test_pipeline_command.py b/tests/workspace/cli/test_pipeline_command.py
+index e02269857..d7a5e8f67 100644
+--- a/tests/workspace/cli/test_pipeline_command.py
++++ b/tests/workspace/cli/test_pipeline_command.py
+@@ -4,6 +4,7 @@ import contextlib
+ import pytest
+ import logging
+ from subprocess import CalledProcessError
++from typing import Any
+ 
+ import dlt
+ from dlt.common.runners.venv import Venv
+@@ -19,6 +20,21 @@ from tests.workspace.cli.utils import (
+ )
+ 
+ 
++CHOOSE_PRIORITY_CASES = [
++    # always_confirm=True overrides everything
++    (dict(always_choose_default=True, always_choose_value=False, always_confirm=True), True),
++    # always_choose_value overrides always_choose_default
++    (dict(always_choose_default=True, always_choose_value=True, always_confirm=False), True),
++    # always_choose_default kicks in only when value/confirm are off
++    (dict(always_choose_default=True, always_choose_value=None, always_confirm=False), False),
++]
++CHOOSE_PRIORITY_IDS = [
++    "always-confirm-overrides-everything",
++    "always-choose-value-overrides-always-choose-default",
++    "always-choose-default-kicks-in-if-allowed",
++]
++
++
+ def test_pipeline_command_operations(repo_dir: str) -> None:
+     _init_command.init_command("chess", "duckdb", repo_dir)
+ 
+@@ -199,7 +215,10 @@ def test_pipeline_command_failed_jobs(repo_dir: str) -> None:
+         assert "JOB file type: jsonl" in _out
+ 
+ 
+-def test_pipeline_command_drop_partial_loads(repo_dir: str) -> None:
++@pytest.mark.parametrize("choose_kwargs,confirms", CHOOSE_PRIORITY_CASES, ids=CHOOSE_PRIORITY_IDS)
++def test_pipeline_command_drop_partial_loads(
++    repo_dir: str, choose_kwargs: dict[str, Any], confirms: bool
++) -> None:
+     _init_command.init_command("chess", "dummy", repo_dir)
+     os.environ["EXCEPTION_PROB"] = "1.0"
+ 
+@@ -234,17 +253,21 @@ def test_pipeline_command_drop_partial_loads(repo_dir: str) -> None:
+     print(_out)
+ 
+     with io.StringIO() as buf, contextlib.redirect_stdout(buf):
+-        with echo.always_choose(False, True):
++        with echo.always_choose(**choose_kwargs):
+             _pipeline_command.pipeline_command("drop-pending-packages", "chess_pipeline", None, 1)
+             _out = buf.getvalue()
+-            assert "Pending packages deleted" in _out
+     print(_out)
+ 
+-    with io.StringIO() as buf, contextlib.redirect_stdout(buf):
+-        _pipeline_command.pipeline_command("drop-pending-packages", "chess_pipeline", None, 1)
+-        _out = buf.getvalue()
+-        assert "No pending packages found" in _out
+-    print(_out)
++    if confirms:
++        assert "Pending packages deleted" in _out
++        # verify packages are gone
++        with io.StringIO() as buf, contextlib.redirect_stdout(buf):
++            _pipeline_command.pipeline_command("drop-pending-packages", "chess_pipeline", None, 1)
++            _out = buf.getvalue()
++            assert "No pending packages found" in _out
++        print(_out)
++    else:
++        assert "Pending packages deleted" not in _out
+ 
+ 
+ def test_drop_from_wrong_dir(repo_dir: str) -> None:
+@@ -290,7 +313,10 @@ def test_drop_from_wrong_dir(repo_dir: str) -> None:
+         assert "WARNING: You should run this from the same directory as the pipeline script" in _out
+ 
+ 
+-def test_pipeline_command_drop_with_global_args(repo_dir: str) -> None:
++@pytest.mark.parametrize("choose_kwargs,confirms", CHOOSE_PRIORITY_CASES, ids=CHOOSE_PRIORITY_IDS)
++def test_pipeline_command_drop_with_global_args(
++    repo_dir: str, choose_kwargs: dict[str, Any], confirms: bool
++) -> None:
+     """Test that global CLI arguments don't cause errors in pipeline drop command."""
+     _init_command.init_command("chess", "duckdb", repo_dir)
+ 
+@@ -303,9 +329,8 @@ def test_pipeline_command_drop_with_global_args(repo_dir: str) -> None:
+         print(cpe.stderr)
+         raise
+ 
+-    # Test drop command with global arguments that should be ignored
+     with io.StringIO() as buf, contextlib.redirect_stdout(buf):
+-        with echo.always_choose(False, True):
++        with echo.always_choose(**choose_kwargs):
+             _pipeline_command.pipeline_command(
+                 "drop",
+                 "chess_pipeline",
+@@ -316,8 +341,10 @@ def test_pipeline_command_drop_with_global_args(repo_dir: str) -> None:
+                 debug=False,  # Another global arg
+             )
+         _out = buf.getvalue()
+-        assert "Selected resource(s): ['players_games']" in _out
+ 
+-    # Verify the command actually executed
+     pipeline = dlt.attach(pipeline_name="chess_pipeline")
+-    assert "players_games" not in pipeline.default_schema.tables
++    if confirms:
++        assert "Selected resource(s): ['players_games']" in _out
++        assert "players_games" not in pipeline.default_schema.tables
++    else:
++        assert "players_games" in pipeline.default_schema.tables
+
+
+===== COMMIT 55078eb0 =====
+
+
+commit 55078eb0b
+Author: Anuun Chinbat
+Date: 2026-05-05
+
+    fix: correctly materialize empty tables for multi-table resources (#3901)
+
+diff --git a/dlt/extract/extract.py b/dlt/extract/extract.py
+index 9628e4aa9..11267e7b7 100644
+--- a/dlt/extract/extract.py
++++ b/dlt/extract/extract.py
+@@ -345,42 +345,30 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
+     ) -> None:
+         schema = source.schema
+         json_extractor = extractors["object"]
+-        resources_with_items = set().union(*[e.resources_with_items for e in extractors.values()])
++        tables_with_items = set().union(*[e.tables_with_items for e in extractors.values()])
+         # find REPLACE resources that did not yield any pipe items and create empty jobs for them
+         # NOTE: do not include tables that have never seen data
+         data_tables = {t["name"]: t for t in schema.data_tables(seen_data_only=True)}
+         tables_by_resources = utils.group_tables_by_resource(data_tables)
+         for resource in source.resources.selected.values():
+-            if resource.write_disposition != "replace" or resource.name in resources_with_items:
+-                continue
+             if resource.name not in tables_by_resources:
+                 continue
+             for table in tables_by_resources[resource.name]:
++                write_disposition = table.get("write_disposition") or resource.write_disposition
++                if write_disposition != "replace" or table["name"] in tables_with_items:
++                    continue
+                 # we only need to write empty files for the root tables
+                 if not utils.is_nested_table(table):
+                     json_extractor.write_empty_items_file(table["name"])
+ 
+-        # collect resources that received empty materialized lists and had no items
+-        resources_with_empty = (
++        # collect tables that received empty materialized lists and had no items
++        tables_with_empty = (
+             set()
+-            .union(*[e.resources_with_empty for e in extractors.values()])
+-            .difference(resources_with_items)
++            .union(*[e.tables_with_empty for e in extractors.values()])
++            .difference(tables_with_items)
+         )
+-        # get all possible tables
+-        data_tables = {t["name"]: t for t in schema.data_tables()}
+-        tables_by_resources = utils.group_tables_by_resource(data_tables)
+-        for resource_name in resources_with_empty:
+-            if resource := source.resources.selected.get(resource_name):
+-                if tables := tables_by_resources.get("resource_name"):
+-                    # write empty tables
+-                    for table in tables:
+-                        # we only need to write empty files for the root tables
+-                        if not utils.is_nested_table(table):
+-                            json_extractor.write_empty_items_file(table["name"])
+-                else:
+-                    table_name = json_extractor._get_static_table_name(resource, None)
+-                    if table_name:
+-                        json_extractor.write_empty_items_file(table_name)
++        for table_name in tables_with_empty:
++            json_extractor.write_empty_items_file(table_name)
+ 
+     def _extract_single_source(
+         self,
+diff --git a/dlt/extract/extractors.py b/dlt/extract/extractors.py
+index 983ab9c21..3110cdd02 100644
+--- a/dlt/extract/extractors.py
++++ b/dlt/extract/extractors.py
+@@ -124,10 +124,10 @@ class Extractor:
+         self.schema = schema
+         self.naming = schema.naming
+         self.collector = collector
+-        self.resources_with_items: Set[str] = set()
+-        """Tracks resources that received items"""
+-        self.resources_with_empty: Set[str] = set()
+-        """Track resources that received empty materialized list"""
++        self.tables_with_items: Set[str] = set()
++        """Tracks tables that received items"""
++        self.tables_with_empty: Set[str] = set()
++        """Tracks tables that received empty materialized list"""
+         self.load_id = load_id
+         self.item_storage = item_storage
+         self._table_contracts: Dict[str, TSchemaContractDict] = {}
+@@ -190,10 +190,10 @@ class Extractor:
+         self.collector.update(table_name, inc=new_rows_count)
+         # if there were rows or item was empty arrow table
+         if new_rows_count > 0 or self.__class__ is ArrowExtractor:
+-            self.resources_with_items.add(resource_name)
++            self.tables_with_items.add(table_name)
+         else:
+             if isinstance(items, MaterializedEmptyList):
+-                self.resources_with_empty.add(resource_name)
++                self.tables_with_empty.add(table_name)
+ 
+     def _import_item(
+         self,
+@@ -210,7 +210,7 @@ class Extractor:
+             meta.file_format,
+         )
+         self.collector.update(table_name, inc=metrics.items_count)
+-        self.resources_with_items.add(resource_name)
++        self.tables_with_items.add(table_name)
+ 
+     def _write_to_dynamic_table(self, resource: DltResource, items: TDataItems, meta: Any) -> None:
+         if not isinstance(items, list):
+diff --git a/tests/extract/test_extract.py b/tests/extract/test_extract.py
+index 7f20ea4c0..b80dac3b5 100644
+--- a/tests/extract/test_extract.py
++++ b/tests/extract/test_extract.py
+@@ -13,6 +13,7 @@ from dlt.common.storages import (
+ )
+ from dlt.common.storages.schema_storage import SchemaStorage
+ from dlt.common.typing import TTableNames, TDataItems
++from dlt.common.utils import uniq_id
+ 
+ from dlt.extract import DltResource, DltSource
+ from dlt.extract.exceptions import DataItemRequiredForDynamicTableHints, ResourceExtractionError
+@@ -613,6 +614,54 @@ def test_materialize_table_schema_with_pipe_items():
+     assert found_empty_list
+ 
+ 
++@pytest.mark.parametrize(
++    "yield_one,yield_two",
++    [(True, False), (False, True), (False, False), (True, True)],
++    ids=["only_first", "only_second", "neither", "both"],
++)
++def test_materialize_table_schema_multi_table(yield_one: bool, yield_two: bool) -> None:
++    """Empty table materialization works correctly for resources that produce multiple tables."""
++
++    @dlt.resource
++    def multi_table():
++        yield dlt.mark.with_hints(
++            dlt.mark.materialize_table_schema(),
++            dlt.mark.make_hints(
++                table_name="table_one",
++                write_disposition="replace",
++                columns={"col_one": {"data_type": "text"}},
++            ),
++            create_table_variant=True,
++        )
++        yield dlt.mark.with_hints(
++            dlt.mark.materialize_table_schema(),
++            dlt.mark.make_hints(
++                table_name="table_two",
++                write_disposition="replace",
++                columns={"col_two": {"data_type": "bigint"}},
++            ),
++            create_table_variant=True,
++        )
++        if yield_one:
++            yield dlt.mark.with_table_name({"col_one": "val"}, table_name="table_one")
++        if yield_two:
++            yield dlt.mark.with_table_name({"col_two": 5}, table_name="table_two")
++
++    p = dlt.pipeline(
++        pipeline_name="materialize_multi_" + uniq_id(),
++        destination="duckdb",
++        dev_mode=True,
++    )
++    extract_info = p.extract(multi_table())
++
++    extracted_tables = {
++        job.job_file_info.table_name for job in extract_info.load_packages[0].jobs["new_jobs"]
++    }
++    # both tables should always have jobs — either with data or empty files
++    assert "table_one" in extracted_tables
++    assert "table_two" in extracted_tables
++
++
+ @pytest.mark.parametrize(
+     "with_custom_metrics", [True, False], ids=["with_custom_metrics", "without_custom_metrics"]
+ )
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index 31a0a656a..e0c41242b 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -86,6 +86,7 @@ from tests.pipeline.utils import (
+     load_table_counts,
+     load_tables_to_dicts,
+     many_delayed,
++    table_exists,
+ )
+ 
+ from dlt.destinations.dataset import get_destination_client_initial_config
+@@ -3573,6 +3574,109 @@ def test_yielding_empty_list_creates_table() -> None:
+             assert rows[0] == (1, None)
+ 
+ 
++@pytest.mark.parametrize(
++    "yield_one,yield_two",
++    [(True, False), (False, True), (False, False), (True, True)],
++    ids=["only_first", "only_second", "neither", "both"],
++)
++def test_materialize_table_schema_multi_table_duckdb(yield_one: bool, yield_two: bool) -> None:
++    """End-to-end check that a multi-table resource materializes both tables in duckdb,
++    whether they receive data or not. Dispatch happens via `with_table_name` and table
++    variants are pre-declared with `materialize_table_schema()`.
++    """
++
++    @dlt.resource
++    def multi_table():
++        yield dlt.mark.with_hints(
++            dlt.mark.materialize_table_schema(),
++            dlt.mark.make_hints(
++                table_name="table_one",
++                write_disposition="replace",
++                columns={"col_one": {"data_type": "text"}},
++            ),
++            create_table_variant=True,
++        )
++        yield dlt.mark.with_hints(
++            dlt.mark.materialize_table_schema(),
++            dlt.mark.make_hints(
++                table_name="table_two",
++                write_disposition="replace",
++                columns={"col_two": {"data_type": "bigint"}},
++            ),
++            create_table_variant=True,
++        )
++        if yield_one:
++            yield dlt.mark.with_table_name({"col_one": "val"}, table_name="table_one")
++        if yield_two:
++            yield dlt.mark.with_table_name({"col_two": 5}, table_name="table_two")
++
++    pipeline = dlt.pipeline(
++        pipeline_name="materialize_multi_e2e_" + uniq_id(),
++        destination="duckdb",
++        dev_mode=True,
++    )
++    load_info = pipeline.run(multi_table())
++    assert_load_info(load_info)
++
++    expected = {
++        "table_one": 1 if yield_one else 0,
++        "table_two": 1 if yield_two else 0,
++    }
++    assert_table_counts(pipeline, expected)
++
++    schema_tables = pipeline.default_schema.tables
++    assert "col_one" in schema_tables["table_one"]["columns"]
++    assert "col_two" in schema_tables["table_two"]["columns"]
++
++
++def test_materialize_table_schema_with_nested_hints_duckdb() -> None:
++    """Pre-declared nested table via `nested_hints` is added to the schema but does NOT
++    materialize at the destination when only the root yields `materialize_table_schema()`.
++    The normalizer attaches parent/child linking columns only when real nested data flows
++    through it, so an empty nested table cannot be meaningfully created up front.
++    """
++
++    @dlt.resource(
++        name="users",
++        write_disposition="replace",
++        columns=[
++            {"name": "id", "data_type": "bigint", "nullable": False},
++            {"name": "name", "data_type": "text"},
++        ],
++        nested_hints={
++            "purchases": dlt.mark.make_nested_hints(
++                columns=[{"name": "price", "data_type": "decimal"}],
++            ),
++        },
++    )
++    def users_with_nested():
++        yield dlt.mark.materialize_table_schema()
++
++    pipeline = dlt.pipeline(
++        pipeline_name="materialize_nested_e2e_" + uniq_id(),
++        destination="duckdb",
++        dev_mode=True,
++    )
++    load_info = pipeline.run(users_with_nested())
++    assert_load_info(load_info)
++
++    # root table is materialized empty in duckdb with declared columns
++    assert table_exists(pipeline, "users")
++    assert load_table_counts(pipeline, "users") == {"users": 0}
++    users_columns = pipeline.default_schema.tables["users"]["columns"]
++    assert {"id", "name", "_dlt_load_id", "_dlt_id"}.issubset(users_columns.keys())
++
++    # nested table is computed into the schema from `nested_hints`
++    assert "users__purchases" in pipeline.default_schema.tables
++    nested_columns = pipeline.default_schema.tables["users__purchases"]["columns"]
++    assert "price" in nested_columns
++
++    # but it is NOT created at the destination — no MaterializedEmptyList ever flows
++    # through `_write_item` for the nested name, and parent linkage columns are produced
++    # by the normalizer only on real nested rows
++    assert not table_exists(pipeline, "users__purchases")
++
++
+ @pytest.mark.parametrize(
+     "local_path_kind",
+     (
+
+
+===== COMMIT 9c825eb4 =====
+
+
+commit 9c825eb47
+Author: Travior
+Date: 2026-05-05
+
+    fix `with_load_id` breaking on non-root sibling branches (#3878)
+
+diff --git a/dlt/dataset/relation.py b/dlt/dataset/relation.py
+index 7982daa57..13988f864 100644
+--- a/dlt/dataset/relation.py
++++ b/dlt/dataset/relation.py
+@@ -29,9 +29,8 @@ from dlt.common.schema.typing import (
+     TTableSchema,
+     TTableSchemaColumns,
+     C_DLT_LOAD_ID,
+-    TTableReference,
+ )
+-from dlt.common.schema import utils as schema_utils, TSchemaTables
++from dlt.common.schema import utils as schema_utils
+ from dlt.common.typing import Self, TSortOrder, TypedDict
+ from dlt.common.exceptions import ValueErrorWithKnownValues
+ from dlt.dataset import lineage
+@@ -590,16 +589,14 @@ class Relation(WithSqlClient):
+     def with_load_id_col(self) -> dlt.Relation:
+         """Return the relation with the `_dlt_load_id` included.
+ 
+-        This only works on relations created via ``.table()``.
++        This only works on relations created via `.table()`.
+ 
+-        There are 3 cases:
+-        - If the relation is a root table, this is a no-op
+-        - If the relation has a root key, join relation to root table
+-        - If the relation has a parent key, iteratively join the root to the relation
+-        - Else raise
++        If the relation already includes `_dlt_load_id`, it is returned unchanged.
++        Otherwise, the root table is joined to add the column to the current relation.
+ 
+-        This should only raise if the `dlt.Schema` was tempered, breaking the
+-        dlt-generated root and parent relationships.
++        Raises:
++            ValueError: If called on a non-table relation, a root table without
++                `_dlt_load_id`, or a relation whose root load ID column cannot be located.
+         """
+         if not self._table_name or self._query is not None:
+             raise ValueError(
+@@ -607,16 +604,34 @@ class Relation(WithSqlClient):
+                 " It can't be applied to arbitrary relation."
+             )
+ 
+-        table_schema = self._dataset.schema.tables[self._table_name]
++        normalized_load_id = self._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID)
+ 
+-        if self._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID) in self.columns:
++        if normalized_load_id in self.columns:
+             return self
+-        elif schema_utils.has_column_with_prop(table_schema, "root_key"):
+-            return _add_load_id_via_root_key(self)
+-        elif schema_utils.has_column_with_prop(table_schema, "parent_key"):
+-            return _add_load_id_via_parent_key(self)
+-        else:
+-            raise ValueError
++
++        root_table_name = schema_utils.get_root_table(
++            self._dataset.schema.tables, self._table_name
++        )["name"]
++        if root_table_name == self._table_name:
++            raise ValueError(f"{root_table_name} is a root table, but load id column is not present.")
++
++        join_alias = "_dlt_root"
++        joined = self.join(root_table_name, alias=join_alias)
++        joined_expression = joined.sqlglot_expression.copy()
++        left_projection = joined_expression.selects[: len(self.sqlglot_expression.selects)]
++        load_id_output_name = f"{join_alias}__{normalized_load_id}"
++        load_id_expr = next(
++            (expr for expr in joined_expression.selects if expr.output_name == load_id_output_name),
++            None,
++        )
++        if load_id_expr is None:
++            raise ValueError(f"Could not locate column {normalized_load_id}")
++
++        joined_expression.set("expressions", [*left_projection, load_id_expr.this.copy()])
++
++        rel = self.__copy__()
++        rel._sqlglot_expression = joined_expression
++        return rel
+ 
+     def from_loads(
+         self,
+@@ -726,154 +741,3 @@ def _get_relation_output_columns_schema(
+         allow_partial=allow_partial,
+     )
+     return columns_schema, normalized_query
+-
+-
+-def _add_load_id_via_root_key_query(
+-    table_name: str,
+-    root_table_name: str,
+-    child_root_key: str,
+-    root_row_key: str,
+-    *,
+-    normalized_load_id: str = C_DLT_LOAD_ID,
+-) -> sge.Select:
+-    child_table = sge.Table(
+-        this=sge.to_identifier(table_name, quoted=True),
+-        alias=sge.TableAlias(this=sge.to_identifier("child", quoted=False)),
+-    )
+-    root_table_expr = sge.Table(
+-        this=sge.to_identifier(root_table_name, quoted=True),
+-        alias=sge.TableAlias(this=sge.to_identifier("root", quoted=False)),
+-    )
+-
+-    # Build column list: child.*, root._dlt_load_id
+-    columns = [
+-        sge.Column(table=sge.to_identifier("child", quoted=False), this=sge.Star()),
+-        sge.Column(
+-            table=sge.to_identifier("root", quoted=False),
+-            this=sge.to_identifier(normalized_load_id, quoted=True),
+-        ),
+-    ]
+-
+-    join_condition = sge.EQ(
+-        this=sge.Column(
+-            table=sge.to_identifier("child", quoted=False),
+-            this=sge.to_identifier(child_root_key, quoted=True),
+-        ),
+-        expression=sge.Column(
+-            table=sge.to_identifier("root", quoted=False),
+-            this=sge.to_identifier(root_row_key, quoted=True),
+-        ),
+-    )
+-
+-    query = (
+-        sge.Select(expressions=columns)
+-        .from_(child_table)
+-        .join(root_table_expr, on=join_condition, join_type="INNER")
+-    )
+-    return query
+-
+-
+-def _add_load_id_via_root_key(relation: dlt.Relation) -> dlt.Relation:
+-    """Return the input relation with the `_dlt_load_id` column added.
+-
+-    This is done by joining the `root_table._dlt_id` with the `table._dlt_root_id`
+-    """
+-    origin_table_name: str = relation._table_name
+-    tables_schema = relation._dataset.schema.tables
+-    root_table = schema_utils.get_root_table(tables_schema, origin_table_name)
+-    root_table_name = root_table["name"]
+-
+-    ref = schema_utils.create_root_child_reference(tables_schema, origin_table_name)
+-    child_root_key = ref["columns"][0]
+-    root_row_key = ref["referenced_columns"][0]
+-
+-    # Construct SELECT with INNER JOIN
+-    query = _add_load_id_via_root_key_query(
+-        table_name=origin_table_name,
+-        root_table_name=root_table_name,
+-        child_root_key=child_root_key,
+-        root_row_key=root_row_key,
+-        normalized_load_id=relation._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID),
+-    )
+-
+-    rel = relation.__copy__()
+-    rel._sqlglot_expression = query
+-    return rel
+-
+-
+-def _add_load_id_via_parent_key_query(
+-    table_name: str, table_schemas: TSchemaTables, normalized_load_id: str = C_DLT_LOAD_ID
+-) -> sge.Select:
+-    # The reference_chain goes from root to the queried table
+-    # Each reference contains: child table -> parent table relationship
+-    # We need to build joins from the queried table back to root
+-    reference_chain = []
+-    root_table_name = schema_utils.get_root_table(table_schemas, table_name)["name"]
+-    for reference in schema_utils.get_all_parent_child_references_from_root(
+-        table_schemas, root_table_name
+-    ):
+-        reference_chain.append(reference)
+-        if reference["table"] == table_name:
+-            break
+-
+-    queried_table = sge.Table(
+-        this=sge.to_identifier(table_name, quoted=True),
+-        alias=sge.TableAlias(this=sge.to_identifier("t0", quoted=False)),
+-    )
+-
+-    # build final table query with all columns explicitly + _dlt_load_id from root table
+-    columns = [
+-        sge.Column(
+-            table=sge.to_identifier("t0", quoted=False),
+-            this=sge.to_identifier(col_name, quoted=True),
+-        )
+-        for col_name in table_schemas[table_name]["columns"]
+-    ]
+-    columns.append(
+-        sge.Column(
+-            table=sge.to_identifier(f"t{len(reference_chain)}", quoted=False),
+-            this=sge.to_identifier(normalized_load_id, quoted=True),
+-        )
+-    )
+-    query = sge.Select(expressions=columns).from_(queried_table)
+-
+-    # loop through references from table to root to append INNER JOINs
+-    for i, ref in enumerate(reversed(reference_chain)):
+-        parent_alias = f"t{i + 1}"
+-        parent_table = sge.Table(
+-            this=sge.to_identifier(ref["referenced_table"], quoted=True),
+-            alias=sge.TableAlias(this=sge.to_identifier(parent_alias, quoted=False)),
+-        )
+-        join_condition = sge.EQ(
+-            this=sge.Column(
+-                table=sge.to_identifier(f"t{i}", quoted=False),
+-                this=sge.to_identifier(ref["columns"][0], quoted=True),
+-            ),
+-            expression=sge.Column(
+-                table=sge.to_identifier(parent_alias, quoted=False),
+-                this=sge.to_identifier(ref["referenced_columns"][0], quoted=True),
+-            ),
+-        )
+-        query = query.join(parent_table, on=join_condition, join_type="INNER")
+-
+-    return query
+-
+-
+-def _add_load_id_via_parent_key(relation: dlt.Relation) -> dlt.Relation:
+-    """Return the input relation with the `_dlt_load_id` column added.
+-
+-    This is done by iteratively joining the `root_table._dlt_id` with `child._dlt_parent_id`
+-    until the input relation is reached.
+-    """
+-    origin_table_name: str = relation._table_name
+-    table_schemas = relation._dataset.schema.tables
+-
+-    query = _add_load_id_via_parent_key_query(
+-        table_name=origin_table_name,
+-        table_schemas=table_schemas,
+-        normalized_load_id=relation._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID),
+-    )
+-
+-    rel = relation.__copy__()
+-    rel._sqlglot_expression = query
+-    return rel
+diff --git a/tests/dataset/test_relation.py b/tests/dataset/test_relation.py
+index 7a6c3333e..0bafcfb19 100644
+--- a/tests/dataset/test_relation.py
++++ b/tests/dataset/test_relation.py
+@@ -6,6 +6,7 @@ import pytest
+ from sqlglot import expressions as sge
+ 
+ import dlt
++from dlt.common.utils import uniq_id
+ from dlt.common.schema.schema import Schema
+ from dlt.common.schema.typing import C_DLT_LOAD_ID, LOADS_TABLE_NAME, VERSION_TABLE_NAME
+ from dlt.common.schema.utils import new_table
+@@ -195,6 +196,45 @@ def test_relation_with_load_id(
+     assert list(df.columns) == expected_columns
+ 
+ 
++def test_relation_with_load_id_on_parallel_child_branch(tmp_path) -> None:
++    data = [
++        {
++            "id": 1,
++            "orders": [{"order_id": 101, "total_amount": 100.0}],
++            "profiles": [{"type": "personal"}],
++        },
++        {
++            "id": 2,
++            "orders": [{"order_id": 102, "total_amount": 200.0}],
++            "profiles": [{"type": "work"}],
++        },
++    ]
++
++    @dlt.resource(name="users")
++    def users():
++        yield data
++
++    pipeline = dlt.pipeline(
++        pipeline_name="parallel_child_branch_" + uniq_id(),
++        pipelines_dir=str(tmp_path / "pipelines_dir"),
++        destination=dlt.destinations.duckdb(str(tmp_path / "parallel_child_branch.duckdb")),
++        dev_mode=True,
++    )
++    pipeline.run(users(), dataset_name="test")
++
++    table = pipeline.dataset().table("users__profiles")
++    output = table.with_load_id_col()
++    expected_columns = table.columns + [C_DLT_LOAD_ID]
++
++    assert output.columns == expected_columns
++
++    df = output.df()
++
++    assert len(df) == len(data)
++    assert list(df.columns) == expected_columns
++    assert set(df[C_DLT_LOAD_ID]) == {pipeline.last_trace.last_normalize_info.loads_ids[0]}
++
++
+ @pytest.mark.parametrize("selected_load_id_idx", [[0], [1], [0, 1]])
+ @pytest.mark.parametrize("table_name", ["products", "users__orders", "users__orders__items"])
+ @pytest.mark.parametrize("add_load_id_column", [True, False])
+
+
+===== COMMIT d44ae685 =====
+
+
+commit d44ae685f
+Author: Travior
+Date: 2026-05-05
+
+    Improve docs around `join` usage (#3902)
+
+diff --git a/docs/website/docs/general-usage/dataset-access/dataset.md b/docs/website/docs/general-usage/dataset-access/dataset.md
+index 81f6af7e5..a45382a5e 100644
+--- a/docs/website/docs/general-usage/dataset-access/dataset.md
++++ b/docs/website/docs/general-usage/dataset-access/dataset.md
+@@ -121,10 +121,36 @@ You can refine your data retrieval by limiting the number of records, selecting
+ 
+ ### Join related tables
+ 
+-Use `join()` to navigate dlt's schema references between related tables, such as parent/child tables created from nested data, or tables where you explicitly annotate the relationship. Joined columns are prefixed with the joined table name, or with the alias you provide.
++The `join()` method follows relationships already defined in the dlt schema. It can resolve direct schema references between tables as well as multi-hop parent/child paths when one table is an ancestor or descendant of the other. This makes `join()` well suited for navigating nested tables created by dlt and tables connected by explicit references. Joined columns are appended from the target table only and are prefixed with the target table name, or with the alias you provide.
++
++By default, `join()` creates an `inner` join. Use `kind="left"`, `"right"`, or `"full"` to choose another SQL join type.
++
++When you do not specify an alias, joined columns use the joined table name as their prefix. For example, `dataset["users"].join("users__orders")` adds columns such as `users__orders__order_id`. When you pass `alias="orders"`, the same column is projected as `orders__order_id` instead. Use `alias` to make result columns easier to read or to avoid output name conflicts.
+ 
+ <!--@@@DLT_SNIPPET ./dataset_snippets/dataset_snippets.py::join_related_tables-->
+ 
++**Limits:** `join()` only works when dlt can resolve a supported schema-defined path between the current relation's base table and the target table. Both sides must be base-table relations, for example `dataset["users"].join("users__orders")`. You cannot call `join()` after transforming a relation with methods such as `select()` or `where()`.
++
++`join()` does not support:
++
++- arbitrary join conditions
++- joins on columns that are not defined as schema references
++- self-joins
++- joins across different datasets
++- joins between tables that are only related indirectly through a shared ancestor or another non-linear schema path
++
++In practice, this means `join()` supports ancestor/descendant navigation, but not general graph traversal across the schema.
++
++For example:
++
++- `dataset["users__orders__items"].join("users")` works because `users` is an ancestor in the nested table hierarchy
++- joining two sibling tables just because both descend from `users` does not work
++- joining two tables on a custom predicate such as `orders.customer_email = customers.email` does not work unless that relationship is defined in the schema
++
++When `join()` needs intermediate tables to reach the target, those tables are used only to build the join path. Their columns are not added to the result automatically. Only columns from the explicitly joined target table are appended.
++
++For arbitrary join logic, use Ibis.
++
+ ### Chain operations
+ 
+ You can combine `select`, `limit`, and other methods.
+diff --git a/docs/website/docs/general-usage/dataset-access/dataset_snippets/dataset_snippets.py b/docs/website/docs/general-usage/dataset-access/dataset_snippets/dataset_snippets.py
+index 77da2d280..f0adcdbaa 100644
+--- a/docs/website/docs/general-usage/dataset-access/dataset_snippets/dataset_snippets.py
++++ b/docs/website/docs/general-usage/dataset-access/dataset_snippets/dataset_snippets.py
+@@ -228,7 +228,9 @@ def join_related_tables_snippet(tmp_path: Path) -> None:
+     dataset = pipeline.dataset()
+ 
+     # @@@DLT_SNIPPET_START join_related_tables
+-    users_with_orders = dataset["users"].join("users__orders", alias="orders")
++    users_with_orders = dataset["users"].join(
++        "users__orders", alias="orders", kind="left"
++    )
+     df = users_with_orders.select("name", "orders__order_id", "orders__total").df()
+     # @@@DLT_SNIPPET_END join_related_tables
+ 
+
+
+===== COMMIT 327bf9a4 =====
+
+
+commit 327bf9a4e
+Author: Mridankan Mandal
+Date: 2026-05-04
+
+    fix(clickhouse): correct merge delete temp table handling with replica-safe temp-table engines (#3824)
+
+diff --git a/dlt/destinations/impl/athena/athena.py b/dlt/destinations/impl/athena/athena.py
+index 4aade928e..f2f296d31 100644
+--- a/dlt/destinations/impl/athena/athena.py
++++ b/dlt/destinations/impl/athena/athena.py
+@@ -78,7 +78,13 @@ class AthenaMergeJob(SqlMergeFollowupJob):
+             )
+ 
+     @classmethod
+-    def _to_temp_table(cls, select_sql: str, temp_table_name: str, unique_column: str) -> str:
++    def _to_temp_table(
++        cls,
++        select_sql: str,
++        temp_table_name: str,
++        unique_column: str,
++        sql_client: SqlClientBase[Any],
++    ) -> str:
+         # regular table because Athena does not support temporary tables
+         return f"CREATE TABLE {temp_table_name} AS {select_sql}"
+ 
+diff --git a/dlt/destinations/impl/clickhouse/clickhouse.py b/dlt/destinations/impl/clickhouse/clickhouse.py
+index 489362c9c..98481e59b 100644
+--- a/dlt/destinations/impl/clickhouse/clickhouse.py
++++ b/dlt/destinations/impl/clickhouse/clickhouse.py
+@@ -1,6 +1,6 @@
+ from copy import deepcopy
+ from textwrap import dedent
+-from typing import Any, Literal, Optional, List, Sequence, cast
++from typing import Any, Dict, Literal, Optional, List, Sequence, cast
+ from urllib.parse import ParseResult, urlparse
+ 
+ import clickhouse_connect
+@@ -237,15 +237,27 @@ class ClickHouseMergeJob(SqlMergeFollowupJob):
+                 )
+             )
+ 
++    # temp table engine should match configured table engine
++    TEMP_TABLE_ENGINE: Dict[TTableEngineType, str] = {
++        "merge_tree": "MergeTree",
++        "replacing_merge_tree": "MergeTree",
++        "shared_merge_tree": "SharedMergeTree",
++        "replicated_merge_tree": "ReplicatedMergeTree",
++    }
++
+     @classmethod
+-    def _to_temp_table(cls, select_sql: str, temp_table_name: str, unique_column: str) -> str:
+-        # Use CREATE OR REPLACE to avoid slow DROP TABLE ... SYNC on replicated ClickHouse clusters.
+-        # The Atomic database engine (default since ClickHouse 20.5) handles this via atomic swap
+-        # using renameat2(), which is nearly instant. The old table is cleaned up asynchronously.
+-        # See: https://github.com/dlt-hub/dlt/issues/3562
++    def _to_temp_table(
++        cls,
++        select_sql: str,
++        temp_table_name: str,
++        unique_column: str,
++        sql_client: SqlClientBase[Any],
++    ) -> str:
++        # CREATE OR REPLACE avoids slow DROP TABLE ... SYNC on replicated clusters.
++        engine = cls.TEMP_TABLE_ENGINE.get(sql_client.config.table_engine_type, "MergeTree")
+         return (
+             f"CREATE OR REPLACE TABLE {temp_table_name} ENGINE ="
+-            f" MergeTree PRIMARY KEY {unique_column} AS {select_sql}"
++            f" {engine} PRIMARY KEY {unique_column} AS {select_sql}"
+         )
+ 
+     @classmethod
+@@ -259,8 +271,7 @@ class ClickHouseMergeJob(SqlMergeFollowupJob):
+     ) -> List[str]:
+         if for_delete:
+             # ClickHouse lightweight DELETE doesn't support table aliases or
+-            # correlated subqueries with qualified column references. Use IN
+-            # with one DELETE per key group (like BigQuery's OR-split pattern).
++            # correlated subqueries with qualified column references.
+             sql: List[str] = []
+             for cols in (primary_keys, merge_keys):
+                 if cols:
+diff --git a/dlt/destinations/impl/databricks/databricks.py b/dlt/destinations/impl/databricks/databricks.py
+index 8f7a8f2c5..e5ac49b8d 100644
+--- a/dlt/destinations/impl/databricks/databricks.py
++++ b/dlt/destinations/impl/databricks/databricks.py
+@@ -1,5 +1,5 @@
+ import os
+-from typing import Dict, Optional, Sequence, List, cast, Union
++from typing import Any, Dict, Optional, Sequence, List, cast, Union
+ from urllib.parse import urlparse
+ from pathlib import Path
+ 
+@@ -46,6 +46,7 @@ from dlt.destinations.job_client_impl import SqlJobClientWithStagingDataset
+ from dlt.destinations.exceptions import LoadJobTerminalException
+ from dlt.destinations.impl.databricks.configuration import DatabricksClientConfiguration
+ from dlt.destinations.impl.databricks.sql_client import DatabricksSqlClient
++from dlt.destinations.sql_client import SqlClientBase
+ from dlt.destinations.sql_jobs import SqlMergeFollowupJob
+ from dlt.destinations.job_impl import ReferenceFollowupJobRequest
+ from dlt.destinations.impl.databricks.typing import TDatabricksColumnHint
+@@ -287,7 +288,13 @@ class DatabricksLoadJob(RunnableLoadJob, HasFollowupJobs):
+ 
+ class DatabricksMergeJob(SqlMergeFollowupJob):
+     @classmethod
+-    def _to_temp_table(cls, select_sql: str, temp_table_name: str, unique_column: str) -> str:
++    def _to_temp_table(
++        cls,
++        select_sql: str,
++        temp_table_name: str,
++        unique_column: str,
++        sql_client: SqlClientBase[Any],
++    ) -> str:
+         return f"CREATE TEMPORARY VIEW {temp_table_name} AS {select_sql}"
+ 
+     @classmethod
+diff --git a/dlt/destinations/impl/dremio/dremio.py b/dlt/destinations/impl/dremio/dremio.py
+index 84718cd77..a8f216d42 100644
+--- a/dlt/destinations/impl/dremio/dremio.py
++++ b/dlt/destinations/impl/dremio/dremio.py
+@@ -34,7 +34,13 @@ class DremioMergeJob(SqlMergeFollowupJob):
+             )
+ 
+     @classmethod
+-    def _to_temp_table(cls, select_sql: str, temp_table_name: str, unique_column: str) -> str:
++    def _to_temp_table(
++        cls,
++        select_sql: str,
++        temp_table_name: str,
++        unique_column: str,
++        sql_client: SqlClientBase[Any],
++    ) -> str:
+         return (
+             f"DROP TABLE IF EXISTS {temp_table_name}; CREATE TABLE {temp_table_name} AS"
+             f" {select_sql}"
+diff --git a/dlt/destinations/impl/mssql/mssql.py b/dlt/destinations/impl/mssql/mssql.py
+index cdd81f2aa..3ec069879 100644
+--- a/dlt/destinations/impl/mssql/mssql.py
++++ b/dlt/destinations/impl/mssql/mssql.py
+@@ -76,7 +76,13 @@ class MsSqlMergeJob(SqlMergeFollowupJob):
+         )
+ 
+     @classmethod
+-    def _to_temp_table(cls, select_sql: str, temp_table_name: str, unique_column: str) -> str:
++    def _to_temp_table(
++        cls,
++        select_sql: str,
++        temp_table_name: str,
++        unique_column: str,
++        sql_client: SqlClientBase[Any],
++    ) -> str:
+         return f"SELECT * INTO {temp_table_name} FROM ({select_sql}) as t"
+ 
+     @classmethod
+diff --git a/dlt/destinations/sql_jobs.py b/dlt/destinations/sql_jobs.py
+index 5fb78fcec..f4a236ff9 100644
+--- a/dlt/destinations/sql_jobs.py
++++ b/dlt/destinations/sql_jobs.py
+@@ -248,7 +248,7 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+         sql: List[str] = []
+         temp_table_name = cls._new_temp_table_name(table_name, "delete", sql_client)
+         select_statement = f"SELECT d.{unique_column} {key_table_clauses[0]}"
+-        sql.append(cls._to_temp_table(select_statement, temp_table_name, unique_column))
++        sql.append(cls._to_temp_table(select_statement, temp_table_name, unique_column, sql_client))
+         for clause in key_table_clauses[1:]:
+             sql.append(f"INSERT INTO {temp_table_name} SELECT {unique_column} {clause}")
+         return sql, temp_table_name
+@@ -354,7 +354,9 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+         else:
+             # don't deduplicate
+             select_sql = f"SELECT {unique_column} FROM {staging_root_table_name} WHERE {condition}"
+-        return [cls._to_temp_table(select_sql, temp_table_name, unique_column)], temp_table_name
++        return [
++            cls._to_temp_table(select_sql, temp_table_name, unique_column, sql_client)
++        ], temp_table_name
+ 
+     @classmethod
+     def gen_delete_from_sql(
+@@ -389,13 +391,20 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+         return cls._shorten_table_name(f"{table_name}_{op}_{uniq_id()}", sql_client)
+ 
+     @classmethod
+-    def _to_temp_table(cls, select_sql: str, temp_table_name: str, unique_column: str) -> str:
++    def _to_temp_table(
++        cls,
++        select_sql: str,
++        temp_table_name: str,
++        unique_column: str,
++        sql_client: SqlClientBase[Any],
++    ) -> str:
+         """Generate sql that creates temp table from select statement. May return several statements.
+ 
+         Args:
+             select_sql: select statement to create temp table from
+             temp_table_name: name of the temp table (unqualified)
+             unique_column: column in the select list that is unique. used by Clickhouse only
++            sql_client: sql client used to execute the resulting sql.
+ 
+         Returns:
+             sql statement that inserts data from selects into temp table
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+index a586a6605..11120c3a2 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+@@ -132,6 +132,12 @@ your configuration:
+ select_sequential_consistency = 0
+ ```
+ 
++### Merge on replicated clusters
++
++When merging tables that have nested children, `dlt` creates short-lived temp tables to stage delete
++keys and insert keys. The temp tables follow the configured `table_engine_type` so the staged rows replicate the same way the destination tables do. Single-table merges use lightweight `DELETE` directly
++and don't need temp tables.
++
+ ## Datasets
+ 
+ ClickHouse does not support multiple datasets in one database; dlt relies on datasets to exist for multiple reasons.
+diff --git a/tests/load/clickhouse/test_clickhouse_table_builder.py b/tests/load/clickhouse/test_clickhouse_table_builder.py
+index 1aaa9f59f..1f892d19c 100644
+--- a/tests/load/clickhouse/test_clickhouse_table_builder.py
++++ b/tests/load/clickhouse/test_clickhouse_table_builder.py
+@@ -6,7 +6,7 @@ import pytest
+ from dlt.common.configuration import resolve_configuration
+ from dlt.common.utils import custom_environ, digest128
+ from dlt.common.utils import uniq_id
+-from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseClient
++from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseClient, ClickHouseMergeJob
+ from dlt.destinations.impl.clickhouse.configuration import (
+     ClickHouseCredentials,
+     ClickHouseClientConfiguration,
+@@ -294,3 +294,44 @@ def test_clickhouse_replacing_merge_tree_fallback_non_append(
+     sql = clickhouse_client._get_table_update_sql(table_name, columns, False)[0]
+     assert "ENGINE = MergeTree" in sql
+     assert "ReplacingMergeTree" not in sql
++
++
++@pytest.mark.parametrize(
++    "table_engine_type,expected_engine",
++    [
++        ("merge_tree", "MergeTree"),
++        # ReplacingMergeTree's dedup args don't apply to temp tables — collapses to MergeTree
++        ("replacing_merge_tree", "MergeTree"),
++        ("shared_merge_tree", "SharedMergeTree"),
++        ("replicated_merge_tree", "ReplicatedMergeTree"),
++    ],
++    ids=lambda x: x if isinstance(x, str) else "",
++)
++def test_clickhouse_merge_temp_table_engine(
++    clickhouse_client: ClickHouseClient,
++    table_engine_type: str,
++    expected_engine: str,
++) -> None:
++    """Merge delete/insert temp tables follow `config.table_engine_type` so they replicate
++    consistently with the destination tables.
++    """
++    clickhouse_client.config.table_engine_type = table_engine_type  # type: ignore[assignment]
++    sql_client = clickhouse_client.sql_client
++
++    delete_sql, _ = ClickHouseMergeJob.gen_delete_temp_table_sql(
++        "items",
++        "`_dlt_id`",
++        ["FROM dest AS d JOIN staging AS s ON d.`id` = s.`id`"],
++        sql_client,
++    )
++    assert f"ENGINE = {expected_engine}" in delete_sql[0]
++
++    insert_sql, _ = ClickHouseMergeJob.gen_insert_temp_table_sql(
++        "items",
++        "staging",
++        sql_client,
++        primary_keys=["`id`"],
++        unique_column="`_dlt_id`",
++        condition="1 = 1",
++    )
++    assert f"ENGINE = {expected_engine}" in insert_sql[0]
+
+
+===== COMMIT 9d2dc69c =====
+
+
+commit 9d2dc69c1
+Author: rudolfix
+Date: 2026-05-04
+
+    (fix) propagates `dataset_name` to job metrics in load step (#3808)
+
+diff --git a/dlt/common/data_types/type_helpers.py b/dlt/common/data_types/type_helpers.py
+index 185ff104c..24619ee35 100644
+--- a/dlt/common/data_types/type_helpers.py
++++ b/dlt/common/data_types/type_helpers.py
+@@ -4,8 +4,8 @@ import dataclasses
+ import datetime  # noqa: I251
+ from collections.abc import Mapping as C_Mapping, Sequence as C_Sequence
+ from functools import lru_cache
+-from typing import Any, Type, Union, Callable, Dict, Tuple
+ from enum import Enum
++from typing import Any, Type, Union, Callable, Dict, Tuple
+ 
+ from dlt.common.json import custom_pua_remove, json
+ from dlt.common.json._simplejson import custom_encode as json_custom_encode
+@@ -33,8 +33,10 @@ PY_TYPE_TO_SC_TYPE: Dict[Type[Any], TDataType] = {
+     int: "bigint",
+     float: "double",
+     bool: "bool",
++    bytes: "binary",
+     dict: "json",
+     list: "json",
++    Decimal: "decimal",
+     datetime.datetime: "timestamp",
+     datetime.date: "date",
+     datetime.time: "time",
+diff --git a/dlt/common/normalizers/json/relational.py b/dlt/common/normalizers/json/relational.py
+index d89cd5922..119b1c61b 100644
+--- a/dlt/common/normalizers/json/relational.py
++++ b/dlt/common/normalizers/json/relational.py
+@@ -1,4 +1,5 @@
+ from functools import lru_cache, partial
++from importlib import import_module
+ from typing import (
+     ClassVar,
+     Dict,
+@@ -431,10 +432,17 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
+ 
+     @classmethod
+     def ensure_this_normalizer(cls, norm_config: TJSONNormalizer) -> None:
+-        # make sure schema has right normalizer
++        # make sure schema has right normalizer (or a subclass of it)
+         present_normalizer = norm_config["module"]
+-        if present_normalizer != cls.__module__:
+-            raise InvalidJsonNormalizer(cls.__module__, present_normalizer)
++        if present_normalizer == cls.__module__:
++            return
++        try:
++            mod = import_module(present_normalizer)
++            if issubclass(mod.DataItemNormalizer, cls):
++                return
++        except (ImportError, AttributeError):
++            pass
++        raise InvalidJsonNormalizer(cls.__module__, present_normalizer)
+ 
+     @classmethod
+     def update_normalizer_config(cls, schema: Schema, config: RelationalNormalizerConfig) -> None:
+diff --git a/dlt/common/pipeline.py b/dlt/common/pipeline.py
+index d09e1cc19..e1361339b 100644
+--- a/dlt/common/pipeline.py
++++ b/dlt/common/pipeline.py
+@@ -340,7 +340,13 @@ class LoadInfo(StepInfo[LoadMetrics], _LoadInfo):
+             assert len(metrics_list) == 1
+             metrics = metrics_list[0]
+             for job_metrics in metrics["job_metrics"].values():
+-                load_metrics["job_metrics"].append({"load_id": load_id, **job_metrics._asdict()})
++                load_metrics["job_metrics"].append(
++                    {
++                        "load_id": load_id,
++                        "dataset_name": metrics.get("dataset_name"),
++                        **job_metrics._asdict(),
++                    }
++                )
+ 
+         d.update(load_metrics)
+         return d
+diff --git a/dlt/common/runners/pool_runner.py b/dlt/common/runners/pool_runner.py
+index e694d735d..a4ded6519 100644
+--- a/dlt/common/runners/pool_runner.py
++++ b/dlt/common/runners/pool_runner.py
+@@ -133,6 +133,12 @@ def get_default_start_method(method_: str) -> str:
+         if detected is not None:
+             logger.info(f"Switching pool start method to `spawn` because `{detected}` is True")
+             return "spawn"
++        if threading.current_thread() is not threading.main_thread():
++            logger.info(
++                "Switching pool start method to `spawn` because"
++                " forking from a non-main thread may deadlock"
++            )
++            return "spawn"
+     return method_
+ 
+ 
+diff --git a/dlt/common/storages/file_storage.py b/dlt/common/storages/file_storage.py
+index 2c051b6e1..a12006812 100644
+--- a/dlt/common/storages/file_storage.py
++++ b/dlt/common/storages/file_storage.py
+@@ -2,9 +2,9 @@ import gzip
+ import os
+ import re
+ import stat
++import time
+ import errno
+ import shutil
+-import time
+ import pathvalidate
+ from typing import IO, Any, Optional, List, cast
+ from dlt.common.typing import AnyFun
+@@ -212,27 +212,34 @@ class FileStorage:
+         """Renames a tree using os.rename if possible making it atomic
+ 
+         If we get 'too many open files' or a transient Windows access denied
+-        during directory rename, `rename_tree_files` is used.
++        during directory rename, `rename_tree_files` is used. On Windows, NTFS
++        may briefly hold directory handles after file operations inside the
++        tree, so EACCES/EPERM are retried with a short backoff before falling
++        back (same strategy as pip).
+         """
+-        to_path = self.make_full_path(to_relative_path)
+-
+-        for attempt in range(WINDOWS_TREE_RENAME_RETRIES if os.name == "nt" else 1):
+-            try:
+-                self.atomic_rename(from_relative_path, to_relative_path)
+-                return
+-            except OSError as ex:
+-                if ex.errno == errno.EMFILE:
+-                    break
+-                if not (
+-                    os.name == "nt"
+-                    and ex.errno in WINDOWS_TREE_RENAME_RETRY_ERRNOS
+-                    and not os.path.exists(to_path)
+-                ):
+-                    raise
+-                if attempt + 1 < WINDOWS_TREE_RENAME_RETRIES:
+-                    time.sleep(0.05 * (attempt + 1))
+-                    continue
+-                break
++        try:
++            self.atomic_rename(from_relative_path, to_relative_path)
++            return
++        except OSError as ex:
++            if ex.errno == errno.EMFILE:
++                pass
++            elif (
++                os.name == "nt"
++                and ex.errno in WINDOWS_TREE_RENAME_RETRY_ERRNOS
++                and not os.path.exists(self.make_full_path(to_relative_path))
++            ):
++                for attempt in range(1, WINDOWS_TREE_RENAME_RETRIES):
++                    time.sleep(0.05 * attempt)
++                    try:
++                        self.atomic_rename(from_relative_path, to_relative_path)
++                        return
++                    except OSError as retry_ex:
++                        if retry_ex.errno == errno.EMFILE:
++                            break
++                        if retry_ex.errno not in WINDOWS_TREE_RENAME_RETRY_ERRNOS:
++                            raise
++            else:
++                raise
+         self.rename_tree_files(from_relative_path, to_relative_path)
+ 
+     def rename_tree_files(self, from_relative_path: str, to_relative_path: str) -> None:
+diff --git a/dlt/normalize/items_normalizers/jsonl.py b/dlt/normalize/items_normalizers/jsonl.py
+index 14b6f2b3d..1d2159bb4 100644
+--- a/dlt/normalize/items_normalizers/jsonl.py
++++ b/dlt/normalize/items_normalizers/jsonl.py
+@@ -65,11 +65,11 @@ class JsonLItemsNormalizer(ItemsNormalizer):
+         self._null_only_columns: Dict[str, Set[str]] = {}
+         self._shorten_fragments = lru_cache(maxsize=None)(self.schema.naming.shorten_fragments)
+         # cache coercion interface from data item normalizer
+-        _din = self.schema.data_item_normalizer
+-        self._type_map = _din.py_type_to_sc_type_map
+-        self._can_coerce_type = _din.can_coerce_type
+-        self._coerce_type = _din.coerce_type
+-        self._py_type_to_sc_type = _din.py_type_to_sc_type
++        _item_normalizer = self.schema.data_item_normalizer
++        self._type_map = _item_normalizer.py_type_to_sc_type_map
++        self._can_coerce_type = _item_normalizer.can_coerce_type
++        self._coerce_type = _item_normalizer.coerce_type
++        self._py_type_to_sc_type = _item_normalizer.py_type_to_sc_type
+ 
+     @property
+     def null_only_columns(self) -> Dict[str, Set[str]]:
+diff --git a/tests/common/normalizers/test_json_relational_no_coercion.py b/tests/common/normalizers/test_json_relational_no_coercion.py
+index 9ff7c806a..498f1b41b 100644
+--- a/tests/common/normalizers/test_json_relational_no_coercion.py
++++ b/tests/common/normalizers/test_json_relational_no_coercion.py
+@@ -9,6 +9,9 @@ from dlt.common.normalizers.typing import TNormalizersConfig
+ from dlt.common.schema import Schema
+ from dlt.common.storages import NormalizeStorage
+ from dlt.common.storages.configuration import NormalizeStorageConfiguration
++from dlt.common.normalizers.json.relational import (
++    DataItemNormalizer as RelationalNormalizer,
++)
+ from dlt.common.normalizers.json.relational_no_coercion import (
+     DataItemNormalizer as NoCoercionNormalizer,
+ )
+@@ -215,3 +218,21 @@ def test_same_type_no_variant(item_normalizer: JsonLItemsNormalizer) -> None:
+     new_row, new_table = item_normalizer._coerce_row("users", None, row_2)
+     assert new_table is None
+     assert new_row["name"] == "bob"
++
++
++def test_ensure_this_normalizer_accepts_no_coercion_subclass() -> None:
++    """ensure_this_normalizer must accept relational_no_coercion as a valid subclass."""
++    schema = Schema("test_ensure", NO_COERCION_NORMALIZERS)
++    norm_config = schema._normalizers_config["json"]
++    # must not raise
++    RelationalNormalizer.ensure_this_normalizer(norm_config)
++
++
++def test_update_and_get_normalizer_config_with_no_coercion() -> None:
++    """update_normalizer_config / get_normalizer_config must work with relational_no_coercion."""
++    schema = Schema("test_config", NO_COERCION_NORMALIZERS)
++    # update config must not raise
++    RelationalNormalizer.update_normalizer_config(schema, {"max_nesting": 3})
++    # get config must return the updated value
++    config = RelationalNormalizer.get_normalizer_config(schema)
++    assert config["max_nesting"] == 3
+diff --git a/tests/common/schema/test_import_normalizers.py b/tests/common/schema/test_import_normalizers.py
+index a31e735ae..fd5997030 100644
+--- a/tests/common/schema/test_import_normalizers.py
++++ b/tests/common/schema/test_import_normalizers.py
+@@ -214,7 +214,7 @@ def test_import_normalizers_with_caps() -> None:
+         assert naming.max_length == 127
+ 
+     # max table nesting generates relational normalizer
+-    default_: TNormalizersConfig = {
++    subclass_default: TNormalizersConfig = {
+         "names": "dlt.destinations.impl.weaviate.naming",
+         "json": {"module": "tests.common.normalizers.custom_normalizers"},
+     }
+@@ -224,8 +224,17 @@ def test_import_normalizers_with_caps() -> None:
+         assert config["json"]["config"]["max_nesting"] == 0
+         assert relational is RelationalNormalizer
+ 
+-        # wrong normalizer
+-        config, _, relational = import_normalizers(configured_normalizers(), default_)
++        # subclass of relational normalizer is recognized; max_nesting is set
++        config, _, relational = import_normalizers(configured_normalizers(), subclass_default)
++        assert config["json"]["config"]["max_nesting"] == 0
++        assert relational is CustomRelationalNormalizer
++
++        # unrelated normalizer (abstract base class, not a relational subclass): no config set
++        non_relational_default: TNormalizersConfig = {
++            "names": "dlt.destinations.impl.weaviate.naming",
++            "json": {"module": "dlt.common.normalizers.json"},
++        }
++        config, _, _ = import_normalizers(configured_normalizers(), non_relational_default)
+         assert "config" not in config["json"]
+ 
+ 
+diff --git a/tests/normalize/test_json_item_inference.py b/tests/normalize/test_json_item_inference.py
+index eed645a86..74ad9f165 100644
+--- a/tests/normalize/test_json_item_inference.py
++++ b/tests/normalize/test_json_item_inference.py
+@@ -3,18 +3,18 @@ from pendulum import UTC
+ import pytest
+ from copy import deepcopy
+ from typing import Any, Iterator, List, Sequence
++
+ from dlt.common.libs.hexbytes import HexBytes
+ from dlt.common import Wei, Decimal, pendulum, json
+ from dlt.common.configuration.container import Container
+ from dlt.common.destination.capabilities import DestinationCapabilitiesContext
+-from dlt.common.json import custom_pua_decode
++from dlt.common.json import custom_pua_decode, _WEI, _HEXBYTES
+ from dlt.common.schema import Schema, utils
+ from dlt.common.schema.typing import TColumnSchema, TSchemaUpdate
+ from dlt.common.schema.exceptions import (
+     CannotCoerceColumnException,
+     CannotCoerceNullException,
+     ParentTableNotFoundException,
+-    SchemaCorruptedException,
+     TablePropertiesConflictException,
+ )
+ from dlt.common.storages.configuration import NormalizeStorageConfiguration
+@@ -445,9 +445,8 @@ def test_coerce_json_variant(item_normalizer: JsonLItemsNormalizer) -> None:
+ 
+ def test_supports_variant_pua_decode(item_normalizer: JsonLItemsNormalizer) -> None:
+     rows = load_json_case("pua_encoded_row")
+-    # use actual encoding for wei
+-    from dlt.common.json import _WEI, _HEXBYTES
+ 
++    # use actual encoding for wei
+     rows[0]["_tx_transactionHash"] = rows[0]["_tx_transactionHash"].replace("", _HEXBYTES)
+     rows[0]["wad"] = rows[0]["wad"].replace("", _WEI)
+ 
+diff --git a/tests/pipeline/cases/contracts/trace.schema.yaml b/tests/pipeline/cases/contracts/trace.schema.yaml
+index df1420a12..53aeee55f 100644
+--- a/tests/pipeline/cases/contracts/trace.schema.yaml
++++ b/tests/pipeline/cases/contracts/trace.schema.yaml
+@@ -660,6 +660,10 @@ tables:
+       load_id:
+         data_type: text
+         nullable: true
++      dataset_name:
++        description: Dataset name targeted by this load package
++        data_type: text
++        nullable: true
+       job_id:
+         data_type: text
+         nullable: true
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index 848763bcd..31a0a656a 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -38,6 +38,7 @@ from dlt.common.destination.exceptions import (
+     UnknownDestinationModule,
+ )
+ from dlt.common.exceptions import PipelineStateNotAvailable, SignalReceivedException
++from dlt.common.normalizers.typing import TNormalizersConfig
+ from dlt.common.pipeline import ExtractInfo, LoadInfo, PipelineContext, SupportsPipeline
+ from dlt.common.runtime import signals
+ from dlt.common.runtime.collector import DictCollector, LogCollector
+@@ -3486,6 +3487,22 @@ def test_load_info_dataset_name_per_load_id(use_single_dataset: bool) -> None:
+     step_dict = load_step.asdict()
+     assert "dataset_name" in step_dict["load_info"]
+ 
++    # verify dataset_name is propagated into serialized job_metrics
++    asdict_job_metrics = load_info.asdict()["job_metrics"]
++    assert all("dataset_name" in jm for jm in asdict_job_metrics)
++    # each job's dataset_name must match the per-load-id value from LoadMetrics
++    for jm in asdict_job_metrics:
++        assert jm["dataset_name"] == ds_names[jm["load_id"]]
++
++    # same for the trace step dict
++    trace_job_metrics = step_dict["load_info"]["job_metrics"]
++    assert all("dataset_name" in jm for jm in trace_job_metrics)
++    trace_ds_names = {jm["dataset_name"] for jm in trace_job_metrics}
++    if use_single_dataset:
++        assert trace_ds_names == {"test_data"}
++    else:
++        assert trace_ds_names == {"test_data", "test_data_schema_b"}
++
+ 
+ def test_load_info_dataset_name_none_for_non_dwh_destination() -> None:
+     """Destinations without DestinationClientDwhConfiguration (e.g. dummy, custom)
+@@ -5416,6 +5433,60 @@ def test_merge_no_child_duplicates_on_duplicate_staging_data(skip_dedup: bool) -
+         assert_table_counts(p, {"items": 2, "items__nested": 2})
+ 
+ 
++def test_no_coercion_normalizer_creates_variant_columns() -> None:
++    """relational_no_coercion normalizer produces variant columns on type mismatch
++    instead of coercing values. Also verifies ensure_this_normalizer accepts the subclass
++    so update/get_normalizer_config work correctly.
++    """
++    no_coercion: TNormalizersConfig = {
++        "names": "snake_case",
++        "json": {"module": "relational_no_coercion"},
++    }
++    schema = Schema("no_coercion", no_coercion)
++
++    pipeline = dlt.pipeline(
++        pipeline_name="test_no_coercion_variants",
++        destination="duckdb",
++    )
++    # first batch establishes column types: double and text
++    pipeline.run(
++        [{"id": 1, "score": 3.14, "value": 100}],
++        table_name="items",
++        schema=schema,
++        schema_contract={"data_type": "evolve"},
++    )
++    # second batch: int into double column (relational would coerce), text into bigint column
++    pipeline.run(
++        [{"id": 2, "score": 42, "value": "not_a_number"}],
++        table_name="items",
++    )
++
++    columns = pipeline.default_schema.tables["items"]["columns"]
++    # int into double creates variant (relational normalizer would coerce this)
++    assert "score__v_bigint" in columns
++    assert columns["score__v_bigint"]["data_type"] == "bigint"
++    assert columns["score__v_bigint"]["variant"] is True
++    # text into bigint creates variant
++    assert "value__v_text" in columns
++    assert columns["value__v_text"]["data_type"] == "text"
++    assert columns["value__v_text"]["variant"] is True
++
++    with pipeline.sql_client() as client:
++        rows = client.execute_sql(
++            "SELECT id, score, score__v_bigint, value, value__v_text FROM items ORDER BY id"
++        )
++    # row 1: original columns populated, variants NULL
++    assert rows[0][1] == 3.14
++    assert rows[0][2] is None
++    assert rows[0][3] == 100
++    assert rows[0][4] is None
++    # row 2: originals NULL, values in variant columns
++    assert rows[1][1] is None
++    assert rows[1][2] == 42
++    assert rows[1][3] is None
++    assert rows[1][4] == "not_a_number"
++
++
+ def test_cleanup() -> None:
+     # this must happen after all forked tests (problems with tests teardowns in other tests)
+     pass
+
+
+===== COMMIT d4e6bade =====
+
+
+commit d4e6badef
+Author: Anuun Chinbat
+Date: 2026-05-04
+
+    Chore: ci from fork (#3897)
+
+diff --git a/.github/workflows/fork_tests_with_secrets.yml b/.github/workflows/fork_tests_with_secrets.yml
+new file mode 100644
+index 000000000..7f65ea9b4
+--- /dev/null
++++ b/.github/workflows/fork_tests_with_secrets.yml
+@@ -0,0 +1,39 @@
++name: dlt | fork tests with secrets
++
++on:
++  pull_request_target:
++    branches: [devel]
++    types: [labeled, synchronize]
++
++permissions:
++  contents: read
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
++  cancel-in-progress: true
++
++jobs:
++
++  authorize:
++    name: authorize fork run (requires reviewer approval)
++    if: >-
++      github.event.pull_request.head.repo.full_name != github.repository
++      && contains(github.event.pull_request.labels.*.name, 'ci from fork')
++    runs-on: ubuntu-latest
++    environment: fork-ci
++    steps:
++      - run: echo "Fork PR authorized — running secret-requiring tests against ${{ github.event.pull_request.head.sha }}"
++
++  test_destinations_remote:
++    name: test remote destinations with secrets (fork)
++    needs: [authorize]
++    uses: ./.github/workflows/test_destinations_remote.yml
++    secrets: inherit
++    with:
++      run_full_test_suite: ${{ contains(github.event.pull_request.labels.*.name, 'ci full') }}
++
++  test_tools_dbt_runner:
++    name: test dbt runner (fork)
++    needs: [authorize]
++    uses: ./.github/workflows/test_tools_dbt_runner.yml
++    secrets: inherit
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 45c2a1b12..629a9f288 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -16,11 +16,11 @@ jobs:
+     name: docs changes
+     uses: ./.github/workflows/get_docs_changes.yml
+ 
+-  # if the PR is from a fork, we need to authorize the secrets access and remote destinations run with a lable
+-  authorize_run_from_fork:
+-    name: check if fork and if so wether secrets are available
+-    # run when label is assigned OR when we are not a fork
+-    if: ${{ contains(github.event.pull_request.labels.*.name, 'ci from fork') || (github.event.pull_request.head.repo.full_name == github.repository && (github.event.action == 'opened' || github.event.action == 'synchronize'))}}
++  # check for secret-requiring jobs: secrets are only available for internal (same-repo) PRs under pull_request.
++  # fork PRs with the `ci from fork` label are handled separately by fork_tests_with_secrets.yml (pull_request_target).
++  authorize_secrets:
++    name: secrets available (internal PRs only)
++    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && (github.event.action == 'opened' || github.event.action == 'synchronize') }}
+     runs-on: ubuntu-latest
+     steps:
+       - run: true
+@@ -89,7 +89,7 @@ jobs:
+ 
+   test_destinations_remote:
+     name: test remote destinations with secrets
+-    needs: [authorize_run_from_fork, test_common]
++    needs: [authorize_secrets, test_common]
+     uses: ./.github/workflows/test_destinations_remote.yml
+     secrets: inherit
+     with:
+@@ -100,12 +100,12 @@ jobs:
+   #
+   test_tools_dbt_runner:
+     name: test dbt runner
+-    needs: [test_common, authorize_run_from_fork]
++    needs: [test_common, authorize_secrets]
+     uses: ./.github/workflows/test_tools_dbt_runner.yml
+     secrets: inherit
+   
+   # dbt cloud tests currently are disabled, TODO: explain why
+   # test_tools_dbt_cloud:
+-  #   needs: [test_common, authorize_run_from_fork]
++  #   needs: [test_common, authorize_secrets]
+   #   uses: ./.github/workflows/test_tools_dbt_cloud.yml
+   #   secrets: inherit
+\ No newline at end of file
+
+
+===== COMMIT 58d66fce =====
+
+
+commit 58d66fcee
+Author: Thierry Jean
+Date: 2026-04-30
+
+    docs: misc fixes (#3909)
+
+diff --git a/docs/examples/logfire_telemetry_export/logfire_telemetry_export.py b/docs/examples/logfire_telemetry_export/logfire_telemetry_export.py
+index 7c7680000..3da496227 100644
+--- a/docs/examples/logfire_telemetry_export/logfire_telemetry_export.py
++++ b/docs/examples/logfire_telemetry_export/logfire_telemetry_export.py
+@@ -57,10 +57,11 @@ async def metrics(
+         pyarrow.Table: A batch of metric rows as an Arrow table.
+     """
+     async with AsyncLogfireQueryClient(read_token=read_token) as client:
+-        yield client.query_arrow(
++        batch = await client.query_arrow(
+             sql=f"SELECT * FROM metrics LIMIT {batch_size}",
+             min_timestamp=min_timestamp.start_value,
+         )
++        yield batch.to_pylist()
+ 
+ 
+ @dlt.resource
+@@ -91,10 +92,11 @@ async def records(
+         pyarrow.Table: A batch of span/log rows as an Arrow table.
+     """
+     async with AsyncLogfireQueryClient(read_token=read_token) as client:
+-        yield client.query_arrow(
+-            sql=f"SELECT * FROM metrics LIMIT {batch_size}",
++        batch = await client.query_arrow(
++            sql=f"SELECT * FROM records LIMIT {batch_size}",
+             min_timestamp=min_timestamp.start_value,
+         )
++        yield batch.to_pylist()
+ 
+ 
+ @dlt.source
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 584e6a57c..3c45d0fe9 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -417,13 +417,6 @@ const sidebars = {
+         'hub/getting-started/installation',
+         'hub/getting-started/runtime-tutorial',
+       ]
+-    },
+-        {
+-      type: 'category',
+-      label: 'AI Workbench',
+-      items: [
+-        'dlt-ecosystem/llm-tooling/llm-native-workflow',
+-      ]
+     },
+     {
+       type: 'category',
+@@ -506,19 +499,17 @@ const sidebars = {
+ 
+  // insert examples
+ for (const item of sidebars.cookbookSidebar) {
+-    if (item.label === 'Cookbook') {
+-      for (let examplePath of walkSync("./docs_processed/examples")) {
+-        examplePath = examplePath.replace(/\\/g, "/");
+-        examplePath = examplePath.replace("docs_processed/", "");
+-        examplePath = examplePath.replace(".mdx", "");
+-        examplePath = examplePath.replace(".md", "");
+-        item.items.push(examplePath);
+-    }
++  for (let examplePath of walkSync("./docs_processed/examples")) {
++    examplePath = examplePath.replace(/\\/g, "/");
++    examplePath = examplePath.replace("docs_processed/", "");
++    examplePath = examplePath.replace(".mdx", "");
++    examplePath = examplePath.replace(".md", "");
++    item.items.push(examplePath);
+   }
+ }
+ 
+ 
+- // inject api reference if it exists
++// inject api reference if it exists
+ if (fs.existsSync('./docs_processed/api_reference/sidebar.json')) {
+   for (const item of sidebars.docsSidebar) {
+     if (item.label === 'Reference') {
+diff --git a/docs/website/tools/update_versions.js b/docs/website/tools/update_versions.js
+index 7eb6013a4..b28d4cf94 100644
+--- a/docs/website/tools/update_versions.js
++++ b/docs/website/tools/update_versions.js
+@@ -95,6 +95,34 @@ if (branch != "devel") {
+  * @param {string} versionedSidebarsFolder - Path to the versioned_sidebars directory.
+  * @param {string[]} sidebarIds - Sidebar IDs to backfill if absent from a snapshot.
+  */
++const SIDEBAR_FALLBACKS = {
++    cookbookSidebar: [
++        {
++            type: 'category',
++            label: 'Cookbook',
++            link: {
++                type: 'doc',
++                id: 'examples/index',
++            },
++            items: [],
++        },
++    ],
++    educationSidebar: [
++        {
++            type: 'category',
++            label: 'Education',
++            link: {
++                type: 'doc',
++                id: 'tutorial/education',
++            },
++            items: [
++              'tutorial/fundamentals-course',
++              'tutorial/advanced-course',
++            ]
++        },
++    ],
++};
++
+ function backfillVersionedSidebars(versionedSidebarsFolder, sidebarIds) {
+     const files = fs.readdirSync(versionedSidebarsFolder).filter(f => f.endsWith('.json'));
+     for (const file of files) {
+@@ -102,27 +130,8 @@ function backfillVersionedSidebars(versionedSidebarsFolder, sidebarIds) {
+         const snapshot = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+         let patched = false;
+         for (const id of sidebarIds) {
+-            if (!snapshot[id]) {
+-                snapshot[id] = [
+-                    {
+-                        type: 'category',
+-                        label: 'Cookbook',
+-                        link: {
+-                            type: 'doc',
+-                            id: 'examples/index',
+-                        },
+-                        items: [],
+-                    },
+-                    {
+-                        type: 'category',
+-                        label: 'Education',
+-                        link: {
+-                            type: 'doc',
+-                            id: 'tutorial/education',
+-                        },
+-                        items: [],
+-                    },
+-                ];
++            if (!snapshot[id] && SIDEBAR_FALLBACKS[id]) {
++                snapshot[id] = SIDEBAR_FALLBACKS[id];
+                 patched = true;
+             }
+         }
+
+
+===== COMMIT 541dfcee =====
+
+
+commit 541dfceea
+Author: deschman
+Date: 2026-04-30
+
+    fix: `scd2` unmapped insert for nested tables (#3812)
+
+diff --git a/dlt/destinations/sql_jobs.py b/dlt/destinations/sql_jobs.py
+index 82083c2d1..5fb78fcec 100644
+--- a/dlt/destinations/sql_jobs.py
++++ b/dlt/destinations/sql_jobs.py
+@@ -981,6 +981,7 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+         sql.append(retire_sql)
+ 
+         # insert new active records in root table
++        # incomplete columns are already stripped by prepare_load_table, so .keys() is safe
+         columns = map(escape_column_id, list(root_table["columns"].keys()))
+         col_str = ", ".join([c for c in columns if c not in (from_, to)])
+         sql.append(f"""
+@@ -1007,9 +1008,12 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+                     )
+                 )
+                 table_name, staging_table_name = sql_client.get_qualified_table_names(table["name"])
++                # incomplete columns are already stripped by prepare_load_table, so .keys() is safe
++                columns = map(escape_column_id, list(table["columns"].keys()))
++                col_str = ", ".join([c for c in columns if c])
+                 sql.append(f"""
+-                    INSERT INTO {table_name}
+-                    SELECT *
++                    INSERT INTO {table_name} ({col_str})
++                    SELECT {col_str}
+                     FROM {staging_table_name}
+                     WHERE {row_key_column} NOT IN (SELECT {row_key_column} FROM {table_name});
+                 """)
+
+
+===== COMMIT 7cef8cb3 =====
+
+
+commit 7cef8cb36
+Author: Aditya Panda
+Date: 2026-04-29
+
+    Rectify Schema naming convention for max length param (#3826)
+
+diff --git a/dlt/common/schema/schema.py b/dlt/common/schema/schema.py
+index ce346b25a..6dfccccc1 100644
+--- a/dlt/common/schema/schema.py
++++ b/dlt/common/schema/schema.py
+@@ -947,6 +947,8 @@ class Schema:
+             d["name"] = with_name
+             d["previous_hashes"] = []
+         schema = Schema.from_stored_schema(d)
++        # max_length will not be cloned - it is not serialized in schema, propagate it explicitly
++        schema.naming.max_length = self.naming.max_length
+         # update normalizers and possibly all schema identifiers
+         if update_normalizers:
+             schema.update_normalizers()
+diff --git a/tests/common/schema/test_schema.py b/tests/common/schema/test_schema.py
+index ee0baf8dc..29c19dfce 100644
+--- a/tests/common/schema/test_schema.py
++++ b/tests/common/schema/test_schema.py
+@@ -291,6 +291,14 @@ def test_clone(schema: Schema) -> None:
+     assert cloned.is_modified
+     assert cloned._normalizers_config["names"] == "direct"
+ 
++    # max_length is in-memory state on the naming instance and is not serialized,
++    # but clone must still preserve it across the to_dict/from_stored_schema round-trip
++    simple.naming.max_length = 65536
++    cloned = simple.clone()
++    assert cloned.naming.max_length == 65536
++    cloned = simple.clone(with_name="renamed")
++    assert cloned.naming.max_length == 65536
++
+ 
+ def test_new_schema_alt_name() -> None:
+     schema = Schema("model")
+@@ -1191,6 +1199,17 @@ def test_unify_schemas_naming_mismatch() -> None:
+         schema_a.unify_schemas([schema_b], check_naming_convention=True)
+ 
+ 
++def test_unify_schemas_with_matching_max_length() -> None:
++    # regression for #3816: max_length is destination-derived runtime state and is lost
++    # by the to_dict/from_stored_schema round-trip inside clone unless explicitly preserved
++    schema_a = Schema("alpha")
++    schema_b = Schema("beta")
++    schema_a.naming.max_length = 65536
++    schema_b.naming.max_length = 65536
++    unified = schema_a.unify_schemas([schema_b], check_naming_convention=True)
++    assert unified.naming.max_length == 65536
++
++
+ def test_unify_schemas_nested_tables() -> None:
+     schema_a = Schema("alpha")
+     schema_a.update_table(utils.new_table("events", columns=[]))
+
+
+===== COMMIT 10c63323 =====
+
+
+commit 10c633236
+Author: Anton Burnashev
+Date: 2026-04-28
+
+    Make the naming-convention check in `Schema.unify_schemas()` opt-in (#3898)
+
+diff --git a/dlt/_workspace/mcp/tools/data_tools.py b/dlt/_workspace/mcp/tools/data_tools.py
+index d6906d363..5192457bd 100644
+--- a/dlt/_workspace/mcp/tools/data_tools.py
++++ b/dlt/_workspace/mcp/tools/data_tools.py
+@@ -10,7 +10,6 @@ from fastmcp.exceptions import ToolError
+ import dlt
+ from dlt.common.configuration.specs.pluggable_run_context import ProfilesRunContext
+ from dlt.common.runtime.run_context import active as active_run_context
+-from dlt.common.schema.exceptions import IncompatibleSchemaException
+ from dlt.common.schema.schema import Schema
+ from dlt.common.typing import Annotated
+ from dlt._workspace.cli import formatters
+@@ -31,19 +30,13 @@ def _attach(pipeline_name: str) -> dlt.Pipeline:
+ 
+ 
+ def _get_unified_schema(pipeline: dlt.Pipeline) -> Schema:
+-    """Build a unified schema from all pipeline schemas.
+-
+-    Falls back to default schema if naming conventions are incompatible.
+-    """
++    """Build a unified schema from all pipeline schemas."""
+     schema_names = list(pipeline.schemas)
+     if len(schema_names) <= 1:
+         return pipeline.default_schema
+     default = pipeline.default_schema
+     others = [pipeline.schemas[n] for n in schema_names if n != default.name]
+-    try:
+-        return default.unify_schemas(others)
+-    except IncompatibleSchemaException:
+-        return default
++    return default.unify_schemas(others)
+ 
+ 
+ def _get_dataset(pipeline_name: str) -> dlt.Dataset:
+diff --git a/dlt/common/schema/schema.py b/dlt/common/schema/schema.py
+index ca63a5d5a..ce346b25a 100644
+--- a/dlt/common/schema/schema.py
++++ b/dlt/common/schema/schema.py
+@@ -407,21 +407,31 @@ class Schema:
+                 for chain_table in utils.get_nested_tables(schema._schema_tables, table["name"]):
+                     self.update_table(chain_table)
+ 
+-    def unify_schemas(self, schemas: Sequence["Schema"]) -> "Schema":
++    def unify_schemas(
++        self,
++        schemas: Sequence["Schema"],
++        check_naming_convention: bool = False,
++    ) -> "Schema":
+         """Create a new schema containing tables from self and all given schemas.
+ 
+-        All schemas must use the same naming convention (type, case sensitivity,
+-        and max_length). Tables are merged without normalizing identifiers
+-        (assumed already normalized). Parent tables are added before children.
++        Tables are merged without normalizing identifiers (assumed already normalized).
++        Parent tables are added before children.
++
++        Args:
++            schemas: Schemas to merge into a clone of this schema.
++            check_naming_convention: When True, require all input schemas to
++                share the same naming convention (type, case sensitivity, and
++                `max_length`).
+ 
+         Raises:
+-            IncompatibleSchemaException: when naming conventions differ
++            IncompatibleSchemaException: when `check_naming_convention=True`
++                and naming conventions differ.
+         """
+         all_names = sorted([self.name] + [s.name for s in schemas])
+         unified_name = utils.normalize_schema_name("u_" + "_".join(all_names))
+         unified = self.clone(with_name=unified_name)
+         for schema in schemas:
+-            if str(unified.naming) != str(schema.naming):
++            if check_naming_convention and str(unified.naming) != str(schema.naming):
+                 raise IncompatibleSchemaException(
+                     unified.name,
+                     schema.name,
+diff --git a/tests/common/schema/test_schema.py b/tests/common/schema/test_schema.py
+index a0fc7700c..ee0baf8dc 100644
+--- a/tests/common/schema/test_schema.py
++++ b/tests/common/schema/test_schema.py
+@@ -1184,8 +1184,11 @@ def test_unify_schemas_naming_mismatch() -> None:
+     schema_a = Schema("alpha")
+     schema_b = Schema("beta")
+     schema_b._configure_normalizers({"names": "dlt.common.normalizers.naming.direct", "json": None})
++    unified = schema_a.unify_schemas([schema_b])
++    assert unified.name == "u_alpha_beta"
++
+     with pytest.raises(IncompatibleSchemaException, match="naming convention mismatch"):
+-        schema_a.unify_schemas([schema_b])
++        schema_a.unify_schemas([schema_b], check_naming_convention=True)
+ 
+ 
+ def test_unify_schemas_nested_tables() -> None:
+@@ -1239,6 +1242,102 @@ def test_unify_schemas_sql_naming_convention_mismatch() -> None:
+     schema_b._configure_normalizers(
+         {"names": "dlt.common.normalizers.naming.sql_ci_v1", "json": None}
+     )
++    schema_a.unify_schemas([schema_b])
++    with pytest.raises(IncompatibleSchemaException, match="naming convention mismatch"):
++        schema_a.unify_schemas([schema_b], check_naming_convention=True)
++
++
++def test_unify_schemas_max_length_mismatch() -> None:
++    schema_a = Schema("alpha")
++    schema_a.update_table(utils.new_table("items", columns=[{"name": "id", "data_type": "bigint"}]))
++
++    schema_b = Schema("beta")
++    schema_b.update_table(
++        utils.new_table("digits", columns=[{"name": "value", "data_type": "bigint"}])
++    )
++    schema_b.naming.max_length = 63
++    assert str(schema_a.naming) != str(schema_b.naming)
++
++    unified = schema_a.unify_schemas([schema_b])
++    assert "items" in unified.tables
++    assert "digits" in unified.tables
++    assert "id" in unified.get_table_columns("items")
++    assert "value" in unified.get_table_columns("digits")
+ 
+     with pytest.raises(IncompatibleSchemaException, match="naming convention mismatch"):
+-        schema_a.unify_schemas([schema_b])
++        schema_a.unify_schemas([schema_b], check_naming_convention=True)
++
++
++def test_unify_schemas_verbatim_across_conventions() -> None:
++    schema_snake = Schema("snake")
++    schema_snake._configure_normalizers(
++        {"names": "dlt.common.normalizers.naming.snake_case", "json": None}
++    )
++    schema_snake.update_table(
++        utils.new_table("users", columns=[{"name": "id", "data_type": "bigint"}])
++    )
++    schema_snake.update_table(
++        utils.new_table(
++            "users__orders",
++            parent_table_name="users",
++            columns=[{"name": "amount", "data_type": "double"}],
++        )
++    )
++
++    schema_direct = Schema("direct")
++    schema_direct._configure_normalizers(
++        {"names": "dlt.common.normalizers.naming.direct", "json": None}
++    )
++    schema_direct.update_table(
++        utils.new_table("Inventory📦", columns=[{"name": "Sku🔖", "data_type": "text"}])
++    )
++    schema_direct.update_table(
++        utils.new_table(
++            "Inventory📦▶Stock",
++            parent_table_name="Inventory📦",
++            columns=[{"name": "Qty", "data_type": "bigint"}],
++        )
++    )
++
++    schema_upper = Schema("upper")
++    schema_upper._configure_normalizers(
++        {"names": "tests.common.cases.normalizers.sql_upper", "json": None}
++    )
++    schema_upper.update_table(
++        utils.new_table("EVENTS📊", columns=[{"name": "EVENT_ID", "data_type": "bigint"}])
++    )
++    schema_upper.update_table(
++        utils.new_table(
++            "EVENTS📊__DETAILS",
++            parent_table_name="EVENTS📊",
++            columns=[{"name": "PAYLOAD", "data_type": "text"}],
++        )
++    )
++
++    unified = schema_snake.unify_schemas([schema_direct, schema_upper])
++
++    expected_tables = {
++        "_dlt_version",
++        "_dlt_loads",
++        "_DLT_VERSION",
++        "_DLT_LOADS",
++        "users",
++        "users__orders",
++        "Inventory📦",
++        "Inventory📦▶Stock",
++        "EVENTS📊",
++        "EVENTS📊__DETAILS",
++    }
++    assert set(unified.tables) == expected_tables
++
++    assert unified.get_table_columns("users").keys() == {"id"}
++    assert unified.get_table_columns("users__orders").keys() == {"amount"}
++    assert unified.get_table("users__orders")["parent"] == "users"
++
++    assert unified.get_table_columns("Inventory📦").keys() == {"Sku🔖"}
++    assert unified.get_table_columns("Inventory📦▶Stock").keys() == {"Qty"}
++    assert unified.get_table("Inventory📦▶Stock")["parent"] == "Inventory📦"
++
++    assert unified.get_table_columns("EVENTS📊").keys() == {"EVENT_ID"}
++    assert unified.get_table_columns("EVENTS📊__DETAILS").keys() == {"PAYLOAD"}
++    assert unified.get_table("EVENTS📊__DETAILS")["parent"] == "EVENTS📊"
+diff --git a/tests/dataset/test_relation.py b/tests/dataset/test_relation.py
+index 5059a2110..7a6c3333e 100644
+--- a/tests/dataset/test_relation.py
++++ b/tests/dataset/test_relation.py
+@@ -320,16 +320,7 @@ def multi_schema_pipeline(module_tmp_path: pathlib.Path) -> dlt.Pipeline:
+ 
+ @pytest.fixture(scope="module")
+ def multi_schema_dataset(multi_schema_pipeline: dlt.Pipeline) -> dlt.Dataset:
+-    ds = multi_schema_pipeline.dataset()
+-    # we need to reset max_length here to avoid IncompatibleSchemaException
+-    # down the line in unify_schemas: max_length is resolved from
+-    # DestinationCapabilitiesContext at schema construction time
+-    # The deactivate_pipeline autouse fixture removes caps from the Container
+-    # between tests, so clone() inside unify_schemas would create schemas without
+-    # max_length.
+-    for s in ds.schemas:
+-        s.naming.max_length = None
+-    return ds
++    return multi_schema_pipeline.dataset()
+ 
+ 
+ def test_multi_schema_schemas_property(multi_schema_dataset: dlt.Dataset) -> None:
+@@ -542,10 +533,7 @@ def overlapping_tables_dataset(module_tmp_path: pathlib.Path) -> dlt.Dataset:
+     )
+     pipeline.run(src_a())
+     pipeline.run(src_b())
+-    ds = pipeline.dataset()
+-    for s in ds.schemas:
+-        s.naming.max_length = None
+-    return ds
++    return pipeline.dataset()
+ 
+ 
+ def test_shared_table_merge(overlapping_tables_dataset: dlt.Dataset) -> None:
+@@ -584,6 +572,40 @@ def test_multi_schema_row_counts_by_load_id(
+     }
+ 
+ 
++def test_unify_schemas_across_naming_conventions(
++    module_tmp_path: pathlib.Path,
++) -> None:
++    pipeline = dlt.pipeline(
++        pipeline_name="multi_naming",
++        pipelines_dir=str(module_tmp_path / "pipelines_dir"),
++        destination=dlt.destinations.duckdb(
++            str(module_tmp_path / "multi_naming.db"),
++            enable_dataset_name_normalization=False,
++        ),
++        dataset_name="multi_naming_ds",
++    )
++    # default snake_case schema
++    pipeline.run([{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}], table_name="users")
++
++    upper_schema = dlt.Schema("events")
++    upper_schema._configure_normalizers(
++        {"names": "tests.common.cases.normalizers.sql_upper", "json": None}
++    )
++    pipeline.run(
++        [{"id": 7, "value": "hello"}],
++        table_name="events📊",
++        schema=upper_schema,
++    )
++    assert "users" in pipeline.schemas["multi_naming"].data_table_names()
++    assert "EVENTS📊" in pipeline.schemas["events"].data_table_names()
++
++    dataset = pipeline.dataset()
++    users = sorted(row[:2] for row in dataset.users.fetchall())
++    assert users == [(1, "alice"), (2, "bob")]
++    events = [row[:2] for row in dataset["EVENTS📊"].fetchall()]
++    assert events == [(7, "hello")]
++
++
+ @pytest.fixture
+ def mock_dataset() -> dlt.Dataset:
+     s = Schema("my_schema")
+
+
+===== COMMIT c9f11e2b =====
+
+
+commit c9f11e2bb
+Author: Violetta Mishechkina
+Date: 2026-04-28
+
+    Docs/improved dashboard docs (#3484)
+

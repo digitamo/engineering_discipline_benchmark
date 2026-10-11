@@ -1,0 +1,2634 @@
+diff --git a/dlt/destinations/impl/clickhouse/clickhouse.py b/dlt/destinations/impl/clickhouse/clickhouse.py
+index 48bf63295..f2fcf1d68 100644
+--- a/dlt/destinations/impl/clickhouse/clickhouse.py
++++ b/dlt/destinations/impl/clickhouse/clickhouse.py
+@@ -271,10 +271,7 @@ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
+         )
+ 
+     def _get_table_update_sql(
+-        self,
+-        table_name: str,
+-        new_columns: Sequence[TColumnSchema],
+-        generate_alter: bool,
++        self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
+     ) -> List[str]:
+         table = self.prepare_load_table(table_name)
+         sql = SqlJobClientBase._get_table_update_sql(self, table_name, new_columns, generate_alter)
+diff --git a/dlt/destinations/impl/databricks/databricks.py b/dlt/destinations/impl/databricks/databricks.py
+index 8bcb66014..cf6010f2d 100644
+--- a/dlt/destinations/impl/databricks/databricks.py
++++ b/dlt/destinations/impl/databricks/databricks.py
+@@ -393,11 +393,7 @@ class DatabricksClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
+         return ""
+ 
+     def _get_table_update_sql(
+-        self,
+-        table_name: str,
+-        new_columns: Sequence[TColumnSchema],
+-        generate_alter: bool,
+-        separate_alters: bool = False,
++        self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
+     ) -> List[str]:
+         table = self.prepare_load_table(table_name)
+ 
+diff --git a/dlt/destinations/impl/dremio/dremio.py b/dlt/destinations/impl/dremio/dremio.py
+index 7eb4f2121..84718cd77 100644
+--- a/dlt/destinations/impl/dremio/dremio.py
++++ b/dlt/destinations/impl/dremio/dremio.py
+@@ -129,11 +129,7 @@ class DremioClient(SqlJobClientWithStagingDataset, SupportsStagingDestination):
+         return job
+ 
+     def _get_table_update_sql(
+-        self,
+-        table_name: str,
+-        new_columns: Sequence[TColumnSchema],
+-        generate_alter: bool,
+-        separate_alters: bool = False,
++        self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
+     ) -> List[str]:
+         sql = super()._get_table_update_sql(table_name, new_columns, generate_alter)
+ 
+diff --git a/dlt/destinations/impl/ducklake/ducklake.py b/dlt/destinations/impl/ducklake/ducklake.py
+index c9716725b..972232642 100644
+--- a/dlt/destinations/impl/ducklake/ducklake.py
++++ b/dlt/destinations/impl/ducklake/ducklake.py
+@@ -134,11 +134,7 @@ class DuckLakeClient(DuckDbClient):
+         return job
+ 
+     def _get_table_update_sql(
+-        self,
+-        table_name: str,
+-        new_columns: Sequence[TColumnSchema],
+-        generate_alter: bool,
+-        separate_alters: bool = False,
++        self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
+     ) -> List[str]:
+         sql = super()._get_table_update_sql(table_name, new_columns, generate_alter)
+ 
+diff --git a/dlt/destinations/impl/snowflake/snowflake.py b/dlt/destinations/impl/snowflake/snowflake.py
+index 9d212bfc9..8d725c5e2 100644
+--- a/dlt/destinations/impl/snowflake/snowflake.py
++++ b/dlt/destinations/impl/snowflake/snowflake.py
+@@ -196,24 +196,52 @@ class SnowflakeClient(SqlJobClientWithStagingDataset, SupportsStagingDestination
+                     return f",\nCONSTRAINT {pk_constraint_name} PRIMARY KEY ({quoted_pk_cols})"
+         return ""
+ 
+-    def _get_table_update_sql(
++    def _get_cluster_sql(self, cluster_column_names: Sequence[str]) -> str:
++        if cluster_column_names:
++            cluster_column_names_str = ",".join(
++                [self.sql_client.escape_column_name(col) for col in cluster_column_names]
++            )
++            return f"CLUSTER BY ({cluster_column_names_str})"
++        else:
++            return "DROP CLUSTERING KEY"
++
++    def _get_alter_cluster_sql(self, table_name: str, cluster_column_names: Sequence[str]) -> str:
++        qualified_name = self.sql_client.make_qualified_table_name(table_name)
++        return self._make_alter_table(qualified_name) + self._get_cluster_sql(cluster_column_names)
++
++    def _add_cluster_sql(
+         self,
++        sql: List[str],
+         table_name: str,
+-        new_columns: Sequence[TColumnSchema],
+         generate_alter: bool,
+-        separate_alters: bool = False,
+     ) -> List[str]:
+-        sql = super()._get_table_update_sql(table_name, new_columns, generate_alter)
++        """Adds CLUSTER BY / DROP CLUSTERING KEY clause to SQL statements based on cluster hints.
++
++        This method modifies the input `sql` list in place and also returns it.
++        """
+ 
+-        cluster_list = [
+-            self.sql_client.escape_column_name(c["name"]) for c in new_columns if c.get("cluster")
++        cluster_column_names = [
++            c["name"]
++            for c in self.schema.get_table_columns(table_name).values()
++            if c.get("cluster")
+         ]
+ 
+-        if cluster_list:
+-            sql[0] = sql[0] + "\nCLUSTER BY (" + ",".join(cluster_list) + ")"
++        if generate_alter:
++            # altering -> need to issue separate ALTER TABLE statement for cluster operations
++            stmt = self._get_alter_cluster_sql(table_name, cluster_column_names)
++            sql.append(stmt)
++        elif not generate_alter and cluster_column_names:
++            # creating -> can append CLUSTER BY clause to CREATE TABLE statement
++            sql[0] = sql[0] + self._get_cluster_sql(cluster_column_names)
+ 
+         return sql
+ 
++    def _get_table_update_sql(
++        self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
++    ) -> List[str]:
++        sql = super()._get_table_update_sql(table_name, new_columns, generate_alter)
++        return self._add_cluster_sql(sql, table_name, generate_alter)
++
+     def _from_db_type(
+         self, bq_t: str, precision: Optional[int], scale: Optional[int]
+     ) -> TColumnType:
+diff --git a/dlt/destinations/job_client_impl.py b/dlt/destinations/job_client_impl.py
+index 7707e5159..0fcbfa166 100644
+--- a/dlt/destinations/job_client_impl.py
++++ b/dlt/destinations/job_client_impl.py
+@@ -695,6 +695,11 @@ WHERE """
+             not_exists_clause = " IF NOT EXISTS "
+         return f"CREATE TABLE{not_exists_clause}{qualified_name}"
+ 
++    @staticmethod
++    def _make_alter_table(qualified_name: str) -> str:
++        """Begins ALTER TABLE statement"""
++        return f"ALTER TABLE {qualified_name}\n"
++
+     def _get_table_update_sql(
+         self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
+     ) -> List[str]:
+@@ -712,7 +717,7 @@ WHERE """
+             sql += ")"
+             sql_result.append(sql)
+         else:
+-            sql_base = f"ALTER TABLE {qualified_name}\n"
++            sql_base = self._make_alter_table(qualified_name)
+             add_column_statements = self._make_add_column_sql(new_columns, table)
+             if self.capabilities.alter_add_multi_column:
+                 column_sql = ",\n"
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+index e174ad6ae..f40bce692 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+@@ -232,7 +232,7 @@ Note that we ignore missing columns `ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE` and
+ 
+ ## Supported column hints
+ Snowflake supports the following [column hints](../../general-usage/schema#tables-and-columns):
+-* `cluster` - Creates a cluster column(s). Many columns per table are supported and only when a new table is created.
++* `cluster` - Makes column part of [cluster key](https://docs.snowflake.com/en/user-guide/tables-clustering-keys), can be added to many columns. The `cluster` columns are added to the cluster key in order of appearance in the table schema. Changing `cluster` hints after table creation is supported, but the changes will only be applied if/when a new column is added.
+ * `unique` - Creates UNIQUE hint on a Snowflake column, can be added to many columns. ([optional](#additional-destination-options))
+ * `primary_key` - Creates PRIMARY KEY on selected column(s), may be compound. ([optional](#additional-destination-options))
+ 
+diff --git a/tests/load/pipeline/test_snowflake_pipeline.py b/tests/load/pipeline/test_snowflake_pipeline.py
+index 24c5418bd..ebb6793a6 100644
+--- a/tests/load/pipeline/test_snowflake_pipeline.py
++++ b/tests/load/pipeline/test_snowflake_pipeline.py
+@@ -1,6 +1,7 @@
+ from copy import deepcopy
+ import os
+ import pytest
++from typing import cast
+ from pytest_mock import MockerFixture
+ 
+ import dlt
+@@ -315,6 +316,79 @@ def test_snowflake_use_vectorized_scanner(
+         )
+ 
+ 
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(default_sql_configs=True, subset=["snowflake"]),
++    ids=lambda x: x.name,
++)
++def test_snowflake_cluster_hints(destination_config: DestinationTestConfiguration) -> None:
++    from dlt.destinations.impl.snowflake.sql_client import SnowflakeSqlClient
++
++    def get_cluster_key(sql_client: SnowflakeSqlClient, table_name: str) -> str:
++        with sql_client:
++            _catalog_name, schema_name, table_names = sql_client._get_information_schema_components(
++                table_name
++            )
++            qry = f"""
++                SELECT CLUSTERING_KEY FROM INFORMATION_SCHEMA.TABLES
++                WHERE TABLE_SCHEMA = '{schema_name}'
++                AND TABLE_NAME = '{table_names[0]}'
++            """
++            return sql_client.execute_sql(qry)[0][0]
++
++    pipeline = destination_config.setup_pipeline("test_snowflake_cluster_hints", dev_mode=True)
++    sql_client = cast(SnowflakeSqlClient, pipeline.sql_client())
++    table_name = "test_snowflake_cluster_hints"
++
++    @dlt.resource(table_name=table_name)
++    def test_data():
++        return [
++            {"c1": 1, "c2": "a"},
++            {"c1": 2, "c2": "b"},
++        ]
++
++    # create new table with clustering
++    test_data.apply_hints(columns=[{"name": "c1", "cluster": True}])
++    info = pipeline.run(test_data(), **destination_config.run_kwargs)
++    assert_load_info(info)
++    assert get_cluster_key(sql_client, table_name) == 'LINEAR("C1")'
++
++    # change cluster hints on existing table without adding new column
++    test_data.apply_hints(columns=[{"name": "c2", "cluster": True}])
++    info = pipeline.run(test_data(), **destination_config.run_kwargs)
++    assert_load_info(info)
++    assert get_cluster_key(sql_client, table_name) == 'LINEAR("C1")'  # unchanged (no new column)
++
++    # add new column to existing table with pending cluster hints from previous run
++    test_data.apply_hints(columns=[{"name": "c3", "data_type": "bool"}])
++    info = pipeline.run(test_data(), **destination_config.run_kwargs)
++    assert_load_info(info)
++    assert get_cluster_key(sql_client, table_name) == 'LINEAR("C1","C2")'  # updated
++
++    # remove clustering from existing table
++    test_data.apply_hints(
++        columns=[
++            {"name": "c1", "cluster": False},
++            {"name": "c2", "cluster": False},
++            {"name": "c4", "data_type": "bool"},  # include new column to trigger alter
++        ]
++    )
++    info = pipeline.run(test_data(), **destination_config.run_kwargs)
++    assert_load_info(info)
++    assert get_cluster_key(sql_client, table_name) is None
++
++    # add clustering to existing table (and add new column to trigger alter)
++    test_data.apply_hints(
++        columns=[
++            {"name": "c1", "cluster": True},
++            {"name": "c5", "data_type": "bool"},  # include new column to trigger alter
++        ]
++    )
++    info = pipeline.run(test_data(), **destination_config.run_kwargs)
++    assert_load_info(info)
++    assert get_cluster_key(sql_client, table_name) == 'LINEAR("C1")'
++
++
+ @pytest.mark.skip(reason="perf test for merge")
+ @pytest.mark.parametrize(
+     "destination_config",
+diff --git a/tests/load/snowflake/test_snowflake_table_builder.py b/tests/load/snowflake/test_snowflake_table_builder.py
+index 24c1091fa..72d614ccf 100644
+--- a/tests/load/snowflake/test_snowflake_table_builder.py
++++ b/tests/load/snowflake/test_snowflake_table_builder.py
+@@ -8,7 +8,8 @@ import pytest
+ import sqlfluff
+ 
+ from dlt.common.utils import uniq_id
+-from dlt.common.schema import Schema, utils
++from dlt.common.schema import Schema
++from dlt.common.schema.utils import new_table
+ from dlt.destinations import snowflake
+ from dlt.destinations.impl.snowflake.snowflake import SnowflakeClient, SUPPORTED_HINTS
+ from dlt.destinations.impl.snowflake.configuration import (
+@@ -119,46 +120,103 @@ def test_create_table_with_hints(snowflake_client: SnowflakeClient) -> None:
+     assert 'CONSTRAINT "PK_EVENT_TEST_TABLE_' in sql
+     assert 'PRIMARY KEY ("COL1", "COL6")' in sql
+ 
+-    # generate alter
+-    mod_update = deepcopy(TABLE_UPDATE[11:])
+-    mod_update[0]["primary_key"] = True
+-    mod_update[1]["unique"] = True
+-
+-    sql = ";".join(snowflake_client._get_table_update_sql("event_test_table", mod_update, True))
+-    # PK constraint ignored for alter
+-    assert "PRIMARY KEY" not in sql
+-    assert '"COL2_NULL" FLOAT UNIQUE' in sql
+-
+ 
+ def test_alter_table(snowflake_client: SnowflakeClient) -> None:
+-    statements = snowflake_client._get_table_update_sql("event_test_table", TABLE_UPDATE, True)
+-    assert len(statements) == 1
+-    sql = statements[0]
++    new_columns = deepcopy(TABLE_UPDATE[1:10])
++    statements = snowflake_client._get_table_update_sql("event_test_table", new_columns, True)
+ 
+-    # TODO: sqlfluff doesn't parse snowflake multi ADD COLUMN clause correctly
+-    # sqlfluff.parse(sql, dialect='snowflake')
++    assert len(statements) == 2, "Should have one ADD COLUMN and one DROP CLUSTERING KEY statement"
++    add_column_sql = statements[0]
+ 
+-    assert sql.startswith("ALTER TABLE")
+-    assert sql.count("ALTER TABLE") == 1
+-    assert sql.count("ADD COLUMN") == 1
+-    assert '"EVENT_TEST_TABLE"' in sql
+-    assert '"COL1" NUMBER(19,0)  NOT NULL' in sql
+-    assert '"COL2" FLOAT  NOT NULL' in sql
+-    assert '"COL3" BOOLEAN  NOT NULL' in sql
+-    assert '"COL4" TIMESTAMP_TZ  NOT NULL' in sql
+-    assert '"COL5" VARCHAR' in sql
+-    assert '"COL6" NUMBER(38,9)  NOT NULL' in sql
+-    assert '"COL7" BINARY' in sql
+-    assert '"COL8" NUMBER(38,0)' in sql
+-    assert '"COL9" VARIANT  NOT NULL' in sql
+-    assert '"COL10" DATE' in sql
++    # TODO: sqlfluff doesn't parse snowflake multi ADD COLUMN clause correctly
++    # sqlfluff.parse(add_column_sql, dialect='snowflake')
++
++    assert add_column_sql.startswith("ALTER TABLE")
++    assert add_column_sql.count("ALTER TABLE") == 1
++    assert add_column_sql.count("ADD COLUMN") == 1
++    assert '"EVENT_TEST_TABLE"' in add_column_sql
++    assert '"COL1"' not in add_column_sql
++    assert '"COL2" FLOAT  NOT NULL' in add_column_sql
++    assert '"COL3" BOOLEAN  NOT NULL' in add_column_sql
++    assert '"COL4" TIMESTAMP_TZ  NOT NULL' in add_column_sql
++    assert '"COL5" VARCHAR' in add_column_sql
++    assert '"COL6" NUMBER(38,9)  NOT NULL' in add_column_sql
++    assert '"COL7" BINARY' in add_column_sql
++    assert '"COL8" NUMBER(38,0)' in add_column_sql
++    assert '"COL9" VARIANT  NOT NULL' in add_column_sql
++    assert '"COL10" DATE' in add_column_sql
++
++
++def test_alter_table_with_hints(snowflake_client: SnowflakeClient) -> None:
++    table_name = "event_test_table"
+ 
+-    mod_table = deepcopy(TABLE_UPDATE)
+-    mod_table.pop(0)
+-    sql = snowflake_client._get_table_update_sql("event_test_table", mod_table, True)[0]
++    # mock hints
++    snowflake_client.active_hints = SUPPORTED_HINTS
+ 
+-    assert '"COL1"' not in sql
+-    assert '"COL2" FLOAT  NOT NULL' in sql
++    # test primary key and unique hints
++    new_columns = deepcopy(TABLE_UPDATE[11:])
++    new_columns[0]["primary_key"] = True
++    new_columns[1]["unique"] = True
++    statements = snowflake_client._get_table_update_sql(table_name, new_columns, True)
++
++    assert len(statements) == 2, "Should have one ADD COLUMN and one DROP CLUSTERING KEY statement"
++    add_column_sql = statements[0]
++    assert "PRIMARY KEY" not in add_column_sql  # PK constraint ignored for alter
++    assert '"COL2_NULL" FLOAT UNIQUE' in add_column_sql
++
++    # test cluster hint
++
++    # case: drop clustering (always run if no cluster hints present in table schema)
++    cluster_by_sql = statements[1]
++
++    assert cluster_by_sql.startswith("ALTER TABLE")
++    assert f'"{table_name.upper()}"' in cluster_by_sql
++    assert cluster_by_sql.endswith("DROP CLUSTERING KEY")
++
++    # case: add clustering (without clustering -> with clustering)
++    old_columns = deepcopy(TABLE_UPDATE[:1])
++    new_columns = deepcopy(TABLE_UPDATE[1:2])
++    new_columns[0]["cluster"] = True  # COL2
++    all_columns = deepcopy(old_columns + new_columns)
++    snowflake_client.schema.update_table(new_table(table_name, columns=deepcopy(all_columns)))
++    statements = snowflake_client._get_table_update_sql(table_name, new_columns, True)
++
++    assert len(statements) == 2, "Should have one ADD COLUMN and one CLUSTER BY statement"
++    cluster_by_sql = statements[1]
++    assert cluster_by_sql.startswith("ALTER TABLE")
++    assert f'"{table_name.upper()}"' in cluster_by_sql
++    assert 'CLUSTER BY ("COL2")' in cluster_by_sql
++
++    # case: modify clustering (extend cluster columns)
++    old_columns = deepcopy(TABLE_UPDATE[:2])
++    old_columns[1]["cluster"] = True  # COL2
++    new_columns = deepcopy(TABLE_UPDATE[2:5])
++    new_columns[2]["cluster"] = True  # COL5
++    all_columns = deepcopy(old_columns + new_columns)
++    snowflake_client.schema.update_table(new_table(table_name, columns=all_columns))
++    statements = snowflake_client._get_table_update_sql(table_name, new_columns, True)
++
++    assert len(statements) == 2, "Should have one ADD COLUMN and one CLUSTER BY statement"
++    cluster_by_sql = statements[1]
++    assert cluster_by_sql.count("ALTER TABLE") == 1
++    assert cluster_by_sql.count("CLUSTER BY") == 1
++    assert 'CLUSTER BY ("COL2","COL5")' in cluster_by_sql
++
++    # case: modify clustering (reorder cluster columns)
++    old_columns = deepcopy(TABLE_UPDATE[:5])
++    old_columns[1]["cluster"] = True  # COL2
++    old_columns[4]["cluster"] = True  # COL5
++    old_columns[1], old_columns[4] = old_columns[4], old_columns[1]  # swap order
++    new_columns = deepcopy(TABLE_UPDATE[5:6])
++    all_columns = deepcopy(old_columns + new_columns)
++    # cannot change column order in existing table schema, so we drop and recreate
++    snowflake_client.schema.drop_tables([table_name])
++    snowflake_client.schema.update_table(new_table(table_name, columns=all_columns))
++    statements = snowflake_client._get_table_update_sql(table_name, new_columns, True)
++
++    assert len(statements) == 2, "Should have one ADD COLUMN and one CLUSTER BY statement"
++    cluster_by_sql = statements[1]
++    assert 'CLUSTER BY ("COL5","COL2")' in cluster_by_sql  # reordered (COL5 first)
+ 
+ 
+ def test_create_table_case_sensitive(cs_client: SnowflakeClient) -> None:
+@@ -170,9 +228,7 @@ def test_create_table_case_sensitive(cs_client: SnowflakeClient) -> None:
+         assert cs_client.sql_client.dataset_name.endswith("staginG")
+     assert cs_client.sql_client.staging_dataset_name.endswith("staginG")
+     # check tables
+-    cs_client.schema.update_table(
+-        utils.new_table("event_test_table", columns=deepcopy(TABLE_UPDATE))
+-    )
++    cs_client.schema.update_table(new_table("event_test_table", columns=deepcopy(TABLE_UPDATE)))
+     sql = cs_client._get_table_update_sql(
+         "Event_test_tablE",
+         list(cs_client.schema.get_table_columns("Event_test_tablE").values()),
+@@ -192,7 +248,9 @@ def test_create_table_with_partition_and_cluster(snowflake_client: SnowflakeClie
+     mod_update[3]["partition"] = True
+     mod_update[4]["cluster"] = True
+     mod_update[1]["cluster"] = True
+-    statements = snowflake_client._get_table_update_sql("event_test_table", mod_update, False)
++    table_name = "event_test_table"
++    snowflake_client.schema.update_table(new_table(table_name, columns=deepcopy(mod_update)))
++    statements = snowflake_client._get_table_update_sql(table_name, mod_update, False)
+     assert len(statements) == 1
+     sql = statements[0]
+ 
+
+
+===== COMMIT 1e73d678 =====
+
+
+commit 1e73d678f
+Author: Menna
+Date: 2025-11-25
+
+    Refactor boundary timestamp handling in SqlMergeFollowupJob and SqlalchemyMergeFollowupJob to ensure current load package creation time is used when no boundary timestamp is provided. Update DltResourceHints class to streamline timestamp validation for active_record_timestamp and boundary_timestamp. Adjust tests accordingly. (#3378)
+
+diff --git a/dlt/destinations/impl/sqlalchemy/merge_job.py b/dlt/destinations/impl/sqlalchemy/merge_job.py
+index e6b2584c0..1b2aa8625 100644
+--- a/dlt/destinations/impl/sqlalchemy/merge_job.py
++++ b/dlt/destinations/impl/sqlalchemy/merge_job.py
+@@ -1,7 +1,8 @@
+-from typing import Sequence, Tuple, Optional, List, Union
++from typing import Sequence, Tuple, Optional, List, Union, cast
+ import operator
+ import sqlalchemy as sa
+ 
++from dlt.common.typing import TAnyDateTime
+ from dlt.common.utils import uniq_id
+ from dlt.common.destination import PreparedTableSchema, DestinationCapabilitiesContext
+ from dlt.common.schema.utils import (
+@@ -374,10 +375,13 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
+             format_datetime_literal = (
+                 DestinationCapabilitiesContext.generic_capabilities().format_datetime_literal
+             )
+-
+-        boundary_ts = ensure_pendulum_datetime_utc(
+-            root_table.get("x-boundary-timestamp", current_load_package()["state"]["created_at"])  # type: ignore[arg-type]
++        _boundary_ts = cast(Optional[TAnyDateTime], root_table.get("x-boundary-timestamp"))
++        boundary_ts: TAnyDateTime = (
++            _boundary_ts
++            if _boundary_ts is not None
++            else current_load_package()["state"]["created_at"]
+         )
++        boundary_ts = ensure_pendulum_datetime_utc(boundary_ts)
+ 
+         boundary_literal = format_datetime_literal(boundary_ts, caps.timestamp_precision)
+ 
+diff --git a/dlt/destinations/sql_jobs.py b/dlt/destinations/sql_jobs.py
+index 9839883fe..2b84a53fc 100644
+--- a/dlt/destinations/sql_jobs.py
++++ b/dlt/destinations/sql_jobs.py
+@@ -4,7 +4,7 @@ import yaml
+ from dlt.common.time import ensure_pendulum_datetime_utc
+ from dlt.common.destination import PreparedTableSchema
+ from dlt.common.destination.utils import resolve_merge_strategy
+-from dlt.common.typing import TypedDict
++from dlt.common.typing import TAnyDateTime, TypedDict
+ 
+ from dlt.common.schema.typing import (
+     TSortOrder,
+@@ -845,12 +845,14 @@ class SqlMergeFollowupJob(SqlFollowupJob):
+                 DestinationCapabilitiesContext.generic_capabilities().format_datetime_literal
+             )
+ 
+-        boundary_ts = ensure_pendulum_datetime_utc(
+-            root_table.get(  # type: ignore[arg-type]
+-                "x-boundary-timestamp",
+-                current_load_package()["state"]["created_at"],
+-            )
++        _boundary_ts = cast(Optional[TAnyDateTime], root_table.get("x-boundary-timestamp"))
++        boundary_ts: TAnyDateTime = (
++            _boundary_ts
++            if _boundary_ts is not None
++            else current_load_package()["state"]["created_at"]
+         )
++        boundary_ts = ensure_pendulum_datetime_utc(boundary_ts)
++
+         boundary_literal = format_datetime_literal(
+             boundary_ts,
+             caps.timestamp_precision,
+diff --git a/dlt/extract/hints.py b/dlt/extract/hints.py
+index ac771bcf0..623a26898 100644
+--- a/dlt/extract/hints.py
++++ b/dlt/extract/hints.py
+@@ -830,6 +830,8 @@ class DltResourceHints:
+                     ):
+                         continue  # None is allowed for active_record_timestamp
+                     if ts in wd:
++                        if wd[ts] is None:  # type: ignore[literal-required]
++                            continue
+                         try:
+                             ensure_pendulum_datetime_utc(wd[ts])  # type: ignore[literal-required]
+                         except Exception:
+diff --git a/docs/website/docs/general-usage/merge-loading.md b/docs/website/docs/general-usage/merge-loading.md
+index ad09f347e..80e85c457 100644
+--- a/docs/website/docs/general-usage/merge-loading.md
++++ b/docs/website/docs/general-usage/merge-loading.md
+@@ -567,6 +567,35 @@ def dim_customer():
+     ...
+ ```
+ 
++#### Reset boundary timestamp to the current load time
++To stop using a previously set `boundary_timestamp` and revert to the default (the current load package creation time), set `boundary_timestamp` to `None`. You can do this either at definition time or dynamically with `apply_hints` before a run.
++
++Definition-time (always use current load time):
++```py
++@dlt.resource(
++    write_disposition={
++        "disposition": "merge",
++        "strategy": "scd2",
++        "boundary_timestamp": None,  # reset to current load time
++    }
++)
++def dim_customer():
++    ...
++```
++
++Per-run reset (override just for this run):
++```py
++r.apply_hints(
++    write_disposition={
++        "disposition": "merge",
++        "strategy": "scd2",
++        "boundary_timestamp": None,  # reset to current load time for this run
++    }
++)
++pipeline.run(r(...))
++```
++When `boundary_timestamp` is `None` (or omitted), `dlt` uses the load package's creation timestamp as the boundary for both retiring existing versions and creating new versions.
++
+ ### Example: Use your own row hash
+ By default, `dlt` generates a row hash based on all columns provided by the resource and stores it in `_dlt_id`. You can use your own hash instead by specifying `row_version_column_name` in the `write_disposition` dictionary. You might already have a column present in your resource that can naturally serve as a row hash, in which case it's more efficient to use those pre-existing hash values than to generate new artificial ones. This option also allows you to use hashes based on a subset of columns, in case you want to ignore changes in some of the columns. When using your own hash, values for `_dlt_id` are randomly generated.
+ ```py
+diff --git a/tests/load/pipeline/test_scd2.py b/tests/load/pipeline/test_scd2.py
+index c189775ca..c9a3ec43e 100644
+--- a/tests/load/pipeline/test_scd2.py
++++ b/tests/load/pipeline/test_scd2.py
+@@ -1,5 +1,6 @@
+ # timezone is removed from all datetime objects in these tests to simplify comparison
+ 
++from unittest import mock
+ import pytest
+ from typing import List, Dict, Any, Optional
+ from datetime import date, datetime, timezone  # noqa: I251
+@@ -633,7 +634,7 @@ def test_active_record_timestamp(
+ 
+ @pytest.mark.parametrize(
+     "destination_config",
+-    destinations_configs(default_sql_configs=True, subset=["duckdb"]),
++    destinations_configs(default_sql_configs=True, subset=["sqlalchemy", "duckdb"]),
+     ids=lambda x: x.name,
+ )
+ def test_boundary_timestamp(
+@@ -645,6 +646,7 @@ def test_boundary_timestamp(
+     ts2 = "2024-08-22"
+     ts3 = date(2024, 8, 20)  # earlier than ts1 and ts2
+     ts4 = "i_am_not_a_timestamp"
++    ts5 = pendulum.datetime(2025, 8, 21, 12, 15, tz="UTC").timestamp()
+ 
+     @dlt.resource(
+         table_name="dim_test",
+@@ -657,75 +659,127 @@ def test_boundary_timestamp(
+     def r(data):
+         yield data
+ 
++    # normalize timestamps once for assertions
++    ts1_dt = strip_timezone(ts1)
++    ts2_dt = strip_timezone(ts2)
++    ts3_dt = strip_timezone(ts3)
++    ts5_dt = strip_timezone(ts5)
++
+     # load 1 — initial load
+     dim_snap = [
+         l1_1 := {"nk": 1, "foo": "foo"},
+         l1_2 := {"nk": 2, "foo": "foo"},
+     ]
+-    info = p.run(r(dim_snap), **destination_config.run_kwargs)
+-    assert_load_info(info)
+-    assert load_table_counts(p, "dim_test")["dim_test"] == 2
+-    expected = [
+-        {**{FROM: strip_timezone(ts1), TO: None}, **l1_1},
+-        {**{FROM: strip_timezone(ts1), TO: None}, **l1_2},
+-    ]
+-    assert get_table(p, "dim_test", "nk") == expected
+-
+-    # load 2 — different source records, different boundary timestamp
+-    r.apply_hints(
+-        write_disposition={
+-            "disposition": "merge",
+-            "strategy": "scd2",
+-            "boundary_timestamp": ts2,
+-        }
+-    )
+-    dim_snap = [
+-        l2_1 := {"nk": 1, "foo": "bar"},  # natural key 1 updated
+-        # l1_2,  # natural key 2 no longer present
+-        l2_3 := {"nk": 3, "foo": "foo"},  # new natural key
+-    ]
+-    info = p.run(r(dim_snap), **destination_config.run_kwargs)
+-    assert_load_info(info)
+-    assert load_table_counts(p, "dim_test")["dim_test"] == 4
+-    expected = [
+-        {**{FROM: strip_timezone(ts1), TO: strip_timezone(ts2)}, **l1_1},  # retired
+-        {**{FROM: strip_timezone(ts1), TO: strip_timezone(ts2)}, **l1_2},  # retired
+-        {**{FROM: strip_timezone(ts2), TO: None}, **l2_1},  # new
+-        {**{FROM: strip_timezone(ts2), TO: None}, **l2_3},  # new
+-    ]
+-    assert_records_as_set(get_table(p, "dim_test"), expected)
+-
+-    # load 3 — earlier boundary timestamp
+-    # we naively apply any valid timestamp
+-    # may lead to "valid from" > "valid to", as in this test case
+-    r.apply_hints(
+-        write_disposition={
+-            "disposition": "merge",
+-            "strategy": "scd2",
+-            "boundary_timestamp": ts3,
+-        }
+-    )
+-    dim_snap = [l2_1]  # natural key 3 no longer present
+-    info = p.run(r(dim_snap), **destination_config.run_kwargs)
+-    assert_load_info(info)
+-    assert load_table_counts(p, "dim_test")["dim_test"] == 4
+-    expected = [
+-        {**{FROM: strip_timezone(ts1), TO: strip_timezone(ts2)}, **l1_1},  # unchanged
+-        {**{FROM: strip_timezone(ts1), TO: strip_timezone(ts2)}, **l1_2},  # unchanged
+-        {**{FROM: strip_timezone(ts2), TO: None}, **l2_1},  # unchanged
+-        {**{FROM: strip_timezone(ts2), TO: strip_timezone(ts3)}, **l2_3},  # retired
+-    ]
+-    assert_records_as_set(get_table(p, "dim_test"), expected)
++    current_time: Dict[str, Optional[float]] = {"ts": None}
++    with mock.patch(
++        "dlt.common.storages.load_package.precise_time",
++        side_effect=lambda: current_time["ts"],
++    ):
++        # load 1 — initial load
++        current_time["ts"] = pendulum.datetime(2024, 8, 21, 12, 15, tz="UTC").timestamp()
++        r.apply_hints(
++            write_disposition={
++                "disposition": "merge",
++                "strategy": "scd2",
++                "boundary_timestamp": ts1,
++            }
++        )
++        info = p.run(r(dim_snap), **destination_config.run_kwargs)
++        assert_load_info(info)
++        assert load_table_counts(p, "dim_test")["dim_test"] == 2
++        expected = [
++            {**{FROM: ts1_dt, TO: None}, **l1_1},
++            {**{FROM: ts1_dt, TO: None}, **l1_2},
++        ]
++        assert get_table(p, "dim_test", "nk", ts_columns=[FROM, TO]) == expected
++
++        # load 2 — different source records, different boundary timestamp
++        current_time["ts"] = pendulum.datetime(2024, 8, 22, tz="UTC").timestamp()
++        dim_snap = [
++            l2_1 := {"nk": 1, "foo": "bar"},  # natural key 1 updated
++            # l1_2,  # natural key 2 no longer present
++            l2_3 := {"nk": 3, "foo": "foo"},  # new natural key
++        ]
++        r.apply_hints(
++            write_disposition={
++                "disposition": "merge",
++                "strategy": "scd2",
++                "boundary_timestamp": ts2,
++            }
++        )
++        info = p.run(r(dim_snap), **destination_config.run_kwargs)
++        assert_load_info(info)
++        assert load_table_counts(p, "dim_test")["dim_test"] == 4
++        expected = [
++            {**{FROM: ts1_dt, TO: ts2_dt}, **l1_1},  # retired
++            {**{FROM: ts1_dt, TO: ts2_dt}, **l1_2},  # retired
++            {**{FROM: ts2_dt, TO: None}, **l2_1},  # new
++            {**{FROM: ts2_dt, TO: None}, **l2_3},  # new
++        ]
++        assert_records_as_set(get_table(p, "dim_test", ts_columns=[FROM, TO]), expected)
++
++        # load 3 — earlier boundary timestamp
++        # we naively apply any valid timestamp
++        # may lead to "valid from" > "valid to", as in this test case
++        current_time["ts"] = pendulum.datetime(2024, 8, 22, 0, 0, 1, tz="UTC").timestamp()
++        dim_snap = [l2_1]  # natural key 3 no longer present
++        r.apply_hints(
++            write_disposition={
++                "disposition": "merge",
++                "strategy": "scd2",
++                "boundary_timestamp": ts3,
++            }
++        )
++        info = p.run(r(dim_snap), **destination_config.run_kwargs)
++        assert_load_info(info)
++        assert load_table_counts(p, "dim_test")["dim_test"] == 4
++        expected = [
++            {**{FROM: ts1_dt, TO: ts2_dt}, **l1_1},  # unchanged
++            {**{FROM: ts1_dt, TO: ts2_dt}, **l1_2},  # unchanged
++            {**{FROM: ts2_dt, TO: None}, **l2_1},  # unchanged
++            {**{FROM: ts2_dt, TO: ts3_dt}, **l2_3},  # retired
++        ]
++        assert_records_as_set(get_table(p, "dim_test", ts_columns=[FROM, TO]), expected)
++
++        # invalid boundary timestamp should raise error
++        with pytest.raises(ValueError):
++            r.apply_hints(
++                write_disposition={
++                    "disposition": "merge",
++                    "strategy": "scd2",
++                    "boundary_timestamp": ts4,
++                }
++            )
+ 
+-    # invalid boundary timestamp should raise error
+-    with pytest.raises(ValueError):
++        # run 4 — no boundary timestamp (use current precise_time)
++        current_time["ts"] = ts5
++        dim_snap = [
++            l3_1 := {"nk": 1, "foo": "foobar"},  # updated
++        ]
+         r.apply_hints(
+             write_disposition={
+                 "disposition": "merge",
+                 "strategy": "scd2",
+-                "boundary_timestamp": ts4,
++                "boundary_timestamp": None,
+             }
+         )
++        info = p.run(r(dim_snap), **destination_config.run_kwargs)
++        assert_load_info(info)
++        assert load_table_counts(p, "dim_test")["dim_test"] == 5
++        expected = [
++            {**{FROM: ts1_dt, TO: ts2_dt}, **l1_1},  # unchanged
++            {**{FROM: ts1_dt, TO: ts2_dt}, **l1_2},  # unchanged
++            {
++                **{FROM: ts2_dt, TO: ts5_dt},
++                **l2_1,
++            },  # retired in this run
++            {
++                **{FROM: ts2_dt, TO: ts3_dt},
++                **l2_3,
++            },  # unchanged (already retired in load 3)
++            {**{FROM: ts5_dt, TO: None}, **l3_1},
++        ]
++        assert_records_as_set(get_table(p, "dim_test", ts_columns=[FROM, TO]), expected)
+ 
+ 
+ @pytest.mark.essential
+
+
+===== COMMIT 382eb6ba =====
+
+
+commit 382eb6bab
+Author: Thierry Jean
+Date: 2025-11-24
+
+    feat: `Schema.to_mermaid()` (#3364)
+
+diff --git a/dlt/_workspace/cli/_pipeline_command.py b/dlt/_workspace/cli/_pipeline_command.py
+index f93f4bf91..5b3109305 100644
+--- a/dlt/_workspace/cli/_pipeline_command.py
++++ b/dlt/_workspace/cli/_pipeline_command.py
+@@ -378,6 +378,8 @@ def pipeline_command(
+             schema_str = s.to_dbml()
+         elif format_ == "dot":
+             schema_str = s.to_dot()
++        elif format_ == "mermaid":
++            schema_str = s.to_mermaid()
+         else:
+             schema_str = s.to_pretty_yaml(remove_defaults=remove_defaults_)
+ 
+diff --git a/dlt/_workspace/cli/commands.py b/dlt/_workspace/cli/commands.py
+index 0377cc1b7..afe5c11ce 100644
+--- a/dlt/_workspace/cli/commands.py
++++ b/dlt/_workspace/cli/commands.py
+@@ -489,6 +489,8 @@ The `dlt schema` command will load, validate and print out a dlt schema: `dlt sc
+                 schema_str = s.to_dbml()
+             elif format_ == "dot":
+                 schema_str = s.to_dot()
++            elif format == "mermaid":
++                schema_str = s.to_mermaid()
+             else:
+                 schema_str = s.to_pretty_yaml(remove_defaults=remove_defaults)
+ 
+diff --git a/dlt/common/schema/schema.py b/dlt/common/schema/schema.py
+index a782b2687..564d5b6be 100644
+--- a/dlt/common/schema/schema.py
++++ b/dlt/common/schema/schema.py
+@@ -795,6 +795,42 @@ class Schema:
+         )
+         return dot
+ 
++    def to_mermaid(
++        self,
++        remove_processing_hints: bool = False,
++        hide_columns: bool = False,
++        hide_descriptions: bool = False,
++        include_dlt_tables: bool = True,
++    ) -> str:
++        """Convert schema to a Mermaid diagram string.
++        Args:
++            remove_processing_hints: If True, remove hints used for data processing and redundant information.
++                This reduces the size of the schema and improves readability.
++            hide_columns: If True, the diagram hides columns details. This helps readability of large diagrams.
++            hide_descriptions: If True, hide the column descriptions
++            include_dlt_tables: If `True` (the default), internal dlt tables (`_dlt_version`,
++                `_dlt_loads`, `_dlt_pipeline_state`)
++
++        Returns:
++            A string containing a Mermaid ERdiagram of the schema.
++        """
++        from dlt.helpers.mermaid import schema_to_mermaid
++
++        stored_schema = self.to_dict(
++            # setting this to `True` removes `name` fields that are used in `schema_to_dbml()`
++            # if required, we can refactor `dlt.helpers.dbml` to support this
++            remove_defaults=False,
++            remove_processing_hints=remove_processing_hints,
++        )
++
++        return schema_to_mermaid(
++            stored_schema,
++            references=self.references,
++            hide_columns=hide_columns,
++            hide_descriptions=hide_descriptions,
++            include_dlt_tables=include_dlt_tables,
++        )
++
+     def clone(
+         self,
+         with_name: str = None,
+diff --git a/dlt/common/storages/configuration.py b/dlt/common/storages/configuration.py
+index 4e26ab9cd..46cf89ccc 100644
+--- a/dlt/common/storages/configuration.py
++++ b/dlt/common/storages/configuration.py
+@@ -22,7 +22,7 @@ from dlt.common.typing import Annotated, DictStrAny, DictStrOptionalStr, get_arg
+ from dlt.common.utils import digest128
+ 
+ 
+-TSchemaFileFormat = Literal["json", "yaml", "dbml", "dot"]
++TSchemaFileFormat = Literal["json", "yaml", "dbml", "dot", "mermaid"]
+ SCHEMA_FILES_EXTENSIONS = get_args(TSchemaFileFormat)
+ 
+ 
+diff --git a/dlt/common/storages/schema_storage.py b/dlt/common/storages/schema_storage.py
+index 666c6fd17..e6e8c9dfd 100644
+--- a/dlt/common/storages/schema_storage.py
++++ b/dlt/common/storages/schema_storage.py
+@@ -284,6 +284,8 @@ class SchemaStorage(Mapping[str, Schema]):
+             raise ValueError(extension, "Schema parser for `dbml` not yet implemented")
+         elif extension == "dot":
+             raise ValueError(extension, "Schema parser for `dot` not yet implemented")
++        elif extension == "mermaid":
++            raise ValueError(extension, "Schema parser for `mermaid` not yet implemented")
+         else:
+             raise ValueError(extension)
+         return imported_schema
+diff --git a/dlt/helpers/mermaid.py b/dlt/helpers/mermaid.py
+new file mode 100644
+index 000000000..ecacdfbef
+--- /dev/null
++++ b/dlt/helpers/mermaid.py
+@@ -0,0 +1,125 @@
++"""Build a mermaid graph representation using raw strings without additional dependencies"""
++from enum import Enum
++
++from dlt.common.schema.typing import (
++    TColumnSchema,
++    TReferenceCardinality,
++    TStoredSchema,
++    TTableReferenceStandalone,
++    TTableSchema,
++)
++
++
++INDENT = "    "
++
++
++def schema_to_mermaid(
++    schema: TStoredSchema,
++    *,
++    references: list[TTableReferenceStandalone],
++    hide_columns: bool = False,
++    hide_descriptions: bool = False,
++    include_dlt_tables: bool = True,
++) -> str:
++    mermaid_er_diagram = "erDiagram\n"
++
++    for table_name, table_schema in schema["tables"].items():
++        if not include_dlt_tables and table_name.startswith("_dlt"):
++            continue
++
++        mermaid_er_diagram += INDENT + _to_mermaid_table(
++            table_schema,
++            hide_columns=hide_columns,
++            hide_descriptions=hide_descriptions,
++        )
++
++    for ref in references:
++        if not include_dlt_tables:
++            if ref["table"].startswith("_dlt") or ref["referenced_table"].startswith("_dlt"):
++                continue
++
++        mermaid_er_diagram += INDENT + _to_mermaid_reference(ref)
++
++    return mermaid_er_diagram
++
++
++def _to_mermaid_table(
++    table: TTableSchema, hide_columns: bool = False, hide_descriptions: bool = False
++) -> str:
++    mermaid_table: str = table["name"]
++    mermaid_table += "{\n"
++
++    if hide_columns is False:
++        for column in table["columns"].values():
++            mermaid_table += INDENT + _to_mermaid_column(
++                column,
++                hide_descriptions=hide_descriptions,
++            )
++
++    mermaid_table += "}\n"
++    return mermaid_table
++
++
++# TODO add scale & precision to `data_type`
++def _to_mermaid_column(column: TColumnSchema, hide_descriptions: bool = False) -> str:
++    mermaid_col = column["data_type"] + " " + column["name"]
++    keys = []
++    if column.get("primary_key"):
++        keys.append("PK")
++
++    if column.get("unique"):
++        keys.append("UK")
++
++    if keys:
++        mermaid_col += " " + ",".join(keys)
++
++    if hide_descriptions is False:
++        if description := column.get("description"):
++            mermaid_col += f' "{description}"'
++
++    mermaid_col += "\n"
++    return mermaid_col
++
++
++class TMermaidArrows(str, Enum):
++    ONE_TO_MANY = "||--|{"
++    MANY_TO_ONE = "}|--||"
++    ZERO_TO_MANY = "|o--|{"
++    MANY_TO_ZERO = "}|--o|"
++    ONE_TO_MORE = "||--o{"
++    MORE_TO_ONE = "}o--||"
++    ONE_TO_ONE = "||--||"
++    MANY_TO_MANY = "}|--|{"
++    ZERO_TO_ONE = "|o--o|"
++
++
++_CARDINALITY_ARROW: dict[TReferenceCardinality, TMermaidArrows] = {
++    "one_to_many": TMermaidArrows.ONE_TO_MANY,
++    "many_to_one": TMermaidArrows.MANY_TO_ONE,
++    "zero_to_many": TMermaidArrows.ZERO_TO_MANY,
++    "many_to_zero": TMermaidArrows.MANY_TO_ZERO,
++    "one_to_one": TMermaidArrows.ONE_TO_ONE,
++    "many_to_many": TMermaidArrows.MANY_TO_MANY,
++    "zero_to_one": TMermaidArrows.ZERO_TO_ONE,
++    "one_to_zero": TMermaidArrows.ZERO_TO_ONE,
++}
++
++
++def _to_mermaid_reference(ref: TTableReferenceStandalone) -> str:
++    """Builds references in the following format using cardinality and label to describe
++    the relationship
++
++    <left-entity> [<relationship> <right-entity> : <relationship-label>]
++    """
++    left_table = ref.get("table")
++    right_table = ref.get("referenced_table")
++    cardinality = ref.get("cardinality", "one_to_many")
++    label = ref.get("label", '""')
++    arrow: str = _CARDINALITY_ARROW.get(cardinality).value
++
++    mermaid_reference = f"{left_table} {arrow} {right_table}"
++    if label:
++        mermaid_reference += f" : {label}"
++
++    mermaid_reference += "\n"
++    return mermaid_reference
+diff --git a/docs/website/docs/general-usage/dataset-access/view-dlt-schema.md b/docs/website/docs/general-usage/dataset-access/view-dlt-schema.md
+index e3aa26424..698aebd2b 100644
+--- a/docs/website/docs/general-usage/dataset-access/view-dlt-schema.md
++++ b/docs/website/docs/general-usage/dataset-access/view-dlt-schema.md
+@@ -837,7 +837,7 @@ TableGroup "_dlt" {
+ 
+ 
+ ## Export to Graphviz
+-[Graphviz](https://www.graphviz.org/) is an open soruce graph visualization engine which uses the [DOT language](https://graphviz.org/doc/info/lang.html). dlt allows you to export your `dlt.Schema` as DOT string, which can be rendered using the Python `graphviz` library, lightweight JS libraries (e.g., [d3-graphviz](https://github.com/magjac/d3-graphviz)), or IDE extensions.
++[Graphviz](https://www.graphviz.org/) is an open source graph visualization engine which uses the [DOT language](https://graphviz.org/doc/info/lang.html). dlt allows you to export your `dlt.Schema` as DOT string, which can be rendered using the Python `graphviz` library, lightweight JS libraries (e.g., [d3-graphviz](https://github.com/magjac/d3-graphviz)), or IDE extensions.
+ 
+ Note that the conversion is lossy. You can't fully recreate `dlt.Schema` from a DOT string.
+ 
+@@ -1278,3 +1278,74 @@ _dlt_version:f4:_ -> _dlt_loads:f2:_ [dir=both, penwidth=1, color="#1c1c34", arr
+ </details>
+ 
+ ![graphviz dot render](https://storage.googleapis.com/dlt-blog-images/schema_dot_export.svg)
++
++
++## Export to Mermaid
++
++[Mermaid](https://www.mermaidchart.com/) is a widely-supported diagramming language. dlt allows you to export your `dlt.Schema` as Mermaid string. This can natively rendered by many tools (GitHub markdown, Notion, marimo notebooks).
++
++Note that the conversion is lossy. You can't fully recreate `dlt.Schema` from a Mermaid string.
++
++```py
++schema_mermaid = pipeline.default_schema.to_mermaid()
++```
++
++```sh
++# `chess_pipeline` is the name of the pipeline
++dlt pipeline chess_pipeline schema --format mermaid
++```
++
++<details>
++  <summary>See Mermaid</summary>
++
++  ```mermaid
++    erDiagram
++      _dlt_version{
++      bigint version
++      bigint engine_version
++      timestamp inserted_at
++      text schema_name
++      text version_hash
++      text schema
++  }
++      _dlt_loads{
++      text load_id
++      text schema_name
++      bigint status
++      timestamp inserted_at
++      text schema_version_hash
++  }
++      customers{
++      bigint id PK
++      text name
++      text city
++      text _dlt_load_id
++      text _dlt_id UK
++  }
++      purchases{
++      bigint id PK
++      bigint customer_id
++      bigint inventory_id
++      bigint quantity
++      text date
++      text _dlt_load_id
++      text _dlt_id UK
++  }
++      _dlt_pipeline_state{
++      bigint version
++      bigint engine_version
++      text pipeline_name
++      text state
++      timestamp created_at
++      text version_hash
++      text _dlt_load_id
++      text _dlt_id UK
++  }
++      customers }|--|| _dlt_loads : _dlt_load
++      purchases }|--|| _dlt_loads : _dlt_load
++      purchases ||--|{ customers : ""
++      _dlt_pipeline_state }|--|| _dlt_loads : _dlt_load
++  ```
++</details>
++
++![mermaid render](https://storage.googleapis.com/dlt-blog-images/schema_mermaid_export.png)
+\ No newline at end of file
+diff --git a/docs/website/docs/reference/command-line-interface.md b/docs/website/docs/reference/command-line-interface.md
+index a7bd17ac6..6083fe958 100644
+--- a/docs/website/docs/reference/command-line-interface.md
++++ b/docs/website/docs/reference/command-line-interface.md
+@@ -89,7 +89,7 @@ Shows, converts and upgrades schemas.
+ 
+ **Usage**
+ ```sh
+-dlt schema [-h] [--format {json,yaml,dbml,dot}] [--remove-defaults] file
++dlt schema [-h] [--format {json,yaml,dbml,dot,mermaid}] [--remove-defaults] file
+ ```
+ 
+ **Description**
+@@ -107,7 +107,7 @@ Inherits arguments from [`dlt`](#dlt).
+ 
+ **Options**
+ * `-h, --help` - Show this help message and exit
+-* `--format {json,yaml,dbml,dot}` - Display schema in this format
++* `--format {json,yaml,dbml,dot,mermaid}` - Display schema in this format
+ * `--remove-defaults` - Does not show default hint values
+ 
+ </details>
+@@ -334,7 +334,7 @@ Displays default schema.
+ 
+ **Usage**
+ ```sh
+-dlt pipeline [pipeline_name] schema [-h] [--format {json,yaml,dbml,dot}]
++dlt pipeline [pipeline_name] schema [-h] [--format {json,yaml,dbml,dot,mermaid}]
+     [--remove-defaults]
+ ```
+ 
+@@ -350,7 +350,7 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
+ 
+ **Options**
+ * `-h, --help` - Show this help message and exit
+-* `--format {json,yaml,dbml,dot}` - Display schema in this format
++* `--format {json,yaml,dbml,dot,mermaid}` - Display schema in this format
+ * `--remove-defaults` - Does not show default hint values
+ 
+ </details>
+diff --git a/tests/helpers/test_mermaid.py b/tests/helpers/test_mermaid.py
+new file mode 100644
+index 000000000..b7c32cf7e
+--- /dev/null
++++ b/tests/helpers/test_mermaid.py
+@@ -0,0 +1,533 @@
++import pytest
++
++import dlt
++from dlt.common.schema.typing import TColumnSchema, TTableReferenceStandalone, TTableSchema
++from dlt.helpers.mermaid import (
++    schema_to_mermaid,
++    _to_mermaid_column,
++    _to_mermaid_reference,
++    _to_mermaid_table,
++)
++
++
++@pytest.fixture
++def example_schema() -> dlt.Schema:
++    return dlt.Schema.from_dict(
++        {
++            "version": 2,
++            "version_hash": "iW0MtTw8NXm1r/amMiYpOF63Of44Mx5VfYOh5DM6/7s=",
++            "engine_version": 11,
++            "name": "fruit_with_ref",
++            "tables": {
++                "_dlt_version": {
++                    "name": "_dlt_version",
++                    "columns": {
++                        "version": {"name": "version", "data_type": "bigint", "nullable": False},
++                        "engine_version": {
++                            "name": "engine_version",
++                            "data_type": "bigint",
++                            "nullable": False,
++                        },
++                        "inserted_at": {
++                            "name": "inserted_at",
++                            "data_type": "timestamp",
++                            "nullable": False,
++                        },
++                        "schema_name": {
++                            "name": "schema_name",
++                            "data_type": "text",
++                            "nullable": False,
++                        },
++                        "version_hash": {
++                            "name": "version_hash",
++                            "data_type": "text",
++                            "nullable": False,
++                        },
++                        "schema": {"name": "schema", "data_type": "text", "nullable": False},
++                    },
++                    "write_disposition": "skip",
++                    "resource": "_dlt_version",
++                    "description": "Created by DLT. Tracks schema updates",
++                },
++                "_dlt_loads": {
++                    "name": "_dlt_loads",
++                    "columns": {
++                        "load_id": {"name": "load_id", "data_type": "text", "nullable": False},
++                        "schema_name": {
++                            "name": "schema_name",
++                            "data_type": "text",
++                            "nullable": True,
++                        },
++                        "status": {"name": "status", "data_type": "bigint", "nullable": False},
++                        "inserted_at": {
++                            "name": "inserted_at",
++                            "data_type": "timestamp",
++                            "nullable": False,
++                        },
++                        "schema_version_hash": {
++                            "name": "schema_version_hash",
++                            "data_type": "text",
++                            "nullable": True,
++                        },
++                    },
++                    "write_disposition": "skip",
++                    "resource": "_dlt_loads",
++                    "description": "Created by DLT. Tracks completed loads",
++                },
++                "customers": {
++                    "columns": {
++                        "id": {
++                            "name": "id",
++                            "nullable": False,
++                            "primary_key": True,
++                            "data_type": "bigint",
++                        },
++                        "name": {
++                            "x-annotation-pii": True,
++                            "name": "name",
++                            "data_type": "text",
++                            "nullable": True,
++                        },
++                        "city": {"name": "city", "data_type": "text", "nullable": True},
++                        "_dlt_load_id": {
++                            "name": "_dlt_load_id",
++                            "data_type": "text",
++                            "nullable": False,
++                        },
++                        "_dlt_id": {
++                            "name": "_dlt_id",
++                            "data_type": "text",
++                            "nullable": False,
++                            "unique": True,
++                            "row_key": True,
++                        },
++                    },
++                    "write_disposition": "append",
++                    "name": "customers",
++                    "resource": "customers",
++                    "x-normalizer": {"seen-data": True},
++                },
++                "purchases": {
++                    "columns": {
++                        "id": {
++                            "name": "id",
++                            "nullable": False,
++                            "primary_key": True,
++                            "data_type": "bigint",
++                        },
++                        "customer_id": {
++                            "name": "customer_id",
++                            "data_type": "bigint",
++                            "nullable": True,
++                        },
++                        "inventory_id": {
++                            "name": "inventory_id",
++                            "data_type": "bigint",
++                            "nullable": True,
++                        },
++                        "quantity": {"name": "quantity", "data_type": "bigint", "nullable": True},
++                        "date": {"name": "date", "data_type": "text", "nullable": True},
++                        "_dlt_load_id": {
++                            "name": "_dlt_load_id",
++                            "data_type": "text",
++                            "nullable": False,
++                        },
++                        "_dlt_id": {
++                            "name": "_dlt_id",
++                            "data_type": "text",
++                            "nullable": False,
++                            "unique": True,
++                            "row_key": True,
++                        },
++                    },
++                    "write_disposition": "append",
++                    "references": [
++                        {
++                            "columns": ["customer_id"],
++                            "referenced_table": "customers",
++                            "referenced_columns": ["id"],
++                        }
++                    ],
++                    "name": "purchases",
++                    "resource": "purchases",
++                    "x-normalizer": {"seen-data": True},
++                },
++                "_dlt_pipeline_state": {
++                    "columns": {
++                        "version": {"name": "version", "data_type": "bigint", "nullable": False},
++                        "engine_version": {
++                            "name": "engine_version",
++                            "data_type": "bigint",
++                            "nullable": False,
++                        },
++                        "pipeline_name": {
++                            "name": "pipeline_name",
++                            "data_type": "text",
++                            "nullable": False,
++                        },
++                        "state": {"name": "state", "data_type": "text", "nullable": False},
++                        "created_at": {
++                            "name": "created_at",
++                            "data_type": "timestamp",
++                            "nullable": False,
++                        },
++                        "version_hash": {
++                            "name": "version_hash",
++                            "data_type": "text",
++                            "nullable": True,
++                        },
++                        "_dlt_load_id": {
++                            "name": "_dlt_load_id",
++                            "data_type": "text",
++                            "nullable": False,
++                        },
++                        "_dlt_id": {
++                            "name": "_dlt_id",
++                            "data_type": "text",
++                            "nullable": False,
++                            "unique": True,
++                            "row_key": True,
++                        },
++                    },
++                    "write_disposition": "append",
++                    "file_format": "preferred",
++                    "name": "_dlt_pipeline_state",
++                    "resource": "_dlt_pipeline_state",
++                    "x-normalizer": {"seen-data": True},
++                },
++                "purchases__items": {
++                    "name": "purchases__items",
++                    "columns": {
++                        "purchase_id": {
++                            "name": "purchase_id",
++                            "data_type": "bigint",
++                            "nullable": False,
++                        },
++                        "name": {"name": "name", "data_type": "text", "nullable": False},
++                        "price": {"name": "price", "data_type": "bigint", "nullable": False},
++                        "_dlt_root_id": {
++                            "name": "_dlt_root_id",
++                            "data_type": "text",
++                            "nullable": False,
++                            "root_key": True,
++                        },
++                        "_dlt_parent_id": {
++                            "name": "_dlt_parent_id",
++                            "data_type": "text",
++                            "nullable": False,
++                            "parent_key": True,
++                        },
++                        "_dlt_list_idx": {
++                            "name": "_dlt_list_idx",
++                            "data_type": "bigint",
++                            "nullable": False,
++                        },
++                        "_dlt_id": {
++                            "name": "_dlt_id",
++                            "data_type": "text",
++                            "nullable": False,
++                            "unique": True,
++                            "row_key": True,
++                        },
++                    },
++                    "parent": "purchases",
++                    "x-normalizer": {"seen-data": True},
++                },
++            },
++            "settings": {
++                "detections": ["iso_timestamp"],
++                "default_hints": {
++                    "not_null": [
++                        "_dlt_id",
++                        "_dlt_root_id",
++                        "_dlt_parent_id",
++                        "_dlt_list_idx",
++                        "_dlt_load_id",
++                    ],
++                    "parent_key": ["_dlt_parent_id"],
++                    "root_key": ["_dlt_root_id"],
++                    "unique": ["_dlt_id"],
++                    "row_key": ["_dlt_id"],
++                },
++            },
++            "normalizers": {
++                "names": "snake_case",
++                "json": {"module": "dlt.common.normalizers.json.relational"},
++            },
++            "previous_hashes": [
++                "+stnjP5XdPbykNQJVpK/zpfo0iVbyRFfSIIRzuPzcI4=",
++                "nTU+qnLwEmiMSWTwu+QH321j4zl8NrOVL4Hx/GxQAHE=",
++            ],
++        }
++    )
++
++
++EXPECTED_MERMAID_STR = """
++"""
++
++
++@pytest.mark.parametrize(
++    "hints,expected_mermaid_col",
++    [
++        (
++            {"name": "simple_col", "data_type": "text"},
++            "text simple_col\n",
++        ),
++        (
++            {"name": "unique_col", "data_type": "text", "unique": True},  # default value
++            "text unique_col UK\n",
++        ),
++        (
++            {"name": "unique_col", "data_type": "text", "unique": False},
++            "text unique_col\n",
++        ),
++        (
++            {"name": "primary_key_col", "data_type": "text", "primary_key": False},
++            "text primary_key_col\n",
++        ),
++        (
++            {"name": "primary_key_col", "data_type": "text", "primary_key": True},
++            "text primary_key_col PK\n",
++        ),
++        (
++            {
++                "name": "unique_and_primary_col",
++                "data_type": "text",
++                "primary_key": True,
++                "unique": True,
++            },
++            "text unique_and_primary_col PK,UK\n",
++        ),
++        (  # change the order of `primary_key` and `unique` in dict
++            {
++                "name": "unique_and_primary_col",
++                "data_type": "text",
++                "unique": True,
++                "primary_key": True,
++            },
++            "text unique_and_primary_col PK,UK\n",
++        ),
++        (
++            {"name": "description_col", "data_type": "text", "description": "foo"},
++            'text description_col "foo"\n',
++        ),
++    ],
++)
++def test_to_mermaid_column(hints: TColumnSchema, expected_mermaid_col: str) -> None:
++    """Test `dlt -> mermaid`."""
++    inferred_mermaid_col = _to_mermaid_column(hints)
++    assert inferred_mermaid_col == expected_mermaid_col
++
++
++@pytest.mark.parametrize(
++    "table,expected_mermaid_table",
++    [
++        (
++            {
++                "name": "simple_table",
++                "columns": {
++                    "foo": {"name": "foo", "data_type": "text"},
++                    "bar": {"name": "bar", "data_type": "bigint"},
++                },
++            },
++            "simple_table{\n    text foo\n    bigint bar\n}\n",
++        ),
++    ],
++)
++def test_to_and_from_dbml_table(table: TTableSchema, expected_mermaid_table: str) -> None:
++    """Test `dlt -> mermaid`."""
++    inferred_mermaid_table = _to_mermaid_table(table)
++    assert inferred_mermaid_table == expected_mermaid_table
++
++
++@pytest.mark.parametrize(
++    "reference, expected_mermaid_reference",
++    [
++        (
++            TTableReferenceStandalone(
++                table="customers",
++                columns=["id"],
++                referenced_columns=["customer_id"],
++                referenced_table="orders",
++                label="ordered",
++                cardinality="zero_to_many",
++            ),
++            "customers |o--|{ orders : ordered\n",
++        ),
++        (  # default label
++            TTableReferenceStandalone(
++                table="customers",
++                columns=["id"],
++                referenced_columns=["customer_id"],
++                referenced_table="orders",
++                cardinality="zero_to_many",
++            ),
++            'customers |o--|{ orders : ""\n',
++        ),
++        (  # default cardinality
++            TTableReferenceStandalone(
++                table="customers",
++                columns=["id"],
++                referenced_columns=["customer_id"],
++                referenced_table="orders",
++                label="ordered",
++            ),
++            "customers ||--|{ orders : ordered\n",
++        ),
++    ],
++)
++def test_to_mermaid_reference(
++    reference: TTableReferenceStandalone, expected_mermaid_reference: str
++) -> None:
++    inferred_mermaid_reference = _to_mermaid_reference(reference)
++    assert inferred_mermaid_reference == expected_mermaid_reference
++
++
++def test_schema_to_mermaid_generates_an_er_diagram(example_schema: dlt.Schema):
++    mermaid_str = schema_to_mermaid(example_schema.to_dict(), references=example_schema.references)
++    assert mermaid_str.startswith("erDiagram")
++
++
++@pytest.mark.parametrize("remove_process_hints", [False, True])
++def test_schema_to_mermaid_invariant_to_processing_hint(
++    example_schema: dlt.Schema, remove_process_hints: bool
++):
++    expected_mermaid_str = """\
++erDiagram
++    _dlt_version{
++    bigint version
++    bigint engine_version
++    timestamp inserted_at
++    text schema_name
++    text version_hash
++    text schema
++}
++    _dlt_loads{
++    text load_id
++    text schema_name
++    bigint status
++    timestamp inserted_at
++    text schema_version_hash
++}
++    customers{
++    bigint id PK
++    text name
++    text city
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    purchases{
++    bigint id PK
++    bigint customer_id
++    bigint inventory_id
++    bigint quantity
++    text date
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    _dlt_pipeline_state{
++    bigint version
++    bigint engine_version
++    text pipeline_name
++    text state
++    timestamp created_at
++    text version_hash
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    purchases__items{
++    bigint purchase_id
++    text name
++    bigint price
++    text _dlt_root_id
++    text _dlt_parent_id
++    bigint _dlt_list_idx
++    text _dlt_id UK
++}
++    customers }|--|| _dlt_loads : _dlt_load
++    purchases }|--|| _dlt_loads : _dlt_load
++    purchases ||--|{ customers : ""
++    _dlt_pipeline_state }|--|| _dlt_loads : _dlt_load
++    purchases__items }|--|| purchases : _dlt_parent
++    purchases__items }|--|| purchases : _dlt_root
++"""
++    schema_dict = example_schema.to_dict(remove_processing_hints=remove_process_hints)
++    mermaid_str = schema_to_mermaid(
++        schema_dict,
++        references=example_schema.references,
++    )
++    assert mermaid_str == expected_mermaid_str
++
++
++def test_schema_to_mermaid_exclude_dlt_tables(example_schema: dlt.Schema) -> None:
++    expected_mermaid_str = """\
++erDiagram
++    customers{
++    bigint id PK
++    text name
++    text city
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    purchases{
++    bigint id PK
++    bigint customer_id
++    bigint inventory_id
++    bigint quantity
++    text date
++    text _dlt_load_id
++    text _dlt_id UK
++}
++    purchases__items{
++    bigint purchase_id
++    text name
++    bigint price
++    text _dlt_root_id
++    text _dlt_parent_id
++    bigint _dlt_list_idx
++    text _dlt_id UK
++}
++    purchases ||--|{ customers : ""
++    purchases__items }|--|| purchases : _dlt_parent
++    purchases__items }|--|| purchases : _dlt_root
++"""
++
++    schema_dict = example_schema.to_dict()
++    mermaid_str = schema_to_mermaid(
++        schema_dict,
++        references=example_schema.references,
++        include_dlt_tables=False,
++    )
++    assert mermaid_str == expected_mermaid_str
++
++
++def test_schema_to_mermaid_hide_columns(example_schema: dlt.Schema) -> None:
++    expected_mermaid_str = """\
++erDiagram
++    _dlt_version{
++}
++    _dlt_loads{
++}
++    customers{
++}
++    purchases{
++}
++    _dlt_pipeline_state{
++}
++    purchases__items{
++}
++    customers }|--|| _dlt_loads : _dlt_load
++    purchases }|--|| _dlt_loads : _dlt_load
++    purchases ||--|{ customers : ""
++    _dlt_pipeline_state }|--|| _dlt_loads : _dlt_load
++    purchases__items }|--|| purchases : _dlt_parent
++    purchases__items }|--|| purchases : _dlt_root
++"""
++
++    schema_dict = example_schema.to_dict()
++    mermaid_str = schema_to_mermaid(
++        schema_dict,
++        references=example_schema.references,
++        hide_columns=True,
++    )
++    assert mermaid_str == expected_mermaid_str
+
+
+===== COMMIT 661c6c1a =====
+
+
+commit 661c6c1ad
+Author: rudolfix
+Date: 2025-11-24
+
+    fix flaky dashboard tests (#3370)
+
+diff --git a/dlt/_workspace/helpers/dashboard/runner.py b/dlt/_workspace/helpers/dashboard/runner.py
+index 71a66ffda..0f06fdfd7 100644
+--- a/dlt/_workspace/helpers/dashboard/runner.py
++++ b/dlt/_workspace/helpers/dashboard/runner.py
+@@ -11,16 +11,6 @@ import urllib
+ from dlt.common.exceptions import MissingDependencyException
+ 
+ 
+-def _detect_dashboard_command() -> str:
+-    command = sys.argv[1]
+-    if command == "pipeline":
+-        return f"dlt pipeline {sys.argv[2]} show"
+-    elif command == "dashboard":
+-        return "dlt dashboard"
+-    else:
+-        raise ValueError(f"Invalid command: {command}")
+-
+-
+ # keep this, will raise if user tries to run dashboard without dependencies
+ try:
+     import marimo
+@@ -28,7 +18,7 @@ try:
+     import ibis
+ except ModuleNotFoundError:
+     raise MissingDependencyException(
+-        _detect_dashboard_command(),
++        "Workspace Dashboard",
+         ['dlt["workspace"]'],
+         "to install the dlt workspace extra.",
+     )
+diff --git a/dlt/_workspace/helpers/dashboard/strings.py b/dlt/_workspace/helpers/dashboard/strings.py
+index ab8c8fc04..91b767b63 100644
+--- a/dlt/_workspace/helpers/dashboard/strings.py
++++ b/dlt/_workspace/helpers/dashboard/strings.py
+@@ -1,7 +1,6 @@
+ #
+ # App general
+ #
+-import marimo as _mo
+ 
+ # Reusable string parts
+ 
+diff --git a/docs/docs_tools/examples/prepare_examples_tests.py b/docs/docs_tools/examples/prepare_examples_tests.py
+index a1dad1b57..b5dcc69ec 100644
+--- a/docs/docs_tools/examples/prepare_examples_tests.py
++++ b/docs/docs_tools/examples/prepare_examples_tests.py
+@@ -13,7 +13,7 @@ EXAMPLES_DIR = "./examples"
+ # settings
+ SKIP_FOLDERS = ["archive", ".", "_", "local_cache"]
+ # @pytest.mark.rfam
+-SKIP_EXAMPLES: List[str] = ["backfill_in_chunks", "connector_x_arrow"]
++SKIP_EXAMPLES: List[str] = ["backfill_in_chunks", "connector_x_arrow", "transformers"]
+ SKIP_FORK_EXAMPLES: List[str] = ["custom_destination_lancedb"]
+ 
+ 
+diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
+index eff225560..ba3458d2a 100644
+--- a/tests/e2e/helpers/dashboard/test_e2e.py
++++ b/tests/e2e/helpers/dashboard/test_e2e.py
+@@ -51,12 +51,16 @@ def _open_section(
+     close_other_sections: bool = True,
+ ) -> None:
+     if close_other_sections:
+-        for s in known_sections:
+-            if s != section:
+-                page.get_by_role("switch", name=s).uncheck()
++        _close_sections(page, section)
+     page.get_by_role("switch", name=section).check()
+ 
+ 
++def _close_sections(page: Page, skip_section: str = None) -> None:
++    for s in known_sections:
++        if s != skip_section:
++            page.get_by_role("switch", name=s).uncheck()
++
++
+ def test_page_overview(page: Page):
+     _go_home(page)
+ 
+@@ -120,22 +124,34 @@ def test_multi_schema_selection(page: Page, multi_schema_pipeline: Any):
+     for section in ["schema", "data"]:
+         _open_section(page, section)  # type: ignore[arg-type]
+ 
++        # NOTE: this is using unspecific selector and may select other dropdowns id present (?)
+         schema_selector = page.get_by_test_id("marimo-plugin-dropdown")
+         schema_selector.select_option("fruitshop_customers")
++        expect(schema_selector).to_have_value("fruitshop_customers")
++        schema_selector.scroll_into_view_if_needed()
++
+         expect(page.get_by_text("customers", exact=True).nth(0)).to_be_visible()
+         expect(page.get_by_text("inventory", exact=True)).to_have_count(0)
+         expect(page.get_by_text("purchases", exact=True)).to_have_count(0)
+ 
+         schema_selector.select_option("fruitshop_inventory")
++        expect(schema_selector).to_have_value("fruitshop_inventory")
++
+         expect(page.get_by_text("inventory", exact=True).nth(0)).to_be_visible()
+         expect(page.get_by_text("customers", exact=True)).to_have_count(0)
+         expect(page.get_by_text("purchases", exact=True)).to_have_count(0)
+ 
+         schema_selector.select_option("fruitshop_purchases")
++        expect(schema_selector).to_have_value("fruitshop_purchases")
++
+         expect(page.get_by_text("purchases", exact=True).nth(0)).to_be_visible()
+         expect(page.get_by_text("inventory", exact=True)).to_have_count(0)
+         expect(page.get_by_text("customers", exact=True)).to_have_count(0)
+ 
++        _close_sections(page)
++        # make sure schema selector removed from page
++        expect(schema_selector).not_to_be_attached()
++
+ 
+ def test_simple_incremental_pipeline(page: Page, simple_incremental_pipeline: Any):
+     #
+
+
+===== COMMIT 81ebbcca =====
+
+
+commit 81ebbcca4
+Author: anuunchin
+Date: 2025-11-24
+
+    Uncalled source in pipeline.run( (#3369)
+
+diff --git a/dlt/extract/extract.py b/dlt/extract/extract.py
+index 60e388620..e25d3e9d6 100644
+--- a/dlt/extract/extract.py
++++ b/dlt/extract/extract.py
+@@ -52,7 +52,7 @@ from dlt.extract.items_transform import ItemTransform
+ from dlt.common.metrics import DataWriterAndCustomMetrics
+ from dlt.extract.pipe_iterator import PipeIterator
+ from dlt.extract.source import DltSource
+-from dlt.extract.reference import SourceReference
++from dlt.extract.reference import SourceReference, SourceFactory
+ from dlt.extract.resource import DltResource
+ from dlt.extract.storage import ExtractStorage
+ from dlt.extract.extractors import ObjectExtractor, ArrowExtractor, Extractor, ModelExtractor
+@@ -125,6 +125,11 @@ def data_to_sources(
+             # many resources with the same name may be present
+             r_ = resources.setdefault(data_item.name, [])
+             r_.append(data_item)
++        elif isinstance(data_item, SourceFactory):
++            source = data_item()
++            if schema:
++                source.schema = schema
++            sources.append(source)
+         else:
+             # iterator/iterable/generator
+             # create resource first without table template
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index cc1b25a75..dc195605c 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -42,7 +42,7 @@ from dlt.common.runtime.collector import DictCollector, LogCollector
+ from dlt.common.schema.exceptions import TableIdentifiersFrozen
+ from dlt.common.schema.typing import TColumnSchema
+ from dlt.common.schema.utils import get_first_column_name_with_prop, new_column, new_table
+-from dlt.common.typing import DictStrAny
++from dlt.common.typing import DictStrAny, TDataItems
+ from dlt.common.utils import uniq_id
+ from dlt.common.schema import Schema
+ 
+@@ -1848,12 +1848,9 @@ def test_invalid_data_edge_cases() -> None:
+     def my_source():
+         return dlt.resource(itertools.count(start=1), name="infinity").add_limit(5)
+ 
+-    # this function will be evaluated like any other. it returns resource which in the pipe
+-    # is just an iterator and it will be iterated
+-    # TODO: we should probably block that behavior
+     pipeline.run(my_source)
+ 
+-    assert pipeline.last_trace.last_normalize_info.row_counts["my_source"] == 5
++    assert pipeline.last_trace.last_normalize_info.row_counts["infinity"] == 5
+ 
+     def res_return():
+         return dlt.resource(itertools.count(start=1), name="infinity").add_limit(5)
+@@ -1876,7 +1873,7 @@ def test_invalid_data_edge_cases() -> None:
+         yield dlt.resource(itertools.count(start=1), name="infinity").add_limit(5)
+ 
+     pipeline.run(my_source_yield)
+-    assert pipeline.last_trace.last_normalize_info.row_counts["my_source_yield"] == 5
++    assert pipeline.last_trace.last_normalize_info.row_counts["infinity"] == 5
+ 
+     # pipeline = dlt.pipeline(pipeline_name="invalid", destination=DUMMY_COMPLETE)
+     # with pytest.raises(PipelineStepFailed) as pip_ex:
+@@ -4347,6 +4344,41 @@ def test_signal_extract_step_shutdown(sig: int) -> None:
+     _done = True
+ 
+ 
++def test_uninitialized_source_factory() -> None:
++    """Test that passing an uncalled source factory preserves resource-level hints such as write_disposition"""
++    data = [
++        {"id": 1, "name": "bulbasaur", "size": {"weight": 6.9, "height": 0.7}},
++        {"id": 4, "name": "charmander", "size": {"weight": 8.5, "height": 0.6}},
++        {"id": 25, "name": "pikachu", "size": {"weight": 6, "height": 0.4}},
++    ]
++
++    @dlt.resource(
++        name="pokemon_resource",
++        write_disposition="merge",
++        primary_key="id",
++    )
++    def pokemon() -> TDataItems:
++        yield data
++
++    @dlt.source(name="pokemon_source")
++    def pokemon_source():
++        yield pokemon
++
++    pipeline = dlt.pipeline(
++        pipeline_name=uniq_id(),
++        destination="duckdb",
++        dataset_name="pokemon_data",
++    )
++
++    pipeline.run(pokemon_source)
++    pipeline.run(pokemon_source)
++
++    with pipeline.sql_client() as client:
++        rows = client.execute_sql("SELECT * FROM pokemon_resource")
++
++    assert len(rows) == 3
++
++
+ def test_cleanup() -> None:
+     # this must happen after all forked tests (problems with tests teardowns in other tests)
+     pass
+
+
+===== COMMIT 033312d3 =====
+
+
+commit 033312d37
+Author: anuunchin
+Date: 2025-11-23
+
+    Fix: The child table column remains in the schema as a partial column with seen-null-first=True (#3131)
+
+diff --git a/dlt/common/schema/utils.py b/dlt/common/schema/utils.py
+index fd5df15f9..0e5303137 100644
+--- a/dlt/common/schema/utils.py
++++ b/dlt/common/schema/utils.py
+@@ -696,6 +696,23 @@ def remove_processing_hints(tables: TSchemaTables) -> TSchemaTables:
+     return tables
+ 
+ 
++def has_seen_null_first_hint(column_schema: TColumnSchema) -> bool:
++    """Checks if `column_schema` has seen seen-null-first hint set to True in the x-normalizer hints."""
++    return bool(column_schema.get("x-normalizer", {}).get("seen-null-first"))
++
++
++def remove_seen_null_first_hint(column_schema: TColumnSchema) -> TColumnSchema:
++    """Removes seen-null-first hint from the x-normalizer hints in `column_schema` in place,
++    if the x-normalizer section becomes empty after removing the hint, it is also removed, returns the modified input
++    """
++    x_normalizer = column_schema.setdefault("x-normalizer", {})
++    if x_normalizer.get("seen-null-first"):
++        x_normalizer.pop("seen-null-first", None)
++    if not x_normalizer:
++        column_schema.pop("x-normalizer", None)
++    return column_schema
++
++
+ def get_processing_hints(
+     tables: TSchemaTables,
+ ) -> Tuple[Dict[str, List[str]], Dict[str, Dict[str, List[str]]]]:
+diff --git a/dlt/normalize/items_normalizers.py b/dlt/normalize/items_normalizers.py
+index b0f71be48..8acced9ac 100644
+--- a/dlt/normalize/items_normalizers.py
++++ b/dlt/normalize/items_normalizers.py
+@@ -17,7 +17,6 @@ from dlt.common.metrics import DataWriterMetrics
+ from dlt.common.normalizers.json.relational import DataItemNormalizer as RelationalNormalizer
+ from dlt.common.normalizers.json.helpers import get_root_row_id_type
+ from dlt.common.runtime import signals
+-from dlt.common.schema import utils
+ from dlt.common.schema.typing import (
+     C_DLT_ID,
+     C_DLT_LOAD_ID,
+@@ -32,7 +31,10 @@ from dlt.common.schema.utils import (
+     dlt_load_id_column,
+     has_table_seen_data,
+     normalize_table_identifiers,
++    is_nested_table,
++    has_seen_null_first_hint,
+ )
++from dlt.common.schema import utils
+ from dlt.common.schema.exceptions import CannotCoerceColumnException, CannotCoerceNullException
+ from dlt.common.time import normalize_timezone
+ from dlt.common.utils import read_dialect_and_sql
+@@ -469,6 +471,7 @@ class JsonLItemsNormalizer(ItemsNormalizer):
+                                 else parent_table or table_name
+                             ),  # parent_table, if present, exists in the schema
+                         )
++
+                         partial_table, filters = schema.apply_schema_contract(
+                             schema_contract, partial_table, data_item=row
+                         )
+@@ -520,8 +523,45 @@ class JsonLItemsNormalizer(ItemsNormalizer):
+                 pass
+             # kill job if signalled
+             signals.raise_if_signalled()
++
++        self._clean_seen_null_first_hint(schema_update)
++
+         return schema_update
+ 
++    def _clean_seen_null_first_hint(self, schema_update: TSchemaUpdate) -> None:
++        """
++        Performs schema and schema update cleanup related to `seen-null-first` hints by
++        removing entire columns with `seen-null-first` hints from parent tables
++        when those columns have been converted to nested tables.
++
++        NOTE: The `seen-null-first` hint is used during schema inference to track columns
++        that were first encountered with null values. In cases where subsequent
++        non-null values create a nested table, the entire
++        column with the `seen-null-first` hint in parent table becomes obsolete.
++
++        Args:
++            schema_update (TSchemaUpdate): Dictionary mapping table names to their table updates.
++        """
++        schema_update_copy = schema_update.copy()
++        for table_name, table_updates in schema_update_copy.items():
++            last_ident_path = self._full_ident_path_tracker.get(table_name)[-1]
++
++            for table_update in table_updates:
++                # Remove the entire column with hint from parent table if it was created as a nested table
++                if is_nested_table(table_update):
++                    parent_name = table_update.get("parent")
++                    parent_col_schemas = self.schema.get_table_columns(
++                        parent_name, include_incomplete=True
++                    )
++                    parent_col_schema = parent_col_schemas.get(last_ident_path)
++
++                    if parent_col_schema and has_seen_null_first_hint(parent_col_schema):
++                        parent_col_schemas.pop(last_ident_path)
++                        parent_updates = schema_update.get(parent_name, [])
++                        for j, parent_update in enumerate(parent_updates):
++                            if last_ident_path in parent_update["columns"]:
++                                schema_update[parent_name][j]["columns"].pop(last_ident_path)
++
+     def _coerce_row(
+         self, table_name: str, parent_table: str, row: StrAny
+     ) -> Tuple[DictStrAny, TPartialTableSchema]:
+diff --git a/dlt/normalize/normalize.py b/dlt/normalize/normalize.py
+index f12b71172..c3e28f3f2 100644
+--- a/dlt/normalize/normalize.py
++++ b/dlt/normalize/normalize.py
+@@ -13,7 +13,11 @@ from dlt.common.runners import TRunMetrics, Runnable, NullExecutor
+ from dlt.common.runtime import signals
+ from dlt.common.runtime.collector import Collector, NULL_COLLECTOR
+ from dlt.common.schema.typing import TStoredSchema, TTableSchema
+-from dlt.common.schema.utils import merge_schema_updates
++from dlt.common.schema.utils import (
++    merge_schema_updates,
++    has_seen_null_first_hint,
++    remove_seen_null_first_hint,
++)
+ from dlt.common.storages import (
+     NormalizeStorage,
+     SchemaStorage,
+@@ -159,7 +163,9 @@ class Normalize(Runnable[Executor], WithStepInfo[NormalizeMetrics, NormalizeInfo
+         )
+         return result
+ 
+-    def clean_x_normalizer(self, load_id: str, table_name: str, table_schema: TTableSchema) -> None:
++    def clean_x_normalizer(
++        self, load_id: str, table_name: str, table_schema: TTableSchema, path_separator: str
++    ) -> None:
+         x_normalizer = table_schema.setdefault("x-normalizer", {})
+         # drop evolve once for all tables that seen data
+         x_normalizer.pop("evolve-columns-once", None)
+@@ -170,14 +176,22 @@ class Normalize(Runnable[Executor], WithStepInfo[NormalizeMetrics, NormalizeInfo
+             )
+             x_normalizer["seen-data"] = True
+ 
+-        # Handle column-level x-normalizer
+-        # drop seen-null-first flag if data type was set
+-        for column in table_schema.get("columns", {}).values():
+-            col_x_normalizer = column.setdefault("x-normalizer", {})
+-            if col_x_normalizer.get("seen-null-first") and "data_type" in column:
+-                col_x_normalizer.pop("seen-null-first", None)
+-            if not col_x_normalizer:
+-                column.pop("x-normalizer", None)
++        # Handle column-level seen-null-first hint in x-normalizer hints
++        col_schemas = table_schema.get("columns", {})
++        for col_name, col_schema in list(col_schemas.items()):
++            if has_seen_null_first_hint(col_schema):
++                if "data_type" in col_schema:
++                    # 1. Remove seen-null-first hint if data type is set
++                    remove_seen_null_first_hint(col_schema)
++                else:
++                    # 2. Remove entire column if it was created as compound column(s)
++                    # TODO: use column ident paths (also in JsonLItemsNormalizer._coerce_null_value),
++                    # path separator is not reliable with shortened names
++                    if any(
++                        col.startswith(col_name + path_separator)
++                        for col in list(col_schemas.keys())
++                    ):
++                        table_schema["columns"].pop(col_name)
+ 
+     def spool_files(
+         self, load_id: str, schema: Schema, map_f: TMapFuncType, files: Sequence[str]
+@@ -196,7 +210,7 @@ class Normalize(Runnable[Executor], WithStepInfo[NormalizeMetrics, NormalizeInfo
+         for table_name in table_metrics:
+             table = schema.tables[table_name]
+             verify_normalized_table(schema, table, self.config.destination_capabilities)
+-            self.clean_x_normalizer(load_id, table_name, table)
++            self.clean_x_normalizer(load_id, table_name, table, schema.naming.PATH_SEPARATOR)
+         # schema is updated, save it to schema volume
+         if schema.is_modified:
+             logger.info(
+diff --git a/tests/normalize/test_json_item_inference.py b/tests/normalize/test_json_item_inference.py
+index e844a8e43..99a3303f7 100644
+--- a/tests/normalize/test_json_item_inference.py
++++ b/tests/normalize/test_json_item_inference.py
+@@ -610,6 +610,18 @@ def test_coerce_null_value_over_not_null(item_normalizer: JsonLItemsNormalizer)
+         item_normalizer._coerce_row("event_user", None, row)
+ 
+ 
++def _normalize_items_chunk(
++    root_table_name: str, items: TDataItems, item_normalizer: JsonLItemsNormalizer
++) -> TSchemaUpdate:
++    schema_update = item_normalizer._normalize_chunk(
++        root_table_name=root_table_name,
++        items=items,
++        may_have_pua=False,
++        skip_write=True,
++    )
++    return schema_update
++
++
+ @pytest.mark.parametrize(
+     "nested_item",
+     [
+@@ -625,69 +637,67 @@ def test_coerce_null_value_over_not_null(item_normalizer: JsonLItemsNormalizer)
+ def test_coerce_null_value_in_nested_table(
+     item_normalizer: JsonLItemsNormalizer, nested_item: TDataItems
+ ) -> None:
+-    """Ensure that a column previously created as a child table
+-    does not attempt new column updates in a subsequent run when it has no values."""
+-
+-    def _normalize_items_chunk(items: TDataItems) -> TSchemaUpdate:
+-        schema_update = item_normalizer._normalize_chunk(
+-            root_table_name="nested",
+-            items=items,
+-            may_have_pua=False,
+-            skip_write=True,
+-        )
+-        return schema_update
+-
+-    # use very long column names
+-    col_name_a = "a" * (item_normalizer.naming.max_length + 1)
+-    norm_col_name_a = item_normalizer.naming.normalize_path(col_name_a)
+-    nested_tbl_name = item_normalizer.naming.shorten_fragments("nested", f"{norm_col_name_a}")
+-
+-    col_name_b = "b" * (item_normalizer.naming.max_length + 1)
+-    norm_col_name_b = item_normalizer.naming.normalize_path(col_name_b)
+-    nested_nested_tbl_name = item_normalizer.naming.shorten_fragments(
+-        "nested", f"{norm_col_name_a}", f"{norm_col_name_b}"
++    """Ensure that a column previously created as a nested table
++    does not attempt new column updates in the parent table in a subsequent run when it has no values.
++    """
++
++    # Create column names that exceed max identifier length
++    # to ensure that shortened names of nested tables are internally still correctly
++    # tracked back to column names in the respective parent tables
++    col_a, col_b = (ch * (item_normalizer.naming.max_length + 1) for ch in "ab")
++    norm_col_a, norm_col_b = (item_normalizer.naming.normalize_path(col) for col in (col_a, col_b))
++    nested_tbl = item_normalizer.naming.shorten_fragments("nested", f"{norm_col_a}")
++    nested_nested_tbl = item_normalizer.naming.shorten_fragments(
++        "nested", f"{norm_col_a}", f"{norm_col_b}"
+     )
+ 
+-    # create parent and child tables
++    # create parent and nested tables
+     schema_update = _normalize_items_chunk(
++        "nested",
+         [
+             {
+                 "timestamp": 82178.1298812,
+-                col_name_a: [
++                col_a: [
+                     {
+                         "timestamp": 82178.1298812,
+-                        col_name_b: nested_item,
++                        col_b: nested_item,
+                     }
+                 ],
+             },
+-        ]
++        ],
++        item_normalizer,
+     )
+     assert "nested" in schema_update
+-    assert nested_tbl_name in schema_update
+-    assert nested_nested_tbl_name in schema_update
++    assert nested_tbl in schema_update
++    assert nested_nested_tbl in schema_update
+ 
+-    # verify that empty child table columns don't create schema updates
++    # verify that columns that have been created as nested tables, don't create
++    # schema updates with seen-null-first hint in parent table
+     schema_update = _normalize_items_chunk(
++        "nested",
+         [
+             {
+                 "timestamp": 82178.1298812,
+-                col_name_a: [
++                col_a: [
+                     {
+                         "timestamp": 82178.1298812,
+-                        col_name_b: None,
++                        col_b: None,
+                     }
+                 ],
+             },
+-        ]
++        ],
++        item_normalizer,
+     )
+     assert not schema_update
+     schema_update = _normalize_items_chunk(
++        "nested",
+         [
+             {
+                 "timestamp": 82178.1298812,
+-                col_name_a: None,
++                col_a: None,
+             },
+-        ]
++        ],
++        item_normalizer,
+     )
+     assert not schema_update
+ 
+diff --git a/tests/pipeline/test_import_export_schema.py b/tests/pipeline/test_import_export_schema.py
+index 55bad3d6c..54d5e8d3b 100644
+--- a/tests/pipeline/test_import_export_schema.py
++++ b/tests/pipeline/test_import_export_schema.py
+@@ -1,3 +1,4 @@
++from typing import List, Any, Dict
+ import dlt, os
+ import pytest
+ 
+@@ -246,3 +247,150 @@ def test_import_schema_preserves_max_nesting(table_nesting: int) -> None:
+         assert "my_table__children" not in p.default_schema.tables
+     else:
+         assert "my_table__children" in p.default_schema.tables
++
++
++def test_empty_column_later_becoming_child_table_removed() -> None:
++    """
++    Test that columns with `seen-null-first` hints are properly removed
++    from the export schema when they become nested tables.
++    """
++    name = "schema_test" + uniq_id()
++    p = dlt.pipeline(
++        pipeline_name=name,
++        destination=dummy(completed_prob=1),
++        export_schema_path=EXPORT_SCHEMA_PATH,
++    )
++
++    # Create column names that exceed max identifier length
++    # to ensure that shortened names of nested tables are internally still correctly
++    # tracked back to column names in the respective parent tables
++    col_a, col_b = (ch * (p.destination.capabilities().max_identifier_length + 1) for ch in "ab")
++
++    @dlt.resource(table_name="my_table")
++    def nested_data(with_grandchild: bool):
++        nested_example_data = EXAMPLE_DATA[0]
++        children_list: List[Dict[str, Any]] = [{"id": 2, "name": "Max"}]
++        nested_example_data[col_a] = children_list
++        if with_grandchild:
++            children_list[0][col_b] = [{"id": 3, "name": "Maximilian"}]
++        else:
++            children_list[0][col_b] = None
++        yield nested_example_data
++
++    # 1. Column 'b' is null, should get 'seen-null-first' hint
++    p.run(nested_data(with_grandchild=False))
++
++    # Calculate expected table and column names
++    norm_col_a, norm_col_b = (
++        p.default_schema.naming.shorten_fragments(col) for col in [col_a, col_b]
++    )
++
++    nested_tbl = p.default_schema.naming.shorten_fragments("my_table", f"{norm_col_a}")
++    nested_nested_tbl = p.default_schema.naming.shorten_fragments(
++        "my_table", f"{norm_col_a}", f"{norm_col_b}"
++    )
++
++    # Column 'b' should exist with 'seen-null-first' hint in the table nested_tbl_name
++    export_schema = _get_export_schema(name)
++    assert set(export_schema.tables[nested_tbl]["columns"].keys()) == {
++        "_dlt_list_idx",
++        "_dlt_parent_id",
++        "id",
++        "_dlt_id",
++        "name",
++        norm_col_b,
++    }
++    assert (
++        export_schema.tables[nested_tbl]["columns"]
++        .get(norm_col_b)["x-normalizer"]
++        .get("seen-null-first", False)
++    )
++
++    # 2. Column 'b' gets complex data, should create new nested table
++    p.run(nested_data(with_grandchild=True))
++
++    # Column 'b' should be removed from the parent table nested_tbl_name
++    # because it now has its own nested table nested_nested_tbl_name
++    export_schema = _get_export_schema(name)
++    assert set(export_schema.tables[nested_tbl]["columns"].keys()) == {
++        "_dlt_list_idx",
++        "_dlt_parent_id",
++        "id",
++        "_dlt_id",
++        "name",
++    }
++    assert nested_tbl in export_schema.tables
++    assert nested_nested_tbl in export_schema.tables
++    assert nested_tbl in p.default_schema.tables
++    assert nested_nested_tbl in p.default_schema.tables
++
++
++@pytest.mark.parametrize(
++    "use_long_col_name",
++    [True, False],
++    ids=["long_col_names", "short_col_names"],
++)
++def test_empty_column_later_becoming_compound_columns_removed(use_long_col_name: bool) -> None:
++    """
++    Test that columns with `seen-null-first` hints are properly removed
++    from the export schema when they become compound column(s) in the same table.
++    """
++    name = "schema_test" + uniq_id()
++    p = dlt.pipeline(
++        pipeline_name=name,
++        destination=dummy(completed_prob=1),
++        export_schema_path=EXPORT_SCHEMA_PATH,
++    )
++
++    col_a = (
++        "a" * (p.destination.capabilities().max_identifier_length + 1) if use_long_col_name else "a"
++    )
++
++    # 1. Column 'a' is null, should get 'seen-null-first' hint
++    p.run([{"id": 1, col_a: None}], table_name="my_table")
++
++    # Calculate column name
++    norm_col_a = p.default_schema.naming.shorten_fragments(col_a)
++
++    # Column 'a' should exist with 'seen-null-first' hint in the table
++    export_schema = _get_export_schema(name)
++    assert set(export_schema.tables["my_table"]["columns"].keys()) == {
++        "id",
++        norm_col_a,
++        "_dlt_id",
++        "_dlt_load_id",
++    }
++    assert (
++        export_schema.tables["my_table"]["columns"]
++        .get(norm_col_a)["x-normalizer"]
++        .get("seen-null-first", False)
++    )
++
++    # 2. Column 'a' gets complex data, should create compound columns
++    p.run([{"id": 1, col_a: {"col1": 1, "col2": "hey"}}], table_name="my_table")
++
++    # Column 'a' should be removed from the table
++    # because the values were normalized to compound columns
++    export_schema = _get_export_schema(name)
++    if not use_long_col_name:
++        assert set(export_schema.tables["my_table"]["columns"].keys()) == {
++            "id",
++            "_dlt_id",
++            "_dlt_load_id",
++            "a__col1",
++            "a__col2",
++        }
++    else:
++        # TODO: Currently we don't properly remove columns with `seen-null-first` hint
++        # when they become compound column(s) in the same table if they have very long names
++        # because we're merely using the naming convention's path separator
++        # to detect whether a column is a compund column.
++        # See Normalize.clean_x_normalizer and JsonLItemsNormalizer._coerce_null_value
++        assert set(export_schema.tables["my_table"]["columns"].keys()) == {
++            "id",
++            "_dlt_id",
++            "_dlt_load_id",
++            norm_col_a,
++            p.default_schema.naming.shorten_fragments(norm_col_a, "col1"),
++            p.default_schema.naming.shorten_fragments(norm_col_a, "col2"),
++        }
+
+
+===== COMMIT 5242790b =====
+
+
+commit 5242790b1
+Author: rudolfix
+Date: 2025-11-22
+
+    (fix) use sparse checkout for dlt init dlthub (#3356)
+
+diff --git a/dlt/_workspace/cli/_ai_command.py b/dlt/_workspace/cli/_ai_command.py
+index 3adb0ca7e..cc4f97b51 100644
+--- a/dlt/_workspace/cli/_ai_command.py
++++ b/dlt/_workspace/cli/_ai_command.py
+@@ -119,7 +119,9 @@ def vibe_source_setup(
+     """Copies files from vibe sources repo into the current working folder"""
+ 
+     fmt.echo("Looking up in dltHub for rules, docs and snippets for %s..." % fmt.bold(source))
+-    src_storage = git.get_fresh_repo_files(location, get_dlt_repos_dir(), branch=branch)
++    src_storage = git.get_fresh_repo_files(
++        location, get_dlt_repos_dir(), branch=branch, path=source
++    )
+     if not src_storage.has_folder(source):
+         fmt.warning("We have nothing for %s at dltHub yet." % fmt.bold(source))
+         return
+diff --git a/dlt/common/libs/git.py b/dlt/common/libs/git.py
+index 9baa9cba8..9e1c1eae5 100644
+--- a/dlt/common/libs/git.py
++++ b/dlt/common/libs/git.py
+@@ -70,14 +70,37 @@ def get_default_branch(repo: Repo) -> str:
+ 
+ 
+ def ensure_remote_head(
+-    repo_path: str, branch: Optional[str] = None, with_git_command: Optional[str] = None
++    repo_path: str,
++    branch: Optional[str] = None,
++    with_git_command: Optional[str] = None,
++    path: Optional[str] = None,
+ ) -> None:
++    """Updates repository from origin and ensures it's clean and synced.
++
++    Uses sparse checkout when path is specified, fetching only the specified
++    directory instead of the entire repository tree.
++
++    Args:
++        repo_path: Local path to the git repository.
++        branch: Branch to checkout. Defaults to repository's default branch.
++        with_git_command: Custom GIT_SSH_COMMAND for authentication.
++        path: Directory path for sparse checkout. When set, only this path
++            is checked out, reducing download size and time.
++
++    Raises:
++        RepositoryDirtyError: If repository has uncommitted changes or is
++            not synced with origin.
++    """
+     from git import Repo, RepositoryDirtyError
+ 
+     # update remotes and check if heads are same. ignores locally modified files
+     with Repo(repo_path) as repo:
+         # use custom environment if specified
+         with repo.git.custom_environment(GIT_SSH_COMMAND=with_git_command):
++            # if path is set, use sparse checkout
++            if path is not None:
++                # assume that sparse checkout was enabled when cloning
++                repo.git.sparse_checkout("set", path)
+             # checkout branch before fetching
+             repo.git.checkout(branch or get_default_branch(repo))
+             # update origin
+@@ -92,14 +115,35 @@ def clone_repo(
+     clone_path: str,
+     branch: Optional[str] = None,
+     with_git_command: Optional[str] = None,
++    path: Optional[str] = None,
+ ) -> Repo:
+     _import_git()
+ 
+     from git import Repo
+ 
+-    repo = Repo.clone_from(repository_url, clone_path, env=dict(GIT_SSH_COMMAND=with_git_command))
++    if path is not None:
++        # set of options that prevents downloading all blobs
++        multi_options = [
++            "--depth=1",
++            "--filter=blob:none",
++            "--no-checkout",
++        ]
++    else:
++        multi_options = None
++    repo = Repo.clone_from(
++        repository_url,
++        clone_path,
++        env=dict(GIT_SSH_COMMAND=with_git_command),
++        multi_options=multi_options,
++    )
++    # set up sparse mode to checkout paths on demand
++    if path is not None:
++        repo.git.sparse_checkout("init", "--cone")
++        repo.git.sparse_checkout("set", path)
+     if branch:
+         repo.git.checkout(branch)
++    elif path is not None:
++        repo.git.checkout()
+     return repo
+ 
+ 
+@@ -109,8 +153,23 @@ def force_clone_repo(
+     repo_name: str,
+     branch: Optional[str] = None,
+     with_git_command: Optional[str] = None,
++    path: Optional[str] = None,
+ ) -> None:
+-    """Deletes the working directory repo_storage.root/repo_name and clones the `repo_url` into it. Will checkout `branch` if provided"""
++    """Deletes existing repository and performs fresh clone.
++
++    Removes repo_storage.root/repo_name if it exists, then clones from
++    repo_url. Uses sparse checkout when path is specified to download only
++    the specified directory, reducing clone time and disk usage.
++
++    Args:
++        repo_url: Git repository URL to clone from.
++        repo_storage: FileStorage instance managing the clone destination.
++        repo_name: Directory name for the cloned repository.
++        branch: Branch to checkout after cloning.
++        with_git_command: Custom GIT_SSH_COMMAND for authentication.
++        path: Directory path for sparse checkout. When set, only this path
++            is cloned using --filter=blob:none and --depth=1.
++    """
+     try:
+         # delete repo folder
+         if repo_storage.has_folder(repo_name):
+@@ -120,6 +179,7 @@ def force_clone_repo(
+             repo_storage.make_full_path(repo_name),
+             branch=branch,
+             with_git_command=with_git_command,
++            path=path,
+         ).close()
+     except Exception:
+         # delete folder so we start clean next time
+@@ -133,8 +193,25 @@ def get_fresh_repo_files(
+     working_dir: str = None,
+     branch: Optional[str] = None,
+     with_git_command: Optional[str] = None,
++    path: Optional[str] = None,
+ ) -> FileStorage:
+-    """Returns a file storage leading to the newest repository files. If `repo_location` is url, file will be checked out into `working_dir/repo_name`"""
++    """Returns FileStorage with up-to-date repository files.
++
++    If repo_location is a local directory, returns storage pointing to it.
++    If it's a git URL, clones or updates the repository in working_dir/repo_name.
++    Supports sparse checkout to fetch only a specific directory path.
++
++    Args:
++        repo_location: Local directory path or git repository URL.
++        working_dir: Directory where repository will be cloned if repo_location is URL.
++        branch: Branch to checkout.
++        with_git_command: Custom GIT_SSH_COMMAND for authentication.
++        path: Directory path for sparse checkout. Downloads only this directory,
++            improving performance for large repositories.
++
++    Returns:
++        FileStorage instance pointing to repository files (or specified path within).
++    """
+     from git import GitError
+ 
+     url = giturlparse.parse(repo_location, check_domain=False)
+@@ -146,7 +223,9 @@ def get_fresh_repo_files(
+         repo_name = url.name
+         repo_path = os.path.join(working_dir, repo_name)
+         try:
+-            ensure_remote_head(repo_path, branch=branch, with_git_command=with_git_command)
++            ensure_remote_head(
++                repo_path, branch=branch, with_git_command=with_git_command, path=path
++            )
+         except GitError:
+             force_clone_repo(
+                 repo_location,
+@@ -154,6 +233,7 @@ def get_fresh_repo_files(
+                 repo_name,
+                 branch=branch,
+                 with_git_command=with_git_command,
++                path=path,
+             )
+         return FileStorage(repo_path)
+ 
+diff --git a/tests/libs/test_git.py b/tests/libs/test_git.py
+index 0c5bdbbfb..35f89bcb9 100644
+--- a/tests/libs/test_git.py
++++ b/tests/libs/test_git.py
+@@ -21,6 +21,7 @@ AWESOME_REPO = "https://github.com/sindresorhus/awesome.git"
+ JAFFLE_SHOP_REPO = "https://github.com/dbt-labs/jaffle_shop.git"
+ PRIVATE_REPO = "git@github.com:scale-vector/rasa_bot_experiments.git"
+ PRIVATE_REPO_WITH_ACCESS = "git@github.com:scale-vector/test_private_repo.git"
++CONTEXT_REPO = "https://github.com/dlt-hub/vibe-hub.git"
+ 
+ 
+ def test_ssh_key_context() -> None:
+@@ -116,6 +117,32 @@ def test_fresh_repo_files_branch_change(test_storage: FileStorage) -> None:
+         assert is_clean_and_synced(repo)
+ 
+ 
++def test_sparse_checkout(test_storage: FileStorage) -> None:
++    repo_storage = get_fresh_repo_files(CONTEXT_REPO, test_storage.storage_path, path="abbyy")
++    assert repo_storage.has_folder("abbyy")
++    # only abbyy present
++    assert len(repo_storage.list_folder_dirs(".")) == 2  # .git abbyy
++    # two files inside
++    assert len(repo_storage.list_folder_files("abbyy")) == 2
++
++    # checkout the other one
++    repo_storage = get_fresh_repo_files(CONTEXT_REPO, test_storage.storage_path, path="stripe")
++    assert repo_storage.has_folder("stripe")
++    assert len(repo_storage.list_folder_dirs(".")) == 2  # .git stripe
++
++    # unknown path in case repo is already cloned and checkout was done
++    repo_storage = get_fresh_repo_files(CONTEXT_REPO, test_storage.storage_path, path="__unknown")
++    assert not repo_storage.has_folder("__unknown")
++    assert len(repo_storage.list_folder_dirs(".")) == 1  # .git
++
++
++def test_sparse_checkout_path_not_exist_on_clone(test_storage: FileStorage) -> None:
++    # unknown path before first checkout
++    repo_storage = get_fresh_repo_files(CONTEXT_REPO, test_storage.storage_path, path="__unknown")
++    assert not repo_storage.has_folder("__unknown")
++    assert len(repo_storage.list_folder_dirs(".")) == 1  # .git
++
++
+ def test_fresh_repo_files_branch_change_to_default(test_storage: FileStorage) -> None:
+     repo_storage = get_fresh_repo_files(AWESOME_REPO, test_storage.storage_path, branch="gh-pages")
+     with get_repo(repo_storage.storage_path) as repo:
+
+
+===== COMMIT bbc1cb81 =====
+
+
+commit bbc1cb81c
+Author: djudjuu
+Date: 2025-11-21
+
+    fix: dashboard no longer crashes on broken home cell (#3348)
+

@@ -1,0 +1,2776 @@
+diff --git a/dlt/common/runners/pool_runner.py b/dlt/common/runners/pool_runner.py
+index ecd54b793..9a6172b1d 100644
+--- a/dlt/common/runners/pool_runner.py
++++ b/dlt/common/runners/pool_runner.py
+@@ -201,10 +201,12 @@ def run_pool(
+     try:
+         logger.debug("Running pool")
+         while _run_func():
+-            # for next run
++            # raise on signal: safe to do that out of _run_func()
+             signals.raise_if_signalled()
+             runs_count += 1
+             sleep(config.run_sleep)
++            # signal could come
++            signals.raise_if_signalled()
+         return runs_count
+     except SignalReceivedException as sigex:
+         # sleep this may raise SignalReceivedException
+diff --git a/dlt/common/runtime/collector.py b/dlt/common/runtime/collector.py
+index cab343111..98a828726 100644
+--- a/dlt/common/runtime/collector.py
++++ b/dlt/common/runtime/collector.py
+@@ -53,6 +53,7 @@ class DictCollector(Collector):
+     """A collector that just counts"""
+ 
+     def __init__(self) -> None:
++        self.step = None
+         self.counters: DefaultDict[str, int] = None
+ 
+     def update(
+@@ -101,6 +102,7 @@ class LogCollector(Collector):
+             log_level (str, optional): Log level for the logger. Defaults to INFO level
+             dump_system_stats (bool, optional): Log memory and cpu usage. Defaults to True
+         """
++        self.step = None
+         self.log_period = log_period
+         self.logger = logger
+         self.log_level = log_level
+@@ -260,6 +262,7 @@ class TqdmCollector(Collector):
+             raise MissingDependencyException(
+                 "TqdmCollector", ["tqdm"], "We need tqdm to display progress bars."
+             )
++        self.step = None
+         self.single_bar = single_bar
+         self._bars: Dict[str, tqdm[None]] = {}
+         self.tqdm_kwargs = tqdm_kwargs or {}
+@@ -321,6 +324,7 @@ class AliveCollector(Collector):
+                 ["alive-progress"],
+                 "We need alive-progress to display progress bars.",
+             )
++        self.step = None
+         self.single_bar = single_bar
+         self._bars: Dict[str, Any] = {}
+         self._bars_counts: Dict[str, int] = {}
+@@ -399,6 +403,7 @@ class EnlightenCollector(Collector):
+                 ["enlighten"],
+                 "We need enlighten to display progress bars with a space for log messages.",
+             )
++        self.step = None
+         self.single_bar = single_bar
+         self.enlighten_kwargs = enlighten_kwargs
+ 
+diff --git a/dlt/common/runtime/signals.py b/dlt/common/runtime/signals.py
+index 7212e3253..4d03e70fe 100644
+--- a/dlt/common/runtime/signals.py
++++ b/dlt/common/runtime/signals.py
+@@ -1,30 +1,74 @@
++import sys
+ import threading
+ import signal
+ from contextlib import contextmanager
+ from threading import Event
+-from typing import Any, Iterator
++from types import FrameType
++from typing import Any, Callable, Dict, Iterator, Optional, Union
+ 
+ from dlt.common import logger
+ from dlt.common.exceptions import SignalReceivedException
+ 
+ _received_signal: int = 0
+ exit_event = Event()
++_signal_counts: Dict[int, int] = {}
++_original_handlers: Dict[int, Union[int, Callable[[int, Optional[FrameType]], Any]]] = {}
+ 
+ 
+-def signal_receiver(sig: int, frame: Any) -> None:
+-    global _received_signal
++def signal_receiver(sig: int, frame: FrameType) -> None:
++    """Handle POSIX signals with two-stage escalation.
+ 
+-    logger.info(f"Signal {sig} received")
++    This handler is installed by delayed_signals(). On the first occurrence of a
++    supported signal (eg. SIGINT, SIGTERM) it requests a graceful shutdown by
++    setting a process-wide flag and waking sleeping threads via exit_event.
++    A second occurrence of the same signal escalates by delegating to the
++    original handler or the system default, which typically results in an
++    immediate process termination (eg. KeyboardInterrupt for SIGINT).
+ 
+-    if _received_signal > 0:
+-        logger.info(f"Another signal received after {_received_signal}")
+-        return
++    Args:
++        sig: Signal number (for example, signal.SIGINT or signal.SIGTERM).
++        frame: The current stack frame when the signal was received.
+ 
+-    _received_signal = sig
+-    # awake all threads sleeping on event
+-    exit_event.set()
++    Notes:
++        - The CPython runtime delivers signal handlers in the main thread only.
++          Worker threads must cooperatively observe shutdown via raise_if_signalled()
++          or the signal-aware sleep().
++    """
++    global _received_signal
+ 
+-    logger.info("Sleeping threads signalled")
++    # track how many times this signal type has been received
++    _signal_counts[sig] = _signal_counts.get(sig, 0) + 1
++
++    if _signal_counts[sig] == 1:
++        # first signal of this type: set flag and wake threads
++        _received_signal = sig
++        if sig == signal.SIGINT:
++            sig_desc = "CTRL-C"
++        else:
++            sig_desc = f"Signal {sig}"
++        msg = (
++            f"{sig_desc} received. Trying to shut down gracefully. It may take time to drain job"
++            f" pools. Send {sig_desc} again to force stop."
++        )
++        if sys.stdin.isatty():
++            # log to console
++            sys.stderr.write(msg)
++            sys.stderr.flush()
++        else:
++            logger.warning(msg)
++    elif _signal_counts[sig] >= 2:
++        # Second signal of this type: call original handler
++        logger.debug(f"Second signal {sig} received, calling default handler")
++        original_handler = _original_handlers.get(sig, signal.SIG_DFL)
++        if callable(original_handler):
++            original_handler(sig, frame)
++        elif original_handler == signal.SIG_DFL:
++            # Restore default and re-raise to trigger default behavior
++            signal.signal(sig, signal.SIG_DFL)
++            signal.raise_signal(sig)
++
++    exit_event.set()
++    logger.debug("Sleeping threads signalled")
+ 
+ 
+ def raise_if_signalled() -> None:
+@@ -38,14 +82,10 @@ def signal_received() -> bool:
+ 
+ 
+ def sleep(sleep_seconds: float) -> None:
+-    """A signal-aware version of sleep function. Will raise SignalReceivedException if signal was received during sleep period."""
+-    # do not allow sleeping if signal was received
+-    raise_if_signalled()
++    """A signal-aware version of sleep function. Will wake up if signal is received but will not raise exception."""
+     # sleep or wait for signal
+     exit_event.clear()
+     exit_event.wait(sleep_seconds)
+-    # if signal then raise
+-    raise_if_signalled()
+ 
+ 
+ def wake_all() -> None:
+@@ -53,23 +93,50 @@ def wake_all() -> None:
+     exit_event.set()
+ 
+ 
++def _clear_signals() -> None:
++    global _received_signal
++
++    _received_signal = 0
++    _signal_counts.clear()
++    _original_handlers.clear()
++
++
+ @contextmanager
+ def delayed_signals() -> Iterator[None]:
+-    """Will delay signalling until `raise_if_signalled` is used or signalled `sleep`"""
++    """Will delay signalling until `raise_if_signalled` is explicitly used or when
++    a second signal with the same int value arrives.
++
++    A no-op when not called on main thread.
++
++    Can be nested - nested calls are no-ops.
++    """
+ 
+     if threading.current_thread() is threading.main_thread():
+-        original_sigint_handler = signal.getsignal(signal.SIGINT)
++        # check if handlers are already installed (nested call)
++        current_sigint_handler = signal.getsignal(signal.SIGINT)
++
++        if current_sigint_handler is signal_receiver:
++            # already installed, this is a nested call - just yield
++            yield
++            return
++
++        # First call - install handlers
++        original_sigint_handler = current_sigint_handler
+         original_sigterm_handler = signal.getsignal(signal.SIGTERM)
++
++        # store original handlers for signal_receiver to use
++        _original_handlers[signal.SIGINT] = original_sigint_handler
++        _original_handlers[signal.SIGTERM] = original_sigterm_handler
++
+         try:
+             signal.signal(signal.SIGINT, signal_receiver)
+             signal.signal(signal.SIGTERM, signal_receiver)
+             yield
+         finally:
+-            global _received_signal
+-
+-            _received_signal = 0
+             signal.signal(signal.SIGINT, original_sigint_handler)
+             signal.signal(signal.SIGTERM, original_sigterm_handler)
++            _clear_signals()
++
+     else:
+         logger.info("Running in daemon thread, signals not enabled")
+         yield
+diff --git a/dlt/destinations/job_impl.py b/dlt/destinations/job_impl.py
+index a3421a4fc..6f1c126f1 100644
+--- a/dlt/destinations/job_impl.py
++++ b/dlt/destinations/job_impl.py
+@@ -122,19 +122,19 @@ class DestinationLoadJob(RunnableLoadJob, ABC):
+ 
+     def run(self) -> None:
+         # update filepath, it will be in running jobs now
+-        try:
+-            if self._config.batch_size == 0:
+-                # on batch size zero we only call the callable with the filename
+-                self.call_callable_with_items(self._file_path)
+-            else:
+-                current_index = self._destination_state.get(self._storage_id, 0)
+-                for batch in self.get_batches(current_index):
+-                    self.call_callable_with_items(batch)
+-                    current_index += len(batch)
+-                    self._destination_state[self._storage_id] = current_index
+-        finally:
++        if self._config.batch_size == 0:
++            # on batch size zero we only call the callable with the filename
++            self.call_callable_with_items(self._file_path)
+             # save progress
+             commit_load_package_state()
++        else:
++            current_index = self._destination_state.get(self._storage_id, 0)
++            for batch in self.get_batches(current_index):
++                self.call_callable_with_items(batch)
++                current_index += len(batch)
++                self._destination_state[self._storage_id] = current_index
++                # save progress
++                commit_load_package_state()
+ 
+     def call_callable_with_items(self, items: TDataItems) -> None:
+         if not items:
+diff --git a/dlt/extract/extract.py b/dlt/extract/extract.py
+index 48bbf94f0..f2098d7b9 100644
+--- a/dlt/extract/extract.py
++++ b/dlt/extract/extract.py
+@@ -400,7 +400,10 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
+                             delta = left_gens - curr_gens
+                             left_gens -= delta
+                             collector.update("Resources", delta)
++
++                        # kill extraction if signalled
+                         signals.raise_if_signalled()
++
+                         resource = source.resources.with_pipe(pipe_item.pipe)
+                         item_format = get_data_item_format(pipe_item.item)
+                         extractors[item_format].write_items(
+diff --git a/dlt/load/load.py b/dlt/load/load.py
+index 311e64687..c52d74f63 100644
+--- a/dlt/load/load.py
++++ b/dlt/load/load.py
+@@ -597,7 +597,7 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
+                     if pending_exception:
+                         raise pending_exception
+                     break
+-                # this will raise on signal
++                # this will wake up on os signal or if job thread pool signals
+                 sleep(self._run_loop_sleep_duration)
+             except LoadClientJobFailed:
+                 # the package is completed and skipped
+diff --git a/dlt/normalize/items_normalizers.py b/dlt/normalize/items_normalizers.py
+index 68460b11d..049de3765 100644
+--- a/dlt/normalize/items_normalizers.py
++++ b/dlt/normalize/items_normalizers.py
+@@ -517,6 +517,7 @@ class JsonLItemsNormalizer(ItemsNormalizer):
+                         )
+             except StopIteration:
+                 pass
++            # kill job if signalled
+             signals.raise_if_signalled()
+         return schema_update
+ 
+diff --git a/dlt/pipeline/pipeline.py b/dlt/pipeline/pipeline.py
+index 701e588f7..9aded6179 100644
+--- a/dlt/pipeline/pipeline.py
++++ b/dlt/pipeline/pipeline.py
+@@ -486,7 +486,7 @@ class Pipeline(SupportsPipeline):
+                 # commit load packages with state
+                 extract_step.commit_packages()
+                 return self._get_step_info(extract_step)
+-        except Exception as exc:
++        except (Exception, KeyboardInterrupt) as exc:
+             # emit step info
+             step_info = self._get_step_info(extract_step)
+             current_load_id = step_info.loads_ids[-1] if len(step_info.loads_ids) > 0 else None
+@@ -534,7 +534,7 @@ class Pipeline(SupportsPipeline):
+                 with signals.delayed_signals():
+                     runner.run_pool(normalize_step.config, normalize_step)
+                 return self._get_step_info(normalize_step)
+-            except Exception as n_ex:
++            except (Exception, KeyboardInterrupt) as n_ex:
+                 step_info = self._get_step_info(normalize_step)
+                 raise PipelineStepFailed(
+                     self,
+@@ -591,7 +591,7 @@ class Pipeline(SupportsPipeline):
+             info: LoadInfo = self._get_step_info(load_step)
+             self._update_last_run_context()
+             return info
+-        except Exception as l_ex:
++        except (Exception, KeyboardInterrupt) as l_ex:
+             step_info = self._get_step_info(load_step)
+             raise PipelineStepFailed(
+                 self, "load", load_step.current_load_id, l_ex, step_info
+@@ -684,8 +684,6 @@ class Pipeline(SupportsPipeline):
+         Returns:
+             LoadInfo: Information on loaded data including the list of package ids and failed job statuses. Please not that `dlt` will not raise if a single job terminally fails. Such information is provided via LoadInfo.
+         """
+-
+-        signals.raise_if_signalled()
+         self.activate()
+         self._set_destinations(
+             destination=destination, destination_credentials=credentials, staging=staging
+@@ -866,7 +864,7 @@ class Pipeline(SupportsPipeline):
+                     state["default_schema_name"] = new_default_schema_name
+             bump_pipeline_state_version_if_modified(state)
+             self._save_state(state)
+-        except Exception as ex:
++        except (Exception, KeyboardInterrupt) as ex:
+             raise PipelineStepFailed(self, "sync", None, ex, None) from ex
+ 
+     def activate(self) -> None:
+diff --git a/docs/website/docs/reference/performance.md b/docs/website/docs/reference/performance.md
+index 8899d78f5..dfed1db3d 100644
+--- a/docs/website/docs/reference/performance.md
++++ b/docs/website/docs/reference/performance.md
+@@ -293,6 +293,7 @@ Please note the following:
+ process start method.
+ 2. If you created the `Pipeline` object in the worker thread and you use it from another (i.e., the main thread),
+ call `pipeline.activate()` to inject the right context into the current thread.
++3. Note how `with signals.delayed_signals():` was used to enable graceful shutdown of pipelines running in a thread pool.
+ :::
+ 
+ 
+diff --git a/docs/website/docs/reference/performance_snippets/performance-snippets.py b/docs/website/docs/reference/performance_snippets/performance-snippets.py
+index 34fc70a01..7babf95b3 100644
+--- a/docs/website/docs/reference/performance_snippets/performance-snippets.py
++++ b/docs/website/docs/reference/performance_snippets/performance-snippets.py
+@@ -145,9 +145,10 @@ def performance_chunking_snippet() -> None:
+ def parallel_pipelines_asyncio_snippet() -> None:
+     # @@@DLT_SNIPPET_START parallel_pipelines
+     import asyncio
+-    import dlt
+     from time import sleep
+     from concurrent.futures import ThreadPoolExecutor
++    import dlt
++    from dlt.common.runtime import signals
+ 
+     # create both asyncio and thread parallel resources
+     @dlt.resource
+@@ -183,8 +184,11 @@ def parallel_pipelines_asyncio_snippet() -> None:
+         print("pipeline_1", results[0])
+         print("pipeline_2", results[1])
+ 
+-    # load data
+-    asyncio.run(_run_async())
++    # enable signal handling for graceful shutdowns - it is disabled for pipelines running
++    # in threads
++    with signals.delayed_signals():
++        # load data
++        asyncio.run(_run_async())
+     # activate pipelines before they are used
+     pipeline_1.activate()
+     assert pipeline_1.last_trace.last_normalize_info.row_counts["async_table"] == 10
+diff --git a/tests/common/runtime/test_signals.py b/tests/common/runtime/test_signals.py
+index af30ea16c..58c58eb3a 100644
+--- a/tests/common/runtime/test_signals.py
++++ b/tests/common/runtime/test_signals.py
+@@ -15,7 +15,7 @@ from tests.utils import skipifwindows
+ def clear_signal() -> Iterator[None]:
+     yield
+     signals.exit_event.clear()
+-    signals._received_signal = 0
++    signals._clear_signals()
+ 
+ 
+ def test_sleep() -> None:
+@@ -25,19 +25,19 @@ def test_sleep() -> None:
+     assert time.time() - start - 0.5 < 0.2
+ 
+ 
+-def test_sleep_raises_if_signalled() -> None:
++def test_sleep_not_raises_if_signalled() -> None:
+     signals.signal_receiver(4, None)
+-    with pytest.raises(SignalReceivedException) as exc:
+-        sleep(0.1)
+-    assert exc.value.signal_code == 4
++    sleep(0.1)
+ 
+ 
+ def test_signal_receiver() -> None:
+     signals.signal_receiver(8, None)
+     assert signals._received_signal == 8
+-    # second signal gets ignored
++    assert signals._signal_counts[8] == 1
++
+     signals.signal_receiver(4, None)
+-    assert signals._received_signal == 8
++    assert signals._received_signal == 4
++    assert signals._signal_counts[4] == 1
+ 
+ 
+ def test_raise_if_signalled() -> None:
+@@ -64,7 +64,7 @@ def test_delayed_signals_context_manager() -> None:
+         pytest.fail("Unexpected SignalReceivedException was raised")
+ 
+ 
+-def test_sleep_signal() -> None:
++def test_raise_if_signalled_thread() -> None:
+     thread_signal = 0
+ 
+     def _thread() -> None:
+@@ -72,7 +72,9 @@ def test_sleep_signal() -> None:
+ 
+         try:
+             # this will sleep on exit event forever
+-            sleep(1000000)
++            sleep(100000)
++            assert signals.signal_received()
++            signals.raise_if_signalled()
+         except SignalReceivedException as siex:
+             thread_signal = siex.signal_code
+ 
+@@ -96,17 +98,10 @@ def test_raise_signal_received_exception() -> None:
+ 
+ @skipifwindows
+ @pytest.mark.forked
+-def test_signalling() -> None:
+-    thread_signal = 0
+-
++def test_signalling_graceful() -> None:
+     def _thread() -> None:
+-        nonlocal thread_signal
+-
+-        try:
+-            # this will sleep on exit event forever
+-            sleep(1000000)
+-        except SignalReceivedException as siex:
+-            thread_signal = siex.signal_code
++        # this will sleep on exit event forever
++        sleep(1000000)
+ 
+     p = DummyProcess(target=_thread)
+     p.start()
+@@ -115,12 +110,40 @@ def test_signalling() -> None:
+     with signals.delayed_signals():
+         # now signal to itself
+         os.kill(os.getpid(), signals.signal.SIGTERM)
++
+         # handler is executed in the main thread (here)
+         with pytest.raises(SignalReceivedException) as exc:
+             signals.raise_if_signalled()
+         assert exc.value.signal_code == 15
+         p.join()
+-        assert thread_signal == 15
++
++
++@skipifwindows
++@pytest.mark.forked
++def test_signalling_forced() -> None:
++    _done = False
++
++    def _thread() -> None:
++        from time import sleep
++
++        # this will block forever
++        while not _done:
++            sleep(1)
++
++    p = DummyProcess(target=_thread)
++    p.start()
++
++    # handle signals without killing the process
++    with signals.delayed_signals():
++        # now signal to itself
++        os.kill(os.getpid(), signals.signal.SIGINT)
++
++        # second signal kills immediately (SIGTERM would just exit process)
++        with pytest.raises(KeyboardInterrupt):
++            os.kill(os.getpid(), signals.signal.SIGINT)
++
++        _done = True
++        p.join()
+ 
+ 
+ def test_cleanup() -> None:
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index afa7eaa68..c5d5d218f 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -1,4 +1,5 @@
+ import asyncio
++from multiprocessing.dummy import DummyProcess
+ import pathlib
+ import pickle
+ from concurrent.futures import ThreadPoolExecutor
+@@ -12,16 +13,15 @@ from time import sleep
+ from typing import Any, List, Tuple, cast
+ from tenacity import retry_if_exception, Retrying, stop_after_attempt
+ from unittest.mock import patch
+-
+ import pytest
++
++import dlt
++from dlt.common import json, pendulum, Decimal
+ from dlt.common.configuration import resolve
+ from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
+ from dlt.common.known_env import DLT_LOCAL_DIR
+ from dlt.common.storages import FileStorage
+ from dlt.common.storages.load_storage import ParsedLoadJobFileName
+-
+-import dlt
+-from dlt.common import json, pendulum, Decimal
+ from dlt.common.configuration.container import Container
+ from dlt.common.configuration.exceptions import ConfigFieldMissingException, InvalidNativeValue
+ from dlt.common.data_writers.exceptions import FileImportNotFound, SpecLookupFailed
+@@ -37,17 +37,16 @@ from dlt.common.destination.exceptions import (
+ )
+ from dlt.common.exceptions import PipelineStateNotAvailable
+ from dlt.common.pipeline import LoadInfo, PipelineContext, SupportsPipeline
+-from dlt.common.runtime.collector import LogCollector
++from dlt.common.runtime import signals
++from dlt.common.runtime.collector import DictCollector, LogCollector
+ from dlt.common.schema.exceptions import TableIdentifiersFrozen
+ from dlt.common.schema.typing import TColumnSchema
+ from dlt.common.schema.utils import get_first_column_name_with_prop, new_column, new_table
+-from dlt.common.storages.exceptions import SchemaNotFoundError
+ from dlt.common.typing import DictStrAny
+ from dlt.common.utils import uniq_id
+ from dlt.common.schema import Schema
+ 
+ from dlt.destinations import filesystem, redshift, dummy, duckdb
+-import dlt.destinations.dataset
+ from dlt.destinations.impl.filesystem.filesystem import INIT_FILE_NAME
+ from dlt.extract.exceptions import (
+     InvalidResourceDataTypeBasic,
+@@ -73,9 +72,7 @@ from dlt.pipeline.trace import PipelineTrace, PipelineStepTrace
+ from dlt.pipeline.typing import TPipelineStep
+ 
+ from tests.common.utils import TEST_SENTRY_DSN
+-from tests.utils import TEST_STORAGE_ROOT
+-from tests.pipeline.utils import assert_load_info, load_table_counts
+-
++from tests.utils import TEST_STORAGE_ROOT, skipifwindows
+ from tests.extract.utils import expect_extracted_file
+ from tests.pipeline.utils import (
+     assert_table_counts,
+@@ -3975,3 +3972,185 @@ def test_pipeline_with_null_executors(monkeypatch) -> None:
+     p = dlt.pipeline(pipeline_name="null_executor", destination="duckdb")
+     p.run([{"id": 1}], table_name="test_table")
+     assert p.dataset().row_counts().fetchall() == [("test_table", 1)]
++
++
++@skipifwindows
++@pytest.mark.parametrize("sig", (signals.signal.SIGINT, signals.signal.SIGTERM))
++@pytest.mark.forked
++def test_signal_graceful_load_step_shutdown(sig: int) -> None:
++    # NOTE: forked tests do not show any console/logs
++
++    @dlt.destination
++    def wait_until_signal(item, schema):
++        # exit if signalled
++        while not signals.signal_received():
++            signals.sleep(1)
++        # some more sleep to make pipeline load pool drain
++        signals.sleep(2)
++
++    pipeline = dlt.pipeline(
++        "signal_waiter",
++        destination=wait_until_signal(),
++        dataset_name="_data",
++        progress=DictCollector(),
++    )
++
++    def _thread() -> None:
++        # wait until pipeline gets into load step
++        while not pipeline.collector.step or not pipeline.collector.step.startswith("Load"):
++            print(pipeline.collector.step)
++            signals.sleep(0.1)
++
++        # send signal to drain pool and stop load
++        os.kill(os.getpid(), sig)
++
++    p = DummyProcess(target=_thread)
++    p.start()
++
++    # should end gracefully
++    load_info = pipeline.run([1, 2, 3], table_name="digits")
++    assert_load_info(load_info)
++
++
++@skipifwindows
++@pytest.mark.parametrize("sig", (signals.signal.SIGINT, signals.signal.SIGTERM))
++# @pytest.mark.forked
++def test_signal_graceful_load_step_shutdown_pipeline_in_thread(sig: int) -> None:
++    # NOTE: forked tests do not show any console/logs
++
++    @dlt.destination
++    def wait_until_signal(item, schema):
++        # exit if signalled
++        while not signals.signal_received():
++            signals.sleep(1)
++        # some more sleep to make pipeline load pool drain
++        signals.sleep(2)
++
++    pipeline = dlt.pipeline(
++        "signal_waiter",
++        destination=wait_until_signal(),
++        dataset_name="_data",
++        progress=DictCollector(),
++    )
++
++    def _thread() -> None:
++        # should end gracefully
++        load_info = pipeline.run([1, 2, 3], table_name="digits")
++        assert_load_info(load_info)
++
++    # we can nest those freely
++    with signals.delayed_signals():
++        with signals.delayed_signals():
++            p = threading.Thread(target=_thread)
++            p.start()
++
++            # wait until pipeline gets into load step
++            while not pipeline.collector.step or not pipeline.collector.step.startswith("Load"):
++                print(pipeline.collector.step)
++                signals.sleep(0.1)
++
++            # send signal to drain pool and stop load
++            os.kill(os.getpid(), sig)
++
++        # must join in context manager
++        p.join()
++
++
++@skipifwindows
++@pytest.mark.parametrize("sig", (signals.signal.SIGINT,))  # signals.signal.SIGTERM
++@pytest.mark.forked
++def test_signal_force_load_step_shutdown(sig: int) -> None:
++    # NOTE: forked tests do not show any console/logs
++
++    _done = False
++
++    @dlt.destination
++    def wait_forever(item, schema):
++        # never exit
++        from time import sleep
++
++        # this one does not wake up on signal
++        while not _done:
++            sleep(1)
++
++        # make the job fail if it gets here
++        raise KeyboardInterrupt()
++
++    pipeline = dlt.pipeline(
++        "signal_waiter", destination=wait_forever(), dataset_name="_data", progress=DictCollector()
++    )
++
++    def _thread() -> None:
++        # wait until pipeline gets into load step
++        while not pipeline.collector.step or not pipeline.collector.step.startswith("Load"):
++            print(pipeline.collector.step)
++            signals.sleep(0.1)
++
++        # send signal to drain pool and stop load
++        os.kill(os.getpid(), sig)
++        signals.sleep(0.5)
++        # send to kill
++        os.kill(os.getpid(), sig)
++
++    p = DummyProcess(target=_thread)
++    p.start()
++
++    # should raise regular pipeline exception
++    with pytest.raises(PipelineStepFailed) as pip_ex:
++        pipeline.run([1, 2, 3], table_name="digits")
++    assert isinstance(pip_ex.value.__cause__, KeyboardInterrupt)
++
++    # now we have hanging `wait_forever` in job pool. load step exited after short wait & warning
++    _done = True
++
++
++@skipifwindows
++@pytest.mark.parametrize("sig", (signals.signal.SIGINT,))  # signals.signal.SIGTERM
++@pytest.mark.forked
++def test_signal_extract_step_shutdown(sig: int) -> None:
++    # NOTE: forked tests do not show any console/logs
++
++    _done = False
++
++    @dlt.resource
++    def wait_forever():
++        # never exit
++        from time import sleep
++
++        # this one does not wake up on signal
++        while not _done:
++            sleep(1)
++
++        # make the job fail if it gets here
++        raise KeyboardInterrupt()
++
++    pipeline = dlt.pipeline(
++        "signal_waiter", destination="dummy", dataset_name="_data", progress=DictCollector()
++    )
++
++    def _thread() -> None:
++        # wait until pipeline gets into extract step
++        while not pipeline.collector.step or not pipeline.collector.step.startswith("Extract"):
++            print(pipeline.collector.step)
++            signals.sleep(0.1)
++
++        # extract step does not set signals
++        os.kill(os.getpid(), sig)
++        signals.sleep(0.5)
++
++    p = DummyProcess(target=_thread)
++    p.start()
++
++    # should raise regular pipeline exception
++    with pytest.raises(PipelineStepFailed) as pip_ex:
++        pipeline.run(wait_forever())
++    assert pip_ex.value.step == "extract"
++    assert isinstance(pip_ex.value.__cause__, KeyboardInterrupt)
++
++    # now we have hanging `wait_forever` in job pool. load step exited after short wait & warning
++    _done = True
++
++
++def test_cleanup() -> None:
++    # this must happen after all forked tests (problems with tests teardowns in other tests)
++    pass
+
+
+===== COMMIT 84de7115 =====
+
+
+commit 84de7115a
+Author: David Scharf
+Date: 2025-10-24
+
+    Re-enable python 3.14 common tests (#3242)
+
+diff --git a/.github/workflows/test_common.yml b/.github/workflows/test_common.yml
+index c59d6ae8c..d500355bc 100644
+--- a/.github/workflows/test_common.yml
++++ b/.github/workflows/test_common.yml
+@@ -43,9 +43,9 @@ jobs:
+             python-version: "3.13"
+             shell: bash
+ 
+-          # - os: ubuntu-latest
+-          #   python-version: "3.14.0-beta.4"
+-          #   shell: bash
++          - os: "macos-14"
++            python-version: "3.14"
++            shell: bash
+ 
+           # linux test with minimal dependencies
+           - os: ubuntu-latest
+@@ -114,40 +114,40 @@ jobs:
+ 
+       - name: Install pyarrow
+         run: uv sync ${{ matrix.uv_sync_args }} --extra duckdb --extra cli --extra parquet --group sentry-sdk
+-        if: matrix.python-version != '3.14.0-beta.4'
++        if: matrix.python-version != '3.14'
+ 
+       - name: Run pipeline tests with pyarrow but no pandas installed
+         run: |
+           pytest tests/pipeline/test_pipeline_extra.py -k arrow ${{ matrix.pytest_args }}
+-        if: matrix.python-version != '3.14.0-beta.4'
++        if: matrix.python-version != '3.14'
+ 
+       - name: Install workspace dependencies
+         run: uv sync ${{ matrix.uv_sync_args }} --extra workspace --extra cli --group sentry-sdk
+-        if: matrix.python-version != '3.14.0-beta.4'
++        if: matrix.python-version != '3.14'
+ 
+       - name: Run workspace tests
+         run: |
+           pytest tests/workspace ${{ matrix.pytest_args }}
+-        if: matrix.python-version != '3.14.0-beta.4'
++        if: matrix.python-version != '3.14'
+ 
+       - name: Install pipeline and sources dependencies
+         run: uv sync ${{ matrix.uv_sync_args }} --extra http --extra duckdb --extra cli --extra parquet --extra deltalake --extra sql_database --group sentry-sdk --group pipeline --group sources --group ibis
+-        if: matrix.python-version != '3.14.0-beta.4'
++        if: matrix.python-version != '3.14'
+ 
+       - name: Run extract and pipeline tests
+         run: |
+           pytest tests/extract tests/pipeline tests/libs tests/destinations tests/sources ${{ matrix.pytest_args }}
+-        if: matrix.python-version != '3.14.0-beta.4'
++        if: matrix.python-version != '3.14'
+ 
+       # here we upgrade sql alchemy to 2 an run the sql_database tests again
+       - name: Upgrade sql alchemy
+         run: uv run pip install sqlalchemy==2.0.32
+-        if: matrix.python-version != '3.14.0-beta.4'
++        if: matrix.python-version != '3.14'
+ 
+       - name: Run extract and pipeline tests 
+         run: |
+           pytest tests/sources/sql_database
+-        if: matrix.python-version != '3.14.0-beta.4'
++        if: matrix.python-version != '3.14'
+   matrix_job_required_check:
+     name: common | common tests
+     needs: run_common
+diff --git a/.github/workflows/test_tools_dashboard.yml b/.github/workflows/test_tools_dashboard.yml
+index ed037c4fa..733782133 100644
+--- a/.github/workflows/test_tools_dashboard.yml
++++ b/.github/workflows/test_tools_dashboard.yml
+@@ -104,16 +104,17 @@ jobs:
+         run: |
+           pytest tests/workspace/helpers/dashboard
+ 
+-      # Run pipeline dashboard e2e tests (does not pass with python 3.9, does not pass on windows (playwright does not work somehow), does not pass on python 3.13 (ibis not available))
+-      # Mac is also disabled for the time being
++      # Run pipeline dashboard e2e tests (does not pass with python 3.9
+       - name: Run dashboard e2e
+         run: |
+           marimo run --headless dlt/_workspace/helpers/dashboard/dlt_dashboard.py -- -- --pipelines-dir _storage/.dlt/pipelines/ --with_test_identifiers true & pytest --browser chromium tests/e2e
+         if: matrix.python-version != '3.9' && matrix.python-version != '3.14.0-beta.4' && matrix.os != 'windows-latest'
+ 
++      # note that this test will pass only when running from cmd shell (_storage\.dlt\pipelines\ must stay)
+       - name: Run dashboard e2e windows
+         run: |
+           start marimo run --headless dlt/_workspace/helpers/dashboard/dlt_dashboard.py -- -- --pipelines-dir _storage\.dlt\pipelines\ --with_test_identifiers true
++          timeout /t 2 /nobreak >NUL
+           pytest --browser chromium tests/e2e
+         if: matrix.python-version != '3.9' && matrix.python-version != '3.14.0-beta.4' && matrix.os == 'windows-latest'
+   
+diff --git a/README.md b/README.md
+index 60116222f..d497de8c1 100644
+--- a/README.md
++++ b/README.md
+@@ -31,7 +31,7 @@ Be it a Google Colab notebook, AWS Lambda function, an Airflow DAG, your local l
+ 
+ ## Installation
+ 
+-dlt supports Python 3.9 through Python 3.14 (beta 4). Note that some optional extras are not yet available for Python 3.14, so support for this version is considered experimental.
++dlt supports Python 3.9 through Python 3.14. Note that some optional extras are not yet available for Python 3.14, so support for this version is considered experimental.
+ 
+ ```sh
+ pip install dlt
+
+
+===== COMMIT 76823c31 =====
+
+
+commit 76823c311
+Author: Adrian Macias
+Date: 2025-10-23
+
+    Skip `cluster by` in bigquery on alter statements (#3239)
+
+diff --git a/dlt/destinations/impl/bigquery/bigquery.py b/dlt/destinations/impl/bigquery/bigquery.py
+index f3eea5acf..04d2b1c61 100644
+--- a/dlt/destinations/impl/bigquery/bigquery.py
++++ b/dlt/destinations/impl/bigquery/bigquery.py
+@@ -346,7 +346,7 @@ class BigQueryClient(SqlJobClientWithStagingDataset, SupportsStagingDestination)
+             else cluster_columns_from_column_hints
+         )
+ 
+-        if cluster_columns_final:
++        if cluster_columns_final and not generate_alter:
+             cluster_list = [
+                 self.sql_client.escape_column_name(col) for col in cluster_columns_final
+             ]
+
+
+===== COMMIT 26d0cfa6 =====
+
+
+commit 26d0cfa6a
+Author: ivasio
+Date: 2025-10-23
+
+    Fix: add support for yield_map in rest resource (#3211)
+
+diff --git a/dlt/sources/rest_api/__init__.py b/dlt/sources/rest_api/__init__.py
+index 6bbaaf5ec..6bb010e6b 100644
+--- a/dlt/sources/rest_api/__init__.py
++++ b/dlt/sources/rest_api/__init__.py
+@@ -284,6 +284,8 @@ def create_resources(
+                     resource.add_filter(step["filter"])
+                 if "map" in step:
+                     resource.add_map(step["map"])
++                if "yield_map" in step:
++                    resource.add_yield_map(step["yield_map"])
+             return resource
+ 
+         if resolved_params is None:
+diff --git a/dlt/sources/rest_api/typing.py b/dlt/sources/rest_api/typing.py
+index 6a6d34b4d..4785f46cb 100644
+--- a/dlt/sources/rest_api/typing.py
++++ b/dlt/sources/rest_api/typing.py
+@@ -2,6 +2,7 @@ from typing import (
+     Any,
+     Callable,
+     Dict,
++    Iterator,
+     List,
+     Literal,
+     Optional,
+@@ -262,6 +263,7 @@ class Endpoint(TypedDict, total=False):
+ class ProcessingSteps(TypedDict, total=False):
+     filter: Optional[Callable[[Any], bool]]  # noqa: A003
+     map: Optional[Callable[[Any], Any]]  # noqa: A003
++    yield_map: Optional[Callable[[Any], Iterator[Any]]]  # noqa: A003
+ 
+ 
+ class ResourceBase(TResourceHintsBase, total=False):
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
+index dc497a3c9..0bde49d1f 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
+@@ -972,7 +972,7 @@ def repositories() -> Generator[Dict[str, Any], Any, Any]:
+ 
+ The `processing_steps` field in the resource configuration allows you to apply transformations to the data fetched from the API before it is loaded into your destination. This is useful when you need to filter out certain records, modify the data structure, or anonymize sensitive information.
+ 
+-Each processing step is a dictionary specifying the type of operation (`filter` or `map`) and the function to apply. Steps apply in the order they are listed.
++Each processing step is a dictionary specifying the type of operation (`filter`, `map` or `yield_map`) and the function to apply. Steps apply in the order they are listed.
+ 
+ #### Quick example
+ 
+@@ -981,6 +981,12 @@ def lower_title(record):
+     record["title"] = record["title"].lower()
+     return record
+ 
++def flatten_reactions(post):
++    post_without_reactions = copy.deepcopy(post)
++    post_without_reactions.pop("reactions")
++    for reaction in post["reactions"]:
++        yield {"reaction": reaction, **post_without_reactions}
++
+ config: RESTAPIConfig = {
+     "client": {
+         "base_url": "https://api.example.com",
+@@ -991,6 +997,7 @@ config: RESTAPIConfig = {
+             "processing_steps": [
+                 {"filter": lambda x: x["id"] < 10},
+                 {"map": lower_title},
++                {"yield_map": flatten_reactions},
+             ],
+         },
+     ],
+@@ -1000,7 +1007,9 @@ config: RESTAPIConfig = {
+ In the example above:
+ 
+ - First, the `filter` step uses a lambda function to include only records where `id` is less than 10.
+-- Thereafter, the `map` step applies the `lower_title` function to each remaining record.
++- Then, the `map` step applies the `lower_title` function to each remaining record.
++- Finally, the `yield_map` step applies the `flatten_reactions` function to each transformed record, 
++yielding a set of records, one for each reaction for the given post.
+ 
+ #### Using `filter`
+ 
+@@ -1042,6 +1051,31 @@ config: RESTAPIConfig = {
+ }
+ ```
+ 
++#### Using `yield_map`
++
++The `yield_map` step allows you to transform a record into multiple records. The provided function should take a record as an argument and return an iterator of records. For example, to flatten the `reactions` field:
++
++```py
++def flatten_reactions(post):
++    post_without_reactions = copy.deepcopy(post)
++    post_without_reactions.pop("reactions")
++    for reaction in post["reactions"]:
++        yield {"reaction": reaction, **post_without_reactions}
++
++config: RESTAPIConfig = {
++    "client": {
++        "base_url": "https://api.example.com",
++    },
++    "resources": [
++        {
++            "name": "posts",
++            "processing_steps": [
++                {"yield_map": flatten_reactions},
++            ],
++        },
++    ],
++}
++```
+ #### Combining `filter` and `map`
+ 
+ You can combine multiple processing steps to achieve complex transformations:
+diff --git a/tests/sources/rest_api/conftest.py b/tests/sources/rest_api/conftest.py
+index 39ae5a3a5..b581a425e 100644
+--- a/tests/sources/rest_api/conftest.py
++++ b/tests/sources/rest_api/conftest.py
+@@ -18,6 +18,8 @@ MOCK_BASE_URL = "https://api.example.com"
+ DEFAULT_PAGE_SIZE = 5
+ DEFAULT_TOTAL_PAGES = 5
+ DEFAULT_LIMIT = 10
++DEFAULT_REACTIONS_COUNT = 5
++DEFAULT_COMMENTS_COUNT = 50
+ 
+ 
+ router = APIRouter(MOCK_BASE_URL)
+@@ -27,7 +29,22 @@ def generate_posts(count=DEFAULT_PAGE_SIZE * DEFAULT_TOTAL_PAGES):
+     return [{"id": i, "title": f"Post {i}"} for i in range(count)]
+ 
+ 
+-def generate_comments(post_id, count=50):
++def generate_posts_with_reactions(
++    count=DEFAULT_PAGE_SIZE * DEFAULT_TOTAL_PAGES, count_reactions=DEFAULT_REACTIONS_COUNT
++):
++    return [
++        {
++            "id": i,
++            "title": f"Post {i}",
++            "reactions": [
++                {"id": j, "title": f"Reaction {j} for post {i}"} for j in range(count_reactions)
++            ],
++        }
++        for i in range(count)
++    ]
++
++
++def generate_comments(post_id, count=DEFAULT_COMMENTS_COUNT):
+     return [
+         {"id": i, "post_id": post_id, "body": f"Comment {i} for post {post_id}"}
+         for i in range(count)
+@@ -389,6 +406,10 @@ def mock_api_server():
+         def posts(request, context):
+             return paginate_by_page_number(request, generate_posts())
+ 
++        @router.get(r"/posts_with_reactions(\?.*)?$")
++        def posts_with_reactions(request, context):
++            return paginate_by_page_number(request, generate_posts_with_reactions())
++
+         router.register_routes(m)
+ 
+         yield m
+diff --git a/tests/sources/rest_api/integration/test_processing_steps.py b/tests/sources/rest_api/integration/test_processing_steps.py
+index 5d3cc6336..7022e4b54 100644
+--- a/tests/sources/rest_api/integration/test_processing_steps.py
++++ b/tests/sources/rest_api/integration/test_processing_steps.py
+@@ -1,9 +1,16 @@
++import copy
+ from typing import Any, Callable, Dict, List
+ 
+ import pytest
+ 
+ import dlt
+ from dlt.sources.rest_api import RESTAPIConfig, rest_api_source
++from ..conftest import (
++    DEFAULT_COMMENTS_COUNT,
++    DEFAULT_PAGE_SIZE,
++    DEFAULT_TOTAL_PAGES,
++    DEFAULT_REACTIONS_COUNT,
++)
+ 
+ 
+ def _make_pipeline(destination_name: str):
+@@ -259,3 +266,146 @@ def test_rest_api_source_filtered_and_map_child(mock_api_server, comments_endpoi
+ 
+     data = list(mock_source.with_resources("comments"))
+     assert data[0]["body"] == "Post 2 - Comment 0 for post 2"
++
++
++def flatten_reactions(post):
++    post_without_reactions = copy.deepcopy(post)
++    post_without_reactions.pop("reactions")
++    for reaction in post["reactions"]:
++        yield {"reaction": reaction, **post_without_reactions}
++
++
++def test_rest_api_source_yield_map(mock_api_server) -> None:
++    config: RESTAPIConfig = {
++        "client": {
++            "base_url": "https://api.example.com",
++        },
++        "resources": [
++            {
++                "name": "posts",
++                "endpoint": "posts_with_reactions",
++                "processing_steps": [
++                    {"yield_map": flatten_reactions},
++                ],
++            },
++        ],
++    }
++    mock_source = rest_api_source(config)
++
++    data = list(mock_source.with_resources("posts"))
++
++    assert len(data) == DEFAULT_PAGE_SIZE * DEFAULT_TOTAL_PAGES * DEFAULT_REACTIONS_COUNT
++    assert all("reaction" in record and "reactions" not in record for record in data)
++    assert all(
++        record["reaction"]["title"]
++        == f"Reaction {record['reaction']['id']} for post {record['id']}"
++        for record in data
++    )
++
++
++def test_rest_api_source_filter_then_yield_map(mock_api_server) -> None:
++    config: RESTAPIConfig = {
++        "client": {
++            "base_url": "https://api.example.com",
++        },
++        "resources": [
++            {
++                "name": "posts",
++                "endpoint": "posts_with_reactions",
++                "processing_steps": [
++                    {"filter": lambda x: x["id"] != 1},
++                    {"yield_map": flatten_reactions},
++                ],
++            },
++        ],
++    }
++    mock_source = rest_api_source(config)
++
++    data = list(mock_source.with_resources("posts"))
++
++    assert len(data) == (DEFAULT_PAGE_SIZE * DEFAULT_TOTAL_PAGES - 1) * DEFAULT_REACTIONS_COUNT
++    assert all(record["id"] != 1 for record in data)
++
++
++def test_rest_api_source_yield_map_then_filter_reactions(mock_api_server) -> None:
++    config: RESTAPIConfig = {
++        "client": {
++            "base_url": "https://api.example.com",
++        },
++        "resources": [
++            {
++                "name": "posts",
++                "endpoint": "posts_with_reactions",
++                "processing_steps": [
++                    {"yield_map": flatten_reactions},
++                    {"filter": lambda x: x["reaction"]["id"] != 0},
++                ],
++            },
++        ],
++    }
++    mock_source = rest_api_source(config)
++
++    data = list(mock_source.with_resources("posts"))
++
++    assert len(data) == DEFAULT_PAGE_SIZE * DEFAULT_TOTAL_PAGES * (DEFAULT_REACTIONS_COUNT - 1)
++    assert all(record["reaction"]["id"] != 0 for record in data)
++
++
++@pytest.mark.parametrize(
++    "comments_endpoint",
++    [
++        {
++            "path": "/posts/{post_id}/comments",
++            "params": {
++                "post_id": {
++                    "type": "resolve",
++                    "resource": "posts",
++                    "field": "id",
++                }
++            },
++        },
++        "posts/{resources.posts.id}/comments",
++    ],
++)
++def test_rest_api_source_yield_map_child(mock_api_server, comments_endpoint) -> None:
++    def extend_body(row):
++        row["body"] = f"{row['_posts_title']} - {row['body']}"
++        return row
++
++    def flatten_comment_reactions(comment_enriched):
++        comment_without_reactions = copy.deepcopy(comment_enriched)
++        comment_without_reactions.pop("_posts_reactions")
++        for reaction in comment_enriched["_posts_reactions"]:
++            yield {"_posts_reaction": reaction, **comment_without_reactions}
++
++    config: RESTAPIConfig = {
++        "client": {
++            "base_url": "https://api.example.com",
++        },
++        "resources": [
++            {
++                "name": "posts",
++                "endpoint": "posts_with_reactions",
++                "processing_steps": [
++                    {"filter": lambda x: x["id"] in (1, 2)},
++                ],
++            },
++            {
++                "name": "comments",
++                "endpoint": comments_endpoint,
++                "include_from_parent": ["title", "reactions"],
++                "processing_steps": [
++                    {"map": extend_body},
++                    {"filter": lambda x: x["body"].startswith("Post 2")},
++                    {"yield_map": flatten_comment_reactions},
++                ],
++            },
++        ],
++    }
++    mock_source = rest_api_source(config)
++
++    data = list(mock_source.with_resources("comments"))
++
++    assert len(data) == DEFAULT_COMMENTS_COUNT * DEFAULT_REACTIONS_COUNT
++    assert data[0]["body"] == "Post 2 - Comment 0 for post 2"
++    assert data[0]["_posts_reaction"]["title"] == "Reaction 0 for post 2"
+
+
+===== COMMIT a3d73a51 =====
+
+
+commit a3d73a51f
+Author: Willi Müller
+Date: 2025-10-23
+
+    Fixes docs on schema file naming convention (#3244)
+
+diff --git a/docs/website/docs/general-usage/schema.md b/docs/website/docs/general-usage/schema.md
+index 810e0914f..ce99993b9 100644
+--- a/docs/website/docs/general-usage/schema.md
++++ b/docs/website/docs/general-usage/schema.md
+@@ -532,7 +532,7 @@ all the settings to default.
+ 
+ ### Automatically load schema file stored with source python module
+ 
+-If no schema instance is passed, and a file with a name `{source name}_schema.yml` exists in the
++If no schema instance is passed, and a file with a name `{source name}.schema.yaml` exists in the
+ same folder as the module with the decorated function, it will be automatically loaded and used as
+ the schema.
+ 
+
+
+===== COMMIT 98c81466 =====
+
+
+commit 98c81466e
+Author: Max Yakovenko
+Date: 2025-10-23
+
+    Feature: Introduce support of http based resources for fs source (#3029)
+
+diff --git a/.github/workflows/test_common.yml b/.github/workflows/test_common.yml
+index bf3d4fdb9..c59d6ae8c 100644
+--- a/.github/workflows/test_common.yml
++++ b/.github/workflows/test_common.yml
+@@ -131,7 +131,7 @@ jobs:
+         if: matrix.python-version != '3.14.0-beta.4'
+ 
+       - name: Install pipeline and sources dependencies
+-        run: uv sync ${{ matrix.uv_sync_args }} --extra duckdb --extra cli --extra parquet --extra deltalake --extra sql_database --group sentry-sdk --group pipeline --group sources --group ibis
++        run: uv sync ${{ matrix.uv_sync_args }} --extra http --extra duckdb --extra cli --extra parquet --extra deltalake --extra sql_database --group sentry-sdk --group pipeline --group sources --group ibis
+         if: matrix.python-version != '3.14.0-beta.4'
+ 
+       - name: Run extract and pipeline tests
+diff --git a/dlt/common/storages/configuration.py b/dlt/common/storages/configuration.py
+index cbe5642ae..4e26ab9cd 100644
+--- a/dlt/common/storages/configuration.py
++++ b/dlt/common/storages/configuration.py
+@@ -137,7 +137,17 @@ def _make_file_url(scheme: str, fs_path: str, bucket_url: str) -> str:
+     return uri
+ 
+ 
+-MAKE_URI_DISPATCH = {"az": _make_az_url, "file": _make_file_url, "sftp": _make_sftp_url}
++def _make_http_url(schema: str, fs_path: str, bucket_url: str) -> str:
++    parsed_http_url = urlparse(fs_path, schema)
++    return urlunparse(parsed_http_url)
++
++
++MAKE_URI_DISPATCH = {
++    "az": _make_az_url,
++    "file": _make_file_url,
++    "sftp": _make_sftp_url,
++    "https": _make_http_url,
++}
+ 
+ MAKE_URI_DISPATCH["adl"] = MAKE_URI_DISPATCH["az"]
+ MAKE_URI_DISPATCH["abfs"] = MAKE_URI_DISPATCH["az"]
+diff --git a/dlt/common/storages/fsspec_filesystem.py b/dlt/common/storages/fsspec_filesystem.py
+index a98dcdb9b..74c3b6b42 100644
+--- a/dlt/common/storages/fsspec_filesystem.py
++++ b/dlt/common/storages/fsspec_filesystem.py
+@@ -64,6 +64,12 @@ MTIME_DISPATCH = {
+     "adl": lambda f: ensure_pendulum_datetime_utc(f["LastModified"]),
+     "az": lambda f: ensure_pendulum_datetime_utc(f["last_modified"]),
+     "gcs": lambda f: ensure_pendulum_datetime_utc(f["updated"]),
++    "https": lambda f: cast(
++        pendulum.DateTime, pendulum.parse(f["Last-Modified"], exact=True, strict=False)
++    ),
++    "http": lambda f: cast(
++        pendulum.DateTime, pendulum.parse(f["Last-Modified"], exact=True, strict=False)
++    ),
+     "file": lambda f: ensure_pendulum_datetime_utc(f["mtime"]),
+     "memory": lambda f: ensure_pendulum_datetime_utc(f["created"]),
+     "gdrive": lambda f: ensure_pendulum_datetime_utc(f["modifiedTime"]),
+@@ -157,7 +163,7 @@ def prepare_fsspec_args(config: FilesystemConfiguration) -> DictStrAny:
+ 
+     fs_kwargs.update(DEFAULT_KWARGS.get(protocol, {}))
+ 
+-    if protocol == "sftp":
++    if protocol in ("https", "http", "sftp"):
+         fs_kwargs.clear()
+ 
+     if config.kwargs is not None:
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/basic.md b/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/basic.md
+index 95bc3b29a..59a60f510 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/basic.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/basic.md
+@@ -23,7 +23,28 @@ For the most common cases we provide `readers` source that does the above in a s
+ 
+ ## Quick example
+ 
+-In two steps:
++Let's see how to load a parquet file from a public website. The following example downloads a single file of yellow taxi trip records from the [NYC Taxi & Limousine Commission](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) website and loads it into DuckDB.
++
++```py
++import datetime as dt
++
++import dlt
++from dlt.sources.filesystem import filesystem, read_parquet
++
++filesystem_resource = filesystem(
++  bucket_url="https://d37ci6vzurychx.cloudfront.net/trip-data",
++  file_glob=f"yellow_tripdata_{(dt.datetime.now() - dt.timedelta(days=90)).strftime('%Y-%m')}.parquet",
++)
++filesystem_pipe = filesystem_resource | read_parquet()
++
++# We load the data into the table_name table
++pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
++load_info = pipeline.run(filesystem_pipe.with_name("yellow_tripdata"))
++print(load_info)
++print(pipeline.last_trace.last_normalize_info)
++```
++
++This section illustrates how to perform an efficient incremental load of Parquet files from a remote source, specifically an S3 bucket.
+ 
+ ```py
+ import dlt
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md b/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md
+index 5aa930c1a..649056de3 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md
+@@ -11,6 +11,7 @@ The filesystem source allows seamless loading of files from the following locati
+ * Azure Blob Storage
+ * remote filesystem (via SFTP)
+ * local filesystem
++* Public CDN
+ 
+ The filesystem source natively supports [CSV](../../file-formats/csv.md), [Parquet](../../file-formats/parquet.md), and [JSONL](../../file-formats/jsonl.md) files and allows customization for loading any type of structured file.
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 46df1d67b..e93eda279 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -52,7 +52,7 @@ dependencies = [
+     "orjson>=3.11.0 ; python_version > '3.13'",
+     "tenacity>=8.0.2",
+     "jsonpath-ng>=1.5.3",
+-    "fsspec>=2022.4.0",
++    "fsspec>=2025.9.0",
+     "packaging>=21.1",
+     "pluggy>=1.3.0",
+     "win-precise-time>=1.4.2 ; os_name == 'nt' and python_version < '3.13'",
+@@ -108,6 +108,9 @@ az = [
+ sftp = [
+     "paramiko>=3.3.0"
+ ]
++http = [
++    "aiohttp>3.9.0"
++]
+ snowflake = ["snowflake-connector-python>=3.5.0"]
+ motherduck = [
+     "duckdb>=0.9",
+diff --git a/tests/.dlt/config.toml b/tests/.dlt/config.toml
+index 71f78f029..903680347 100644
+--- a/tests/.dlt/config.toml
++++ b/tests/.dlt/config.toml
+@@ -5,6 +5,7 @@ dlthub_telemetry=false
+ [tests]
+ bucket_url_gs="gs://ci-test-bucket"
+ bucket_url_s3="s3://dlt-ci-test-bucket"
++bucket_url_http="http://localhost:8189"
+ # uses local_dir which is _storage/data
+ bucket_url_file="data"
+ bucket_url_az="az://dlt-ci-test-bucket"
+diff --git a/tests/load/conftest.py b/tests/load/conftest.py
+index 40993ff13..267c6af76 100644
+--- a/tests/load/conftest.py
++++ b/tests/load/conftest.py
+@@ -9,7 +9,11 @@ from tests.load.utils import (
+     drop_pipeline,
+     empty_schema,
+ )
+-from tests.utils import preserve_environ, auto_test_run_context, autouse_test_storage
++from tests.utils import (
++    preserve_environ,
++    auto_test_run_context,
++    autouse_test_storage,
++)
+ 
+ 
+ @pytest.fixture(scope="function", params=DEFAULT_BUCKETS)
+diff --git a/tests/load/sources/filesystem/test_filesystem_source.py b/tests/load/sources/filesystem/test_filesystem_source.py
+index c00efc6f0..20b9d7311 100644
+--- a/tests/load/sources/filesystem/test_filesystem_source.py
++++ b/tests/load/sources/filesystem/test_filesystem_source.py
+@@ -21,7 +21,7 @@ from tests.pipeline.utils import (
+     load_table_counts,
+     assert_query_column,
+ )
+-from tests.utils import TEST_STORAGE_ROOT
++from tests.utils import TEST_STORAGE_ROOT, public_http_server
+ from tests.load.sources.filesystem.cases import GLOB_RESULTS, TESTS_BUCKET_URLS
+ 
+ 
+diff --git a/tests/load/utils.py b/tests/load/utils.py
+index 6ca9b8f84..92a506128 100644
+--- a/tests/load/utils.py
++++ b/tests/load/utils.py
+@@ -85,6 +85,7 @@ GDRIVE_BUCKET = dlt.config.get("tests.bucket_url_gdrive", str)
+ FILE_BUCKET = dlt.config.get("tests.bucket_url_file", str)
+ R2_BUCKET = dlt.config.get("tests.bucket_url_r2", str)
+ SFTP_BUCKET = dlt.config.get("tests.bucket_url_sftp", str)
++HTTP_BUCKET = dlt.config.get("tests.bucket_url_http", str)
+ MEMORY_BUCKET = dlt.config.get("tests.memory", str)
+ 
+ ALL_FILESYSTEM_DRIVERS = dlt.config.get("ALL_FILESYSTEM_DRIVERS", list) or [
+@@ -95,6 +96,7 @@ ALL_FILESYSTEM_DRIVERS = dlt.config.get("ALL_FILESYSTEM_DRIVERS", list) or [
+     "gdrive",
+     "file",
+     "memory",
++    "https",
+     "r2",
+     "sftp",
+ ]
+diff --git a/tests/sources/filesystem/test_filesystem_source.py b/tests/sources/filesystem/test_filesystem_source.py
+new file mode 100644
+index 000000000..a4a054302
+--- /dev/null
++++ b/tests/sources/filesystem/test_filesystem_source.py
+@@ -0,0 +1,28 @@
++import pytest
++
++import dlt
++
++from dlt.sources.filesystem import filesystem
++
++from tests.load.utils import HTTP_BUCKET
++from tests.pipeline.utils import assert_load_info
++from tests.utils import public_http_server
++
++
++@pytest.mark.parametrize(
++    "bucket_url",
++    [
++        HTTP_BUCKET,
++    ],
++)
++def test_http_filesystem(public_http_server, bucket_url: str):
++    public_resource = filesystem(bucket_url=bucket_url, file_glob="parquet/mlb_players.parquet")
++    pipeline = dlt.pipeline("test_http_load", dev_mode=True, destination="duckdb")
++    # just execute iterator
++    load_info = pipeline.run(
++        [
++            public_resource.with_name("http_parquet_example"),
++        ]
++    )
++    assert_load_info(load_info)
++    assert pipeline.last_trace.last_normalize_info.row_counts["http_parquet_example"] == 1
+diff --git a/tests/utils.py b/tests/utils.py
+index 9433fa5e3..9fd5a8ab2 100644
+--- a/tests/utils.py
++++ b/tests/utils.py
+@@ -1,9 +1,14 @@
+ import contextlib
++from http import HTTPStatus
++import http.server
+ import multiprocessing
+ import os
+ import platform
++import threading
+ import sys
++from functools import partial
+ from os import environ
++from pathlib import Path
+ from typing import Any, Iterable, Iterator, Literal, Optional, Union, get_args, List
+ from unittest.mock import patch
+ 
+@@ -35,7 +40,7 @@ from dlt.common.schema import Schema
+ from dlt.common.schema.typing import TTableFormat
+ from dlt.common.storages import FileStorage
+ from dlt.common.storages.versioned_storage import VersionedStorage
+-from dlt.common.typing import StrAny, TDataItem
++from dlt.common.typing import StrAny, TDataItem, PathLike
+ from dlt.common.utils import set_working_dir
+ 
+ TEST_STORAGE_ROOT = "_storage"
+@@ -139,6 +144,19 @@ def TEST_DICT_CONFIG_PROVIDER():
+         return provider
+ 
+ 
++class PublicCDNHandler(http.server.SimpleHTTPRequestHandler):
++    @classmethod
++    def factory(cls, *args, directory: Path) -> "PublicCDNHandler":
++        return cls(*args, directory=directory)
++
++    def __init__(self, *args, directory: Optional[Path] = None):
++        super().__init__(*args, directory=str(directory) if directory else None)
++
++    def list_directory(self, path: Union[str, PathLike]) -> None:
++        self.send_error(HTTPStatus.FORBIDDEN, "Directory listing is forbidden")
++        return None
++
++
+ class MockHttpResponse(Response):
+     def __init__(self, status_code: int) -> None:
+         self.status_code = status_code
+@@ -204,6 +222,29 @@ def auto_module_test_run_context(auto_module_test_storage) -> Iterator[None]:
+     yield from create_test_run_context()
+ 
+ 
++@pytest.fixture
++def public_http_server():
++    """
++    A simple HTTP server serving files from the current directory.
++    Used to simulate public CDN. It allows only file access, directory listing is forbidden.
++    """
++    httpd = http.server.ThreadingHTTPServer(
++        ("localhost", 8189),
++        partial(
++            PublicCDNHandler.factory, directory=Path.cwd().joinpath("tests/common/storages/samples")
++        ),
++    )
++    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
++    server_thread.start()
++    try:
++        yield httpd
++    finally:
++        # always close
++        httpd.shutdown()
++        server_thread.join()
++        httpd.server_close()
++
++
+ def create_test_run_context() -> Iterator[None]:
+     # this plugs active context
+     ctx = PluggableRunContext()
+diff --git a/uv.lock b/uv.lock
+index 0cd9cc3b7..4b0021970 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2140,6 +2140,9 @@ gcp = [
+ gs = [
+     { name = "gcsfs" },
+ ]
++http = [
++    { name = "aiohttp" },
++]
+ lancedb = [
+     { name = "lancedb", marker = "python_full_version < '3.13'" },
+     { name = "pyarrow" },
+@@ -2336,6 +2339,7 @@ requires-dist = [
+     { name = "adlfs", marker = "extra == 'az'", specifier = ">=2024.7.0" },
+     { name = "adlfs", marker = "extra == 'clickhouse'", specifier = ">=2024.7.0" },
+     { name = "adlfs", marker = "extra == 'synapse'", specifier = ">=2024.7.0" },
++    { name = "aiohttp", marker = "extra == 'http'", specifier = ">3.9.0" },
+     { name = "alembic", marker = "extra == 'sqlalchemy'", specifier = ">1.10.0" },
+     { name = "botocore", marker = "extra == 'athena'", specifier = ">=1.28" },
+     { name = "botocore", marker = "extra == 'filesystem'", specifier = ">=1.28" },
+@@ -2354,7 +2358,7 @@ requires-dist = [
+     { name = "duckdb", marker = "extra == 'ducklake'", specifier = ">=1.2.0" },
+     { name = "duckdb", marker = "extra == 'motherduck'", specifier = ">=0.9" },
+     { name = "duckdb", marker = "extra == 'workspace'", specifier = ">=0.9" },
+-    { name = "fsspec", specifier = ">=2022.4.0" },
++    { name = "fsspec", specifier = ">=2025.9.0" },
+     { name = "gcsfs", marker = "extra == 'bigquery'", specifier = ">=2022.4.0" },
+     { name = "gcsfs", marker = "extra == 'clickhouse'", specifier = ">=2022.4.0" },
+     { name = "gcsfs", marker = "extra == 'gcp'", specifier = ">=2022.4.0" },
+@@ -2430,7 +2434,7 @@ requires-dist = [
+     { name = "weaviate-client", marker = "extra == 'weaviate'", specifier = ">=3.22" },
+     { name = "win-precise-time", marker = "python_full_version < '3.13' and os_name == 'nt'", specifier = ">=1.4.2" },
+ ]
+-provides-extras = ["gcp", "bigquery", "postgres", "redshift", "parquet", "duckdb", "ducklake", "filesystem", "s3", "gs", "az", "sftp", "snowflake", "motherduck", "cli", "athena", "weaviate", "mssql", "synapse", "qdrant", "databricks", "clickhouse", "dremio", "lancedb", "deltalake", "sql-database", "sqlalchemy", "pyiceberg", "postgis", "workspace", "dbml"]
++provides-extras = ["gcp", "bigquery", "postgres", "redshift", "parquet", "duckdb", "ducklake", "filesystem", "s3", "gs", "az", "sftp", "http", "snowflake", "motherduck", "cli", "athena", "weaviate", "mssql", "synapse", "qdrant", "databricks", "clickhouse", "dremio", "lancedb", "deltalake", "sql-database", "sqlalchemy", "pyiceberg", "postgis", "workspace", "dbml"]
+ 
+ [package.metadata.requires-dev]
+ adbc = [{ name = "adbc-driver-postgresql", specifier = ">=1.6.0" }]
+@@ -3210,16 +3214,16 @@ wheels = [
+ 
+ [[package]]
+ name = "fsspec"
+-version = "2025.5.1"
++version = "2025.9.0"
+ source = { registry = "https://pypi.org/simple" }
+-sdist = { url = "https://files.pythonhosted.org/packages/00/f7/27f15d41f0ed38e8fcc488584b57e902b331da7f7c6dcda53721b15838fc/fsspec-2025.5.1.tar.gz", hash = "sha256:2e55e47a540b91843b755e83ded97c6e897fa0942b11490113f09e9c443c2475", size = 303033, upload-time = "2025-05-24T12:03:23.792Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/de/e0/bab50af11c2d75c9c4a2a26a5254573c0bd97cea152254401510950486fa/fsspec-2025.9.0.tar.gz", hash = "sha256:19fd429483d25d28b65ec68f9f4adc16c17ea2c7c7bf54ec61360d478fb19c19", size = 304847, upload-time = "2025-09-02T19:10:49.215Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/bb/61/78c7b3851add1481b048b5fdc29067397a1784e2910592bc81bb3f608635/fsspec-2025.5.1-py3-none-any.whl", hash = "sha256:24d3a2e663d5fc735ab256263c4075f374a174c3410c0b25e5bd1970bceaa462", size = 199052, upload-time = "2025-05-24T12:03:21.66Z" },
++    { url = "https://files.pythonhosted.org/packages/47/71/70db47e4f6ce3e5c37a607355f80da8860a33226be640226ac52cb05ef2e/fsspec-2025.9.0-py3-none-any.whl", hash = "sha256:530dc2a2af60a414a832059574df4a6e10cce927f6f4a78209390fe38955cfb7", size = 199289, upload-time = "2025-09-02T19:10:47.708Z" },
+ ]
+ 
+ [[package]]
+ name = "gcsfs"
+-version = "2025.5.1"
++version = "2025.9.0"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "aiohttp" },
+@@ -3230,9 +3234,9 @@ dependencies = [
+     { name = "google-cloud-storage" },
+     { name = "requests" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/d8/4a/47ad326cc74ccfd97e125c0087a36d516ed74c61f53e458067737378d0f2/gcsfs-2025.5.1.tar.gz", hash = "sha256:ba945530cf4857cd9d599ccb3ae729c65c39088880b11c4df1fecac30df5f3e3", size = 82173, upload-time = "2025-05-24T12:12:58.519Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/54/55/cd737f96929f9cf52666bd49e9b4d1aac697655b3ab17c49ab4fb587bb12/gcsfs-2025.9.0.tar.gz", hash = "sha256:36b8c379d9789d5332a45a3aa2840ec518ff73c6d21c1e962f53318d1cd65db9", size = 82843, upload-time = "2025-09-02T19:23:19.22Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/ff/eb/9182e875592c48d282c5eab602000f0618817b9011b2b2925165e4b4b7f3/gcsfs-2025.5.1-py2.py3-none-any.whl", hash = "sha256:48712471ff71ac83d3e2152ba4dc232874698466e344d5e700feba06b0a0de7b", size = 36581, upload-time = "2025-05-24T12:12:57.011Z" },
++    { url = "https://files.pythonhosted.org/packages/4c/41/f793f3bae39f9fbaabf935d0afcf3aa99e417c92096f3e232ac085aaddbf/gcsfs-2025.9.0-py2.py3-none-any.whl", hash = "sha256:38208bc79af60c693e44ff2f0bd6fd3ca664fea1940fe6770ac1c6003aa0f559", size = 36893, upload-time = "2025-09-02T19:23:18.002Z" },
+ ]
+ 
+ [[package]]
+@@ -8450,16 +8454,16 @@ wheels = [
+ 
+ [[package]]
+ name = "s3fs"
+-version = "2025.5.1"
++version = "2025.9.0"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "aiobotocore" },
+     { name = "aiohttp" },
+     { name = "fsspec" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/7f/6f/d0ee452580d7d0643a1a776b95dfef2144023f3fc077038e07d651995d34/s3fs-2025.5.1.tar.gz", hash = "sha256:84beffa231b8ed94f8d667e93387b38351e1c4447aedea5c2c19dd88b7fcb658", size = 77276, upload-time = "2025-05-24T12:14:11.442Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/ee/f3/8e6371436666aedfd16e63ff68a51b8a8fcf5f33a0eee33c35e0b2476b27/s3fs-2025.9.0.tar.gz", hash = "sha256:6d44257ef19ea64968d0720744c4af7a063a05f5c1be0e17ce943bef7302bc30", size = 77823, upload-time = "2025-09-02T19:18:21.781Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/d5/c0/f5cc95ec88694429fcb841a37456be0a27463bc39d43edbd36e3164120ed/s3fs-2025.5.1-py3-none-any.whl", hash = "sha256:7475e7c40a3a112f17144907ffae50782ab6c03487fe0b45a9c3942bb7a5c606", size = 30476, upload-time = "2025-05-24T12:14:10.056Z" },
++    { url = "https://files.pythonhosted.org/packages/37/b3/ca7d58ca25b1bb6df57e6cbd0ca8d6437a4b9ce1cd35adc8a6b2949c113b/s3fs-2025.9.0-py3-none-any.whl", hash = "sha256:c33c93d48f66ed440dbaf6600be149cdf8beae4b6f8f0201a209c5801aeb7e30", size = 30319, upload-time = "2025-09-02T19:18:20.563Z" },
+ ]
+ 
+ [[package]]
+
+
+===== COMMIT f14eca1c =====
+
+
+commit f14eca1cf
+Author: anuunchin
+Date: 2025-10-23
+
+    Initial commit with add_metrics (#3240)
+
+diff --git a/dlt/extract/items_transform.py b/dlt/extract/items_transform.py
+index e61dc867c..83c17eae6 100644
+--- a/dlt/extract/items_transform.py
++++ b/dlt/extract/items_transform.py
+@@ -9,7 +9,6 @@ from typing import (
+     Generic,
+     Iterator,
+     Mapping,
+-    MutableMapping,
+     Optional,
+     Union,
+     Dict,
+@@ -30,6 +29,7 @@ ItemTransformFunctionWithMeta = Callable[[TDataItem, str], TAny]
+ ItemTransformFunctionNoMeta = Callable[[TDataItem], TAny]
+ ItemTransformFunc = Union[ItemTransformFunctionWithMeta[TAny], ItemTransformFunctionNoMeta[TAny]]
+ 
++MetricsFunctionWithMeta = Callable[[TDataItems, Any, Dict[str, Any]], None]
+ 
+ TCustomMetrics = TypeVar(
+     "TCustomMetrics", covariant=True, bound=Mapping[str, Any], default=Dict[str, Any]
+@@ -225,3 +225,21 @@ class LimitItem(ItemTransform[TDataItem]):
+             return None
+ 
+         return item
++
++
++class MetricsItem(ItemTransform[None]):
++    """Collects custom metrics from data flowing through the pipe without modifying items.
++
++    The metrics function receives items, optionally meta, and a metrics dictionary that it can
++    update in-place. The items are passed through unchanged.
++    """
++
++    _metrics_f: MetricsFunctionWithMeta = None
++
++    def __init__(self, metrics_f: MetricsFunctionWithMeta) -> None:
++        BaseItemTransform.__init__(self)
++        self._metrics_f = metrics_f
++
++    def __call__(self, item: TDataItems, meta: Any = None) -> Optional[TDataItems]:
++        self._metrics_f(item, meta, self._custom_metrics)
++        return item
+diff --git a/dlt/extract/resource.py b/dlt/extract/resource.py
+index 3e5574ac9..b5782137f 100644
+--- a/dlt/extract/resource.py
++++ b/dlt/extract/resource.py
+@@ -12,9 +12,6 @@ from typing import (
+     Union,
+     Any,
+     Optional,
+-    Mapping,
+-    List,
+-    Tuple,
+     Dict,
+ )
+ 
+@@ -66,8 +63,10 @@ from dlt.extract.items_transform import (
+     YieldMapItem,
+     ValidateItem,
+     LimitItem,
++    MetricsItem,
+     ItemTransformFunc,
+     ItemTransformFunctionWithMeta,
++    MetricsFunctionWithMeta,
+ )
+ from dlt.extract.state import resource_state
+ from dlt.extract.pipe_iterator import ManagedPipeIterator
+@@ -345,6 +344,26 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
+             self._pipe.insert_step(MapItem(item_map), insert_at)
+         return self
+ 
++    def add_metrics(
++        self, metrics_f: MetricsFunctionWithMeta, insert_at: int = None
++    ) -> Self:  # noqa: A003
++        """Adds metrics collection function defined in `metrics_f` to the resource pipe at position `inserted_at`
++        `metrics_f` receives data items, meta, and metrics dictionary to update in-place.
++        Items are passed through unchanged.
++
++        Args:
++            metrics_f (MetricsFunctionWithMeta): A function taking items, meta argument, and metrics dict. Returns None.
++            insert_at (int, optional): At which step in pipe to insert the metrics collector. Defaults to None which inserts after last step
++
++        Returns:
++            "DltResource": returns self
++        """
++        if insert_at is None:
++            self._pipe.append_step(MetricsItem(metrics_f))
++        else:
++            self._pipe.insert_step(MetricsItem(metrics_f), insert_at)
++        return self
++
+     def add_yield_map(
+         self,
+         item_map: ItemTransformFunc[Iterator[TDataItem]],
+diff --git a/docs/website/docs/dlt-ecosystem/transformations/add-map.md b/docs/website/docs/dlt-ecosystem/transformations/add-map.md
+index c3d145aac..c3b008ede 100644
+--- a/docs/website/docs/dlt-ecosystem/transformations/add-map.md
++++ b/docs/website/docs/dlt-ecosystem/transformations/add-map.md
+@@ -30,9 +30,10 @@ This page covers how `add_map` works, where it fits in the pipeline, and how to
+ 
+ In addition to `add_map`, dlt provides:
+ 
+-- **`add_filter`**: Excludes records based on a condition. Works like a filter function that removes items you don't want to load. ([`resource.add_filter`)](../../api_reference/dlt/extract/resource#add_filter).
++- **`add_filter`**: Excludes records based on a condition. Works like a filter function that removes items you don't want to load. ([`resource.add_filter`](../../api_reference/dlt/extract/resource#add_filter)).
+ - **`add_yield_map`**: Produces multiple outputs from a single input item. Returns an iterator instead of a single item. ([`resource.add_yield_map`](../../api_reference/dlt/extract/resource#add_yield_map)).
+ - **`add_limit`**: Limits the number of records processed by a resource. Useful for testing or reducing data volume during development. ([`resource.add_limit`](../../api_reference/dlt/extract/resource#add_limit)).
++- **`add_metrics`**: Collects custom metrics from data flowing through the pipeline without modifying items. Useful for tracking statistics like counts, data quality metrics, or processing information. ([`resource.add_metrics`](../../api_reference/dlt/extract/resource#add_metrics)).
+ 
+ These methods help you control the shape and flow of data during transformation.
+ 
+diff --git a/docs/website/docs/general-usage/resource.md b/docs/website/docs/general-usage/resource.md
+index 83214d224..7669460e8 100644
+--- a/docs/website/docs/general-usage/resource.md
++++ b/docs/website/docs/general-usage/resource.md
+@@ -354,12 +354,14 @@ resource. The available transformation types:
+ - **filter** - filter the data item (`resource.add_filter`).
+ - [**yield map**](../dlt-ecosystem/transformations/add-map#add_yield_map) - a map that returns an iterator (so a single row may generate many rows -
+   `resource.add_yield_map`).
++- [**metrics**](#using-add_metrics-as-a-transformation-step) - collect custom metrics without modifying data items (`resource.add_metrics`).
+ 
+ Example: We have a resource that loads a list of users from an API endpoint. We want to customize it
+ so:
+ 
+-1. We remove users with `user_id == "me"`.
+-2. We anonymize user data.
++1. We track how many users with `user_id == "me"` are being filtered out.
++2. We remove users with `user_id == "me"`.
++3. We anonymize user data.
+ 
+ Here's our resource:
+ 
+@@ -384,8 +386,20 @@ def anonymize_user(user_data):
+     user_data["user_email"] = _hash_str(user_data["user_email"])
+     return user_data
+ 
+-# add the filter and anonymize function to users resource and enumerate
+-for user in users().add_filter(lambda user: user["user_id"] != "me").add_map(anonymize_user):
++def track_filtered(items, meta, metrics):
++    """Track how many 'me' users were filtered out."""
++    users_list = items if isinstance(items, list) else [items]
++    for user in users_list:
++        if user["user_id"] == "me":
++            metrics["filtered_me_users"] = metrics.get("filtered_me_users", 0) + 1
++
++# add metrics, filter, and anonymize function to users resource
++for user in (
++    users()
++    .add_metrics(track_filtered)
++    .add_filter(lambda user: user["user_id"] != "me")
++    .add_map(anonymize_user)
++):
+     print(user)
+ ```
+ 
+@@ -702,6 +716,9 @@ The `with_name` method returns a deep copy of the original resource, its data pi
+ 
+ ## Collect custom metrics
+ 
++
++### Using `dlt.current.resource_metrics()` within a resource
++
+ You can track custom statistics during resource extraction with `dlt.current.resource_metrics()`, which might otherwise be lost:
+ 
+ ```py
+@@ -746,6 +763,53 @@ print(f"Custom metrics: {resource_metrics.custom_metrics}")
+ 
+ As shown above, custom metrics are included in pipeline traces. Refer to [pipeline trace loading](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) for more details.
+ 
++### Using `add_metrics` as a transformation step
++
++Alternatively, you can collect metrics using `add_metrics`, which works as a transformation step in the pipeline.
++
++```py
++import dlt
++from dlt.sources.helpers.rest_client import RESTClient
++from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
++
++github_client = RESTClient(
++    base_url="https://pokeapi.co/api/v2",
++    paginator=JSONLinkPaginator(next_url_path="next"),
++    data_selector="results",
++)
++
++@dlt.resource
++def get_pokemons():
++    for page in github_client.paginate(
++        "/pokemon",
++        params={
++            "limit": 100,
++        },
++    ):
++        yield page
++
++def page_counter(items, meta, metrics) -> None:
++    metrics["page_count"] = metrics.get("page_count", 0) + 1
++
++get_pokemons.add_metrics(page_counter)
++
++pipeline = dlt.pipeline(
++    pipeline_name="get_pokemons",
++    destination="duckdb",
++    dataset_name="github_data",
++)
++load_info = pipeline.run(get_pokemons)
++print(load_info)
++
++# Access custom metrics from last trace
++trace = pipeline.last_trace
++load_id = load_info.loads_ids[0]
++resource_metrics = trace.last_extract_info.metrics[load_id][0]["resource_metrics"]["get_pokemons"]
++
++print(f"Custom metrics: {resource_metrics.custom_metrics}")
++```
++
++
+ ## Load resources
+ 
+ You can pass individual resources or a list of resources to the `dlt.pipeline` object. The resources loaded outside the source context will be added to the [default schema](schema.md) of the pipeline.
+diff --git a/tests/extract/test_extract.py b/tests/extract/test_extract.py
+index 401fec537..cbe7e940d 100644
+--- a/tests/extract/test_extract.py
++++ b/tests/extract/test_extract.py
+@@ -12,6 +12,7 @@ from dlt.common.storages import (
+     NormalizeStorageConfiguration,
+ )
+ from dlt.common.storages.schema_storage import SchemaStorage
++from dlt.common.utils import uniq_id
+ 
+ from dlt.common.typing import TTableNames, TDataItems
+ from dlt.extract import DltResource, DltSource
+@@ -20,7 +21,7 @@ from dlt.extract.extract import ExtractStorage, Extract
+ from dlt.extract.hints import TResourceNestedHints, make_hints
+ from dlt.extract.items_transform import ValidateItem
+ 
+-from dlt.extract.items import TableNameMeta
++from dlt.extract.items import TableNameMeta, DataItemWithMeta
+ from tests.utils import MockPipeline, clean_test_storage, TEST_STORAGE_ROOT
+ from tests.extract.utils import expect_extracted_file
+ 
+@@ -727,3 +728,97 @@ def test_resource_step_custom_metrics(extract_step: Extract, with_custom_metrics
+         assert resource_metrics.custom_metrics == expected_metrics
+     else:
+         assert resource_metrics.custom_metrics == {}
++
++
++@pytest.mark.parametrize(
++    "as_single_batch",
++    [True, False],
++    ids=["single_batch", "multiple_batches"],
++)
++def test_add_metrics(extract_step: Extract, as_single_batch: bool) -> None:
++    """Test metrics collection with add_metrics"""
++
++    # 1: Test metrics at different pipeline stages (before/after filter)
++    @dlt.resource
++    def some_data():
++        data = [1, 2, 3, 4, 5, 6]
++        if as_single_batch:
++            yield data
++        else:
++            yield from data
++
++    def early_counter(items: TDataItems, meta: Any, metrics: Dict[str, Any]) -> None:
++        metrics["early_count"] = metrics.get("early_count", 0) + 1
++
++    def late_counter(items: TDataItems, meta: Any, metrics: Dict[str, Any]) -> None:
++        metrics["late_count"] = metrics.get("late_count", 0) + 1
++
++    some_data.add_metrics(early_counter).add_filter(lambda x: x > 3).add_metrics(late_counter)
++
++    # 2. Test metrics with TableNameMeta
++    @dlt.resource
++    def multi_table_data():
++        yield dlt.mark.with_table_name({"id": 1, "name": "Alice"}, "users")
++        yield dlt.mark.with_table_name({"id": 2, "name": "Bob"}, "users")
++        yield dlt.mark.with_table_name({"product": "A"}, "products")
++        yield dlt.mark.with_table_name({"product": "B"}, "products")
++
++    def count_by_table(items: TDataItems, meta: Any, metrics: Dict[str, Any]) -> None:
++        if isinstance(meta, TableNameMeta):
++            table_key = f"count_{meta.table_name}"
++            metrics[table_key] = metrics.get(table_key, 0) + 1
++
++    multi_table_data.add_metrics(count_by_table)
++
++    # 3. Test metrics with custom metadata
++    @dlt.resource
++    def data_with_priority():
++        yield DataItemWithMeta(meta={"priority": "high"}, data={"id": 1})
++        yield DataItemWithMeta(meta={"priority": "high"}, data={"id": 2})
++        yield DataItemWithMeta(meta={"priority": "low"}, data={"id": 3})
++        yield DataItemWithMeta(meta={"priority": "low"}, data={"id": 4})
++        yield DataItemWithMeta(meta={"priority": "low"}, data={"id": 5})
++
++    def count_by_priority(items: TDataItems, meta: Any, metrics: Dict[str, Any]) -> None:
++        if isinstance(meta, dict) and "priority" in meta:
++            priority = meta["priority"]
++            key = f"{priority}_priority_count"
++            metrics[key] = metrics.get(key, 0) + 1
++
++    data_with_priority.add_metrics(count_by_priority)
++
++    source = DltSource(
++        dlt.Schema("metrics"), "module", [some_data, multi_table_data, data_with_priority]
++    )
++    load_id = extract_step.extract(source, 20, 1)
++
++    assert source.resources["some_data"].custom_metrics == {
++        "early_count": 1 if as_single_batch else 6,
++        "late_count": 1 if as_single_batch else 3,
++    }
++    assert source.resources["multi_table_data"].custom_metrics == {
++        "count_users": 2,
++        "count_products": 2,
++    }
++    assert source.resources["data_with_priority"].custom_metrics == {
++        "high_priority_count": 2,
++        "low_priority_count": 3,
++    }
++
++    step_info = extract_step.get_step_info(MockPipeline("buba", first_run=False))  # type: ignore[abstract]
++    all_resource_metrics = step_info.metrics[load_id][0]["resource_metrics"]
++    assert "some_data" in all_resource_metrics
++    assert "multi_table_data" in all_resource_metrics
++    assert "data_with_priority" in all_resource_metrics
++    assert all_resource_metrics["some_data"].custom_metrics == {
++        "early_count": 1 if as_single_batch else 6,
++        "late_count": 1 if as_single_batch else 3,
++    }
++    assert all_resource_metrics["multi_table_data"].custom_metrics == {
++        "count_users": 2,
++        "count_products": 2,
++    }
++    assert all_resource_metrics["data_with_priority"].custom_metrics == {
++        "high_priority_count": 2,
++        "low_priority_count": 3,
++    }
+
+
+===== COMMIT 66da0e1e =====
+
+
+commit 66da0e1ed
+Author: anuunchin
+Date: 2025-10-23
+
+    Feat: dlt.destination as named destination factory (#3204)
+
+diff --git a/dlt/destinations/decorators.py b/dlt/destinations/decorators.py
+index abc7ca77d..176e11371 100644
+--- a/dlt/destinations/decorators.py
++++ b/dlt/destinations/decorators.py
+@@ -1,9 +1,7 @@
+-import functools
+-
+ import inspect
+ from typing import Any, Type, Optional, Callable, Union, overload
+ from typing_extensions import Concatenate
+-from dlt.common.destination.reference import DestinationReference
++from dlt.common.destination.reference import DestinationReference, AnyDestination, Destination
+ from dlt.common.reflection.spec import get_spec_name_from_f
+ from dlt.common.typing import AnyFun
+ 
+@@ -23,28 +21,11 @@ from dlt.destinations.impl.destination.configuration import (
+ )
+ 
+ 
+-@overload
+-def destination(
+-    func: Callable[
+-        Concatenate[Union[TDataItems, str], TTableSchema, TDestinationCallableParams], Any
+-    ],
+-    /,
+-    loader_file_format: TLoaderFileFormat = None,
+-    batch_size: int = 10,
+-    name: str = None,
+-    naming_convention: str = "direct",
+-    skip_dlt_columns_and_tables: bool = True,
+-    max_table_nesting: int = 0,
+-    spec: Type[CustomDestinationClientConfiguration] = None,
+-    max_parallel_load_jobs: Optional[int] = None,
+-    loader_parallelism_strategy: Optional[TLoaderParallelismStrategy] = None,
+-) -> Callable[TDestinationCallableParams, _destination]: ...
+-
+-
+ @overload
+ def destination(
+     func: None = ...,
+     /,
++    *,
+     loader_file_format: TLoaderFileFormat = None,
+     batch_size: int = 10,
+     name: str = None,
+@@ -57,12 +38,71 @@ def destination(
+ ) -> Callable[
+     [Callable[Concatenate[Union[TDataItems, str], TTableSchema, TDestinationCallableParams], Any]],
+     Callable[TDestinationCallableParams, _destination],
+-]: ...
++]:
++    """A decorator that transforms a function into a custom destination with configuration parameters.
++
++    This overload handles parameterized decorator usage where configuration is provided
++    in the decorator call, and the function to be decorated is applied later.
++
++    #### Example Usage:
++
++    >>> @dlt.destination(batch_size=100, loader_file_format="parquet")
++    >>> def my_destination(items, table, api_url: str = dlt.config.value, api_secret = dlt.secrets.value):
++    >>>     print(table["name"])
++    >>>     print(items)
++    >>>
++    >>> p = dlt.pipeline("chess_pipeline", destination=my_destination)
++
++    Args:
++        func (None): Must be None for this overload. The actual function will be provided
++            when the decorator is applied.
++
++        loader_file_format (TLoaderFileFormat, optional): Defines the format in which files are stored
++            in the load package before being sent to the destination function. Defaults to None.
++
++        batch_size (int, optional): Defines how many items per function call are batched together
++            and sent as an array. If set to 0, instead of passing actual data items, you will receive
++            one call per load job with the path of the file as the "items" argument. Defaults to 10.
++
++        name (str, optional): Defines the name of the destination. If not provided, defaults to
++            the name of the decorated function.
+ 
++        naming_convention (str, optional): Controls how table and column names are normalized.
++            The default value, "direct", keeps all names unchanged.
+ 
++        skip_dlt_columns_and_tables (bool, optional): Defines whether internal dlt tables and columns
++            are included in the custom destination function. Defaults to True.
++
++        max_table_nesting (int, optional): Defines how deep the normalizer will go to flatten nested
++            fields in your data to create subtables. This overrides any source settings and defaults
++            to 0, meaning no nested tables are created.
++
++        spec (Type[CustomDestinationClientConfiguration], optional): Defines a configuration spec used
++            to inject arguments into the decorated function. Arguments not included in the spec will
++            not be injected. Defaults to None.
++
++        max_parallel_load_jobs (Optional[int], optional): Defines the maximum number of load jobs
++            that can run concurrently during the load process. Defaults to None.
++
++        loader_parallelism_strategy (Optional[TLoaderParallelismStrategy], optional): Determines the
++            load job parallelism strategy. Can be "sequential" (equivalent to max_parallel_load_jobs=1),
++            "table-sequential" (one load job per table at a time), or "parallel". Defaults to None.
++
++    Returns:
++        Callable[[Callable[Concatenate[Union[TDataItems, str], TTableSchema, TDestinationCallableParams], Any]], Callable[TDestinationCallableParams, _destination]]:
++            A decorator function that accepts the destination function and returns a callable that can
++            be used to create a custom dlt destination instance.
++    """
++    ...
++
++
++@overload
+ def destination(
+-    func: Optional[AnyFun] = None,
++    func: Callable[
++        Concatenate[Union[TDataItems, str], TTableSchema, TDestinationCallableParams], Any
++    ],
+     /,
++    *,
+     loader_file_format: TLoaderFileFormat = None,
+     batch_size: int = 10,
+     name: str = None,
+@@ -72,44 +112,114 @@ def destination(
+     spec: Type[CustomDestinationClientConfiguration] = None,
+     max_parallel_load_jobs: Optional[int] = None,
+     loader_parallelism_strategy: Optional[TLoaderParallelismStrategy] = None,
+-) -> Any:
+-    """A decorator that transforms a function that takes two positional arguments "table" and "items" and any number of keyword arguments with defaults
+-    into a callable that will create a custom destination. The function does not return anything, the keyword arguments can be configuration and secrets values.
++) -> Callable[TDestinationCallableParams, _destination]:
++    """Creates a destination factory from a function by directly passing it as an argument.
+ 
+-    #### Example Usage with Configuration and Secrets:
++    This overload handles direct function calls where the destination function is passed
++    as the first argument, rather than using decorator syntax.
++
++    #### Example Usage:
+ 
+-    >>> @dlt.destination(batch_size=100, loader_file_format="parquet")
+     >>> def my_destination(items, table, api_url: str = dlt.config.value, api_secret = dlt.secrets.value):
+     >>>     print(table["name"])
+     >>>     print(items)
+     >>>
+-    >>> p = dlt.pipeline("chess_pipeline", destination=my_destination)
+-
+-    Here all incoming data will be sent to the destination function with the items in the requested format and the dlt table schema.
+-    The config and secret values will be resolved from the path destination.my_destination.api_url and destination.my_destination.api_secret.
++    >>> dest = dlt.destination(my_destination, batch_size=100, loader_file_format="parquet")
++    >>> p = dlt.pipeline("chess_pipeline", destination=dest)
+ 
+     Args:
+-        func (Optional[AnyFun]): A function that takes two positional arguments "table" and "items" and any number of keyword arguments with defaults which will process the incoming data.
++        func (Callable[Concatenate[Union[TDataItems, str], TTableSchema, TDestinationCallableParams], Any]):
++            A callable that takes two positional arguments "items" and "table",
++            followed by any number of keyword arguments with default values. This function
++            will process the incoming data and does not need to return anything. The keyword
++            arguments can represent configuration or secret values.
++
++        loader_file_format (TLoaderFileFormat): Defines the format in which files are stored in the load package
++            before being sent to the destination function.
++
++        batch_size (int): Defines how many items per function call are batched together and sent as an array.
++            If set to 0, instead of passing actual data items, you will receive one call per load job
++            with the path of the file as the "items" argument. You can then open and process that file as needed.
++
++        name (str): Defines the name of the destination created by the destination decorator.
++            Defaults to the name of the function.
+ 
+-        loader_file_format (TLoaderFileFormat): defines in which format files are stored in the load package before being sent to the destination function, this can be puae-jsonl or parquet.
++        naming_convention (str): Controls how table and column names are normalized.
++            The default value, "direct", keeps all names unchanged.
+ 
+-        batch_size (int): defines how many items per function call are batched together and sent as an array. If you set a batch-size of 0, instead of passing in actual dataitems, you will receive one call per load job with the path of the file as the items argument. You can then open and process that file in any way you like.
++        skip_dlt_columns_and_tables (bool): Defines whether internal dlt tables and columns
++            are included in the custom destination function. Defaults to True.
+ 
+-        name (str): defines the name of the destination that gets created by the destination decorator, defaults to the name of the function
++        max_table_nesting (int): Defines how deep the normalizer will go to flatten nested fields
++            in your data to create subtables. This overrides any source settings and defaults to 0,
++            meaning no nested tables are created.
+ 
+-        naming_convention (str): defines the name of the destination that gets created by the destination decorator. This controls how table and column names are normalized. The default is direct which will keep all names the same.
++        spec (Type[CustomDestinationClientConfiguration]): Defines a configuration spec used
++            to inject arguments into the decorated function. Arguments not included in the spec will not be injected.
++
++        max_parallel_load_jobs (Optional[int]): Defines the maximum number of load jobs
++            that can run concurrently during the load process.
++
++        loader_parallelism_strategy (Optional[TLoaderParallelismStrategy]): Determines the load job parallelism strategy.
++            Can be "sequential" (equivalent to max_parallel_load_jobs=1), "table-sequential" (one load job per table at a time),
++            or "parallel".
++
++    Returns:
++        Callable[TDestinationCallableParams, _destination]: A callable that can be used to create a custom dlt destination instance.
++    """
++    ...
++
++
++@overload
++def destination(
++    destination_name: str,
++    /,
++    *,
++    destination_type: Optional[str] = None,
++    credentials: Optional[Any] = None,
++    **kwargs: Any,
++) -> AnyDestination:
++    """Instantiates a destination from the provided destination name and type by retrieving the corresponding
++    destination factory and initializing it with the given credentials and keyword arguments.
+ 
+-        skip_dlt_columns_and_tables (bool): defines wether internal tables and columns will be fed into the custom destination function. This is set to True by default.
++    Args:
++        destination_name (str): The name of the destination instance to initialize.
+ 
+-        max_table_nesting (int): defines how deep the normalizer will go to normalize nested fields on your data to create subtables. This overwrites any settings on your source and is set to zero to not create any nested tables by default.
++        destination_type (Optional[str]): The type of the destination to instantiate.
+ 
+-        spec (Type[CustomDestinationClientConfiguration]): defines a configuration spec that will be used to to inject arguments into the decorated functions. Argument not in spec will not be injected
++        credentials (Optional[Any]): Credentials used to connect to the destination.
++            May be an instance of a credential class supported by the respective destination.
+ 
+-        max_parallel_load_jobs (Optional[int]): how many load jobs at most will be running during the load
++        **kwargs (Any): Additional keyword arguments passed to the destination factory.
+ 
+-        loader_parallelism_strategy (Optional[TLoaderParallelismStrategy]): Can be "sequential" which equals max_parallel_load_jobs=1, "table-sequential" where each table will have at most one loadjob at any given time and "parallel"
+     Returns:
+-        Any: A callable that can be used to create a dlt custom destination instance
++        AnyDestination: An initialized destination.
++    """
++    ...
++
++
++def destination(
++    func_or_name: Union[Optional[AnyFun], str] = None,
++    /,
++    *,
++    loader_file_format: TLoaderFileFormat = None,
++    batch_size: int = 10,
++    name: str = None,
++    naming_convention: str = "direct",
++    skip_dlt_columns_and_tables: bool = True,
++    max_table_nesting: int = 0,
++    spec: Type[CustomDestinationClientConfiguration] = None,
++    max_parallel_load_jobs: Optional[int] = None,
++    loader_parallelism_strategy: Optional[TLoaderParallelismStrategy] = None,
++    **kwargs: Any,
++) -> Any:
++    """When used as a decorator, transforms a function that takes two positional arguments, "items" and "table",
++    along with any number of keyword arguments with default values, into a callable that will create a custom destination.
++    The function itself does not return anything, the keyword arguments can represent configuration or secret values.
++
++    When used as a function with the first argument being a string (the destination name),
++    instantiates a destination from the provided destination name and type by retrieving the corresponding
++    destination factory and initializing it with the given credentials and keyword arguments.
+     """
+ 
+     def decorator(
+@@ -165,9 +275,31 @@ def destination(
+         setattr(wrapper, "_factory", D)  # noqa
+         return wrapper
+ 
+-    if func is None:
++    if func_or_name is None:
+         # we're called with parens.
+         return decorator
++    elif not isinstance(func_or_name, str):
++        # we're called as @dlt.destination without parens.
++        return decorator(func_or_name)
++
++    # Factory mode: create destination instance from given string
++    destination_type = kwargs.pop("destination_type", None)
++    if destination_type:
++        destination = Destination.from_reference(
++            ref=destination_type,
++            destination_name=func_or_name,
++            **kwargs,
++        )
++    elif kwargs.get("destination_callable"):
++        destination = Destination.from_reference(
++            ref="destination",
++            destination_name=func_or_name,
++            **kwargs,
++        )
++    else:
++        destination = Destination.from_reference(
++            ref=func_or_name,
++            **kwargs,
++        )
+ 
+-    # we're called as @dlt.destination without parens.
+-    return decorator(func)
++    return destination
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/destination.md b/docs/website/docs/dlt-ecosystem/destinations/destination.md
+index 58018fbc7..836a3537a 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/destination.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/destination.md
+@@ -129,21 +129,19 @@ There are multiple ways to pass the custom destination function to the `dlt` pip
+   p = dlt.pipeline("my_pipe", destination=my_destination(api_key=os.getenv("API_KEY"))) # type: ignore[call-arg]
+   ```
+ 
+-- Directly via destination reference. In this case, don't use the decorator for the destination function.
++- Via the `dlt.destination()` function that initializes the destination. In this case, don't use the decorator for the destination function.
+   ```py
+   # File my_destination.py
+ 
+-  from dlt.common.destination import Destination
+-
+   # Don't use the decorator
+   def local_destination_func(items: TDataItems, table: TTableSchema) -> None:
+       ...
+ 
+-  # Via destination reference
++  # Via dlt.destination() that initializes the destination
+   p = dlt.pipeline(
+       "my_pipe",
+-      destination=Destination.from_reference(
+-          "destination", destination_callable=local_destination_func
++      destination=dlt.destination(
++          "my_destination", destination_callable=local_destination_func
+       )
+   )
+   ```
+@@ -151,13 +149,11 @@ There are multiple ways to pass the custom destination function to the `dlt` pip
+   ```py
+   # File my_pipeline.py
+ 
+-  from dlt.common.destination import Destination
+-
+   # Fully qualified string to function location
+   p = dlt.pipeline(
+       "my_pipe",
+-      destination=Destination.from_reference(
+-          "destination", destination_callable="my_destination.local_destination_func"
++      destination=dlt.destination(
++          "my_destination", destination_callable="my_destination.local_destination_func"
+       )
+   )
+   ```
+diff --git a/docs/website/docs/general-usage/credentials/setup.md b/docs/website/docs/general-usage/credentials/setup.md
+index 11191899d..59914b3dc 100644
+--- a/docs/website/docs/general-usage/credentials/setup.md
++++ b/docs/website/docs/general-usage/credentials/setup.md
+@@ -747,7 +747,7 @@ You have additional options for using multiple instances of the same source:
+ 
+ 1. Use the `clone()` method as explained in the [sql_database documentation](../../dlt-ecosystem/verified-sources/sql_database/advanced.md#configure-many-sources-side-by-side-with-custom-sections).
+ 
+-2. Create [named destinations](../destination.md#configure-multiple-destinations-in-a-pipeline) to use the same destination type with different configurations.
++2. Create [named destinations](../destination.md#configure-multiple-destinations-of-the-same-type) to use the same destination type with different configurations.
+ :::
+ 
+ ## Troubleshoot configuration errors
+diff --git a/docs/website/docs/general-usage/destination.md b/docs/website/docs/general-usage/destination.md
+index c04047413..7533ed266 100644
+--- a/docs/website/docs/general-usage/destination.md
++++ b/docs/website/docs/general-usage/destination.md
+@@ -6,7 +6,7 @@ keywords: [destination, load data, configure destination, name destination]
+ 
+ # Destination
+ 
+-[Destination](glossary.md#destination) is a location in which `dlt` creates and maintains the current version of the schema and loads your data. Destinations come in various forms: databases, datalakes, vector stores, or files. `dlt` deals with this variety via modules which you declare when creating a pipeline.
++[Destination](glossary.md#destination) is a location in which `dlt` creates and maintains the current version of the schema and loads your data. Destinations come in various forms: databases, datalakes, vector stores, or files. `dlt` deals with this variety via destination type modules which you declare when creating a pipeline.
+ 
+ We maintain a set of [built-in destinations](../dlt-ecosystem/destinations/) that you can use right away.
+ 
+@@ -18,20 +18,10 @@ We recommend that you declare the destination type when creating a pipeline inst
+ 
+ Above, we want to use the **filesystem** built-in destination. You can use shorthand types only for built-ins.
+ 
+-* Use a **custom destination name** with a configured type
++* Use a [**named destination**](#use-named-destinations) with a configured type
+ <!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::custom_destination_name-->
+ 
+-Above, we use a custom destination name and configure the destination type to **filesystem** using an environment variable.
+-
+-:::note
+-When resolving non-module destination references (e.g., `"filesystem"` or `"my_destination"`, not `"dlt.destinations.filesystem"`), dlt first attempts to resolve the reference as a named destination with a valid destination type configured, then falls back to shorthand type resolution.
+-
+-This means that, in the previous example, if the destination type was not properly configured or was not a valid destination type, dlt would have attempted to resolve `"my_destination"` as a shorthand for a built-in type and would have eventually failed.
+-
+-As another example, the following:
+-<!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::avoid_example-->
+-will be resolved as a BigQuery destination that is named `"filesystem"`!
+-:::
++Above, we use a custom destination name and configure the destination type to **filesystem** using an environment variable. This approach is especially useful when switching between destinations without modifying the actual pipeline code. See details in the [section on using named destinations](#use-named-destinations-to-switch-destinations-without-changing-code).
+ 
+ * Use full **destination factory type**
+ <!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::class_type-->
+@@ -67,7 +57,7 @@ DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME=dltdata
+ DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY="storage key"
+ ```
+ 
+-When using named destination factories, use the destination name in the config section:
++When using destination factories, use the destination name in the config section:
+ <!--@@@DLT_SNIPPET ./snippets/destination-toml.toml::name_layout-->
+ 
+ For custom destination names passed to your pipeline (e.g., `destination="my_destination"`), dlt resolves the destination type from configuration. Add `destination_type` to specify which destination type to use:
+@@ -111,34 +101,117 @@ print(dict(duck_.capabilities()))
+ ```
+ The example above is overriding the `naming_convention` and `recommended_file_size` in the destination capabilities.
+ 
+-### Configure multiple destinations in a pipeline
+-To configure multiple destinations within a pipeline, you need to provide the credentials for each destination in the "secrets.toml" file. This example demonstrates how to configure a BigQuery destination named `destination_one`:
++
++## Use named destinations
++
++Named destinations are destinations with a custom name, the type of which can be explicitly provided or be resolved from the toml files or equivalent environment variables. There are multiple ways to use named destinations:
++
++- Use a named destination string reference with type configured via an environment variable
++
++<!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::custom_destination_name-->
++
++- Use `dlt.destination()` with the type configured via an environment variable
++
++<!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::named_destination_dlt_destination-->
++
++- Use `dlt.destination()` with the type explicitly configured
++
++<!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::named_destination_dlt_destination_explicit_type-->
++
++For all of the above, the destination type can alternatively be configured in the `secrets.toml` file as follows:
+ 
+ ```toml
+-[destination.destination_one]
++[destination.my_destination]
++destination_type = "filesystem"
++```
++
++:::note
++When resolving non-module destination string references (e.g., `"bigquery"` or `"my_destination"`, not `"dlt.destinations.bigquery"`), dlt first attempts to resolve the reference as a named destination with a valid destination type configured, then falls back to shorthand type resolution.
++
++This means that, in the examples above, if the destination type was not properly configured or was not a valid destination type, dlt would have attempted to resolve `"my_destination"` as a shorthand for a built-in type and would have eventually failed.
++
++As another example, the following:
++<!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::avoid_example-->
++will be resolved as a DuckDB destination that is named `"bigquery"`, because a valid destination type `"duckdb"` is configured and dlt does not attempt to resolve the name `"bigquery"` as a shorthand for a built-in type!
++
++**Exception:** If `dlt.destination()` is used and the `destination_type` is explicitly provided as an argument, dlt will skip the shorthand fallback and only attempt named destination resolution.
++
++:::
++
++
++### Configure multiple destinations of the same type
++
++One of the benefits of named destinations is the ability to configure multiple destinations of the same type for use across different pipelines in a single script. For example, if you have two BigQuery destinations, you could define the following in the `secrets.toml` file:
++
++```toml
++[destination.my_destination]
+ location = "US"
+-[destination.destination_one.credentials]
++[destination.my_destination.credentials]
++project_id = "please set me up!"
++private_key = "please set me up!"
++client_email = "please set me up!"
++
++[destination.my_other_destination]
++location = "EU"
++[destination.my_other_destination.credentials]
+ project_id = "please set me up!"
+ private_key = "please set me up!"
+ client_email = "please set me up!"
+ ```
+ 
+-You can then use this destination in your pipeline as follows:
++And use it in the pipeline code as follows:
++```py
++import dlt
++
++# Configure the pipeline to use the "my_destination" BigQuery destination
++my_pipeline = dlt.pipeline(
++    pipeline_name='my_pipeline',
++    destination=dlt.destination("my_destination", destination_type="bigquery"),
++    dataset_name='dataset_name'
++)
++
++# Configure the pipeline to use the "my_other_destination" BigQuery destination
++my_other_pipeline = dlt.pipeline(
++    pipeline_name='my_other_pipeline',
++    destination=dlt.destination("my_other_destination", destination_type="bigquery"),
++    dataset_name='dataset_name'
++)
++```
++
++### Use named destinations to switch destinations without changing code
++
++Another advantage of named destinations is environment-based switching. When you need to use different destinations across development, staging, and production environments, named destinations allow you to switch destinations by modifying only the toml configuration files without changing the pipeline code. For example, if you are developing with DuckDB, you would first have your `secrets.toml` file configured as follows:
++
++```toml
++[destination.my_destination]
++destination_type = "duckdb"
++```
++
++With the pipeline code being:
++
+ ```py
+ import dlt
+-from dlt.common.destination import Destination
+ 
+-# Configure the pipeline to use the "destination_one" BigQuery destination
+ pipeline = dlt.pipeline(
+-    pipeline_name='pipeline',
+-    destination=Destination.from_reference(
+-        "bigquery",
+-        destination_name="destination_one"
+-    ),
++    pipeline_name='my_pipeline',
++    destination='my_destination',
+     dataset_name='dataset_name'
+ )
+ ```
+-Similarly, you can assign multiple destinations to the same or different drivers.
++
++Then when you deploy the script, you would simply adjust your toml file with:
++
++```toml
++[destination.my_destination]
++destination_type = "bigquery"
++[destination.my_destination.credentials]
++project_id = "please set me up!"
++private_key = "please set me up!"
++client_email = "please set me up!"
++```
++
++And keep the pipeline code intact.
++
+ 
+ ## Access a destination
+ When loading data, `dlt` will access the destination in two cases:
+diff --git a/docs/website/docs/general-usage/snippets/destination-snippets.py b/docs/website/docs/general-usage/snippets/destination-snippets.py
+index 2bccf1903..357621b7b 100644
+--- a/docs/website/docs/general-usage/snippets/destination-snippets.py
++++ b/docs/website/docs/general-usage/snippets/destination-snippets.py
+@@ -42,18 +42,6 @@ def destination_instantiation_snippet() -> None:
+     assert pipeline.destination.destination_type == "dlt.destinations.filesystem"
+     assert pipeline.destination.destination_name == "my_destination"
+ 
+-    # @@@DLT_SNIPPET_START avoid_example
+-    import os
+-    import dlt
+-
+-    os.environ["DESTINATION__FILESYSTEM__DESTINATION_TYPE"] = "bigquery"
+-
+-    pipeline = dlt.pipeline("pipeline", destination="filesystem")
+-    # @@@DLT_SNIPPET_END avoid_example
+-
+-    assert pipeline.destination.destination_type == "dlt.destinations.bigquery"
+-    assert pipeline.destination.destination_name == "filesystem"
+-
+     # @@@DLT_SNIPPET_START instance
+     import dlt
+ 
+@@ -103,6 +91,41 @@ def destination_instantiation_snippet() -> None:
+     )
+     # @@@DLT_SNIPPET_END config_partial_spec
+ 
++    # @@@DLT_SNIPPET_START named_destination_dlt_destination
++    import os
++    import dlt
++
++    os.environ["DESTINATION__MY_DESTINATION__DESTINATION_TYPE"] = "filesystem"
++
++    pipeline = dlt.pipeline("pipeline", destination=dlt.destination("my_destination"))
++    # @@@DLT_SNIPPET_END named_destination_dlt_destination
++
++    # @@@DLT_SNIPPET_START named_destination_dlt_destination_explicit_type
++    import dlt
++
++    pipeline = dlt.pipeline(
++        "pipeline", destination=dlt.destination("my_destination", destination_type="filesystem")
++    )
++    # @@@DLT_SNIPPET_END named_destination_dlt_destination_explicit_type
++
++    # @@@DLT_SNIPPET_START named_destination_string_reference
++    import dlt
++
++    pipeline = dlt.pipeline("pipeline", destination="my_destination")
++    # @@@DLT_SNIPPET_END named_destination_string_reference
++
++    # @@@DLT_SNIPPET_START avoid_example
++    import os
++    import dlt
++
++    os.environ["DESTINATION__BIGQUERY__DESTINATION_TYPE"] = "duckdb"
++
++    pipeline = dlt.pipeline("pipeline", destination="bigquery")
++    # @@@DLT_SNIPPET_END avoid_example
++
++    assert pipeline.destination.destination_type == "dlt.destinations.duckdb"
++    assert pipeline.destination.destination_name == "bigquery"
++
+     bucket_url = posixpath.join("file://", os.path.abspath(TEST_STORAGE_ROOT))
+ 
+     # @@@DLT_SNIPPET_START late_destination_access
+diff --git a/tests/load/pipeline/test_pipelines.py b/tests/load/pipeline/test_pipelines.py
+index fbc4732f3..ddde0b257 100644
+--- a/tests/load/pipeline/test_pipelines.py
++++ b/tests/load/pipeline/test_pipelines.py
+@@ -1,7 +1,8 @@
+ from copy import deepcopy
+ import gzip
+ import os
+-from typing import Any, Iterator, List, cast
++from typing import Any, Iterator, List, cast, Tuple
++from pathlib import Path
+ import pytest
+ 
+ import dlt
+@@ -14,7 +15,8 @@ from dlt.common.destination.exceptions import UnknownDestinationModule
+ from dlt.common.schema.schema import Schema
+ from dlt.common.schema.typing import VERSION_TABLE_NAME, REPLACE_STRATEGIES, TLoaderReplaceStrategy
+ from dlt.common.schema.utils import new_table
+-from dlt.common.typing import TDataItem
++from dlt.common.schema import TTableSchema
++from dlt.common.typing import TDataItem, TDataItems
+ from dlt.common.utils import uniq_id
+ 
+ from dlt.destinations.exceptions import DestinationUndefinedEntity
+@@ -41,6 +43,7 @@ from tests.load.utils import (
+     delete_dataset,
+     destinations_configs,
+     DestinationTestConfiguration,
++    FILE_BUCKET,
+ )
+ from tests.load.pipeline.utils import simple_nested_pipeline, skip_if_unsupported_replace_strategy
+ 
+@@ -1132,8 +1135,8 @@ def test_dest_column_hint_timezone(destination_config: DestinationTestConfigurat
+             assert actual == expected
+ 
+ 
+-def test_pipeline_with_destination_name():
+-    # test configured destination name (tests/.dlt/config.toml)
++def test_pipeline_with_named_destination() -> None:
++    # 1. Destination type should be resolved from config (tests/.dlt/config.toml)
+     pipeline = dlt.pipeline(destination="custom_name")
+     assert pipeline.destination.destination_type == "dlt.destinations.duckdb"
+     assert pipeline.destination.destination_name == "custom_name"
+@@ -1145,15 +1148,104 @@ def test_pipeline_with_destination_name():
+     info = pipeline.run(test_data())
+     assert_load_info(info)
+ 
+-    # test unconfigured destination name
++    # 2. Should raise UnknownDestinationModule when shorthand type resolution fails (no config)
+     with pytest.raises(UnknownDestinationModule) as py_exc:
+         dlt.pipeline(destination="another_custom_name")
+     assert py_exc.value.named_dest_attempted is True
+     assert not py_exc.value.destination_type
+     assert "no destination type was configured" in str(py_exc.value)
+ 
+-    # if destination contains dots, no fallbacks must happen
++    # 3. Should raise UnknownDestinationModule for invalid full module reference without falling back to shorthand type resolution
+     with pytest.raises(UnknownDestinationModule) as py_exc:
+         dlt.pipeline(destination="dlt.destinations.unknown")
+     assert not py_exc.value.named_dest_attempted
+     assert not py_exc.value.destination_type
++
++
++def test_pipeline_with_named_destination_via_factory_initializer() -> None:
++    # 1. Destination type should be resolved from config (tests/.dlt/config.toml) when not explicitly provided
++    pipeline = dlt.pipeline(destination=dlt.destination("custom_name"))
++    assert pipeline.destination.destination_type == "dlt.destinations.duckdb"
++    assert pipeline.destination.destination_name == "custom_name"
++
++    # 2. Explicit destination_type should override config settings
++    pipeline = dlt.pipeline(
++        destination=dlt.destination("custom_name", destination_type="filesystem")
++    )
++    assert pipeline.destination.destination_type == "dlt.destinations.filesystem"
++    assert pipeline.destination.destination_name == "custom_name"
++
++    # 3. Should fallback to shorthand type resolution when destination_type is not provided via explicit param or config
++    pipeline = dlt.pipeline(destination=dlt.destination("duckdb"))
++    assert pipeline.destination.destination_type == "dlt.destinations.duckdb"
++    assert pipeline.destination.destination_name == "duckdb"
++
++    # 4. Should raise UnknownDestinationModule when shorthand type resolution fails (no explicit param, no config)
++    with pytest.raises(UnknownDestinationModule) as py_exc:
++        dlt.pipeline(destination=dlt.destination("another_custom_name"))
++    assert py_exc.value.named_dest_attempted is True
++    assert not py_exc.value.destination_type
++
++    # 5. Should resolve full module reference when destination_type is not provided via explicit param or config
++    pipeline = dlt.pipeline(destination=dlt.destination("dlt.destinations.duckdb"))
++    assert pipeline.destination.destination_type == "dlt.destinations.duckdb"
++    assert pipeline.destination.destination_name == "duckdb"
++
++    # 6. Should raise UnknownDestinationModule for invalid full module reference without falling back to shorthand type resolution
++    with pytest.raises(UnknownDestinationModule) as py_exc:
++        dlt.pipeline(destination=dlt.destination("dlt.destinations.unknown"))
++    assert not py_exc.value.named_dest_attempted
++    assert not py_exc.value.destination_type
++
++    # 7. Should accept credentials
++    pipeline = dlt.pipeline(
++        destination=dlt.destination(
++            "custom_name",
++            credentials="duckdb:///random_duck_db.duckdb",
++        )
++    )
++    assert pipeline.destination.destination_type == "dlt.destinations.duckdb"
++    assert pipeline.destination.config_params["credentials"] == "duckdb:///random_duck_db.duckdb"
++
++    @dlt.resource
++    def test_data():
++        yield [{"id": 1, "name": "test"}]
++
++    info = pipeline.run(test_data())
++    assert_load_info(info)
++    assert (Path(TEST_STORAGE_ROOT) / "random_duck_db.duckdb").exists()
++
++    # 8. Should also accept additional destination parameters (such as bucket_url)
++    pipeline = dlt.pipeline(
++        destination=dlt.destination(
++            "custom_name",
++            destination_type="filesystem",
++            bucket_url=FILE_BUCKET,
++        )
++    )
++    assert pipeline.destination.destination_type == "dlt.destinations.filesystem"
++    assert pipeline.destination.config_params["bucket_url"] == FILE_BUCKET
++
++    info = pipeline.run(test_data())
++    assert_load_info(info)
++    assert (Path(TEST_STORAGE_ROOT) / FILE_BUCKET / pipeline.dataset_name / "test_data").exists()
++
++    # 9. Should automatically infer destination type as 'dlt.destinations.destination' (custom destination implementation),
++    # if destination_callable is provided
++    calls: List[Tuple[TDataItems, TTableSchema]] = []
++
++    def local_sink_func(items: TDataItems, table: TTableSchema, my_val=dlt.config.value, /) -> None:
++        nonlocal calls
++        assert my_val == "something"
++        calls.append((items, table))
++
++    os.environ["DESTINATION__MY_VAL"] = "something"
++
++    p = dlt.pipeline(
++        "sink_test",
++        destination=dlt.destination("custom_name", destination_callable=local_sink_func),
++    )
++    assert p.destination.destination_name == "custom_name"
++    assert p.destination.destination_type == "dlt.destinations.destination"
++    p.run([1, 2, 3], table_name="items")
++    assert len(calls) == 1
+
+
+===== COMMIT 91dc3d95 =====
+
+
+commit 91dc3d955
+Author: rudolfix
+Date: 2025-10-23
+
+    avoids passing naming conventions as modules (#3229)
+

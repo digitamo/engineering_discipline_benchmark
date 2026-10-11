@@ -1,0 +1,2622 @@
+diff --git a/dlt/common/storages/fsspec_filesystem.py b/dlt/common/storages/fsspec_filesystem.py
+index 7d0bd0fbe..b15388edf 100644
+--- a/dlt/common/storages/fsspec_filesystem.py
++++ b/dlt/common/storages/fsspec_filesystem.py
+@@ -4,6 +4,8 @@ import gzip
+ import mimetypes
+ import pathlib
+ import posixpath
++from datetime import datetime, timezone  # noqa: I251
++from email.utils import parsedate_to_datetime
+ from io import BytesIO
+ from typing import (
+     Literal,
+@@ -25,7 +27,6 @@ from fsspec.core import url_to_fs
+ 
+ from dlt import version
+ from dlt.common.typing import TypedDict, NotRequired
+-from dlt.common.pendulum import pendulum
+ from dlt.common.configuration.specs import (
+     GcpCredentials,
+     AwsCredentials,
+@@ -39,7 +40,7 @@ from dlt.common.storages.configuration import (
+     FilesystemConfiguration,
+     make_fsspec_url,
+ )
+-from dlt.common.time import ensure_pendulum_datetime_utc
++from dlt.common.time import ensure_datetime_utc
+ from dlt.common.typing import DictStrAny
+ from dlt.common.utils import without_none
+ 
+@@ -52,35 +53,34 @@ class FileItem(TypedDict):
+     relative_path: str
+     mime_type: str
+     encoding: NotRequired[str]
+-    modification_date: pendulum.DateTime
+-    size_in_bytes: int
++    modification_date: datetime
++    size_in_bytes: NotRequired[int]
+     file_content: NotRequired[bytes]
+ 
+ 
+-# Map of protocol to mtime resolver
++def _http_mtime(f: DictStrAny) -> Optional[datetime]:
++    """Reads `Last-Modified` which only `info()` responses carry, http listings have no mtime."""
++    last_modified = f.get("Last-Modified")
++    if last_modified is None:
++        return None
++    # an http date is not iso, only the email parser reads it
++    return ensure_datetime_utc(parsedate_to_datetime(last_modified))
++
++
++# Map of protocol to mtime resolver, returns None when the listing has no modification date
+ # we only need to support a small finite set of protocols
+-MTIME_DISPATCH = {
+-    "s3": lambda f: ensure_pendulum_datetime_utc(f["LastModified"]),
+-    "adl": lambda f: ensure_pendulum_datetime_utc(f["LastModified"]),
+-    "az": lambda f: ensure_pendulum_datetime_utc(f["last_modified"]),
+-    "gcs": lambda f: ensure_pendulum_datetime_utc(f["updated"]),
+-    "hf": lambda f: ensure_pendulum_datetime_utc(f["last_commit"]["date"]),
+-    "https": lambda f: cast(
+-        pendulum.DateTime,
+-        pendulum.parse(
+-            f.get("Last-Modified", pendulum.now().isoformat()), exact=True, strict=False
+-        ),
+-    ),
+-    "http": lambda f: cast(
+-        pendulum.DateTime,
+-        pendulum.parse(
+-            f.get("Last-Modified", pendulum.now().isoformat()), exact=True, strict=False
+-        ),
+-    ),
+-    "file": lambda f: ensure_pendulum_datetime_utc(f["mtime"]),
+-    "memory": lambda f: ensure_pendulum_datetime_utc(f["created"]),
+-    "gdrive": lambda f: ensure_pendulum_datetime_utc(f["modifiedTime"]),
+-    "sftp": lambda f: ensure_pendulum_datetime_utc(f["mtime"]),
++MTIME_DISPATCH: Dict[str, Callable[[DictStrAny], Optional[datetime]]] = {
++    "s3": lambda f: ensure_datetime_utc(f["LastModified"]),
++    "adl": lambda f: ensure_datetime_utc(f["LastModified"]),
++    "az": lambda f: ensure_datetime_utc(f["last_modified"]),
++    "gcs": lambda f: ensure_datetime_utc(f["updated"]),
++    "hf": lambda f: ensure_datetime_utc(f["last_commit"]["date"]),
++    "https": _http_mtime,
++    "http": _http_mtime,
++    "file": lambda f: ensure_datetime_utc(f["mtime"]),
++    "memory": lambda f: ensure_datetime_utc(f["created"]),
++    "gdrive": lambda f: ensure_datetime_utc(f["modifiedTime"]),
++    "sftp": lambda f: ensure_datetime_utc(f["mtime"]),
+ }
+ # Support aliases
+ MTIME_DISPATCH["gs"] = MTIME_DISPATCH["gcs"]
+@@ -350,7 +350,10 @@ def guess_mime_type(file_name: str) -> Sequence[str]:
+ 
+ 
+ def glob_files(
+-    fs_client: AbstractFileSystem, bucket_url: str, file_glob: str = "**"
++    fs_client: AbstractFileSystem,
++    bucket_url: str,
++    file_glob: str = "**",
++    fetch_file_info: bool = False,
+ ) -> Iterator[FileItem]:
+     """Get the files from the filesystem client.
+ 
+@@ -358,6 +361,8 @@ def glob_files(
+         fs_client (AbstractFileSystem): The filesystem client.
+         bucket_url (str): The url to the bucket.
+         file_glob (str): A glob for the filename filter.
++        fetch_file_info (bool): Calls `info` on each listed file that the listing reports no size
++            or modification date for, at the cost of one request per file. Defaults to False.
+ 
+     Returns:
+         Iterable[FileItem]: The list of files.
+@@ -387,10 +392,18 @@ def glob_files(
+                 " version 2023.9.0 or later"
+             )
+ 
++    scheme = bucket_url_parsed.scheme
++
+     for file, md in glob_result.items():
+         if md["type"] != "file":
+             continue
+-        scheme = bucket_url_parsed.scheme
++        size, modification_date = md.get("size"), MTIME_DISPATCH[scheme](md)
++        # if mtime or size are not available, get info for particular file
++        if fetch_file_info and (size is None or modification_date is None):
++            md = fs_client.info(file)
++            size, modification_date = md.get("size"), MTIME_DISPATCH[scheme](md)
++        if modification_date is None:
++            modification_date = datetime.now(timezone.utc)
+ 
+         # relative paths are always POSIX
+         if is_local_fs:
+@@ -410,9 +423,10 @@ def glob_files(
+             relative_path=rel_path,
+             file_url=file_url,
+             mime_type=mime_type,
+-            modification_date=MTIME_DISPATCH[scheme](md),
+-            size_in_bytes=int(md["size"]),
++            modification_date=modification_date,
+         )
++        if size is not None:
++            file_item["size_in_bytes"] = int(size)
+         if encoding is not None:
+             file_item["encoding"] = encoding
+         yield file_item
+diff --git a/dlt/common/storages/transactional_file.py b/dlt/common/storages/transactional_file.py
+index a25f9bb3f..5390db600 100644
+--- a/dlt/common/storages/transactional_file.py
++++ b/dlt/common/storages/transactional_file.py
+@@ -9,13 +9,13 @@ import random
+ import string
+ import time
+ import typing as t
++from datetime import datetime, timedelta, timezone  # noqa: I251
+ from pathlib import Path
+ import posixpath
+ from contextlib import contextmanager
+ from threading import Timer
+ import fsspec
+ 
+-from dlt.common.pendulum import pendulum, timedelta
+ from dlt.common.storages.fsspec_filesystem import MTIME_DISPATCH
+ 
+ 
+@@ -96,14 +96,22 @@ class TransactionalFile:
+     def _sync_locks(self) -> t.List[str]:
+         """Gets a list of lock names after removing stale locks. The list is time-sortable with earliest created lock coming first."""
+         output = []
+-        now = pendulum.now()
++        now = datetime.now(timezone.utc)
+ 
+         for lock in self._fs.ls(posixpath.dirname(self.lock_path), refresh=True, detail=True):
+             name = lock["name"]
+             if not name.startswith(self.lock_prefix):
+                 continue
+-            # Purge stale locks
++            # purge stale locks
+             mtime = self.extract_mtime(lock)
++            if mtime is None:
++                # without an mtime a lock left behind by a crashed holder never expires and
++                # everybody else waits on it forever
++                raise RuntimeError(
++                    f"Filesystem `{self._fs.protocol}` reports no modification time for lock file"
++                    f" `{name}` so stale locks cannot be detected. `TransactionalFile` cannot lock"
++                    " on this filesystem."
++                )
+             if now - mtime > timedelta(seconds=TransactionalFile.LOCK_TTL_SECONDS):
+                 try:  # Janitors can race, so we ignore errors
+                     self._fs.rm(name)
+diff --git a/dlt/sources/filesystem/__init__.py b/dlt/sources/filesystem/__init__.py
+index 57fe6bbc0..89e1eece1 100644
+--- a/dlt/sources/filesystem/__init__.py
++++ b/dlt/sources/filesystem/__init__.py
+@@ -103,6 +103,7 @@ def filesystem(  # noqa DOC
+     kwargs: Optional[Dict[str, Any]] = None,
+     client_kwargs: Optional[Dict[str, Any]] = None,
+     incremental: Optional[dlt.sources.incremental[Any]] = None,
++    fetch_file_info: bool = False,
+ ) -> Iterator[List[FileItem]]:
+     """This resource lists files in `bucket_url` using `file_glob` pattern. The files are yielded as FileItem which also
+     provide methods to open and read file data. It should be combined with transformers that further process (ie. load files)
+@@ -118,6 +119,8 @@ def filesystem(  # noqa DOC
+         client_kwargs (Optional[Dict[str, Any]]): Additional arguments passed to underlying fsspec native client ie. dict(verify="public.crt) for botocore
+         incremental (Optional[dlt.sources.incremental[Any]]): Defines incremental cursor on listed files, with `modification_date`
+             being the most common choice that returns only files created from the previous run.
++        fetch_file_info (bool, optional): If true, `dlt` gets missing `size_in_bytes` and `modification_date` from file details. This
++            requires a server call per file. Currently needed by `http` filesystem only. Defaults to False.
+ 
+     Yields:
+         List[FileItem]: The list of files.
+@@ -133,7 +136,7 @@ def filesystem(  # noqa DOC
+ 
+     files_chunk: List[FileItem] = []
+ 
+-    iter_ = glob_files(fs_client, bucket_url, file_glob)
++    iter_ = glob_files(fs_client, bucket_url, file_glob, fetch_file_info)
+ 
+     # if incremental is set with row order, use it to order the results
+     # NOTE: fsspec glob for buckets reads all files before running iterator
+@@ -144,7 +147,7 @@ def filesystem(  # noqa DOC
+         )
+         iter_ = iter(
+             sorted(
+-                list(glob_files(fs_client, bucket_url, file_glob)),
++                list(glob_files(fs_client, bucket_url, file_glob, fetch_file_info)),
+                 key=lambda f_: f_[incremental.cursor_path],  # type: ignore[literal-required]
+                 reverse=reverse,
+             )
+diff --git a/dlt/sources/filesystem/helpers.py b/dlt/sources/filesystem/helpers.py
+index 3ee482f19..b63bfc10d 100644
+--- a/dlt/sources/filesystem/helpers.py
++++ b/dlt/sources/filesystem/helpers.py
+@@ -29,6 +29,7 @@ class FilesystemConfigurationResource(FilesystemConfigurationWithLocalFiles):
+     file_glob: Optional[str] = "*"
+     files_per_page: int = DEFAULT_CHUNK_SIZE
+     extract_content: bool = False
++    fetch_file_info: bool = False
+ 
+     @resolve_type("credentials")
+     def resolve_credentials_type(self) -> Type[CredentialsConfiguration]:
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md b/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md
+index 476cbe94f..dd186b5aa 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md
+@@ -366,6 +366,15 @@ Full list of `filesystem` resource parameters:
+ 
+ * `files_per_page` - number of files processed at once. The default value is `100`.
+ * `extract_content` - if true, the content of the file will be read and returned in the resource. The default value is `False`.
++* `fetch_file_info` - if true, dlt reads `size_in_bytes` and `modification_date` that the listing does not
++  report. The default value is `False`.
++
++  :::note
++  Only the `http` and `https` filesystems need this parameter. HTTP has no listing protocol. fsspec builds
++  the file list from the HTML index page, which reports neither size nor modification date. Without
++  `fetch_file_info`, these files have no `size_in_bytes`. Their `modification_date` is the time of the
++  listing. With `fetch_file_info`, dlt makes one extra request per file to read both values.
++  :::
+ 
+ ### 2. Choose the right reader
+ 
+@@ -607,6 +616,11 @@ filtered_files = filesystem(bucket_url="s3://bucket_name", file_glob="**/*.json"
+ 
+ If for some reason you only want to load small files, you can also do that:
+ 
++:::note
++Over `http` and `https`, the resource needs `fetch_file_info=True`. Without `fetch_file_info`,
++`size_in_bytes` is missing and the filter below raises `KeyError`.
++:::
++
+ ```py
+ import dlt
+ from dlt.sources.filesystem import filesystem, read_csv
+@@ -653,8 +667,8 @@ The filesystem ensures consistent file representation across bucket types and of
+ - `file_name` - name of the file from the bucket URL.
+ - `relative_path` - set when doing `glob`, is a relative path to a `bucket_url` argument.
+ - `mime_type` - file's MIME type. It is sourced from the bucket provider or inferred from its extension.
+-- `modification_date` - file's last modification time (format: `pendulum.DateTime`).
+-- `size_in_bytes` - file size.
++- `modification_date` - file's last modification time (format: `datetime.datetime`, always UTC).
++- `size_in_bytes` - file size. Not present when the filesystem does not report it (see `fetch_file_info`).
+ - `file_content` - content, provided upon request.
+ 
+ :::info
+diff --git a/tests/common/storages/test_transactional_file.py b/tests/common/storages/test_transactional_file.py
+index 7afdf10c3..6c0b1deaa 100644
+--- a/tests/common/storages/test_transactional_file.py
++++ b/tests/common/storages/test_transactional_file.py
+@@ -185,3 +185,13 @@ def test_file_transaction_directory(fs: fsspec.AbstractFileSystem):
+             writer.write(b"test 1")
+ 
+         writer.release_lock()
++
++
++def test_lock_requires_mtime(fs: fsspec.AbstractFileSystem, file_name: str):
++    """A filesystem without mtime cannot expire stale locks, so locking must fail loudly
++    instead of waiting on a lock no one will ever release."""
++    writer = TransactionalFile(file_name, fs)
++    writer.extract_mtime = lambda _: None
++
++    with pytest.raises(RuntimeError, match="no modification time"):
++        writer.acquire_lock()
+diff --git a/tests/common/storages/utils.py b/tests/common/storages/utils.py
+index ffe13d593..ecb44d055 100644
+--- a/tests/common/storages/utils.py
++++ b/tests/common/storages/utils.py
+@@ -1,5 +1,6 @@
+ import os
+ import glob
++from datetime import datetime  # noqa: I251
+ from pathlib import Path
+ from urllib.parse import urlparse
+ import pytest
+@@ -88,7 +89,7 @@ def assert_sample_files(
+         assert item["file_url"].endswith(item["relative_path"])
+         assert isinstance(item["mime_type"], str)
+         assert isinstance(item["size_in_bytes"], int)
+-        assert isinstance(item["modification_date"], pendulum.DateTime)
++        assert isinstance(item["modification_date"], datetime)
+ 
+         # create file dict
+         file_dict = FileItemDict(item, fs_client)
+diff --git a/tests/load/filesystem/test_filesystem_common.py b/tests/load/filesystem/test_filesystem_common.py
+index 0d40c7ed6..ef7942296 100644
+--- a/tests/load/filesystem/test_filesystem_common.py
++++ b/tests/load/filesystem/test_filesystem_common.py
+@@ -134,7 +134,9 @@ def test_filesystem_instance(with_gdrive_buckets_env: str) -> None:
+     def check_file_changed(file_url_: str):
+         details = filesystem.info(file_url_)
+         assert details["size"] == 11
+-        assert (MTIME_DISPATCH[config.protocol](details) - now).seconds < 160
++        mtime = MTIME_DISPATCH[config.protocol](details)
++        assert mtime is not None
++        assert (mtime - now).seconds < 160
+ 
+     bucket_url = os.environ["DESTINATION__FILESYSTEM__BUCKET_URL"]
+     config = get_config()
+diff --git a/tests/load/sources/filesystem/test_filesystem_source.py b/tests/load/sources/filesystem/test_filesystem_source.py
+index 8fb053626..d1d219a3a 100644
+--- a/tests/load/sources/filesystem/test_filesystem_source.py
++++ b/tests/load/sources/filesystem/test_filesystem_source.py
+@@ -1,4 +1,5 @@
+ import os
++from datetime import datetime  # noqa: I251
+ from typing import Any, Dict, List, cast
+ 
+ from fsspec import AbstractFileSystem
+@@ -68,7 +69,7 @@ def test_load_content_resources(bucket_url: str, extract_content: bool) -> None:
+             assert item["size_in_bytes"] == 14
+             assert item["file_url"].endswith("/samples/sample.txt")
+             assert item["mime_type"] == "text/plain"
+-            assert isinstance(item["modification_date"], pendulum.DateTime)
++            assert isinstance(item["modification_date"], datetime)
+ 
+         yield items
+ 
+diff --git a/tests/load/sources/filesystem/test_http_filesystem.py b/tests/load/sources/filesystem/test_http_filesystem.py
+new file mode 100644
+index 000000000..e2ba3ee70
+--- /dev/null
++++ b/tests/load/sources/filesystem/test_http_filesystem.py
+@@ -0,0 +1,100 @@
++import os
++from datetime import datetime, timezone  # noqa: I251
++from typing import Dict, List
++
++import fsspec
++import pytest
++from fsspec import AbstractFileSystem
++
++from dlt.common import pendulum
++from dlt.common.storages.fsspec_filesystem import FileItem, glob_files
++
++from tests.common.storages.utils import TEST_SAMPLE_FILES
++from tests.utils import autoindex_http_server
++
++AUTOINDEX_BUCKET_URL = "http://localhost:8190"
++
++# sizes of the csv sample files served by `autoindex_http_server`, keyed by relative path
++CSV_SAMPLE_SIZES = {
++    "csv/freshman_kgs.csv": 1455,
++    "csv/freshman_lbs.csv": 1528,
++    "csv/mlb_players.csv": 45498,
++    "csv/mlb_teams_2012.csv": 541,
++}
++
++
++@pytest.fixture
++def http_fs() -> AbstractFileSystem:
++    # a cached listing would mask what each glob actually requests
++    return fsspec.filesystem("http", use_listings_cache=False)
++
++
++def _by_relative_path(items: List[FileItem]) -> Dict[str, FileItem]:
++    return {item["relative_path"]: item for item in items}
++
++
++@pytest.mark.serial
++def test_glob_http_without_file_info(autoindex_http_server, http_fs: AbstractFileSystem) -> None:
++    """fsspec scrapes http listings from an html index which reports no size, so files list
++    without one instead of failing."""
++    items = _by_relative_path(list(glob_files(http_fs, AUTOINDEX_BUCKET_URL, "csv/*.csv")))
++
++    assert set(items) == set(CSV_SAMPLE_SIZES)
++    for item in items.values():
++        assert "size_in_bytes" not in item
++        # no Last-Modified in a listing, mtime falls back to now
++        assert item["modification_date"].tzinfo is not None
++        assert (datetime.now(timezone.utc) - item["modification_date"]).total_seconds() < 60
++
++
++@pytest.mark.serial
++def test_glob_http_with_file_info(autoindex_http_server, http_fs: AbstractFileSystem) -> None:
++    """`fetch_file_info` reads size and mtime per file, which is the only place http reports them."""
++    items = _by_relative_path(
++        list(glob_files(http_fs, AUTOINDEX_BUCKET_URL, "csv/*.csv", fetch_file_info=True))
++    )
++
++    assert set(items) == set(CSV_SAMPLE_SIZES)
++    for rel_path, item in items.items():
++        assert item["size_in_bytes"] == CSV_SAMPLE_SIZES[rel_path]
++        # the server sends `Last-Modified` off the sample file mtime, truncated to whole seconds,
++        # so we get that back and not a fresh `now`
++        on_disk = datetime.fromtimestamp(
++            os.path.getmtime(os.path.join(TEST_SAMPLE_FILES, rel_path)), timezone.utc
++        )
++        assert 0 <= (on_disk - item["modification_date"]).total_seconds() < 1
++        assert isinstance(item["modification_date"], datetime)
++        assert not isinstance(item["modification_date"], pendulum.DateTime)
++
++
++@pytest.mark.serial
++@pytest.mark.parametrize("fetch_file_info", (True, False), ids=("with_info", "without_info"))
++def test_glob_http_recursive(
++    autoindex_http_server, http_fs: AbstractFileSystem, fetch_file_info: bool
++) -> None:
++    items = _by_relative_path(
++        list(glob_files(http_fs, AUTOINDEX_BUCKET_URL, "**/*.csv", fetch_file_info=fetch_file_info))
++    )
++
++    assert set(items) == set(CSV_SAMPLE_SIZES) | {
++        "met_csv/A801/A881_20230920.csv",
++        "met_csv/A803/A803_20230919.csv",
++        "met_csv/A803/A803_20230920.csv",
++    }
++
++
++@pytest.mark.serial
++@pytest.mark.parametrize("fetch_file_info", (True, False), ids=("with_info", "without_info"))
++def test_glob_http_single_file(
++    autoindex_http_server, http_fs: AbstractFileSystem, fetch_file_info: bool
++) -> None:
++    """A glob without wildcards resolves through `info` so it reports size either way."""
++    items = list(
++        glob_files(
++            http_fs, AUTOINDEX_BUCKET_URL, "csv/mlb_players.csv", fetch_file_info=fetch_file_info
++        )
++    )
++
++    assert len(items) == 1
++    assert items[0]["file_name"] == "mlb_players.csv"
++    assert items[0]["size_in_bytes"] == CSV_SAMPLE_SIZES["csv/mlb_players.csv"]
+diff --git a/tests/utils.py b/tests/utils.py
+index eee3cdc24..754d245db 100644
+--- a/tests/utils.py
++++ b/tests/utils.py
+@@ -10,7 +10,7 @@ import sys
+ from functools import partial
+ from os import environ
+ from pathlib import Path
+-from typing import Any, Dict, Iterable, Iterator, Literal, Optional, Union, get_args, List
++from typing import Any, Dict, Iterable, Iterator, Literal, Optional, Type, Union, get_args, List
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -189,13 +189,6 @@ def TEST_DICT_CONFIG_PROVIDER():
+ 
+ 
+ class PublicCDNHandler(http.server.SimpleHTTPRequestHandler):
+-    @classmethod
+-    def factory(cls, *args, directory: Path) -> "PublicCDNHandler":
+-        return cls(*args, directory=directory)
+-
+-    def __init__(self, *args, directory: Optional[Path] = None):
+-        super().__init__(*args, directory=str(directory) if directory else None)
+-
+     def list_directory(self, path: Union[str, PathLike]) -> None:
+         self.send_error(HTTPStatus.FORBIDDEN, "Directory listing is forbidden")
+         return None
+@@ -266,17 +259,12 @@ def auto_module_test_run_context(auto_module_test_storage) -> Iterator[None]:
+     yield from create_test_run_context()
+ 
+ 
+-@pytest.fixture
+-def public_http_server():
+-    """
+-    A simple HTTP server serving files from the current directory.
+-    Used to simulate public CDN. It allows only file access, directory listing is forbidden.
+-    """
++def _serve_sample_files(
++    handler: Type[http.server.SimpleHTTPRequestHandler], port: int
++) -> Iterator[http.server.ThreadingHTTPServer]:
+     httpd = http.server.ThreadingHTTPServer(
+-        ("localhost", 8189),
+-        partial(
+-            PublicCDNHandler.factory, directory=Path.cwd().joinpath("tests/common/storages/samples")
+-        ),
++        ("localhost", port),
++        partial(handler, directory=Path.cwd().joinpath("tests/common/storages/samples")),
+     )
+     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+     server_thread.start()
+@@ -289,6 +277,24 @@ def public_http_server():
+         httpd.server_close()
+ 
+ 
++@pytest.fixture
++def public_http_server() -> Iterator[http.server.ThreadingHTTPServer]:
++    """
++    A simple HTTP server serving files from the current directory.
++    Used to simulate public CDN. It allows only file access, directory listing is forbidden.
++    """
++    yield from _serve_sample_files(PublicCDNHandler, 8189)
++
++
++@pytest.fixture
++def autoindex_http_server() -> Iterator[http.server.ThreadingHTTPServer]:
++    """
++    Serves the same files as `public_http_server` but renders an html directory index.
++    fsspec has no listing protocol over http, it scrapes that index to list files.
++    """
++    yield from _serve_sample_files(http.server.SimpleHTTPRequestHandler, 8190)
++
++
+ def create_test_run_context() -> Iterator[None]:
+     # this plugs active context
+     ctx = PluggableRunContext()
+
+
+===== COMMIT cfd4812b =====
+
+
+commit cfd4812b2
+Author: Sam Debruyn
+Date: 2026-08-25
+
+    fix(fabric): allow time columns through the parquet load path (#4260)
+
+diff --git a/dlt/destinations/impl/fabric/factory.py b/dlt/destinations/impl/fabric/factory.py
+index 83efc9c61..a4e4a3718 100644
+--- a/dlt/destinations/impl/fabric/factory.py
++++ b/dlt/destinations/impl/fabric/factory.py
+@@ -15,6 +15,7 @@ from dlt.common.normalizers.naming import NamingConvention
+ from dlt.destinations.impl.synapse.factory import synapse, SynapseTypeMapper
+ from dlt.common.destination.typing import PreparedTableSchema
+ from dlt.common.schema.typing import TColumnSchema
++from dlt.common.typing import TLoaderFileFormat
+ 
+ from .configuration import FabricClientConfiguration
+ 
+@@ -46,6 +47,16 @@ class FabricTypeMapper(SynapseTypeMapper):
+         # Use precision 6 as default (instead of 7 in SQL Server)
+         return "datetime2(6)"
+ 
++    def ensure_supported_type(
++        self,
++        column: TColumnSchema,
++        table: PreparedTableSchema,
++        loader_file_format: TLoaderFileFormat,
++    ) -> None:
++        if loader_file_format == "parquet" and column["data_type"] == "time":
++            return
++        super().ensure_supported_type(column, table, loader_file_format)
++
+     def to_destination_type(self, column: TColumnSchema, table: PreparedTableSchema) -> str:
+         """Override to use varchar instead of nvarchar and datetime2 instead of datetimeoffset"""
+         sc_t = column["data_type"]
+diff --git a/tests/load/pipeline/test_pipelines.py b/tests/load/pipeline/test_pipelines.py
+index 966a785ee..569b721f3 100644
+--- a/tests/load/pipeline/test_pipelines.py
++++ b/tests/load/pipeline/test_pipelines.py
+@@ -681,7 +681,6 @@ def test_parquet_loading(destination_config: DestinationTestConfiguration) -> No
+         "synapse",
+         "databricks",
+         "clickhouse",
+-        "fabric",
+     ]:
+         datetime_data.pop("col11")
+         datetime_data.pop("col11_null")
+diff --git a/tests/load/utils.py b/tests/load/utils.py
+index 63e768c64..6e3e5ed7a 100644
+--- a/tests/load/utils.py
++++ b/tests/load/utils.py
+@@ -1551,10 +1551,10 @@ def table_update_and_row_for_destination(destination_config: DestinationTestConf
+         exclude_types.append("time")
+ 
+     if (
+-        destination_config.destination_type in ("synapse", "fabric")
++        destination_config.destination_type == "synapse"
+         and destination_config.file_format == "parquet"
+     ):
+-        # TIME columns are not supported for staged parquet loads into Synapse/Fabric
++        # TIME columns are not supported for staged parquet loads into Synapse
+         exclude_types.append("time")
+ 
+     if destination_config.destination_type in (
+
+
+===== COMMIT 04c80cd6 =====
+
+
+commit 04c80cd61
+Author: rudolfix
+Date: 2026-08-24
+
+    enables Replicated for table swap job (#4392)
+
+diff --git a/dlt/destinations/impl/clickhouse/clickhouse.py b/dlt/destinations/impl/clickhouse/clickhouse.py
+index ca88ad807..acbc0b130 100644
+--- a/dlt/destinations/impl/clickhouse/clickhouse.py
++++ b/dlt/destinations/impl/clickhouse/clickhouse.py
+@@ -40,6 +40,7 @@ from dlt.destinations.impl.clickhouse.configuration import (
+ from dlt.destinations.impl.clickhouse.sql_client import ClickHouseSqlClient
+ from dlt.destinations.impl.clickhouse.typing import (
+     CODEC_HINT,
++    EXCHANGE_CAPABLE_DATABASE_ENGINES,
+     HINT_TO_CLICKHOUSE_ATTR,
+     PARTITION_HINT,
+     SETTINGS_HINT,
+@@ -301,7 +302,7 @@ class ClickHouseMergeJob(SqlMergeFollowupJob):
+ class ClickHouseStagingReplaceJob(SqlStagingReplaceFollowupJob):
+     """Atomic staging-optimized replace via `EXCHANGE TABLES`.
+ 
+-    Requires the destination database to use the `Atomic` or `Shared` engine.
++    Requires the destination database to use the `Atomic`, `Replicated` or `Shared` engine.
+     The previous destination data lands in the staging slot after the swap; dlt
+     truncates staging tables at the start of the next load.
+     """
+@@ -394,14 +395,16 @@ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
+         return loaded_tables
+ 
+     def _verify_database_supports_exchange(self) -> None:
+-        # `EXCHANGE TABLES` is only supported on Atomic and Shared database engines
++        # `Replicated` derives from `Atomic` and supports EXCHANGE, but reports its own engine
++        # name in system.databases, so every exchange-capable engine must be listed explicitly
+         result = self.sql_client.execute_sql(
+             "SELECT engine FROM system.databases WHERE name = currentDatabase()"
+         )
+         engine = result[0][0] if result else "unknown"
+-        if engine not in ("Atomic", "Shared"):
++        if engine not in EXCHANGE_CAPABLE_DATABASE_ENGINES:
++            supported = " or ".join(EXCHANGE_CAPABLE_DATABASE_ENGINES)
+             raise DestinationTerminalException(
+-                "ClickHouse replace_strategy='staging-optimized' requires the Atomic or Shared"
++                f"ClickHouse replace_strategy='staging-optimized' requires the {supported}"
+                 f" database engine to use EXCHANGE TABLES (current: {engine}). Either choose"
+                 " 'insert-from-staging' or 'truncate-and-insert', or recreate the database with"
+                 " ENGINE = Atomic."
+diff --git a/dlt/destinations/impl/clickhouse/typing.py b/dlt/destinations/impl/clickhouse/typing.py
+index 2900cbf20..2e5d9f715 100644
+--- a/dlt/destinations/impl/clickhouse/typing.py
++++ b/dlt/destinations/impl/clickhouse/typing.py
+@@ -1,4 +1,4 @@
+-from typing import Literal, Dict, Set, Union
++from typing import Literal, Dict, Set, Tuple, Union
+ 
+ from dlt.common.schema import TColumnHint
+ from dlt.common.typing import get_args
+@@ -43,3 +43,4 @@ SORT_HINT: Literal["x-clickhouse-sort"] = "x-clickhouse-sort"
+ PARTITION_HINT: Literal["x-clickhouse-partition"] = "x-clickhouse-partition"
+ SETTINGS_HINT: Literal["x-clickhouse-settings"] = "x-clickhouse-settings"
+ CODEC_HINT: Literal["x-clickhouse-codec"] = "x-clickhouse-codec"
++EXCHANGE_CAPABLE_DATABASE_ENGINES: Tuple[str, ...] = ("Atomic", "Replicated", "Shared")
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+index 4faf9662a..06ee10c0f 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+@@ -121,7 +121,7 @@ session_timezone = "Europe/Berlin"
+ 
+ All [write dispositions](../../general-usage/incremental-loading#choosing-a-write-disposition) are supported.
+ 
+-If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be atomically swapped with the staging tables via [`EXCHANGE TABLES`](https://clickhouse.com/docs/en/sql-reference/statements/exchange) (requires `Atomic` or `Shared` database engine).
++If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be atomically swapped with the staging tables via [`EXCHANGE TABLES`](https://clickhouse.com/docs/en/sql-reference/statements/exchange) (requires `Atomic`, `Replicated` or `Shared` database engine).
+ 
+ ## Data loading
+ 
+diff --git a/tests/load/clickhouse/test_clickhouse_configuration.py b/tests/load/clickhouse/test_clickhouse_configuration.py
+index da8b5ba5c..5ea83fa5a 100644
+--- a/tests/load/clickhouse/test_clickhouse_configuration.py
++++ b/tests/load/clickhouse/test_clickhouse_configuration.py
+@@ -188,7 +188,7 @@ def test_client_table_name_and_paths(client: ClickHouseClient) -> None:
+     assert parts[1] == f"{dataset_name}###test_table"
+ 
+ 
+-@pytest.mark.parametrize("engine", ["Atomic", "Shared"])
++@pytest.mark.parametrize("engine", ["Atomic", "Replicated", "Shared"])
+ def test_staging_optimized_accepts_supported_engines(
+     client: ClickHouseClient, mocker: MockerFixture, engine: str
+ ) -> None:
+@@ -196,12 +196,12 @@ def test_staging_optimized_accepts_supported_engines(
+     client._verify_database_supports_exchange()
+ 
+ 
+-@pytest.mark.parametrize("engine", ["Ordinary", "Replicated", "Lazy"])
++@pytest.mark.parametrize("engine", ["Ordinary", "Lazy", "Memory"])
+ def test_staging_optimized_rejects_unsupported_engines(
+     client: ClickHouseClient, mocker: MockerFixture, engine: str
+ ) -> None:
+     mocker.patch.object(client.sql_client, "execute_sql", return_value=[(engine,)])
+-    with pytest.raises(DestinationTerminalException, match="Atomic or Shared"):
++    with pytest.raises(DestinationTerminalException, match="Atomic or Replicated or Shared"):
+         client._verify_database_supports_exchange()
+ 
+ 
+
+
+===== COMMIT b70b29ba =====
+
+
+commit b70b29ba7
+Author: Alena Astrakhantseva
+Date: 2026-08-24
+
+    add platform alerts to docs (#4391)
+
+diff --git a/docs/website/docs/hub/notifications/email.md b/docs/website/docs/hub/notifications/email.md
+index 0005c9533..ec7192f84 100644
+--- a/docs/website/docs/hub/notifications/email.md
++++ b/docs/website/docs/hub/notifications/email.md
+@@ -1,14 +1,30 @@
+ ---
+ title: Send email notifications
+-description: Notify by email when a dltHub job succeeds or fails, using Gmail SMTP.
+-keywords: [email, smtp, gmail, notifications, alerting, hub, dltHub]
++description: Subscribe to dltHub workspace failure alerts, or send your own emails from a job with SMTP.
++keywords: [email, smtp, gmail, notifications, alerting, alerts, hub, dltHub]
+ ---
+ 
+ # Send email notifications
+ 
+-The pattern below uses Python's standard `smtplib` with Gmail SMTP, but the same shape works for any SMTP server (Outlook, Workspace SMTP relay, or transactional providers like Resend, SendGrid, Mailgun).
++## dltHub Platform alerts
+ 
+-## Prerequisites
++Failure alerts by email: subscribe to workspace alerts and get an email when a run fails. Manage
++subscriptions from the **Alerts** tab in workspace settings.
++
++![Alerts settings showing the job run failure alerts toggle and role selection](https://storage.googleapis.com/dlt-blog-images/workspace-images/alerts.png)
++
++## Custom email notification on pipeline failure
++
++:::note
++Platform alerts above notify you when a **job run** fails, whatever the cause. The custom
++notification below covers **pipeline failures** only: it runs inside your job, so it cannot report a
++job that fails before your code runs or is killed mid-run.
++:::
++
++If you need a different channel, recipient list, or message body than the platform alerts provide,
++send the email from the job itself. The pattern below uses Python's standard `smtplib` with Gmail SMTP, but the same shape works for any SMTP server (Outlook, Workspace SMTP relay, or transactional providers like Resend, SendGrid, Mailgun).
++
++### Prerequisites
+ 
+ Generate a Gmail **App Password**, a 16-character credential that lets SMTP authenticate without your real password:
+ 
+@@ -21,7 +37,7 @@ App Passwords don't affect normal sign-in: your password, 2FA, and existing sess
+ 
+ If you're on a **Google Workspace** domain, an administrator may have disabled App Passwords org-wide. In that case use a transactional provider (Resend, SendGrid, Mailgun). The wiring is the same; just point `smtplib` at their SMTP server and use their API key as the password.
+ 
+-## Store credentials in your prod profile
++### Store credentials in your prod profile
+ 
+ Add to `.dlt/prod.secrets.toml`:
+ 
+@@ -40,7 +56,7 @@ password = "abcdefghijklmnop"     # 16 chars, no spaces, no angle brackets
+ If your SMTP server requires IP allowlisting, enable [static egress IPs](../pipeline-operations/job-configuration.md#static-egress-ips) so the job's outbound traffic uses a known set of source IPs.
+ :::
+ 
+-## Wire it into your pipeline
++### Wire it into your pipeline
+ 
+ ```python
+ import smtplib
+@@ -105,7 +121,7 @@ def my_job():
+ 
+ Wrap the failure-path `send_email` in its own try/except: a broken alerting channel shouldn't mask the underlying pipeline error.
+ 
+-## Deploy and trigger
++### Deploy and trigger
+ 
+ ```sh
+ uv run dlthub deploy                            # syncs code + SMTP credentials
+diff --git a/docs/website/docs/hub/platform-capabilities/settings.md b/docs/website/docs/hub/platform-capabilities/settings.md
+index d94d58ee0..2a8314085 100644
+--- a/docs/website/docs/hub/platform-capabilities/settings.md
++++ b/docs/website/docs/hub/platform-capabilities/settings.md
+@@ -15,6 +15,7 @@ Workspace settings are scoped to a single workspace. Workspace [Owners](users-an
+ - **Name and description.** Edit the workspace name and description. Changes save immediately.
+ - **Connection info.** Connection details that external tools and integrations use to talk to the workspace.
+ - **Environment variables.** Define plain and secret process environment variables for the whole workspace or for a specific profile. See [Environment variables](../pipeline-operations/environment-variables.md).
++- **Alerts.** Subscribe to workspace alerts and get an email when a job run fails. See [dltHub Platform alerts](../notifications/email.md#dlthub-platform-alerts).
+ - **Usage chart.** A monthly bar chart showing workspace consumption for the previous six months.
+ 
+ ### Members
+@@ -71,4 +72,5 @@ Existing keys can be deleted at any time. Once deleted, the key can no longer au
+ - [Users and roles](users-and-roles.md)
+ - [Environment variables](../pipeline-operations/environment-variables.md)
+ - [Regions and data residency](regions.md)
++- [Send email notifications](../notifications/email.md)
+ - [dltHub platform overview](../pipeline-operations/overview.md)
+
+
+===== COMMIT 4bd01fd4 =====
+
+
+commit 4bd01fd4f
+Author: Tushar Pagar
+Date: 2026-08-24
+
+    fix(filesystem): drop the hard orjson import in the filesystem destination (#4385)
+
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 2fd0859db..33a5c252c 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -40,6 +40,16 @@ jobs:
+       - name: Run make lint
+         run: make lint
+ 
++      # emscripten drops the marker-excluded deps (orjson), so this catches a hard
++      # import of one of them that plain CPython lint cannot see
++      - name: Setup Node
++        uses: actions/setup-node@v5
++        with:
++          node-version: '22'
++
++      - name: Check dlt imports under emscripten
++        run: make lint-emscripten
++
+       - name: Check filesizes
+         uses: ppremk/lfs-warning@v3.2
+         with:
+diff --git a/.gitignore b/.gitignore
+index a6090d76b..cdc7787e7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -166,3 +166,6 @@ compiled_requirements.txt
+ 
+ # docker folder for running tests as other OS
+ tests/.docker/
++
++# npm packages pulled in by lint-emscripten
++node_modules/
+diff --git a/Makefile b/Makefile
+index f7a72ad51..091eb8091 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,10 @@
+ .DEFAULT_GOAL := help
+-.PHONY: install-uv has-uv dev lint test test-common test-common-p reset-test-storage recreate-compiled-deps build-library-prerelease build-library publish-library test-load-local test-load-local-p test-load-local-postgres test-load-local-postgres-p install-snowflake-extras test-remote-snowflake test-remote-snowflake-p install-common-core test-common-core install-common-core-source test-common-core-source install-common-source install-pipeline-min test-pipeline-min install-pipeline-arrow test-pipeline-arrow install-pipeline-min-arrow test-pipeline-min-arrow install-workspace test-workspace test-workspace-dashboard install-hub-minimal test-hub-minimal test-hub install-pipeline-full test-pipeline-full install-pipeline-full-sql test-pipeline-full-sql install-sqlalchemy2 test-with-sqlalchemy-2 test-dest-load test-dest-remote-essential test-dest-remote-nonessential test-dbt-no-venv test-dbt-runner-venv test-sources-load test-sources-sql-database
++.PHONY: install-uv has-uv dev lint lint-emscripten test test-common test-common-p reset-test-storage recreate-compiled-deps build-library-prerelease build-library publish-library test-load-local test-load-local-p test-load-local-postgres test-load-local-postgres-p install-snowflake-extras test-remote-snowflake test-remote-snowflake-p install-common-core test-common-core install-common-core-source test-common-core-source install-common-source install-pipeline-min test-pipeline-min install-pipeline-arrow test-pipeline-arrow install-pipeline-min-arrow test-pipeline-min-arrow install-workspace test-workspace test-workspace-dashboard install-hub-minimal test-hub-minimal test-hub install-pipeline-full test-pipeline-full install-pipeline-full-sql test-pipeline-full-sql install-sqlalchemy2 test-with-sqlalchemy-2 test-dest-load test-dest-remote-essential test-dest-remote-nonessential test-dbt-no-venv test-dbt-runner-venv test-sources-load test-sources-sql-database
+ 
+ PYV=$(shell python3 -c "import sys;t='{v[0]}.{v[1]}'.format(v=list(sys.version_info[:2]));sys.stdout.write(t)")
++
++# pyodide release used by lint-emscripten
++PYODIDE_VERSION ?= 0.28.3
+ .SILENT:has-uv
+ 
+ # read version from package
+@@ -42,6 +45,12 @@ lint: lint-core lint-security lint-docstrings lint-lock lint-deps ## Runs all li
+ lint-lock: ## Checks uv lockfile is in sync
+ 	uv lock --check
+ 
++lint-emscripten: ## Checks dlt imports in a pyodide (emscripten) VM (needs node, hits PyPI)
++	-@rm -rf dist
++	uv build --wheel --out-dir dist
++	npm install --no-save --no-audit --no-fund pyodide@$(PYODIDE_VERSION)
++	node tools/check_pyodide_import.mjs dist
++
+ lint-deps: ## Checks dependencies, hub extras, and API breaking changes (informational)
+ 	-uv run python tools/check_hub_extras.py
+ 	-uv run python -m tools.check_dependency_changes
+diff --git a/dlt/common/json/_orjson.py b/dlt/common/json/_orjson.py
+index 5879844d0..1d08ffaed 100644
+--- a/dlt/common/json/_orjson.py
++++ b/dlt/common/json/_orjson.py
+@@ -1,5 +1,5 @@
+ from typing import IO, Any, Union
+-import orjson
++import orjson  # noqa: I251
+ 
+ from dlt.common.json import (
+     custom_pua_encode,
+diff --git a/dlt/common/json/_simplejson.py b/dlt/common/json/_simplejson.py
+index 01d42fc3f..ca02255d0 100644
+--- a/dlt/common/json/_simplejson.py
++++ b/dlt/common/json/_simplejson.py
+@@ -1,7 +1,7 @@
+ import codecs
+ from typing import IO, Any, Union
+ 
+-import simplejson
++import simplejson  # noqa: I251
+ import platform
+ 
+ from dlt.common.json import (
+diff --git a/dlt/destinations/impl/filesystem/filesystem.py b/dlt/destinations/impl/filesystem/filesystem.py
+index 3f60ece36..f04e71519 100644
+--- a/dlt/destinations/impl/filesystem/filesystem.py
++++ b/dlt/destinations/impl/filesystem/filesystem.py
+@@ -1,7 +1,6 @@
+ import posixpath
+ import os
+ import time as _time
+-import orjson
+ import base64
+ from contextlib import contextmanager
+ from types import TracebackType
+@@ -681,7 +680,7 @@ class FilesystemClient(
+             version_dict: Dict[str, int] = json.loads(version_info_str)
+             initial_version: int = version_dict["initial_version"]
+             current_version: int = version_dict["current_version"]
+-        except (KeyError, orjson.JSONDecodeError) as exc:
++        except (KeyError, TypeError, ValueError) as exc:
+             raise ValueError(
+                 f"Invalid content in {self.init_file_path}: {version_info_str!r}"
+             ) from exc
+diff --git a/pyproject.toml b/pyproject.toml
+index f9cc64466..bb9392544 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -49,7 +49,7 @@ dependencies = [
+     "orjson>=3.6.7,<4,!=3.9.11,!=3.9.12,!=3.9.13,!=3.9.14,!=3.10.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
+     # enables pyodide install, mind that 3.10.1 is a buggy version and should be yanked
+     "orjson>=3.10.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
+-    "orjson>=3.11.0 ; python_version > '3.13'",
++    "orjson>=3.11.0 ; python_version > '3.13' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
+     "tenacity>=8.0.2",
+     "jsonpath-ng>=1.8.0",
+     "fsspec>=2022.4.0",
+diff --git a/tests/load/filesystem/test_filesystem_client.py b/tests/load/filesystem/test_filesystem_client.py
+index 9170cfdc1..137d473a4 100644
+--- a/tests/load/filesystem/test_filesystem_client.py
++++ b/tests/load/filesystem/test_filesystem_client.py
+@@ -1,8 +1,7 @@
+-from typing import Dict, List, Optional, Union
++from typing import Dict, List, Optional, Type, Union
+ import posixpath
+ import os
+ import json
+-import orjson
+ from unittest import mock
+ from pathlib import Path
+ from unittest.mock import patch
+@@ -10,7 +9,6 @@ from urllib.parse import urlparse
+ 
+ import pytest
+ 
+-from dlt.common.configuration.specs.azure_credentials import AzureCredentials
+ from dlt.common.configuration.specs.base_configuration import (
+     CredentialsConfiguration,
+     extract_inner_hint,
+@@ -509,16 +507,35 @@ def test_get_storage_version_valid(version_info: Union[str, Dict[str, int]]) ->
+ 
+ 
+ @pytest.mark.parametrize(
+-    "invalid_version_info",
++    "invalid_version_info,expected_exception,match",
+     [
+-        "random",
+-        {"unexpected": 2, "current_version": 2},
+-        {"initial_version": 1},
+-        {"current_version": 2},
+-        {"initial_version": 2, "current_version": 3},
++        # not json at all
++        ("random", ValueError, "Invalid content"),
++        # valid json, but not an object so the version keys cannot be looked up
++        ("5", ValueError, "Invalid content"),
++        ('"2"', ValueError, "Invalid content"),
++        ("[1, 2]", ValueError, "Invalid content"),
++        ("null", ValueError, "Invalid content"),
++        # object with an unexpected or a missing key
++        ({"unexpected": 2, "current_version": 2}, ValueError, "Invalid content"),
++        ({"initial_version": 1}, ValueError, "Invalid content"),
++        ({"current_version": 2}, ValueError, "Invalid content"),
++        # both keys present but the version is not supported
++        (
++            {
++                "initial_version": min(SUPPORTED_VERSIONS),
++                "current_version": max(SUPPORTED_VERSIONS) + 1,
++            },
++            UnsupportedStorageVersionException,
++            "Expected storage",
++        ),
+     ],
+ )
+-def test_get_storage_version_invalid(invalid_version_info: Union[str, Dict[str, int]]) -> None:
++def test_get_storage_version_invalid(
++    invalid_version_info: Union[str, Dict[str, int]],
++    expected_exception: Type[Exception],
++    match: str,
++) -> None:
+     filesystem_ = filesystem("random_location")
+     client = _client_factory(filesystem_)
+     init_file = client.pathlib.join(client.dataset_path, INIT_FILE_NAME)
+@@ -534,21 +551,9 @@ def test_get_storage_version_invalid(invalid_version_info: Union[str, Dict[str,
+         encoding="utf-8",
+     )
+ 
+-    # If random text
+-    if invalid_version_info == "random":
+-        with pytest.raises(ValueError):
+-            client.get_storage_versions()
+-    # If unexpected key
+-    elif invalid_version_info == {"unexpected": 2, "current_version": 2}:
+-        with pytest.raises(ValueError):
+-            client.get_storage_versions()
+-    # If one key is missing
+-    elif invalid_version_info in [{"initial_version": 1}, {"current_version": 2}]:
+-        with pytest.raises(ValueError):
+-            client.get_storage_versions()
+-    else:
+-        with pytest.raises(UnsupportedStorageVersionException):
+-            client.get_storage_versions()
++    # match pins the curated message: a decode error leaking from the json backend must fail here
++    with pytest.raises(expected_exception, match=match):
++        client.get_storage_versions()
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tools/check_pyodide_import.mjs b/tools/check_pyodide_import.mjs
+new file mode 100644
+index 000000000..d4ca89ff7
+--- /dev/null
++++ b/tools/check_pyodide_import.mjs
+@@ -0,0 +1,85 @@
++// Imports the built dlt wheel inside a pyodide (emscripten) VM.
++//
++// Usage:
++//
++//     node tools/check_pyodide_import.mjs <dist-dir>
++//
++// Booting the VM and resolving the dependency tree both need the network, so any
++// failure before dlt is installed is an environment problem and skips the check.
++// Only an installed dlt that cannot be imported fails it.
++
++import fs from "node:fs";
++import path from "node:path";
++
++// dists our markers exclude on emscripten; a missing module outside this set means
++// micropip installed an incomplete tree rather than dlt reaching for a banned dep
++const EXCLUDED_ON_EMSCRIPTEN = ["orjson", "win32api", "win_precise_time"];
++const INSTALL_ATTEMPTS = 3;
++
++const distDir = process.argv[2] ?? "dist";
++const wheels = fs.existsSync(distDir)
++  ? fs.readdirSync(distDir).filter((f) => f.startsWith("dlt-") && f.endsWith(".whl"))
++  : [];
++if (wheels.length !== 1) {
++  console.error(`FAILED: expected exactly one dlt wheel in ${distDir}/, found ${wheels.length}`);
++  process.exit(1);
++}
++const wheel = wheels[0];
++
++let py;
++try {
++  const { loadPyodide } = await import("pyodide");
++  py = await loadPyodide({ stdout: () => {}, stderr: () => {} });
++  // micropip parses name and version out of the filename, so keep it verbatim
++  py.FS.writeFile(`/${wheel}`, new Uint8Array(fs.readFileSync(path.join(distDir, wheel))));
++  await py.loadPackage("micropip");
++  await py.loadPackage("six");
++} catch (e) {
++  skip("could not start a pyodide VM", e);
++}
++
++let installed = false;
++for (let attempt = 1; attempt <= INSTALL_ATTEMPTS && !installed; attempt++) {
++  try {
++    await py.pyimport("micropip").install(`emfs:/${wheel}`);
++    installed = true;
++  } catch (e) {
++    if (attempt === INSTALL_ATTEMPTS) skip(`could not install ${wheel} under emscripten`, e);
++    console.error(`micropip attempt ${attempt} failed, retrying`);
++  }
++}
++
++try {
++  py.runPython("import dlt; import dlt.destinations; from dlt.destinations import filesystem");
++} catch (e) {
++  const missing = /No module named '([^']+)'/.exec(String(e?.message ?? e))?.[1];
++  const banned = missing && EXCLUDED_ON_EMSCRIPTEN.includes(missing.split(".")[0]);
++  if (!banned) skip(`micropip left '${missing ?? "a dependency"}' unusable`, e);
++  console.error("FAILED: dlt is installed under emscripten but does not import");
++  console.error(`a module on the import path imports '${missing}', which is excluded here`);
++  console.error(tail(e));
++  process.exit(1);
++}
++
++const report = py.runPython(`
++import sys, dlt
++from dlt.common.json import json
++f"dlt {dlt.__version__} imports on {sys.platform} using the {json._impl_name} json backend"
++`);
++console.log(report);
++
++function tail(e, n = 12) {
++  return String(e?.message ?? e)
++    .split("\n")
++    .map((l) => l.trim())
++    .filter((l) => l && l.length < 200)
++    .slice(-n)
++    .join("\n");
++}
++
++function skip(summary, e) {
++  console.error(`SKIPPED: ${summary}`);
++  console.error(e);
++  console.error("this is a pyodide/PyPI environment problem, not a dlt import problem");
++  process.exit(1);
++}
+diff --git a/tox.ini b/tox.ini
+index 04d4ed279..4de3749f8 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -2,6 +2,8 @@
+ ignore=E1,E2,E3,E4,F401,W391,W292,E501,E731,F811,W503,E704,W504,DOC502,DOC503,DOC501,B010,I250,B042
+ banned-modules = datetime = use dlt.common.pendulum
+                  json = use dlt.common.json
++                 orjson = use dlt.common.json
++                 simplejson = use dlt.common.json
+                  decimal = use dlt.common.decimal
+                  decimal.Decimal = use dlt.common.Decimal
+                  open = use dlt.common.open
+diff --git a/uv.lock b/uv.lock
+index 5102b763b..fc2998769 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2511,7 +2511,7 @@ dependencies = [
+     { name = "giturlparse" },
+     { name = "humanize" },
+     { name = "jsonpath-ng" },
+-    { name = "orjson", marker = "(python_full_version >= '3.14' and platform_python_implementation == 'PyPy') or (python_full_version >= '3.14' and sys_platform == 'emscripten') or (platform_python_implementation != 'PyPy' and sys_platform != 'emscripten')" },
++    { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'" },
+     { name = "packaging" },
+     { name = "pathvalidate" },
+     { name = "pendulum" },
+@@ -2868,9 +2868,9 @@ requires-dist = [
+     { name = "lancedb", marker = "extra == 'lance'", specifier = ">=0.33.0" },
+     { name = "lancedb", marker = "extra == 'lancedb'", specifier = ">=0.22.0" },
+     { name = "oracledb", marker = "extra == 'oracle'", specifier = ">=3.4.1" },
+-    { name = "orjson", marker = "python_full_version >= '3.14'", specifier = ">=3.11.0" },
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.6.7,!=3.9.11,!=3.9.12,!=3.9.13,!=3.9.14,!=3.10.1,<4" },
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.10.1" },
++    { name = "orjson", marker = "python_full_version >= '3.14' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.11.0" },
+     { name = "packaging", specifier = ">=21.1" },
+     { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.3.0,<5" },
+     { name = "pathvalidate", specifier = ">=2.5.2" },
+
+
+===== COMMIT a425ff5c =====
+
+
+commit a425ff5c2
+Author: rudolfix
+Date: 2026-08-21
+
+    fixing incorrect alias usage in bind_query + additional tests (#4359)
+
+diff --git a/dlt/common/libs/sqlglot.py b/dlt/common/libs/sqlglot.py
+index 7eb9d8a32..216481e56 100644
+--- a/dlt/common/libs/sqlglot.py
++++ b/dlt/common/libs/sqlglot.py
+@@ -1103,7 +1103,7 @@ def bind_query(
+     if is_casefolding:
+         orig_selects = {}
+         for i, proj in enumerate(qualified_query.selects):
+-            orig_selects[i] = proj.name or proj.args["alias"].name
++            orig_selects[i] = proj.output_name
+ 
+     # case-fold overrides for identifiers that belong to a dataset, recorded at the parent
+     # table or column (the walk visits a parent first and its mutated children after)
+diff --git a/tests/common/schema/test_schema_utils.py b/tests/common/schema/test_schema_utils.py
+index d25f25ef6..da6cb954f 100644
+--- a/tests/common/schema/test_schema_utils.py
++++ b/tests/common/schema/test_schema_utils.py
+@@ -174,13 +174,15 @@ def test_version_table_has_column_descriptions() -> None:
+         "inserted_at",
+         "schema_name",
+         "version_hash",
+-        "schema"
++        "schema",
+     ]
+     for col_name in expected_columns:
+         assert col_name in table["columns"], f"Column {col_name} missing from version_table"
+         col = table["columns"][col_name]
+         assert "description" in col, f"Column {col_name} missing description"
+-        assert isinstance(col["description"], str), f"Column {col_name} description should be a string"
++        assert isinstance(
++            col["description"], str
++        ), f"Column {col_name} description should be a string"
+         assert len(col["description"]) > 0, f"Column {col_name} description should not be empty"
+ 
+ 
+@@ -193,18 +195,14 @@ def test_loads_table_has_column_descriptions() -> None:
+     assert table["description"] == "Created by DLT. Tracks completed loads"
+ 
+     # Verify all columns have descriptions
+-    expected_columns = [
+-        "load_id",
+-        "schema_name",
+-        "status",
+-        "inserted_at",
+-        "schema_version_hash"
+-    ]
++    expected_columns = ["load_id", "schema_name", "status", "inserted_at", "schema_version_hash"]
+     for col_name in expected_columns:
+         assert col_name in table["columns"], f"Column {col_name} missing from loads_table"
+         col = table["columns"][col_name]
+         assert "description" in col, f"Column {col_name} missing description"
+-        assert isinstance(col["description"], str), f"Column {col_name} description should be a string"
++        assert isinstance(
++            col["description"], str
++        ), f"Column {col_name} description should be a string"
+         assert len(col["description"]) > 0, f"Column {col_name} description should not be empty"
+ 
+ 
+@@ -231,7 +229,9 @@ def test_pipeline_state_table_has_column_descriptions() -> None:
+         assert col_name in table["columns"], f"Column {col_name} missing from pipeline_state_table"
+         col = table["columns"][col_name]
+         assert "description" in col, f"Column {col_name} missing description"
+-        assert isinstance(col["description"], str), f"Column {col_name} description should be a string"
++        assert isinstance(
++            col["description"], str
++        ), f"Column {col_name} description should be a string"
+         assert len(col["description"]) > 0, f"Column {col_name} description should not be empty"
+ 
+ 
+@@ -257,9 +257,9 @@ def test_internal_tables_column_descriptions_are_not_empty() -> None:
+ 
+     for table_name, table in tables:
+         for col_name, col in table["columns"].items():
+-            assert "description" in col, (
+-                f"Table {table_name}, column {col_name} missing description"
+-            )
+-            assert col["description"] is not None and col["description"].strip() != "", (
+-                f"Table {table_name}, column {col_name} has empty description"
+-            )
+\ No newline at end of file
++            assert (
++                "description" in col
++            ), f"Table {table_name}, column {col_name} missing description"
++            assert (
++                col["description"] is not None and col["description"].strip() != ""
++            ), f"Table {table_name}, column {col_name} has empty description"
+diff --git a/tests/dataset/test_relation.py b/tests/dataset/test_relation.py
+index d52c3227d..8b07d4eec 100644
+--- a/tests/dataset/test_relation.py
++++ b/tests/dataset/test_relation.py
+@@ -431,6 +431,40 @@ def test_multi_schema_row_counts(multi_schema_dataset: dlt.Dataset) -> None:
+     assert counts == expected_counts
+ 
+ 
++@pytest.fixture(scope="module")
++def casefolding_dataset(module_tmp_path: pathlib.Path) -> dlt.Dataset:
++    """Dataset on a duckdb that folds identifiers to upper case, like snowflake."""
++    pipeline = dlt.pipeline(
++        pipeline_name="casefolding",
++        pipelines_dir=str(module_tmp_path / "pipelines_dir"),
++        destination=dlt.destinations.duckdb(
++            str(module_tmp_path / "casefolding.db"),
++            casefold_identifier=str.upper,
++            has_case_sensitive_identifiers=True,
++        ),
++        dev_mode=True,
++    )
++    pipeline.run(inventory())
++    return pipeline.dataset()
++
++
++def test_casefolding_row_counts_output_names(casefolding_dataset: dlt.Dataset) -> None:
++    """`row_counts` names its output columns in the dlt schema namespace, also when the
++    destination folds identifiers."""
++    counts = casefolding_dataset.row_counts()
++    assert counts.columns == ["table_name", "row_count"]
++    rows = counts.arrow().to_pylist()
++    assert {row["table_name"]: row["row_count"] for row in rows} == {
++        "items": len(ITEMS_DATA),
++        "warehouses": len(WAREHOUSES_DATA),
++    }
++
++
++def test_casefolding_literal_projection_output_name(casefolding_dataset: dlt.Dataset) -> None:
++    relation = casefolding_dataset("SELECT 'Widget' AS kind, item_id FROM items ORDER BY item_id")
++    assert relation.arrow().schema.names == ["kind", "item_id"]
++
++
+ def test_multi_schema_cross_schema_sql_query(multi_schema_dataset: dlt.Dataset) -> None:
+     result = multi_schema_dataset.query(
+         "SELECT u.id, i.item_id FROM users u, items i WHERE u.id = i.item_id"
+diff --git a/tests/destinations/test_queries.py b/tests/destinations/test_queries.py
+index ee960cee8..559832d0b 100644
+--- a/tests/destinations/test_queries.py
++++ b/tests/destinations/test_queries.py
+@@ -1,4 +1,4 @@
+-from typing import Any, Iterator, List, Optional, cast
++from typing import Any, Callable, Iterator, List, Optional, cast
+ 
+ import duckdb
+ import pytest
+@@ -195,6 +195,39 @@ def test_bind_query_per_dataset_casefold() -> None:
+     )
+ 
+ 
++@pytest.mark.parametrize("casefold", (str.upper, str.lower), ids=("upper", "lower"))
++def test_bind_query_keeps_declared_output_names(
++    duckdb_sql_client: SqlClientBase[Any], casefold: Callable[[str], str]
++) -> None:
++    """A case-folding binding restores the output names that the query declares. A projection
++    over a literal keeps its alias and does not take the text of the literal."""
++    binding = IdentifiersBinding(
++        (None, duckdb_sql_client.dataset_name),
++        duckdb_sql_client.make_qualified_table_name_path,
++        casefold,
++    )
++    sqlglot_schema = SQLGlotSchema({"my_table": {"id": str}})
++
++    bound = bind_query(
++        qualified_query=build_row_counts_expr("my_table"),
++        sqlglot_schema=sqlglot_schema,
++        bindings={},
++        default_binding=binding,
++    )
++    assert [proj.output_name for proj in bound.selects] == ["table_name", "row_count"]
++
++    # a literal or NULL projection in a user query keeps its alias as well
++    bound = bind_query(
++        qualified_query=cast(
++            sge.Query, sqlglot.parse_one("SELECT 'items' AS kind, NULL AS missing FROM my_table")
++        ),
++        sqlglot_schema=sqlglot_schema,
++        bindings={},
++        default_binding=binding,
++    )
++    assert [proj.output_name for proj in bound.selects] == ["kind", "missing"]
++
++
+ def test_bind_query_with_legacy_path_signature(
+     duckdb_sql_client: SqlClientBase[Any],
+ ) -> None:
+diff --git a/tests/load/test_read_interfaces.py b/tests/load/test_read_interfaces.py
+index d6d3abcaa..d972d9d33 100644
+--- a/tests/load/test_read_interfaces.py
++++ b/tests/load/test_read_interfaces.py
+@@ -385,6 +385,8 @@ def test_row_counts(populated_pipeline: Pipeline) -> None:
+     total_records = _total_records(populated_pipeline.destination.destination_type)
+ 
+     dataset = populated_pipeline.dataset()
++    # the output columns are named in the dlt schema namespace, also on case-folding destinations
++    assert list(dataset.row_counts().df().columns) == ["table_name", "row_count"]
+     # default is all data tables
+     assert set(dataset.row_counts().df().itertuples(index=False, name=None)) == {
+         (
+diff --git a/tests/normalize/test_json_item_inference.py b/tests/normalize/test_json_item_inference.py
+index e445c5c06..3756208ac 100644
+--- a/tests/normalize/test_json_item_inference.py
++++ b/tests/normalize/test_json_item_inference.py
+@@ -1132,4 +1132,3 @@ def test_variant_column_description_with_bool_variant(
+ 
+     assert variant_col["variant"] is True
+     assert variant_col["description"] == "Variant of column value__v_bool generated by dlt"
+-
+diff --git a/tests/workspace/helpers/dashboard/conftest.py b/tests/workspace/helpers/dashboard/conftest.py
+index c36d75b69..264ee0463 100644
+--- a/tests/workspace/helpers/dashboard/conftest.py
++++ b/tests/workspace/helpers/dashboard/conftest.py
+@@ -8,6 +8,7 @@ from dlt._workspace.helpers.dashboard import strings
+ 
+ from tests.workspace.helpers.dashboard.example_pipelines import (
+     create_success_pipeline_duckdb,
++    create_success_pipeline_duckdb_casefold,
+     create_success_pipeline_filesystem,
+     create_extract_exception_pipeline,
+     create_normalize_exception_pipeline,
+@@ -62,6 +63,18 @@ def success_pipeline_duckdb():
+             db_conn.close()
+ 
+ 
++@pytest.fixture
++def success_pipeline_duckdb_casefold():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        import duckdb
++
++        db_conn = duckdb.connect()
++        try:
++            yield create_success_pipeline_duckdb_casefold(temp_dir, db_conn=db_conn)
++        finally:
++            db_conn.close()
++
++
+ @pytest.fixture
+ def success_pipeline_filesystem():
+     with tempfile.TemporaryDirectory() as temp_dir:
+diff --git a/tests/workspace/helpers/dashboard/example_pipelines.py b/tests/workspace/helpers/dashboard/example_pipelines.py
+index e890e3acd..75f692b31 100644
+--- a/tests/workspace/helpers/dashboard/example_pipelines.py
++++ b/tests/workspace/helpers/dashboard/example_pipelines.py
+@@ -23,6 +23,7 @@ from dlt.common.destination.exceptions import (
+ from tests.utils import get_test_storage_root
+ 
+ SUCCESS_PIPELINE_DUCKDB = "success_pipeline_duckdb"
++SUCCESS_PIPELINE_DUCKDB_CASEFOLD = "success_pipeline_duckdb_casefold"
+ SUCCESS_PIPELINE_FILESYSTEM = "success_pipeline_filesystem"
+ EXTRACT_EXCEPTION_PIPELINE = "extract_exception_pipeline"
+ NORMALIZE_EXCEPTION_PIPELINE = "normalize_exception_pipeline"
+@@ -36,6 +37,7 @@ CUSTOM_DEST_STRING_REF_PIPELINE = "custom_dest_string_ref_pipeline"
+ 
+ ALL_PIPELINES = [
+     SUCCESS_PIPELINE_DUCKDB,
++    SUCCESS_PIPELINE_DUCKDB_CASEFOLD,
+     EXTRACT_EXCEPTION_PIPELINE,
+     NORMALIZE_EXCEPTION_PIPELINE,
+     NEVER_RAN_PIPELINE,
+@@ -60,7 +62,11 @@ PIPELINES_WITH_EXCEPTIONS = [
+     LOAD_EXCEPTION_PIPELINE,
+     SYNC_EXCEPTION_PIPELINE,
+ ]
+-PIPELINES_WITH_LOAD = [SUCCESS_PIPELINE_DUCKDB, SUCCESS_PIPELINE_FILESYSTEM]
++PIPELINES_WITH_LOAD = [
++    SUCCESS_PIPELINE_DUCKDB,
++    SUCCESS_PIPELINE_DUCKDB_CASEFOLD,
++    SUCCESS_PIPELINE_FILESYSTEM,
++]
+ 
+ 
+ def run_success_pipeline(pipeline: dlt.Pipeline):
+@@ -132,6 +138,26 @@ def create_success_pipeline_duckdb(pipelines_dir: str = None, db_conn: Any = Non
+     return pipeline
+ 
+ 
++def create_success_pipeline_duckdb_casefold(pipelines_dir: str = None, db_conn: Any = None):
++    """Create a test pipeline on a duckdb that folds identifiers to upper case, like snowflake.
++
++    Properties see `run_success_pipeline`.
++    """
++    pipeline = dlt.pipeline(
++        pipeline_name=SUCCESS_PIPELINE_DUCKDB_CASEFOLD,
++        pipelines_dir=pipelines_dir,
++        destination=dlt.destinations.duckdb(
++            credentials=db_conn if db_conn else None,
++            casefold_identifier=str.upper,
++            has_case_sensitive_identifiers=True,
++        ),
++    )
++
++    run_success_pipeline(pipeline)
++
++    return pipeline
++
++
+ def create_success_pipeline_filesystem(
+     pipelines_dir: str = None,
+ ):
+@@ -350,6 +376,7 @@ def create_custom_dest_string_ref_pipeline(pipelines_dir: str = None):
+ # NOTE: this script can be run to create the test pipelines globally for manual testing of the dashboard app and cli
+ if __name__ == "__main__":
+     create_success_pipeline_duckdb()
++    create_success_pipeline_duckdb_casefold()
+     create_success_pipeline_filesystem()
+     create_extract_exception_pipeline()
+     create_normalize_exception_pipeline()
+diff --git a/tests/workspace/helpers/dashboard/test_query_operations.py b/tests/workspace/helpers/dashboard/test_query_operations.py
+index 84f194d17..525ca4a93 100644
+--- a/tests/workspace/helpers/dashboard/test_query_operations.py
++++ b/tests/workspace/helpers/dashboard/test_query_operations.py
+@@ -11,7 +11,7 @@ from dlt._workspace.helpers.dashboard.utils.queries import (
+ )
+ from tests.workspace.helpers.dashboard.example_pipelines import (
+     PIPELINES_WITH_LOAD,
+-    SUCCESS_PIPELINE_DUCKDB,
++    SUCCESS_PIPELINE_FILESYSTEM,
+ )
+ 
+ 
+@@ -27,11 +27,9 @@ def test_get_query_result(pipeline: dlt.Pipeline):
+     if pipeline.pipeline_name in PIPELINES_WITH_LOAD:
+         assert isinstance(result, pyarrow.Table)
+         assert len(result) == 1
+-        assert (
+-            result[0][0].as_py() == 100
+-            if pipeline.pipeline_name == SUCCESS_PIPELINE_DUCKDB
+-            else 103
+-        )  #  merge does not work on filesystem
++        # merge does not work on filesystem
++        expected_count = 103 if pipeline.pipeline_name == SUCCESS_PIPELINE_FILESYSTEM else 100
++        assert result[0][0].as_py() == expected_count
+     else:
+         assert len(result) == 0
+         assert error_message
+diff --git a/tests/workspace/helpers/dashboard/test_table_operations.py b/tests/workspace/helpers/dashboard/test_table_operations.py
+index bf9ad9899..27825a8f7 100644
+--- a/tests/workspace/helpers/dashboard/test_table_operations.py
++++ b/tests/workspace/helpers/dashboard/test_table_operations.py
+@@ -14,7 +14,7 @@ from dlt._workspace.helpers.dashboard.utils.ui import dlt_table
+ from tests.workspace.helpers.dashboard.example_pipelines import (
+     ALL_PIPELINES,
+     PIPELINES_WITH_LOAD,
+-    SUCCESS_PIPELINE_DUCKDB,
++    SUCCESS_PIPELINE_FILESYSTEM,
+ )
+ 
+ 
+@@ -123,7 +123,7 @@ def test_get_row_counts_list(pipeline: dlt.Pipeline):
+             "customers": 13,
+             "inventory": 6,
+             "purchases": (
+-                100 if pipeline.pipeline_name == SUCCESS_PIPELINE_DUCKDB else 103
++                103 if pipeline.pipeline_name == SUCCESS_PIPELINE_FILESYSTEM else 100
+             ),  #  merge does not work on filesystem
+             "purchases__child": 3,
+             "inventory_categories": 3,
+
+
+===== COMMIT d989cec3 =====
+
+
+commit d989cec3f
+Author: Alena Astrakhantseva
+Date: 2026-08-20
+
+    fix timeout and grace_period form to nested (#4380)
+
+diff --git a/docs/website/docs/hub/pipeline-operations/job-configuration.md b/docs/website/docs/hub/pipeline-operations/job-configuration.md
+index a4f6a91d9..8648eafc0 100644
+--- a/docs/website/docs/hub/pipeline-operations/job-configuration.md
++++ b/docs/website/docs/hub/pipeline-operations/job-configuration.md
+@@ -17,7 +17,7 @@ All options below are arguments to the `@run.pipeline`, `@run.job`, and `@run.in
+ ```py
+ @run.pipeline(
+     my_pipeline,
+-    execute={"timeout": 7200, "grace_period": 60},
++    execute={"timeout": {"timeout": 7200, "grace_period": 60}},
+ )
+ def long_load():
+     ...
+
+
+===== COMMIT 226a193f =====
+
+
+commit 226a193f9
+Author: richacode007-byte
+Date: 2026-08-19
+
+    Feat/3269 snowflake workload identity provider (#4362)
+
+diff --git a/dlt/destinations/impl/snowflake/configuration.py b/dlt/destinations/impl/snowflake/configuration.py
+index 83c3183a8..04da12a33 100644
+--- a/dlt/destinations/impl/snowflake/configuration.py
++++ b/dlt/destinations/impl/snowflake/configuration.py
+@@ -31,6 +31,7 @@ class SnowflakeCredentialsWithoutDefaults(ConnectionStringCredentials):
+     role: Optional[str] = None
+     authenticator: Optional[str] = None
+     token: Optional[str] = None
++    workload_identity_provider: Optional[str] = None
+     private_key: Optional[TSecretStrValue] = None
+     private_key_path: Optional[str] = None
+     private_key_passphrase: Optional[TSecretStrValue] = None
+@@ -52,6 +53,7 @@ class SnowflakeCredentialsWithoutDefaults(ConnectionStringCredentials):
+         "role",
+         "authenticator",
+         "token",
++        "workload_identity_provider",
+         "private_key",
+         "private_key_path",
+         "private_key_passphrase",
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+index 5bbd47008..3ca44d95e 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/snowflake.md
+@@ -145,6 +145,19 @@ or
+ destination.snowflake.credentials="snowflake:///dlt_data?authenticator=oauth"  # host and token not specified
+ ```
+ 
++In **Workload Identity Federation (WIF)** authentication, set `authenticator` to
++`WORKLOAD_IDENTITY` and pass `workload_identity_provider` as `AWS`, `AZURE`, `GCP`,
++or `OIDC`. For `OIDC`, also set `token`. Requires `snowflake-connector-python>=3.17.0`.
++See [Snowflake WIF](https://docs.snowflake.com/en/user-guide/workload-identity-federation).
++
++```toml
++[destination.snowflake.credentials]
++database = "dlt_data"
++host = "kgiotue-wn98412"
++authenticator = "WORKLOAD_IDENTITY"
++workload_identity_provider = "AWS"
++```
++
+ ### Additional connection options
+ 
+ We pass all query parameters to the `connect` function of the Snowflake Python Connector. For example:
+diff --git a/tests/load/snowflake/test_snowflake_configuration.py b/tests/load/snowflake/test_snowflake_configuration.py
+index 6b3689c0f..ae154c3a1 100644
+--- a/tests/load/snowflake/test_snowflake_configuration.py
++++ b/tests/load/snowflake/test_snowflake_configuration.py
+@@ -152,6 +152,29 @@ def test_only_authenticator() -> None:
+     }
+ 
+ 
++def test_workload_identity_provider() -> None:
++    c = resolve_configuration(
++        SnowflakeCredentialsWithoutDefaults(
++            "snowflake://host1/db1?authenticator=WORKLOAD_IDENTITY"
++            "&workload_identity_provider=AWS&warehouse=wh1"
++        )
++    )
++    assert c.authenticator == "WORKLOAD_IDENTITY"
++    assert c.workload_identity_provider == "AWS"
++    assert c.warehouse == "wh1"
++    assert c.to_connector_params() == {
++        "timezone": "UTC",
++        "authenticator": "WORKLOAD_IDENTITY",
++        "workload_identity_provider": "AWS",
++        "warehouse": "wh1",
++        "user": None,
++        "password": None,
++        "account": "host1",
++        "database": "db1",
++        "application": "dltHub_dlt",
++    }
++
++
+ # def test_no_query(environment) -> None:
+ #     c = SnowflakeCredentialsWithoutDefaults("snowflake://user1:pass1@host1/db1")
+ #     assert str(c.to_url()) == "snowflake://user1:pass1@host1/db1"
+
+
+===== COMMIT ff052d60 =====
+
+
+commit ff052d602
+Author: Kole Harvey
+Date: 2026-08-19
+
+    test(common): apply auto_test_run_context so tests stop writing to ~/.dlt (#4368)
+
+diff --git a/tests/common/conftest.py b/tests/common/conftest.py
+index 0e84c4108..3279d05ac 100644
+--- a/tests/common/conftest.py
++++ b/tests/common/conftest.py
+@@ -1 +1 @@
+-from tests.utils import preserve_environ
++from tests.utils import auto_test_run_context, preserve_environ
+
+
+===== COMMIT 23ecc8fe =====
+
+
+commit 23ecc8fee
+Author: Thierry Jean
+Date: 2026-08-18
+
+    repo(ci): remove dead `test_examples.yml` workflow
+
+diff --git a/.github/workflows/test_examples.yml b/.github/workflows/test_examples.yml
+deleted file mode 100644
+index d3db6a272..000000000
+--- a/.github/workflows/test_examples.yml
++++ /dev/null
+@@ -1,59 +0,0 @@
+-
+-name: docs | examples
+-
+-on:
+-  workflow_call:
+-  workflow_dispatch:
+-
+-env:
+-  DLT_SECRETS_TOML: ${{ secrets.DLT_SECRETS_TOML }}
+-
+-  # RUNTIME__SENTRY_DSN: https://6f6f7b6f8e0f458a89be4187603b55fe@o1061158.ingest.sentry.io/4504819859914752
+-  RUNTIME__LOG_LEVEL: ERROR
+-
+-  # Slack hook for chess in production example
+-  RUNTIME__SLACK_INCOMING_HOOK: ${{ secrets.RUNTIME__SLACK_INCOMING_HOOK }}
+-  # Path to local qdrant database
+-  DESTINATION__QDRANT__CREDENTIALS__PATH: zendesk.qdb
+-
+-jobs:
+-
+-  run_lint:
+-    name: docs | test examples
+-    runs-on: ubuntu-latest
+-
+-    steps:
+-
+-      - name: Check out
+-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+-        with:
+-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+-
+-      - name: Start weaviate
+-        run:  docker compose -f "tests/load/weaviate/docker-compose.yml" up -d
+-
+-      - name: Setup Python
+-        uses: actions/setup-python@v5
+-        with:
+-          python-version: "3.11"
+-
+-      - name: Install uv
+-        uses: astral-sh/setup-uv@v6
+-        with:
+-          python-version: "3.11"
+-          activate-environment: true
+-          enable-cache: true
+-
+-      - name: Install dependencies
+-        run: uv sync --extra duckdb --extra weaviate --extra parquet --extra qdrant --extra bigquery --extra postgres --extra lancedb  --extra s3 --group workspace-deps --group docs --group ibis --group providers
+-
+-      # - name: Install dlthub incl alpha releases
+-      #   run: uv run pip install --pre dlthub
+-
+-      - name: create secrets.toml for examples
+-        run: pwd && echo "$DLT_SECRETS_TOML" > docs/examples/.dlt/secrets.toml
+-
+-      - name: Run linter and tests on examples
+-        run: make lint-and-test-examples
+-
+-
+
+
+===== COMMIT 989d11d0 =====
+
+
+commit 989d11d0c
+Author: chjnett
+Date: 2026-08-19
+
+    fix(incremental): keep `last_value` forward-only when it is exactly `0` (#4367)
+
+diff --git a/dlt/extract/incremental/__init__.py b/dlt/extract/incremental/__init__.py
+index f8cd0a44d..2cb38fe9b 100644
+--- a/dlt/extract/incremental/__init__.py
++++ b/dlt/extract/incremental/__init__.py
+@@ -686,7 +686,7 @@ class Incremental(
+ 
+         cached_state = self._cached_state
+         # ensure last_value maintains forward-only progression when lag is applied
+-        if self.lag and (cached_last_value := cached_state.get("last_value")):
++        if self.lag and (cached_last_value := cached_state.get("last_value")) is not None:
+             transformer.last_value = self.last_value_func(
+                 (transformer.last_value, cached_last_value)
+             )
+diff --git a/tests/extract/test_incremental.py b/tests/extract/test_incremental.py
+index 97c804d9a..5c70c833f 100644
+--- a/tests/extract/test_incremental.py
++++ b/tests/extract/test_incremental.py
+@@ -3705,6 +3705,39 @@ def test_incremental_lag_int_with_initial_values(lag: float, last_value_func) ->
+         assert result == expected_results[int(lag)]
+ 
+ 
++@pytest.mark.parametrize("first_cursor", [10, 0])
++def test_incremental_lag_forward_only_with_zero_last_value(first_cursor: int) -> None:
++    """
++    The forward-only guard for `lag` must not use a truthiness test on the
++    persisted `last_value`: when the cursor is exactly `0` (falsy), the guard
++    was skipped and `lag` rewound the cursor by one window on the next run.
++
++    Regression for #4363.
++    """
++
++    pipeline = dlt.pipeline(
++        pipeline_name="p" + uniq_id(),
++        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
++    )
++    is_second_run = False
++
++    @dlt.resource(name="events", primary_key="id", write_disposition="append")
++    def events_resource(_=dlt.sources.incremental("counter", lag=5, last_value_func=max)):
++        if is_second_run:
++            yield {"id": 2, "counter": first_cursor - 10}
++        else:
++            yield {"id": 1, "counter": first_cursor}
++
++    pipeline.run(events_resource)
++    is_second_run = True
++    pipeline.run(events_resource)
++
++    last_value = pipeline.state["sources"][pipeline.default_schema_name]["resources"]["events"][
++        "incremental"
++    ]["counter"]["last_value"]
++    assert last_value == first_cursor
++
++
+ @pytest.mark.parametrize("lag", [0, 1.0, 1.5, 2.0])
+ @pytest.mark.parametrize("last_value_func", [min, max])
+ def test_incremental_lag_float(lag: float, last_value_func) -> None:
+
+
+===== COMMIT 9cc8180a =====
+
+
+commit 9cc8180ac
+Author: Shreyas
+Date: 2026-08-18
+
+    docs(hub): move the streamlit page under a renamed Data Apps category and retitle it (#4372)
+
+diff --git a/docs/website/docs/hub/cookbook/build-streamlit-dashboard.md b/docs/website/docs/hub/cookbook/build-streamlit-dashboard.md
+index a6238e3cb..4e533826a 100644
+--- a/docs/website/docs/hub/cookbook/build-streamlit-dashboard.md
++++ b/docs/website/docs/hub/cookbook/build-streamlit-dashboard.md
+@@ -1,10 +1,10 @@
+ ---
+-title: Build and Deploy Streamlit App
++title: Build and deploy a Streamlit app
+ description: Build, serve, and deploy a Streamlit app on dltHub.
+ keywords: [streamlit, dashboard, hub, app, deploy, dltHub]
+ ---
+ 
+-# Build and Deploy Streamlit App
++# Build and deploy a Streamlit app
+ 
+ [Streamlit](https://docs.streamlit.io/) is a Python framework for turning a script into an interactive web app. On dltHub, a Streamlit app is a plain `.py` file that imports `streamlit`, and the runtime serves it as an interactive dashboard.
+ 
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index c8221d33b..47ffd601d 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -541,8 +541,12 @@ const sidebars = {
+     },
+     {
+       type: "category",
+-      label: "Data discovery & serving",
+-      items: ["hub/data-discovery/datasets", { type: "doc", id: "general-usage/dataset-access/marimo" }],
++      label: "Data Apps",
++      items: [
++        "hub/data-discovery/datasets",
++        { type: "doc", id: "general-usage/dataset-access/marimo" },
++        "hub/cookbook/build-streamlit-dashboard",
++      ],
+     },
+     {
+       type: "category",
+@@ -582,13 +586,6 @@ const sidebars = {
+             "walkthroughs/zendesk-weaviate",
+           ],
+         },
+-        {
+-          type: "category",
+-          label: "dltHub",
+-          collapsible: true,
+-          collapsed: true,
+-          items: ["hub/cookbook/build-streamlit-dashboard"],
+-        },
+       ],
+     },
+   ],
+
+
+===== COMMIT 08f60a23 =====
+
+
+commit 08f60a236
+Author: Shreyas
+Date: 2026-08-17
+
+    ci(agentic-docs): pass the Actions run URL to the job (#4364)
+
+diff --git a/.github/workflows/agentic-docs.yml b/.github/workflows/agentic-docs.yml
+index f5d21de62..d5f603777 100644
+--- a/.github/workflows/agentic-docs.yml
++++ b/.github/workflows/agentic-docs.yml
+@@ -58,8 +58,8 @@ jobs:
+   trigger:
+     runs-on: ubuntu-latest
+     # Label events must carry both labels. Comment events must look like a
+-    # command, and may be on either an issue (`/position`, before any PR exists)
+-    # or a pull request (`/revise`, which is where maintainers review).
++    # command, and must be on a pull request — `/revise`, which is where
++    # maintainers review. Nothing a comment says starts a run on an issue.
+     #
+     # GitHub models PR comments as issue comments, so for a comment on a PR
+     # `github.event.issue.number` is the PR number, not the issue's. The step
+@@ -103,7 +103,8 @@ jobs:
+     #
+     # `/position` is deliberately absent. It sets the location and nothing else;
+     # arming is the label's job, so a `/position` comment on an unlabelled issue no
+-    # longer starts a job.
++    # longer starts a job. The generation run reads it out of the issue's comments
++    # instead — which is why it must be posted before the label goes on.
+     if: |
+       (github.event_name == 'issues' &&
+        github.event.label.name == 'agent' &&
+@@ -166,14 +167,13 @@ jobs:
+       # Exactly one of ISSUE_NUMBER / PR_NUMBER is set, and both are numbers:
+       #
+       #   labelled issue        ISSUE_NUMBER, no COMMENT_ID  -> generation
+-      #   comment on an issue   ISSUE_NUMBER + COMMENT_ID    -> /position
+       #   comment on a PR       PR_NUMBER + COMMENT_ID       -> /revise
+       #   review on a PR        PR_NUMBER + REVIEW_ID        -> /revise
+       #
+       # `github.event.issue.pull_request` is present only for a comment on a PR,
+-      # which is how the two comment cases are told apart. A review event has no
+-      # `issue` at all — its number is on `pull_request` — so it is handled
+-      # separately rather than folded into the same expression.
++      # which is how a comment that reaches here is known to be one. A review
++      # event has no `issue` at all — its number is on `pull_request` — so it is
++      # handled separately rather than folded into the same expression.
+       #
+       # Only numeric IDs cross this boundary. The job fetches the comment or
+       # review text itself, so nothing a stranger wrote passes through this shell.
+@@ -197,6 +197,10 @@ jobs:
+           # this file could send any name. Authorisation is settled by asking
+           # GitHub who wrote the artifact the run is reacting to.
+           ACTOR: ${{ github.actor }}
++          # Linked from the "process triggered" comment the job posts on the issue,
++          # so whoever labelled it can watch. Safe in the comma-separated list
++          # below: an Actions run URL contains no comma.
++          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+         run: |
+           set -euo pipefail
+           if [[ "$IS_REVIEW" == "true" ]]; then
+@@ -206,6 +210,7 @@ jobs:
+           else
+             target="ISSUE_NUMBER=${ISSUE_NUMBER},COMMENT_ID=${COMMENT_ID},ACTOR=${ACTOR}"
+           fi
++          target="${target},RUN_URL=${RUN_URL}"
+           gcloud run jobs execute agentic-docs \
+             --region=europe-west3 \
+             --update-env-vars="${target}" \
+
+
+===== COMMIT a4243c99 =====
+
+
+commit a4243c994
+Author: Anas Khan
+Date: 2026-08-14
+
+    fix(cli): remove generic "refer to our docs" note from cli errors (#4136)
+
+diff --git a/dlt/_workspace/cli/_dlt.py b/dlt/_workspace/cli/_dlt.py
+index 45ab59933..db9b0985e 100644
+--- a/dlt/_workspace/cli/_dlt.py
++++ b/dlt/_workspace/cli/_dlt.py
+@@ -18,7 +18,6 @@ from dlt._workspace.cli._telemetry_command import (
+ from dlt._workspace.cli.echo import maybe_no_stdin
+ 
+ ACTION_EXECUTED = False
+-DEFAULT_DOCS_URL = "https://dlthub.com/docs/intro"
+ 
+ 
+ class _LazyMarkdown:
+@@ -317,7 +316,6 @@ def main(host: str = "dlt") -> int:
+         parser, pre_parser, installed_commands = _create_parser(host)
+     except ValueError as ex:
+         fmt.secho(str(ex), err=True, fg="red")
+-        fmt.note("Please refer to our docs at '%s' for further assistance." % DEFAULT_DOCS_URL)
+         return -1
+     # pre-pass extracts global flags at any argv position; main parse uses namespace=ns to keep them
+     ns, remaining = pre_parser.parse_known_args(sys.argv[1:])
+@@ -346,7 +344,7 @@ def main(host: str = "dlt") -> int:
+                         sys.path.insert(0, "")
+                 cmd.execute(args)
+         except Exception as ex:
+-            docs_url = getattr(cmd, "docs_url", None) or DEFAULT_DOCS_URL
++            docs_url = getattr(cmd, "docs_url", None)
+             error_code = -1
+             raiseable_exception = ex
+ 
+@@ -358,7 +356,10 @@ def main(host: str = "dlt") -> int:
+             if raiseable_exception:
+                 fmt.secho(str(raiseable_exception) or str(ex), err=True, fg="red")
+ 
+-            fmt.note("Please refer to our docs at '%s' for further assistance." % docs_url)
++            # only point to docs when the command or exception provides a specific
++            # link; the generic intro-page footer was removed (#4126)
++            if docs_url:
++                fmt.note("Please refer to our docs at '%s' for further assistance." % docs_url)
+             if _debug.is_debug_enabled() and raiseable_exception:
+                 raise raiseable_exception
+ 
+diff --git a/tests/workspace/cli/common/test_cli_invoke.py b/tests/workspace/cli/common/test_cli_invoke.py
+index 46d33c099..adafce1a7 100644
+--- a/tests/workspace/cli/common/test_cli_invoke.py
++++ b/tests/workspace/cli/common/test_cli_invoke.py
+@@ -353,6 +353,48 @@ def test_dlt_ai_moved_to_dlthub_stub(
+     assert rc != 0
+ 
+ 
++def test_command_error_omits_generic_docs_note(
++    monkeypatch: pytest.MonkeyPatch,
++    capsys: pytest.CaptureFixture[str],
++) -> None:
++    """A failing command with no specific docs link shows the real error but no docs footer (#4126)."""
++    # the moved `ai` stub has `docs_url = None` and raises a docs-url-less CliCommandException,
++    # so the command-error path has no command/exception-specific link to fall back to
++    monkeypatch.setattr("sys.argv", ["dlt", "ai", "init"])
++    rc = main("dlt")
++    captured = capsys.readouterr()
++    combined = captured.out + captured.err
++    # the actual error context is still reported
++    assert "`ai` command moved to dlthub" in combined
++    assert rc != 0
++    # but the generic "go to the intro page" footer is gone
++    assert "Please refer to our docs" not in combined
++    assert "docs/intro" not in combined
++
++
++def test_command_error_keeps_specific_docs_note(
++    monkeypatch: pytest.MonkeyPatch,
++    capsys: pytest.CaptureFixture[str],
++) -> None:
++    """A command/exception that defines its own docs_url still surfaces that contextual link (#4126)."""
++    from dlt._workspace.cli import commands
++    from dlt._workspace.cli._urls import DLT_TELEMETRY_DOCS_URL
++
++    # `telemetry` carries a command-specific docs_url; force it to fail to hit the error path
++    def _raise(self: Any, args: Any) -> None:
++        raise CliCommandException()
++
++    monkeypatch.setattr(commands.TelemetryCommand, "execute", _raise)
++    monkeypatch.setattr("sys.argv", ["dlt", "telemetry"])
++    rc = main("dlt")
++    captured = capsys.readouterr()
++    combined = captured.out + captured.err
++    assert rc != 0
++    # the command's own contextual docs link is still shown, but not the generic intro page
++    assert DLT_TELEMETRY_DOCS_URL in combined
++    assert "docs/intro" not in combined
++
++
+ @pytest.mark.parametrize(
+     "argv,case_id",
+     [
+
+
+===== COMMIT 77b7a1dd =====
+
+
+commit 77b7a1dda
+Author: Katharina Lenz
+Date: 2026-08-13
+
+    Dcs/move plaoyground workspace (#4355)
+
+diff --git a/docs/website/docs/hub/getting-started/installation.md b/docs/website/docs/hub/getting-started/installation.md
+index 4e17d1f41..8ffd0d6e7 100644
+--- a/docs/website/docs/hub/getting-started/installation.md
++++ b/docs/website/docs/hub/getting-started/installation.md
+@@ -42,7 +42,7 @@ If you don't have `uv` yet, either [install it first](#setting-up-your-environme
+ pipx run dlthub-start
+ ```
+ 
+-Either way, it runs a guided first experience — it scaffolds the workspace, installs `dlt[hub]` and dependencies with `uv sync`, logs you in to the dltHub platform, connects your personal [Playground workspace](playground-workspace.md), then prompts you to pick a coding agent (Claude / Cursor / Codex) and launches it. Your agent deploys and runs the sample pipeline, then is ready to build your own source.
++Either way, it runs a guided first experience — it scaffolds the workspace, installs `dlt[hub]` and dependencies with `uv sync`, logs you in to the dltHub platform, connects your personal [Playground workspace](../pipeline-operations/playground-workspace.md), then prompts you to pick a coding agent (Claude / Cursor / Codex) and launches it. Your agent deploys and runs the sample pipeline, then is ready to build your own source.
+ 
+ :::tip
+ Run `dlthub-start` yourself with no arguments — it's interactive and guides you through each step. It scaffolds into your current folder, so the AI skills land right where your coding agent is open. For a walkthrough of the whole flow, see [Deploy your first pipeline](onboarding.md).
+diff --git a/docs/website/docs/hub/getting-started/introduction.md b/docs/website/docs/hub/getting-started/introduction.md
+index 172fda623..ad8c9013c 100644
+--- a/docs/website/docs/hub/getting-started/introduction.md
++++ b/docs/website/docs/hub/getting-started/introduction.md
+@@ -20,7 +20,7 @@ Use of the dltHub platform and toolkits is subject to a commercial [dltHub Licen
+ uvx dlthub-start@latest
+ ```
+ 
+-Runs a guided first experience: it scaffolds a local workspace (dltHub AI Workbench + `dlt[hub]`), installs dependencies, logs you in to the dltHub platform, connects your personal [Playground workspace](playground-workspace.md), and launches your coding agent — which then deploys and runs the sample pipeline for you. Follow it step by step in [Deploy your first pipeline](onboarding.md), and see [installation](installation.md) for prerequisites and alternative install paths.
++Runs a guided first experience: it scaffolds a local workspace (dltHub AI Workbench + `dlt[hub]`), installs dependencies, logs you in to the dltHub platform, connects your personal [Playground workspace](../pipeline-operations/playground-workspace.md), and launches your coding agent — which then deploys and runs the sample pipeline for you. Follow it step by step in [Deploy your first pipeline](onboarding.md), and see [installation](installation.md) for prerequisites and alternative install paths.
+ 
+ On the [dltHub platform](../pipeline-operations/overview.md), set `destination="playground"` for a [zero-config destination](../ingestion/playground.md) that is ideal for testing and a quick first run.
+ 
+diff --git a/docs/website/docs/hub/getting-started/onboarding.md b/docs/website/docs/hub/getting-started/onboarding.md
+index 4954db30f..a2691b4e4 100644
+--- a/docs/website/docs/hub/getting-started/onboarding.md
++++ b/docs/website/docs/hub/getting-started/onboarding.md
+@@ -20,7 +20,7 @@ project into a dltHub workspace.
+ - **Python 3.10–3.14** and [uv](https://docs.astral.sh/uv/) (recommended). See [Installation](installation.md) for
+   alternatives.                               
+ - **A coding agent**: Claude Code, Cursor, or Codex.                                                 
+-- **A GitHub, Google, or email login.** `dlthub-start` uses OAuth 2.0 (GitHub, Google, or email) to sign you in and creates your dltHub account on first login. You automatically get a [Playground workspace](playground-workspace.md), so you don't need to configure cloud credentials to complete this guide.
++- **A GitHub, Google, or email login.** `dlthub-start` uses OAuth 2.0 (GitHub, Google, or email) to sign you in and creates your dltHub account on first login. You automatically get a [Playground workspace](../pipeline-operations/playground-workspace.md), so you don't need to configure cloud credentials to complete this guide.
+ 
+ dltHub is commercial. Use is governed by the [license](../license.md). 
+ 
+@@ -79,7 +79,7 @@ starter-test/
+ └── .claude/            # agent toolkits: skills + MCP server (or .cursor/ / .codex/)
+ ```
+ 
+-`pipeline.py` loads the Sample Shop dataset from a public sample REST API into the platform-managed [Playground destination](../getting-started/playground-workspace.md). No warehouse, bucket, or credentials are required.
++`pipeline.py` loads the Sample Shop dataset from a public sample REST API into the platform-managed [Playground destination](../ingestion/playground.md). No warehouse, bucket, or credentials are required.
+ 
+ The pipeline is decorated with `@run.pipeline` and registered as a deployable job in `__deployment__.py`. See [Deployments](../pipeline-operations/deployments.md) for how the manifest works.
+ 
+@@ -152,7 +152,7 @@ To run jobs locally instead, use `dlthub run local`. Local runs use the `dev` [P
+ 
+ The Playground destination is great for testing but isn't meant for production. For real data, you'll want to load into a destination you own.
+ 
+-You can use profiles to run the same pipeline with different destinations and credentials in development and production. See [Workspace setup](../getting-started/playground-workspace.md) and [Profiles](../pipeline-operations/profiles) for the complete configuration.
++You can use profiles to run the same pipeline with different destinations and credentials in development and production. See [Workspace setup](../pipeline-operations/workspace-setup.md) and [Profiles](../pipeline-operations/profiles) for the complete configuration.
+ 
+ Set the destination on the `dlt.pipeline` inside your decorated job. Use a [named destination](../../general-usage/destination.md#use-named-destinations) such as `warehouse` so that the same pipeline code can run against different destinations in `dev` and `prod` profile:
+ 
+diff --git a/docs/website/docs/hub/getting-started/playground-workspace.md b/docs/website/docs/hub/pipeline-operations/playground-workspace.md
+similarity index 85%
+rename from docs/website/docs/hub/getting-started/playground-workspace.md
+rename to docs/website/docs/hub/pipeline-operations/playground-workspace.md
+index 2faa588fc..5a15671f1 100644
+--- a/docs/website/docs/hub/getting-started/playground-workspace.md
++++ b/docs/website/docs/hub/pipeline-operations/playground-workspace.md
+@@ -10,13 +10,13 @@ keywords: [playground, workspace, onboarding, dlthub platform, profiles]
+ 
+ The **Playground workspace** is a regular dltHub [workspace](../getting-started/installation.md#what-is-a-dlthub-workspace) that the platform creates for you automatically when you create your account, so you always have somewhere to try dltHub without setting one up yourself. It is personal (single-member) and, unlike other workspaces, cannot be renamed or deleted.
+ 
+-When you run `uvx dlthub-start`, it connects your local project to this workspace and provides a sample pipeline that loads to the [Playground destination](../ingestion/playground.md), so data lands on dltHub-managed storage with no warehouse, bucket, or credentials to configure. See [Deploy your first pipeline](onboarding.md) for the full flow.
++When you run `uvx dlthub-start`, it connects your local project to this workspace and provides a sample pipeline that loads to the [Playground destination](../ingestion/playground.md), so data lands on dltHub-managed storage with no warehouse, bucket, or credentials to configure. See [Deploy your first pipeline](../getting-started/onboarding.md) for the full flow.
+ 
+ ## When to use it
+ 
+ Use the Playground workspace to get started with dltHub:
+ 
+-* Complete [onboarding](onboarding.md) and the guided tour (`uvx dlthub-start`).
++* Complete [onboarding](../getting-started/onboarding.md) and the guided tour (`uvx dlthub-start`).
+ * Learn how dltHub works: deployments, cloud runs, and the dashboard.
+ * Run examples, paired with the [Playground destination](../ingestion/playground.md) so you can load and explore data without any setup.
+ 
+@@ -41,7 +41,7 @@ Any organization **Member** can create workspaces; **Owners** additionally manag
+ 
+ ## Next steps
+ 
+-* [Workspace setup](../pipeline-operations/workspace-setup.md): configure destinations, config, and secrets.
+-* [Profiles](../pipeline-operations/profiles.md): target different destinations from the same code.
+-* [Deployments](../pipeline-operations/deployments.md): declare jobs and run them on the platform.
++* [Workspace setup](workspace-setup.md): configure destinations, config, and secrets.
++* [Profiles](profiles.md): target different destinations from the same code.
++* [Deployments](deployments.md): declare jobs and run them on the platform.
+ * [Users and roles](../platform-capabilities/users-and-roles.md): invite teammates and manage access.
+diff --git a/docs/website/docs/hub/pipeline-operations/what-is-a-workspace.md b/docs/website/docs/hub/pipeline-operations/what-is-a-workspace.md
+new file mode 100644
+index 000000000..b8db911e6
+--- /dev/null
++++ b/docs/website/docs/hub/pipeline-operations/what-is-a-workspace.md
+@@ -0,0 +1,48 @@
++---
++title: What is a workspace
++description: A dltHub workspace bundles pipelines, configuration, and AI toolkit into a single deployable unit that runs locally and in the cloud.
++keywords: [workspace, dlthub, workspace mode, dlt project, profiles, deployment]
++---
++
++# What is a workspace?
++
++A workspace is a Python project layout that bundles your dlt pipelines, transformations, configuration, and AI toolkit setup into a single deployable unit. The same folder runs on your local machine, in CI, and — when you deploy — on the managed dltHub platform, so what you build locally is what runs in production.
++
++
++A workspace is where you:
++
++- Connect a local repo to a remote workspace on dltHub (`dlthub workspace connect`)
++- Configure [destinations](../../dlt-ecosystem/destinations/index.md), config, and secrets (often via [profiles](profiles.md) like `dev`, `prod`, `access`)
++- Create and manage pipelines, [deployments](deployments.md), jobs/runs, logs, and notebooks
++- Control access via [workspace roles](../platform-capabilities/users-and-roles.md) (owner, developer, viewer)
++
++When you create an account, dltHub automatically creates a personal [Playground workspace](playground-workspace.md) so you can try things without any setup.
++
++
++Every workspace contains:
++
++- **`.dlt/.workspace`** — a marker file that activates the `dlthub` CLI, [profile support](profiles.md), and the managed-platform commands. Without this file you're using plain OSS `dlt`.
++- **`.dlt/config.toml`** and **`.dlt/secrets.toml`** — settings and credentials, with optional per-profile overrides (`dev`, `prod`, `tests`, `access`).
++- **`pyproject.toml`** (or `requirements.txt`) — workspace-level dependencies like `dlt[hub]`, `duckdb`, `marimo`.
++- **Pipeline files** and an optional **`__deployment__.py`** manifest — the code you run, and the description of how it's deployed.
++- **AI toolkit configuration** — skills, rules, and MCP wiring for Claude Code, Cursor, or Codex (added when you opt in during scaffolding).
++
++
++## Creating a workspace
++
++```sh
++uv run dlthub login
++uv run dlthub workspace connect "<name>" --create
++```
++
++When you [deploy](deployments.md), all files from your local project directory are mirrored to the remote workspace on the dltHub platform. To exclude files you don't want deployed (temp directories, data/state directories, local IDE files), list them in `.gitignore`. Files not excluded can cause deployments to fail with:
++
++```text
++Upload failed (HTTP 413): {"status_code":413,"detail":"Request Entity Too Large"}
++```
++
++## Next steps
++
++* [Workspace setup](workspace-setup.md): convert a Python project into a workspace and configure credentials.
++* [The Playground workspace](playground-workspace.md): the auto-created workspace for trying dltHub.
++* [Profiles](profiles.md): target different destinations from the same code.
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 1ddfd85ad..9bfcf9084 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -481,7 +481,6 @@ const sidebars = {
+         "hub/getting-started/oss-and-dlthub",
+         "hub/getting-started/installation",
+         "hub/getting-started/onboarding",
+-        "hub/getting-started/playground-workspace",
+       ],
+     },
+     {
+@@ -517,7 +516,15 @@ const sidebars = {
+       label: "Pipeline operations",
+       items: [
+         "hub/pipeline-operations/overview",
+-        "hub/pipeline-operations/workspace-setup",
++        {
++          type: "category",
++          label: "Workspaces",
++          items: [
++            "hub/pipeline-operations/what-is-a-workspace",
++            "hub/pipeline-operations/workspace-setup",
++            "hub/pipeline-operations/playground-workspace",
++          ],
++        },
+         "hub/pipeline-operations/profiles",
+         "hub/pipeline-operations/secrets-management",
+         "hub/pipeline-operations/deployments",
+
+
+===== COMMIT cd807d68 =====
+
+
+commit cd807d682
+Author: Thierry Jean
+Date: 2026-08-13
+
+    repo(cicd): remove linting matrix; pin to 3.10 (#4350)
+
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 44dfaffbd..2fd0859db 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -8,31 +8,11 @@ on:
+ jobs:
+ 
+   run_lint:
+-    name: ${{ matrix.display_name }}
+-    strategy:
+-      fail-fast: true
+-      matrix:
+-        include:
+-          - display_name: linux-3.10
+-            os: blacksmith-8vcpu-ubuntu-2404
+-            python-version: "3.10"
+-          - display_name: linux-3.11
+-            os: blacksmith-8vcpu-ubuntu-2404
+-            python-version: "3.11"
+-          - display_name: linux-3.12
+-            os: blacksmith-8vcpu-ubuntu-2404
+-            python-version: "3.12"
+-          - display_name: linux-3.13
+-            os: blacksmith-8vcpu-ubuntu-2404
+-            python-version: "3.13"
+-          - display_name: linux-3.14
+-            os: blacksmith-8vcpu-ubuntu-2404
+-            python-version: "3.14"
+-
++    name: lint
+     defaults:
+       run:
+         shell: bash
+-    runs-on: ${{ matrix.os }}
++    runs-on: blacksmith-8vcpu-ubuntu-2404
+ 
+     steps:
+ 
+@@ -42,12 +22,12 @@ jobs:
+       - name: Setup Python
+         uses: actions/setup-python@v5
+         with:
+-          python-version: ${{ matrix.python-version }}
++          python-version: "3.10"
+ 
+       - name: Install uv
+         uses: astral-sh/setup-uv@v6
+         with:
+-          python-version: ${{ matrix.python-version }}
++          python-version: "3.10"
+           activate-environment: true
+           enable-cache: true
+ 
+@@ -70,15 +50,3 @@ jobs:
+             **/*.md
+             **/*.ipynb
+             **/package-lock.json
+-
+-
+-  matrix_job_required_check:
+-    name: lint-check
+-    needs: run_lint
+-    runs-on: blacksmith-2vcpu-ubuntu-2404
+-    if: always()
+-    steps:
+-      - name: Check matrix job results
+-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+-        run: |
+-          echo "One or more matrix job tests failed or were cancelled. You may need to re-run them." && exit 1
+
+
+===== COMMIT c69b3021 =====
+
+
+commit c69b3021f
+Author: Anas Khan
+Date: 2026-08-12
+
+    docs: remove nonexistent from_hints arg from DltResource.set_incremental docstring (#4184)
+
+diff --git a/dlt/extract/resource.py b/dlt/extract/resource.py
+index 448537570..6f4e407f1 100644
+--- a/dlt/extract/resource.py
++++ b/dlt/extract/resource.py
+@@ -524,7 +524,6 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
+ 
+         Args:
+             new_incremental: The Incremental instance/hint to set or replace
+-            from_hints: If the incremental is set from hints. Defaults to False.
+         """
+         if new_incremental is Incremental.EMPTY:
+             new_incremental = None
+
+
+===== COMMIT 9403b392 =====
+
+
+commit 9403b392c
+Author: Sanjay Santhanam
+Date: 2026-08-12
+
+    fix(dlthub,cli): do not follow symlinks when selecting deployment files (#4287)
+
+diff --git a/dlt/_workspace/deployment/file_selector.py b/dlt/_workspace/deployment/file_selector.py
+index 0e49165a3..359902243 100644
+--- a/dlt/_workspace/deployment/file_selector.py
++++ b/dlt/_workspace/deployment/file_selector.py
+@@ -83,7 +83,9 @@ class WorkspaceFileSelector(BaseFileSelector):
+         from pathspec.util import iter_tree_files
+ 
+         root_path = Path(self.root_path)
+-        for file_path in iter_tree_files(self.root_path):
++        # do not follow symlinks: a symlink pointing at one of its own parents makes
++        # `iter_tree_files` recurse until it raises RecursionError
++        for file_path in iter_tree_files(self.root_path, follow_links=False):
+             if not self.ignore_spec.match_file(file_path):
+                 yield root_path / file_path, Path(file_path)
+ 
+diff --git a/tests/workspace/deployment/test_file_selector.py b/tests/workspace/deployment/test_file_selector.py
+index d9ae7d021..16e78270a 100644
+--- a/tests/workspace/deployment/test_file_selector.py
++++ b/tests/workspace/deployment/test_file_selector.py
+@@ -110,6 +110,22 @@ def test_default_ignores_applied_without_ignore_file() -> None:
+         assert "empty_file.py" in files
+ 
+ 
++def test_file_selector_does_not_follow_symlink_loops() -> None:
++    """A symlink pointing at one of its own parents must not make iteration recurse."""
++    with isolated_workspace("default") as ctx:
++        root = Path(ctx.run_dir)
++        looping_dir = root / "looping"
++        looping_dir.mkdir(exist_ok=True)
++        (looping_dir / "somefile.py").write_text("x")
++        os.symlink(looping_dir, looping_dir / "self")
++
++        selector = WorkspaceFileSelector(ctx, ignore_file=".ignorefile")
++        files = {rel.as_posix() for _, rel in selector}
++
++        assert "looping/somefile.py" in files
++        assert "ducklake_pipeline.py" in files
++
++
+ def test_default_ignores_not_applied_with_ignore_file() -> None:
+     """DEFAULT_IGNORES patterns are NOT applied when an ignore file exists."""
+     with isolated_workspace("default") as ctx:
+
+
+===== COMMIT 5a0944c8 =====
+
+
+commit 5a0944c86
+Author: eeshsaxena
+Date: 2026-08-12
+
+    fix: raise `ValueError` coercing a non-finite `decimal` to `bigint` (#4348)
+
+diff --git a/dlt/common/data_types/type_helpers.py b/dlt/common/data_types/type_helpers.py
+index 974c9a0e2..19bc804b2 100644
+--- a/dlt/common/data_types/type_helpers.py
++++ b/dlt/common/data_types/type_helpers.py
+@@ -166,7 +166,14 @@ def _float_to_wei(value: float) -> Wei:
+ 
+ 
+ def _numeric_to_bigint(value: Any) -> int:
+-    if value % 1 != 0:
++    try:
++        if value % 1 != 0:
++            raise ValueError(value)
++    except InvalidOperation:
++        # A non-finite Decimal/Wei (Infinity, -Infinity) has no integer form,
++        # and `value % 1` raises InvalidOperation rather than returning a
++        # remainder. Surface it as a normal coercion failure, the same way the
++        # text-to-decimal coercers already do.
+         raise ValueError(value)
+     return int(value)
+ 
+diff --git a/tests/common/schema/test_coercion.py b/tests/common/schema/test_coercion.py
+index a8e7a1efe..eb0b2e162 100644
+--- a/tests/common/schema/test_coercion.py
++++ b/tests/common/schema/test_coercion.py
+@@ -110,6 +110,15 @@ def test_coerce_type_to_bigint() -> None:
+     with pytest.raises(ValueError):
+         coerce_value("bigint", "wei", Wei(912.12))
+ 
++    # non-finite decimals/wei have no integer form: they must raise ValueError,
++    # not leak decimal.InvalidOperation
++    with pytest.raises(ValueError):
++        coerce_value("bigint", "decimal", Decimal("Infinity"))
++    with pytest.raises(ValueError):
++        coerce_value("bigint", "decimal", Decimal("-Infinity"))
++    with pytest.raises(ValueError):
++        coerce_value("bigint", "wei", Wei("Infinity"))
++
+     # non parsable floats and ints
+     with pytest.raises(ValueError):
+         coerce_value("bigint", "text", "f912.12")
+
+
+===== COMMIT 04914d60 =====
+
+
+commit 04914d607
+Author: Alberto
+Date: 2026-08-12
+
+    fix(test): disable anon telemetry in platform connection test to avoid macOS fork segfault (#4347)
+
+diff --git a/tests/pipeline/test_platform_connection.py b/tests/pipeline/test_platform_connection.py
+index aa4601938..448fed6c0 100644
+--- a/tests/pipeline/test_platform_connection.py
++++ b/tests/pipeline/test_platform_connection.py
+@@ -3,6 +3,8 @@ import pytest
+ import requests_mock
+ 
+ import dlt
++from dlt.common.configuration import resolve_configuration
++from dlt.common.configuration.specs import RuntimeConfiguration
+ 
+ from tests.utils import start_test_telemetry, stop_telemetry
+ 
+@@ -14,7 +16,10 @@ STATE_URL_SUFFIX = "/state"
+ def test_platform_connection() -> None:
+     mock_platform_url = "http://platform.com/endpoint"
+     os.environ["RUNTIME__DLTHUB_DSN"] = mock_platform_url
+-    start_test_telemetry()
++    # platform only; anon telemetry HTTP is not under test and can segfault on macOS after fork
++    runtime_config = resolve_configuration(RuntimeConfiguration())
++    runtime_config.dlthub_telemetry = False
++    start_test_telemetry(runtime_config)
+ 
+     trace_url = mock_platform_url + TRACE_URL_SUFFIX
+     state_url = mock_platform_url + STATE_URL_SUFFIX
+
+
+===== COMMIT 522bbe70 =====
+
+
+commit 522bbe70c
+Author: Shreyas
+Date: 2026-08-12
+
+    docs(sql): warn about cursor column mismatch after reflection (#4300)
+
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/configuration.md b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/configuration.md
+index b3bc9ee61..afe6e9077 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/configuration.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/configuration.md
+@@ -192,6 +192,10 @@ to split long incremental loading into many chunks by time and row count. [Look
+ If your cursor column name contains special characters (e.g., `$`) you need to escape it when passing it to the `incremental` function. For example, if your cursor column is `example_$column`, you should pass it as `"'example_$column'"` or `'"example_$column"'` to the `incremental` function: `incremental("'example_$column'", initial_value=...)`.
+ :::
+ 
++:::info Cursor column not found?
++If you hit ``KeyError: 'Cursor column `...` does not exist in table `...`'``, your cursor name doesn't match the schema SQLAlchemy reflected. See [I get a KeyError saying the cursor column doesn't exist](troubleshooting.md#i-get-a-keyerror-saying-the-cursor-column-doesnt-exist) for how to inspect the reflected columns.
++:::
++
+ ### Configure timezone-aware and naive timestamp cursors
+ If your cursor is on a timestamp/datetime column, make sure you set up your initial and end values correctly. This will help you avoid implicit type conversions, invalid datetime literals, or column comparisons in database queries. Note that implicit conversions may result in data loss, for example if a naive datetime has a different local timezone on the machine where Python is executing versus your DBMS.
+ 
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md
+index 04a0053e1..ae56e8756 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/sql_database/troubleshooting.md
+@@ -23,6 +23,24 @@ must match timezone-awareness of the cursor column](setup.md) because they will
+ In rare cases where the last value is already stored in the pipeline state and has incorrect timezone-awareness, you may not be able to recover your pipeline automatically. You can
+ modify the local pipeline state (after syncing with destination) to add/remove timezone information.
+ 
++## Troubleshooting incremental loading
++
++### I get a KeyError saying the cursor column doesn't exist
++If `dlt` raises ``KeyError: 'Cursor column `...` does not exist in table `...`'``, the name you passed to `dlt.sources.incremental(...)` isn't present in the schema that SQLAlchemy reflected. Reflection returns whatever the database itself stores, and dialects normalize identifiers differently: PostgreSQL lowercases unquoted identifiers, Oracle uppercases them, MySQL, MSSQL, and SQLite preserve the case you declared.
++
++Inspect the reflected column names first:
++
++```py
++import sqlalchemy as sa
++
++engine = sa.create_engine("postgresql://user:pass@host/db")
++meta = sa.MetaData()
++meta.reflect(bind=engine, only=["your_table"])
++print(list(meta.tables["your_table"].c.keys()))
++```
++
++Copy the column name from that output, case included, and pass it to `dlt.sources.incremental(...)`.
++
+ ## Troubleshooting connection
+ 
+ ### Pipeline state grows extremely large or I get deduplication state warnings when using incremental
+
+
+===== COMMIT 20a7a4ae =====
+
+
+commit 20a7a4ae4
+Author: Aditya Panda
+Date: 2026-08-12
+
+    feat: add `description` for variant columns generated by dlt (#3713)
+
+diff --git a/dlt/normalize/items_normalizers/jsonl.py b/dlt/normalize/items_normalizers/jsonl.py
+index 2f06bd5cb..f6c3107f6 100644
+--- a/dlt/normalize/items_normalizers/jsonl.py
++++ b/dlt/normalize/items_normalizers/jsonl.py
+@@ -310,6 +310,7 @@ class JsonLItemsNormalizer(ItemsNormalizer):
+ 
+         if is_variant:
+             column_schema["variant"] = is_variant
++            column_schema["description"] = f"Variant of column {k} generated by dlt"
+         return column_schema
+ 
+     def _coerce_null_value(
+diff --git a/tests/normalize/test_json_item_inference.py b/tests/normalize/test_json_item_inference.py
+index 74ad9f165..e445c5c06 100644
+--- a/tests/normalize/test_json_item_inference.py
++++ b/tests/normalize/test_json_item_inference.py
+@@ -1068,3 +1068,68 @@ def test_filter_hints_no_table(
+     # make sure the column order is the same when inferring from newly created table
+     rows = schema.filter_row_with_hint("event_bot", "not_null", coerced_row)
+     assert list(rows.keys()) == ["timestamp", "sender_id"]
++
++
++def test_variant_column_has_description(item_normalizer: JsonLItemsNormalizer) -> None:
++    """Test that variant columns get a default description when is_variant is True."""
++    # Create a column with variant=True using _infer_column
++    variant_col = item_normalizer._infer_column("test_col", "some_value", is_variant=True)
++
++    assert variant_col is not None
++    assert variant_col["variant"] is True
++    assert "description" in variant_col
++    assert variant_col["description"] == "Variant of column test_col generated by dlt"
++
++
++def test_non_variant_column_has_no_default_description(
++    item_normalizer: JsonLItemsNormalizer,
++) -> None:
++    """Test that non-variant columns do not get the variant description."""
++    # Create a column with variant=False (default)
++    normal_col = item_normalizer._infer_column("test_col", "some_value", is_variant=False)
++
++    assert normal_col is not None
++    assert "variant" not in normal_col
++    assert "description" not in normal_col
++
++
++def test_variant_column_description_via_coerce_row(
++    item_normalizer: JsonLItemsNormalizer,
++) -> None:
++    """Test that variant columns created via _coerce_row have the description."""
++    # First create a column with double type
++    row_1 = {"confidence": 0.1}
++    _, new_table = item_normalizer._coerce_row("event_user", None, row_1)
++    item_normalizer.schema.update_table(new_table)
++
++    # Now send a value that cannot be coerced to double, triggering variant creation
++    row_2 = {"confidence": "NOT_A_NUMBER"}
++    _, new_table = item_normalizer._coerce_row("event_user", None, row_2)
++
++    new_columns = list(new_table["columns"].values())
++    variant_col = new_columns[0]
++
++    assert variant_col["name"] == "confidence__v_text"
++    assert variant_col["variant"] is True
++    assert "description" in variant_col
++    assert variant_col["description"] == "Variant of column confidence__v_text generated by dlt"
++
++
++def test_variant_column_description_with_bool_variant(
++    item_normalizer: JsonLItemsNormalizer,
++) -> None:
++    """Test that bool variant columns have the description."""
++    # Create a double column first
++    row_1 = {"value": 123.45}
++    _, new_table = item_normalizer._coerce_row("test_table", None, row_1)
++    item_normalizer.schema.update_table(new_table)
++
++    # Send a bool value to trigger variant creation
++    row_2 = {"value": False}
++    _, new_table = item_normalizer._coerce_row("test_table", None, row_2)
++
++    variant_col = new_table["columns"]["value__v_bool"]
++
++    assert variant_col["variant"] is True
++    assert variant_col["description"] == "Variant of column value__v_bool generated by dlt"
++
+
+
+===== COMMIT 62c6b450 =====
+
+
+commit 62c6b4505
+Author: Aditya Panda
+Date: 2026-08-12
+
+    feat: add table and column `description` for internal `_dlt` tables (#3719)
+

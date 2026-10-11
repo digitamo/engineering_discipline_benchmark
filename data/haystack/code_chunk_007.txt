@@ -1,0 +1,2903 @@
+diff --git a/.github/workflows/test_destinations_local.yml b/.github/workflows/test_destinations_local.yml
+index 93fa59593..1c45709e0 100644
+--- a/.github/workflows/test_destinations_local.yml
++++ b/.github/workflows/test_destinations_local.yml
+@@ -72,7 +72,7 @@ jobs:
+             filesystem_drivers: "[\"memory\", \"file\"]"
+             extras: "--extra sqlalchemy --extra filesystem --extra parquet --extra postgres --extra oracle --group adbc"
+             needs_mysql: true
+-            post_install_commands: "uv run pip install pymysql && uv run pip install sqlalchemy==1.4 && uv run dbc install mysql && uv run dbc install sqlite"
++            post_install_commands: "uv run pip install pymysql duckdb-engine && uv run pip install sqlalchemy==1.4 && uv run dbc install mysql && uv run dbc install sqlite"
+ 
+           # SQLAlchemy 2.0 (same as above but with sqlalchemy 2.0)
+           - display_name: sqlalchemy-2.0
+@@ -80,7 +80,7 @@ jobs:
+             filesystem_drivers: "[\"memory\", \"file\"]"
+             extras: "--extra sqlalchemy --extra filesystem --extra parquet --extra postgres --extra oracle --group adbc"
+             needs_mysql: true
+-            post_install_commands: "uv run pip install pymysql && uv run pip install sqlalchemy==2.0 && uv run dbc install mysql && uv run dbc install sqlite"
++            post_install_commands: "uv run pip install pymysql duckdb-engine && uv run pip install sqlalchemy==2.0 && uv run dbc install mysql && uv run dbc install sqlite"
+ 
+     env:
+       ACTIVE_DESTINATIONS: ${{ matrix.destinations }}
+diff --git a/dlt/destinations/impl/duckdb/configuration.py b/dlt/destinations/impl/duckdb/configuration.py
+index 14b4e71cd..686eb3203 100644
+--- a/dlt/destinations/impl/duckdb/configuration.py
++++ b/dlt/destinations/impl/duckdb/configuration.py
+@@ -55,7 +55,7 @@ class DuckDbBaseCredentials(CredentialsConfiguration):
+ 
+             if isinstance(native_value, duckdb.DuckDBPyConnection):
+                 self._external_conn = native_value
+-                self.database = ":external:"
++                self.database = self._external_conn_database(native_value)
+                 return
+         except ImportError:
+             pass
+@@ -67,6 +67,25 @@ class DuckDbBaseCredentials(CredentialsConfiguration):
+             else:
+                 raise
+ 
++    @staticmethod
++    def _external_conn_database(conn: DuckDBPyConnection) -> str:
++        """Returns the file path of the connection's current database so physical_location()
++        identifies it, ':external:' for in-memory databases or when the path cannot be read.
++        """
++        try:
++            cur = conn.cursor()
++            try:
++                row = cur.execute(
++                    "select path from duckdb_databases() where database_name = current_database()"
++                ).fetchone()
++            finally:
++                cur.close()
++            if row and row[0]:
++                return str(row[0])
++        except Exception:
++            pass
++        return ":external:"
++
+     def _conn_str(self) -> str:
+         raise NotImplementedError()
+ 
+diff --git a/dlt/destinations/impl/sqlalchemy/configuration.py b/dlt/destinations/impl/sqlalchemy/configuration.py
+index c8996a3a7..17d9fb736 100644
+--- a/dlt/destinations/impl/sqlalchemy/configuration.py
++++ b/dlt/destinations/impl/sqlalchemy/configuration.py
+@@ -167,6 +167,11 @@ class SqlalchemyCredentials(ConnectionStringCredentials):
+         self._external_engine = value
+         self.managed_engine = ManagedEngine(self, engine=value)
+ 
++    @property
++    def is_external_engine(self) -> bool:
++        """True when credentials wrap a user-provided engine that dlt does not own."""
++        return self.managed_engine is not None and not self.managed_engine._conn_owner
++
+     def get_dialect_class(self) -> Optional[Type["Dialect"]]:
+         if not self.drivername:
+             return None
+@@ -214,6 +219,7 @@ class SqlalchemyCredentials(ConnectionStringCredentials):
+ 
+ 
+ SQLITE_DB_NAME_PAT = "%s.db"
++DUCKDB_DB_NAME_PAT = "%s.duckdb"
+ 
+ 
+ @configspec
+@@ -257,23 +263,34 @@ class SqlalchemyClientConfiguration(WithLocalFiles, DestinationClientDwhConfigur
+         if self.engine_kwargs and not self.credentials.engine_kwargs:
+             self.credentials.engine_kwargs = self.engine_kwargs
+ 
+-        # resolve local file path for sqlite backends
+-        if self.credentials.drivername == "sqlite":
+-            if not SqlalchemyCredentials.is_memory_database(
+-                self.credentials.database, self.credentials.query
+-            ):
+-                db = self.credentials.database
+-                if not db or not os.path.isabs(db):
++        # resolve local file path for file-based backends
++        if self.credentials.drivername in ("sqlite", "duckdb"):
++            db = self.credentials.database
++            # skip in-memory databases and special locations like motherduck (md:)
++            if not SqlalchemyCredentials.is_memory_database(db, self.credentials.query) and not (
++                db or ""
++            ).startswith("md:"):
++                if self.credentials.is_external_engine:
++                    # external engines are never rebuilt from credentials: keep the engine's
++                    # database so physical_location() reports the file actually written to
++                    if db and not os.path.isabs(db):
++                        self.credentials.database = os.path.abspath(db)
++                elif not db or not os.path.isabs(db):
++                    name_pat = (
++                        SQLITE_DB_NAME_PAT
++                        if self.credentials.drivername == "sqlite"
++                        else DUCKDB_DB_NAME_PAT
++                    )
+                     self.credentials.database = os.path.normpath(
+-                        self.make_location(db or None, SQLITE_DB_NAME_PAT)
++                        self.make_location(db or None, name_pat)
+                     )
+ 
+     def physical_location(self) -> str:
+-        """Returns sqlite database path for sqlite, otherwise host:port."""
++        """Returns database file path for file-based backends, otherwise host:port."""
+         if not self.credentials:
+             return ""
+ 
+-        if self.get_backend_name() == "sqlite":
++        if self.get_backend_name() in ("sqlite", "duckdb"):
+             # each in-memory database is a separate database
+             if SqlalchemyCredentials.is_memory_database(
+                 self.credentials.database, self.credentials.query
+diff --git a/dlt/destinations/impl/sqlalchemy/db_api_client.py b/dlt/destinations/impl/sqlalchemy/db_api_client.py
+index 515fc1630..ccb7a70e3 100644
+--- a/dlt/destinations/impl/sqlalchemy/db_api_client.py
++++ b/dlt/destinations/impl/sqlalchemy/db_api_client.py
+@@ -205,6 +205,10 @@ class SqlalchemyClient(SqlClientBase[Connection]):
+ 
+     def has_dataset(self) -> bool:
+         with self._ensure_transaction():
++            if self.dialect_name == "duckdb":
++                # duckdb_engine returns catalog-qualified names from get_schema_names(),
++                # has_schema resolves the dataset within the current catalog
++                return self.dialect.has_schema(self._current_connection, self.dataset_name)  # type: ignore[attr-defined,no-any-return]
+             schema_names = self.engine.dialect.get_schema_names(self._current_connection)  # type: ignore[attr-defined]
+         return self.dataset_name in schema_names
+ 
+@@ -339,6 +343,16 @@ class SqlalchemyClient(SqlClientBase[Connection]):
+         key = self.dataset_name + "." + table_name
+         return self.metadata.tables.get(key)  # type: ignore[no-any-return]
+ 
++    def to_dataset_table(self, table_obj: sa.Table, staging: bool = False) -> sa.Table:
++        """Returns table_obj copied into the current or staging dataset in the shared metadata.
++        Reuses a copy already registered there to avoid duplicate table warnings.
++        """
++        dataset_name = self.staging_dataset_name if staging else self.dataset_name
++        existing: Optional[sa.Table] = self.metadata.tables.get(dataset_name + "." + table_obj.name)
++        if existing is not None:
++            return existing
++        return table_obj.to_metadata(self.metadata, schema=dataset_name)  # type: ignore[no-any-return]
++
+     def create_table(self, table_obj: sa.Table) -> None:
+         with self._ensure_transaction():
+             table_obj.create(self._current_connection)
+diff --git a/dlt/destinations/impl/sqlalchemy/dialect.py b/dlt/destinations/impl/sqlalchemy/dialect.py
+index 538cb7c35..d09a2afa8 100644
+--- a/dlt/destinations/impl/sqlalchemy/dialect.py
++++ b/dlt/destinations/impl/sqlalchemy/dialect.py
+@@ -224,6 +224,17 @@ class OracleDialectCapabilities(DialectCapabilities):
+         return super().is_undefined_relation(e)
+ 
+ 
++class DuckdbDialectCapabilities(DialectCapabilities):
++    """Capabilities for DuckDB via duckdb_engine."""
++
++    def is_undefined_relation(self, e: Exception) -> Optional[bool]:
++        msg = str(e).lower()
++        # binder errors (ie. unknown column) also contain "not found" but are terminal
++        if "binder error" in msg:
++            return False
++        return super().is_undefined_relation(e)
++
++
+ def _format_mysql_datetime_literal(v: Any, precision: int = 6, no_tz: bool = False) -> str:
+     from dlt.common.data_writers.escape import format_datetime_literal
+ 
+@@ -235,3 +246,4 @@ register_dialect_capabilities("mariadb", MysqlDialectCapabilities)
+ register_dialect_capabilities("trino", TrinoDialectCapabilities)
+ register_dialect_capabilities("mssql", MssqlDialectCapabilities)
+ register_dialect_capabilities("oracle", OracleDialectCapabilities)
++register_dialect_capabilities("duckdb", DuckdbDialectCapabilities)
+diff --git a/dlt/destinations/impl/sqlalchemy/load_jobs.py b/dlt/destinations/impl/sqlalchemy/load_jobs.py
+index 4d8f290e3..bbaf2da63 100644
+--- a/dlt/destinations/impl/sqlalchemy/load_jobs.py
++++ b/dlt/destinations/impl/sqlalchemy/load_jobs.py
+@@ -121,11 +121,8 @@ class SqlalchemyJsonLInsertJob(RunnableLoadJob, HasFollowupJobs):
+ 
+     def run(self) -> None:
+         _sql_client = self._job_client.sql_client
+-        # Copy the table to the current dataset (i.e. staging) if needed
+-        # This is a no-op if the table is already in the correct schema
+-        table = self.table.to_metadata(
+-            self.table.metadata, schema=_sql_client.dataset_name  # type: ignore[attr-defined]
+-        )
++        # copy the table to the current dataset (i.e. staging) if needed
++        table = _sql_client.to_dataset_table(self.table)
+ 
+         with _sql_client.begin_transaction():
+             for chunk in self._iter_data_item_chunks():
+@@ -248,9 +245,7 @@ class SqlalchemyReplaceJob(SqlFollowupJob):
+         for table in table_chain:
+             # Tables must have already been created in metadata
+             table_obj = sql_client.get_existing_table(table["name"])
+-            staging_table_obj = table_obj.to_metadata(
+-                sql_client.metadata, schema=sql_client.staging_dataset_name
+-            )
++            staging_table_obj = sql_client.to_dataset_table(table_obj, staging=True)
+             stmt = str(table_obj.delete().compile(dialect=sql_client.dialect))
+             statements.append(stmt)
+ 
+diff --git a/dlt/destinations/impl/sqlalchemy/merge_job.py b/dlt/destinations/impl/sqlalchemy/merge_job.py
+index 583341a95..ded75eddb 100644
+--- a/dlt/destinations/impl/sqlalchemy/merge_job.py
++++ b/dlt/destinations/impl/sqlalchemy/merge_job.py
+@@ -41,9 +41,7 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
+         root_table = table_chain[0]
+ 
+         root_table_obj = sql_client.get_existing_table(root_table["name"])
+-        staging_root_table_obj = root_table_obj.to_metadata(
+-            sql_client.metadata, schema=sql_client.staging_dataset_name
+-        )
++        staging_root_table_obj = sql_client.to_dataset_table(root_table_obj, staging=True)
+ 
+         primary_key_names = get_columns_names_with_prop(root_table, "primary_key")
+         merge_key_names = get_columns_names_with_prop(root_table, "merge_key")
+@@ -214,9 +212,7 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
+         # Insert from staging to dataset
+         for table in table_chain:
+             table_obj = sql_client.get_existing_table(table["name"])
+-            staging_table_obj = table_obj.to_metadata(
+-                sql_client.metadata, schema=sql_client.staging_dataset_name
+-            )
++            staging_table_obj = sql_client.to_dataset_table(table_obj, staging=True)
+             select_sql = staging_table_obj.select()
+ 
+             if (primary_key_names and len(table_chain) > 1) or (
+@@ -361,9 +357,7 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
+         sqla_statements = []
+         root_table = table_chain[0]
+         root_table_obj = sql_client.get_existing_table(root_table["name"])
+-        staging_root_table_obj = root_table_obj.to_metadata(
+-            sql_client.metadata, schema=sql_client.staging_dataset_name
+-        )
++        staging_root_table_obj = sql_client.to_dataset_table(root_table_obj, staging=True)
+ 
+         from_, to = get_validity_column_names(root_table)
+         hash_ = get_first_column_name_with_prop(root_table, "x-row-version")
+@@ -454,9 +448,7 @@ class SqlalchemyMergeFollowupJob(SqlMergeFollowupJob):
+             )
+ 
+             table_obj = sql_client.get_existing_table(table["name"])
+-            staging_table_obj = table_obj.to_metadata(
+-                sql_client.metadata, schema=sql_client.staging_dataset_name
+-            )
++            staging_table_obj = sql_client.to_dataset_table(table_obj, staging=True)
+ 
+             insert_statement = table_obj.insert().from_select(
+                 [col.name for col in table_obj.columns],
+diff --git a/dlt/destinations/impl/sqlalchemy/sqlalchemy_job_client.py b/dlt/destinations/impl/sqlalchemy/sqlalchemy_job_client.py
+index b458a8546..ab1b8378e 100644
+--- a/dlt/destinations/impl/sqlalchemy/sqlalchemy_job_client.py
++++ b/dlt/destinations/impl/sqlalchemy/sqlalchemy_job_client.py
+@@ -108,6 +108,9 @@ class SqlalchemyJobClient(SqlJobClientWithStagingDataset):
+             schema_column["name"],
+             self.type_mapper.to_destination_type(schema_column, table),
+             nullable=schema_column.get("nullable", True),
++            # dlt always provides explicit values, never use db-side identity columns
++            # ie. duckdb_engine compiles autoincrement primary keys to unsupported BIGSERIAL
++            autoincrement=False,
+         )
+         if self.config.create_unique_indexes:
+             col_.unique = schema_column.get("unique", False)
+@@ -145,11 +148,12 @@ class SqlalchemyJobClient(SqlJobClientWithStagingDataset):
+         elif parsed_file.file_format == "parquet":
+             table_obj = self._to_table_object(table)
+             dialect_name = self.config.credentials.engine.dialect.name
+-            # Skip ADBC for SQLite: Python's sqlite3 and adbc_driver_sqlite bundle different
+-            # SQLite versions. In WAL mode, both libraries mmap the same -shm index file but
+-            # have separate internal state, causing page-level corruption when writing.
++            # ADBC copy job implements mysql and sqlite dialects only. SQLite is skipped:
++            # Python's sqlite3 and adbc_driver_sqlite bundle different SQLite versions.
++            # In WAL mode, both libraries mmap the same -shm index file but have separate
++            # internal state, causing page-level corruption when writing.
+             # See: https://github.com/tensorflow/tensorboard/issues/1467
+-            if dialect_name != "sqlite" and adbc_has_driver(dialect_name)[0]:
++            if dialect_name == "mysql" and adbc_has_driver(dialect_name)[0]:
+                 return SqlalchemyParquetADBCJob(file_path, table_obj)
+             else:
+                 return SqlalchemyParquetInsertJob(file_path, table_obj)
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md b/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md
+index cfa398d4a..765d36373 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/sqlalchemy.md
+@@ -8,7 +8,7 @@ keywords: [sql, sqlalchemy, database, destination]
+ 
+ The SQLAlchemy destination allows you to use any database that has an [SQLAlchemy dialect](https://docs.sqlalchemy.org/en/20/dialects/) implemented as a destination.
+ 
+-Currently, MySQL and SQLite are considered to have full support and are tested as part of the `dlt` CI suite. Other dialects are not tested but should generally work.
++Currently, MySQL, SQLite, and DuckDB are considered to have full support and are tested as part of the `dlt` CI suite. Other dialects are not tested but should generally work.
+ 
+ ## Install dlt with SQLAlchemy
+ 
+@@ -258,8 +258,56 @@ To work around this issue, use one of the following approaches:
+    workers=1
+    ```
+ 
++## Notes on DuckDB
++Install the [duckdb_engine](https://github.com/Mause/duckdb_engine) dialect to use DuckDB with the SQLAlchemy destination:
++
++```sh
++pip install duckdb-engine
++```
++
++```py
++import dlt
++
++pipeline = dlt.pipeline(
++    pipeline_name="my_pipeline",
++    destination=dlt.destinations.sqlalchemy(credentials="duckdb:///my_data.duckdb"),
++    dataset_name="my_dataset",
++)
++```
++
++Relative database paths are placed in the pipeline's local directory, same as for SQLite and the native DuckDB destination.
++
++**Note**: Prefer the native [DuckDB destination](duckdb.md). Use SQLAlchemy when you need full control over the engine, e.g., to `ATTACH` encrypted database files with connection setup SQL.
++
++### In-memory databases
++An in-memory DuckDB database is private to each connection. Pass an `Engine` that shares a single connection and load sequentially:
++
++```py
++import dlt
++import sqlalchemy as sa
++
++engine = sa.create_engine("duckdb:///:memory:", poolclass=sa.pool.StaticPool)
++
++pipeline = dlt.pipeline(
++    pipeline_name="my_pipeline",
++    destination=dlt.destinations.sqlalchemy(engine),
++    dataset_name="my_dataset",
++)
++```
++
++```toml
++[load]
++workers=1
++```
++
++### DuckDB dialect limitations
++* `duckdb_engine` does not reflect primary key and unique constraints nor indexes: they are created when `create_primary_keys` / `create_unique_indexes` are enabled but cannot be read back with SQLAlchemy tooling.
++* JSON columns are reflected as VARCHAR.
++* VARCHAR precision is accepted in DDL but not stored by DuckDB.
++* Parquet files are loaded with batch INSERT statements: ADBC ingestion is not implemented for this dialect.
++
+ ## Notes on other dialects
+-We tested this destination on **mysql**, **sqlite**, **oracledb** and **mssql** dialects. Below are a few notes that may help enabling other dialects:
++We tested this destination on **mysql**, **sqlite**, **duckdb**, **oracledb** and **mssql** dialects. Below are a few notes that may help enabling other dialects:
+ 1. `dlt` must be able to recognize if a database exception relates to non existing entity (like table or schema). We put
+ some work to recognize those for most of the popular dialects (look for `db_api_client.py`)
+ 2. Primary keys and unique constraints are not created by default to avoid problems with particular dialects.
+diff --git a/tests/load/duckdb/test_duckdb_configuration.py b/tests/load/duckdb/test_duckdb_configuration.py
+index 9056524e4..77cca2db3 100644
+--- a/tests/load/duckdb/test_duckdb_configuration.py
++++ b/tests/load/duckdb/test_duckdb_configuration.py
+@@ -1,7 +1,10 @@
++from pathlib import Path
+ from typing import Optional
+ 
++import duckdb
+ import pytest
+ 
++from dlt.common.configuration import resolve_configuration
+ from dlt.destinations.impl.duckdb.configuration import (
+     DuckDbClientConfiguration,
+     DuckDbCredentials,
+@@ -33,3 +36,35 @@ def test_duckdb_fingerprint(
+     config = DuckDbClientConfiguration(credentials=credentials)
+ 
+     assert config.fingerprint() == expected_fingerprint
++
++
++def test_external_connection_physical_location(tmp_path: Path) -> None:
++    """Connection-passed credentials must identify the real database file so two
++    different databases are not considered join-compatible.
++    """
++    conn_a = duckdb.connect(str(tmp_path / "a.duckdb"))
++    conn_b = duckdb.connect(str(tmp_path / "b.duckdb"))
++    conn_mem = duckdb.connect()
++    try:
++        config_a = resolve_configuration(
++            DuckDbClientConfiguration(credentials=conn_a)._bind_dataset_name(dataset_name="ds")
++        )
++        config_a2 = DuckDbClientConfiguration(credentials=DuckDbCredentials(conn_a))
++        config_b = DuckDbClientConfiguration(credentials=DuckDbCredentials(conn_b))
++        config_mem = DuckDbClientConfiguration(credentials=DuckDbCredentials(conn_mem))
++
++        # real file path survives config resolution (make_location keeps absolute paths)
++        assert config_a.physical_location() == str(tmp_path / "a.duckdb")
++        # same database file: joinable, different files or memory: not
++        assert config_a.can_read_from(config_a2)
++        assert not config_a.can_read_from(config_b)
++        assert not config_mem.can_read_from(config_a)
++        # in-memory connections keep the external marker and stay compatible when shared
++        assert config_mem.physical_location() == ":external:"
++        assert config_mem.can_read_from(
++            DuckDbClientConfiguration(credentials=DuckDbCredentials(conn_mem))
++        )
++    finally:
++        conn_a.close()
++        conn_b.close()
++        conn_mem.close()
+diff --git a/tests/load/pipeline/test_adbc_loading.py b/tests/load/pipeline/test_adbc_loading.py
+index 0b88f8b6e..ca6708050 100644
+--- a/tests/load/pipeline/test_adbc_loading.py
++++ b/tests/load/pipeline/test_adbc_loading.py
+@@ -39,6 +39,8 @@ def test_adbc_detection(destination_config: DestinationTestConfiguration) -> Non
+         driver = "sqlite"
+     elif driver == "sqlalchemy_mysql":
+         driver = "mysql"
++    elif driver == "sqlalchemy_duckdb":
++        pytest.skip("ADBC ingestion not implemented for duckdb via sqlalchemy")
+ 
+     assert has_adbc_driver(driver)[0] is True
+ 
+diff --git a/tests/load/pipeline/test_sqlalchemy_pipeline.py b/tests/load/pipeline/test_sqlalchemy_pipeline.py
+index f0d75bd8c..9f07e68d6 100644
+--- a/tests/load/pipeline/test_sqlalchemy_pipeline.py
++++ b/tests/load/pipeline/test_sqlalchemy_pipeline.py
+@@ -48,6 +48,10 @@ def test_sqlalchemy_create_indexes(
+ 
+     from sqlalchemy import inspect
+ 
++    if destination_config.destination_name == "sqlalchemy_duckdb":
++        # duckdb_engine does not reflect primary key constraints nor indexes
++        return
++
+     with pipeline.sql_client() as client:
+         with_pk: Table = client.reflect_table("with_pk", metadata=MetaData())
+         assert (with_pk.c.id.primary_key or False) is create_primary_keys
+@@ -155,4 +159,8 @@ def test_custom_type_mapper(destination_config: DestinationTestConfiguration) ->
+ 
+         # Check that the json field was mapped to String with length 345
+         assert isinstance(json_column.type, sa.String)
+-        assert json_column.type.length == 345
++        if destination_config.destination_name == "sqlalchemy_duckdb":
++            # duckdb accepts varchar length in DDL but does not store it
++            assert json_column.type.length is None
++        else:
++            assert json_column.type.length == 345
+diff --git a/tests/load/sqlalchemy/test_duckdb_engine_destination.py b/tests/load/sqlalchemy/test_duckdb_engine_destination.py
+new file mode 100644
+index 000000000..ed75e0be9
+--- /dev/null
++++ b/tests/load/sqlalchemy/test_duckdb_engine_destination.py
+@@ -0,0 +1,45 @@
++import os
++
++import pytest
++
++import dlt
++from dlt.common.utils import uniq_id
++
++from tests.pipeline.utils import assert_load_info
++
++sa = pytest.importorskip("sqlalchemy")
++pytest.importorskip("duckdb_engine")
++
++
++@pytest.mark.parametrize(
++    "db_file",
++    ["mydata.db", "my.data.duckdb", "weird name.db", "123abc.db", ":memory:"],
++    ids=["simple", "dotted", "space", "leading-digit", "memory"],
++)
++def test_duckdb_engine_detects_existing_dataset(tmp_path, db_file: str) -> None:
++    """Second run against the same duckdb database must detect the existing dataset:
++    duckdb_engine returns catalog-qualified schema names so a bare name lookup fails
++    and dlt attempts CREATE SCHEMA again.
++    """
++    if db_file == ":memory:":
++        # in-memory duckdb is private per connection: share a single one and load serially
++        engine = sa.create_engine("duckdb:///:memory:", poolclass=sa.pool.StaticPool)
++        os.environ["LOAD__WORKERS"] = "1"
++    else:
++        engine = sa.create_engine(f"duckdb:///{tmp_path / db_file}")
++    pipeline_name = "duckdb_engine_dataset_" + uniq_id()
++
++    try:
++        for item_id in (1, 2):
++            pipeline = dlt.pipeline(
++                destination=dlt.destinations.sqlalchemy(engine),
++                pipeline_name=pipeline_name,
++                dataset_name="myschema",
++                pipelines_dir=str(tmp_path),
++            )
++
++            info = pipeline.run([{"id": item_id}], table_name="numbers")
++
++            assert_load_info(info)
++    finally:
++        engine.dispose()
+diff --git a/tests/load/sqlalchemy/test_sqlalchemy_configuration.py b/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
+index 7dd77f452..136ba5fc1 100644
+--- a/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
++++ b/tests/load/sqlalchemy/test_sqlalchemy_configuration.py
+@@ -134,7 +134,10 @@ def test_sqlalchemy_credentials_from_engine() -> None:
+     assert creds.database == ":memory:"
+ 
+ 
+-def test_sqlalchemy_sqlite_follows_local_dir() -> None:
++@pytest.mark.parametrize(
++    "driver,ext", [("sqlite", ".db"), ("duckdb", ".duckdb")], ids=["sqlite", "duckdb"]
++)
++def test_sqlalchemy_file_db_follows_local_dir(driver: str, ext: str) -> None:
+     local_dir = os.path.join(get_test_storage_root(), uniq_id())
+     os.makedirs(local_dir)
+     os.environ[DLT_LOCAL_DIR] = local_dir
+@@ -142,59 +145,96 @@ def test_sqlalchemy_sqlite_follows_local_dir() -> None:
+     # default case: no explicit database, uses destination_type as default name
+     c = resolve_configuration(
+         SqlalchemyClientConfiguration(
+-            credentials=SqlalchemyCredentials("sqlite:///")
++            credentials=SqlalchemyCredentials(f"{driver}:///")
+         )._bind_dataset_name(dataset_name="test_dataset")
+     )
+-    db_path = os.path.join(local_dir, "sqlalchemy.db")
++    db_path = os.path.join(local_dir, f"sqlalchemy{ext}")
+     assert c.credentials.database == os.path.abspath(db_path)
+ 
+     # named destination: uses destination_name for the filename
+     c = resolve_configuration(
+         SqlalchemyClientConfiguration(
+-            credentials=SqlalchemyCredentials("sqlite:///"),
++            credentials=SqlalchemyCredentials(f"{driver}:///"),
+             destination_name="named",
+         )._bind_dataset_name(dataset_name="test_dataset")
+     )
+-    db_path = os.path.join(local_dir, "named.db")
++    db_path = os.path.join(local_dir, f"named{ext}")
+     assert c.credentials.database == os.path.abspath(db_path)
+ 
+     # explicit relative location: relocated to local_dir
+     c = resolve_configuration(
+         SqlalchemyClientConfiguration(
+-            credentials=SqlalchemyCredentials("sqlite:///./local.db"),
++            credentials=SqlalchemyCredentials(f"{driver}:///./local{ext}"),
+         )._bind_dataset_name(dataset_name="test_dataset")
+     )
+-    db_path = os.path.join(local_dir, "local.db")
++    db_path = os.path.join(local_dir, f"local{ext}")
+     assert c.credentials.database.endswith(db_path)
+ 
+-    # pipeline context: uses <pipeline_name>.db for the filename
+-    pipeline = dlt.pipeline("test_sqlalchemy_sqlite_follows_local_dir")
++    # pipeline context: uses <pipeline_name>.<ext> for the filename
++    pipeline = dlt.pipeline(f"test_sqlalchemy_follows_local_dir_{driver}")
+     c = resolve_configuration(
+         pipeline._bind_local_files(
+             SqlalchemyClientConfiguration(
+-                credentials=SqlalchemyCredentials("sqlite:///"),
++                credentials=SqlalchemyCredentials(f"{driver}:///"),
+             )._bind_dataset_name(dataset_name="test_dataset")
+         )
+     )
+-    db_path = os.path.join(local_dir, "test_sqlalchemy_sqlite_follows_local_dir.db")
++    db_path = os.path.join(local_dir, f"test_sqlalchemy_follows_local_dir_{driver}{ext}")
+     assert c.credentials.database.endswith(db_path)
+ 
+     # absolute path: preserved as-is
+     c = resolve_configuration(
+         SqlalchemyClientConfiguration(
+-            credentials=SqlalchemyCredentials("sqlite:////absolute/path/test.db"),
++            credentials=SqlalchemyCredentials(f"{driver}:////absolute/path/test{ext}"),
+         )._bind_dataset_name(dataset_name="test_dataset")
+     )
+-    assert c.credentials.database == "/absolute/path/test.db"
++    assert c.credentials.database == f"/absolute/path/test{ext}"
+ 
+     # memory database: preserved as-is
+     c = resolve_configuration(
+         SqlalchemyClientConfiguration(
+-            credentials=SqlalchemyCredentials("sqlite:///:memory:"),
++            credentials=SqlalchemyCredentials(f"{driver}:///:memory:"),
+         )._bind_dataset_name(dataset_name="test_dataset")
+     )
+     assert c.credentials.database == ":memory:"
+ 
++    if driver == "duckdb":
++        # motherduck database: preserved as-is
++        c = resolve_configuration(
++            SqlalchemyClientConfiguration(
++                credentials=SqlalchemyCredentials("duckdb:///md:my_db"),
++            )._bind_dataset_name(dataset_name="test_dataset")
++        )
++        assert c.credentials.database == "md:my_db"
++
++
++def test_external_engine_database_not_relocated() -> None:
++    """A user-provided engine is never rebuilt from credentials: its relative database
++    path must not be relocated to the local dir and physical_location() must report
++    the file the engine actually writes to.
++    """
++    local_dir = os.path.join(get_test_storage_root(), uniq_id())
++    os.makedirs(local_dir)
++    os.environ[DLT_LOCAL_DIR] = local_dir
++
++    engine = sa.create_engine("sqlite:///relative_data.db")
++    c = resolve_configuration(
++        SqlalchemyClientConfiguration(credentials=SqlalchemyCredentials(engine))._bind_dataset_name(
++            dataset_name="test_dataset"
++        )
++    )
++    assert c.credentials.is_external_engine
++    assert c.credentials.database == os.path.abspath("relative_data.db")
++    assert c.physical_location() == os.path.abspath("relative_data.db")
++
++    # in-memory external engine has no physical identity
++    c = resolve_configuration(
++        SqlalchemyClientConfiguration(
++            credentials=SqlalchemyCredentials(sa.create_engine("sqlite:///:memory:"))
++        )._bind_dataset_name(dataset_name="test_dataset")
++    )
++    assert c.physical_location() == ""
++
+ 
+ def test_engine_kwargs_forwarded_to_credentials() -> None:
+     """engine_kwargs set on the configuration should be forwarded to credentials."""
+diff --git a/tests/load/test_job_client.py b/tests/load/test_job_client.py
+index 10ac94523..250d3dcc6 100644
+--- a/tests/load/test_job_client.py
++++ b/tests/load/test_job_client.py
+@@ -542,6 +542,9 @@ def test_get_storage_table_with_all_types(
+                 continue
+         if client.config.destination_type == "dremio" and c["data_type"] == "json":
+             continue
++        # duckdb_engine reflects JSON columns as VARCHAR
++        if client.config.destination_name == "sqlalchemy_duckdb" and c["data_type"] == "json":
++            continue
+         if not client.capabilities.supports_native_boolean and c["data_type"] == "bool":
+             # The reflected data type is probably either int or boolean depending on how the client is implemented
+             assert expected_c["data_type"] in ("bigint", "bool")
+diff --git a/tests/load/utils.py b/tests/load/utils.py
+index ead9134c7..7245c13ad 100644
+--- a/tests/load/utils.py
++++ b/tests/load/utils.py
+@@ -554,6 +554,13 @@ def destinations_configs(
+                 destination_name="sqlalchemy_sqlite",
+                 credentials="sqlite:///db.sqlite",
+             ),
++            DestinationTestConfiguration(
++                destination_type="sqlalchemy",
++                supports_merge=True,
++                supports_dbt=False,
++                destination_name="sqlalchemy_duckdb",
++                credentials="duckdb:///db.duckdb",
++            ),
+             # TODO: enable in sql alchemy destination test, 99% of tests work
+             # DestinationTestConfiguration(
+             #     destination_type="sqlalchemy",
+
+
+===== COMMIT 80739621 =====
+
+
+commit 807396211
+Author: Alena Astrakhantseva
+Date: 2026-07-01
+
+    Docs: playground destination  (#4148)
+
+diff --git a/docs/website/docs/hub/getting-started/installation.md b/docs/website/docs/hub/getting-started/installation.md
+index 654ad6e7e..2248ea30b 100644
+--- a/docs/website/docs/hub/getting-started/installation.md
++++ b/docs/website/docs/hub/getting-started/installation.md
+@@ -26,7 +26,7 @@ For the wider feature surface that a workspace unlocks — [profiles](../pipelin
+ 
+ ### Playground destination
+ 
+-When you deploy and run pipelines on the dltHub platform, you can use `destination="playground"` without configuring credentials or storage. The platform provisions isolated storage for each workspace and loads your pipeline data as [Delta tables](../ingestion/delta.md). Use it for testing and for a faster introduction to the platform — set `destination="playground"` in your pipeline and run.
++When you deploy and run pipelines on the dltHub platform, you can use `destination="playground"` without configuring credentials or storage. The platform provisions isolated storage for each workspace and loads your pipeline data as [Delta tables](../ingestion/delta.md). Use it for testing and for a faster introduction to the platform — set `destination="playground"` in your pipeline and run. Read more about [playground destination](../ingestion/playground.md).
+ 
+ ## Quickstart
+ 
+diff --git a/docs/website/docs/hub/ingestion/playground.md b/docs/website/docs/hub/ingestion/playground.md
+new file mode 100644
+index 000000000..405bf47a6
+--- /dev/null
++++ b/docs/website/docs/hub/ingestion/playground.md
+@@ -0,0 +1,103 @@
++---
++title: "Destination: Playground"
++description: Zero-config Playground destination for non-production example pipelines on the dltHub platform
++keywords: [playground, destination, delta, testing, experiments]
++---
++
++# Playground
++
++:::note
++Use of the dltHub platform and toolkits is subject to a commercial dltHub License.
++:::
++
++The **Playground** is a zero-config destination managed by the dltHub platform. When you run pipelines on the platform, you can load data with `destination="playground"` without configuring any credentials or storage of your own. The platform provisions isolated storage for each [workspace](../getting-started/installation.md#what-is-a-dlthub-workspace) and writes your data as [Delta tables](delta.md) to a managed S3 bucket.
++
++It is meant for quick testing, demos, and a fast first run on the platform.
++
++:::warning
++The Playground is intended for demos and a quick start, not for production. For production workloads, use a destination you own and control, such as [Delta](delta.md), [Iceberg](iceberg.md), [Snowflake Plus](snowflake-plus.md), or any of the [dlt destinations](../../dlt-ecosystem/destinations/index.md).
++:::
++
++## Why use it
++
++When you run a pipeline on the platform with a local-style destination such as `duckdb`, the data is written to the dltHub's ephemeral storage, which is erased after the run, so it can't be explored afterwards. The Playground instead **persists** your data in managed storage, so you can query it from the platform UI once the run finishes.
++
++Use it for:
++
++* A quick first run on the dltHub platform without setting up a bucket or credentials.
++* Running examples and demos.
++
++:::warning
++Do not load sensitive or confidential data into the Playground.
++:::
++
++## Prerequisites
++
++* A dltHub [workspace](../getting-started/installation.md). If you don't have one yet, scaffold it with `uvx dlthub-start@latest` (see the [installation guide](../getting-started/installation.md)).
++* You must be logged in and connected to a workspace:
++
++  ```sh
++  uv run dlthub login
++  uv run dlthub workspace connect <workspace-name>
++  ```
++
++* The `deltalake` package must be installed in your project. The Playground writes Delta tables, and the runtime image installs your project dependencies, so add it to your `pyproject.toml`:
++
++  ```sh
++  uv add deltalake
++  ```
++
++## Usage
++
++Set the destination to `playground` in your pipeline and declare it as a job so the platform can deploy and run it. No `bucket_url`, credentials, or other configuration is required.
++
++Decorate your pipeline function with `@run.pipeline` in `data_pipeline.py`:
++
++```py
++import dlt
++from dlt.hub import run
++
++@run.pipeline("pipeline")
++def load_data():
++    pipeline = dlt.pipeline(
++        pipeline_name="pipeline",
++        destination="playground",
++        dataset_name="data",
++    )
++    pipeline.run([{"id": 1}], table_name="items")
++```
++
++Declare the job in `__deployment__.py` so the platform can discover it:
++
++```py
++from data_pipeline import load_data
++
++__all__ = ["load_data"]
++```
++
++Deploy the workspace, then run the job on the platform:
++
++```sh
++uv run dlthub deploy
++uv run dlthub pipeline run pipeline -f
++```
++
++See [deployments](../pipeline-operations/deployments.md) for more on the `__deployment__.py` manifest, `@run.pipeline`, and deploying jobs on the platform.
++
++## Working with the data
++
++Once a run completes, open the platform dashboard to explore the persisted data. It includes a SQL query editor against your dataset:
++
++```sh
++uv run dlthub dashboard
++```
++
++:::note
++The platform dashboard is itself a deployed job, provisioned when you run `dlthub deploy` with a `__deployment__.py` manifest. The local dashboard (`uv run dlthub local show`) does not require a manifest.
++:::
++
++## How it works
++
++The Playground behaves like the [Delta destination](delta.md): it is a `filesystem` destination that writes Delta tables to a dltHub-managed S3 bucket. Each workspace gets its own isolated prefix (`s3://.../<org_id>/<workspace_id>/...`), so data from different workspaces never mixes. Storage and write dispositions follow the behavior of the [Delta destination](delta.md).
++
++dlt is destination-agnostic, so anything you prototype against the Playground can later be moved to any destination you own with minimal changes. You swap the destination and provide your own storage and credentials.
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index fead1ba7a..bb4327eba 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -490,6 +490,7 @@ const sidebars = {
+         "hub/ingestion/init",
+         "hub/ingestion/rest-api-source",
+         "hub/ingestion/dashboard",
++        "hub/ingestion/playground",
+         "hub/ingestion/ms-sql",
+         "hub/ingestion/delta",
+         "hub/ingestion/iceberg",
+
+
+===== COMMIT a6c01de7 =====
+
+
+commit a6c01de7d
+Author: Shreyas
+Date: 2026-06-29
+
+    docs(hub): add Orchestrate with dltHub Cookbook entry (#4077)
+
+diff --git a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-dlthub.md b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-dlthub.md
+index 50d54360b..d734817dd 100644
+--- a/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-dlthub.md
++++ b/docs/website/docs/walkthroughs/deploy-a-pipeline/deploy-with-dlthub.md
+@@ -21,3 +21,5 @@ Instead of deploying a `dlt` pipeline to your own runner (Airflow, GitHub Action
+ ## Get started
+ 
+ For installation, tutorials, and the full reference, see the [dltHub documentation](../../hub/getting-started/introduction.md).
++
++For a quick walkthrough, see [Deploy a pipeline with dltHub](orchestrate-with-dlthub.md).
+diff --git a/docs/website/docs/walkthroughs/deploy-a-pipeline/orchestrate-with-dlthub.md b/docs/website/docs/walkthroughs/deploy-a-pipeline/orchestrate-with-dlthub.md
+new file mode 100644
+index 000000000..71792e7c4
+--- /dev/null
++++ b/docs/website/docs/walkthroughs/deploy-a-pipeline/orchestrate-with-dlthub.md
+@@ -0,0 +1,108 @@
++---
++title: Deploy a pipeline with dltHub
++description: Run, deploy, and schedule dlt pipelines with dltHub's managed orchestrator
++keywords: [orchestrator, scheduling, cron, dlthub, platform, deploy]
++---
++
++# Deploy a pipeline with dltHub
++
++dltHub ships a managed orchestrator built around the `@dlt.hub.run` decorators. The schedule and the data dependencies live in your Python code, not in a separate DAG (directed acyclic graph) file or YAML.
++
++This page walks through four stages: scaffolding a workspace, running a pipeline ad-hoc, deploying it via `__deployment__.py`, and scheduling it with a trigger. For the full feature surface (follow-up chains, freshness gates, refresh cascade, tags, timezones) see [Triggers and scheduling](../../hub/pipeline-operations/triggers.md).
++
++## 1. Install and scaffold a workspace
++
++If you don't have `uv` yet, follow the [uv installation guide](https://docs.astral.sh/uv/getting-started/installation/). Then scaffold a workspace:
++
++```sh
++uvx dlthub-init@latest
++```
++
++This creates the `.dlt/.workspace` marker that activates workspace mode, along with `pyproject.toml` and `.dlt/` config and secrets files. For other install options and setup paths, see [Installation](../../hub/getting-started/installation.md).
++
++## 2. Run a pipeline ad-hoc
++
++Any regular dlt pipeline can be run on the platform without a deployment file. Given a `pipeline.py` with a top-level `pipeline.run(...)` call:
++
++```sh
++uv run dlthub run pipeline.py
++```
++
++This deploys the file ad-hoc, executes it on the platform, and streams logs back to your terminal. Use this for one-off runs and smoke tests. See [Quick deploy](../../hub/pipeline-operations/deployments.md#quick-deploy-ad-hoc-launch).
++
++## 3. Add `__deployment__.py`
++
++To run the same pipeline as a managed job, decorate the entrypoint and declare it in a workspace `__deployment__.py`:
++
++```py
++import dlt
++from dlt.hub import run
++
++
++@run.pipeline("ingest_breweries")
++def ingest_breweries():
++    pipeline = dlt.pipeline(
++        pipeline_name="ingest_breweries",
++        destination="warehouse",
++        dataset_name="brewery_data",
++    )
++    pipeline.run(brewery_source())
++```
++
++```py
++# __deployment__.py
++from ingest_breweries import ingest_breweries
++
++__all__ = ["ingest_breweries"]
++```
++
++Deploy with:
++
++```sh
++uv run dlthub deploy
++```
++
++To trigger a run, invoke the job by name:
++
++```sh
++uv run dlthub run ingest_breweries
++```
++
++See [Deployments](../../hub/pipeline-operations/deployments.md) for the manifest layout, reconciliation rules, and the full lifecycle.
++
++## 4. Schedule it
++
++Pass a `trigger=` to the decorator to make the job cron-driven:
++
++```py
++from dlt.hub.run import trigger
++
++
++@run.pipeline(
++    "ingest_breweries",
++    trigger=trigger.schedule("0 * * * *"),    # every hour, on the hour
++)
++def ingest_breweries():
++    ...
++```
++
++Run `dlthub deploy` again to push the trigger to the platform. The scheduler then runs the job on its cron. Trigger factories also include `trigger.every("5m")` (fixed interval) and `trigger.once(...)` (single run). See [Basic triggers](../../hub/pipeline-operations/triggers.md#basic-triggers).
++
++:::tip Adjust the schedule from the platform
++You can also change the cron from the dltHub platform's **Manage Schedule** dialog, useful for ad-hoc pauses or tweaks without redeploying. To make a change permanent, update the decorator and run `dlthub deploy`.
++:::
++
++## Advanced features
++
++- [Follow-up triggers](../../hub/pipeline-operations/triggers.md#follow-up-triggers): chain jobs by passing `.success` / `.fail` / `.completed` from one job as the trigger of another.
++- [Freshness checks](../../hub/pipeline-operations/triggers.md#freshness-checks): let a job skip its scheduled run if upstream data isn't fresh.
++- [Refresh cascade](../../hub/pipeline-operations/triggers.md#refresh-cascade): propagate a refresh signal downstream through the graph.
++- [Tags and bulk triggering](../../hub/pipeline-operations/triggers.md#tags-and-bulk-triggering): group jobs and trigger them by selector.
++- [Monitoring and debugging](../../hub/pipeline-operations/monitoring.md): runs, logs, and lineage from the command line or web UI.
++
++## See also
++
++- [Introduction to dltHub](../../hub/getting-started/introduction.md)
++- [dltHub platform tutorial](../../hub/getting-started/platform-tutorial.md)
++- [Triggers and scheduling](../../hub/pipeline-operations/triggers.md)
++- [Deployments](../../hub/pipeline-operations/deployments.md)
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index a4de94d32..fead1ba7a 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -422,6 +422,11 @@ const sidebars = {
+           type: "category",
+           label: "Orchestrators",
+           items: [
++            {
++              type: "doc",
++              id: "walkthroughs/deploy-a-pipeline/orchestrate-with-dlthub",
++              label: "dltHub",
++            },
+             {
+               id: "walkthroughs/deploy-a-pipeline/deploy-with-github-actions",
+               type: "doc",
+
+
+===== COMMIT 392caaab =====
+
+
+commit 392caaab3
+Author: Shreyas
+Date: 2026-06-25
+
+    docs(hub): guide for email and Slack notifications (#4081)
+
+diff --git a/docs/website/docs/hub/notifications/email.md b/docs/website/docs/hub/notifications/email.md
+new file mode 100644
+index 000000000..0005c9533
+--- /dev/null
++++ b/docs/website/docs/hub/notifications/email.md
+@@ -0,0 +1,113 @@
++---
++title: Send email notifications
++description: Notify by email when a dltHub job succeeds or fails, using Gmail SMTP.
++keywords: [email, smtp, gmail, notifications, alerting, hub, dltHub]
++---
++
++# Send email notifications
++
++The pattern below uses Python's standard `smtplib` with Gmail SMTP, but the same shape works for any SMTP server (Outlook, Workspace SMTP relay, or transactional providers like Resend, SendGrid, Mailgun).
++
++## Prerequisites
++
++Generate a Gmail **App Password**, a 16-character credential that lets SMTP authenticate without your real password:
++
++1. Make sure **2-Step Verification** is enabled on the Google Account.
++2. Open https://myaccount.google.com/apppasswords.
++3. Create a new password and name it, e.g. "dltHub pipeline".
++4. Copy the 16 characters. Google displays them with spaces (`abcd efgh ijkl mnop`); the spaces are decorative, so strip them.
++
++App Passwords don't affect normal sign-in: your password, 2FA, and existing sessions are unchanged. You can revoke the App Password from the same page without touching the account.
++
++If you're on a **Google Workspace** domain, an administrator may have disabled App Passwords org-wide. In that case use a transactional provider (Resend, SendGrid, Mailgun). The wiring is the same; just point `smtplib` at their SMTP server and use their API key as the password.
++
++## Store credentials in your prod profile
++
++Add to `.dlt/prod.secrets.toml`:
++
++```toml
++[notifications.email]
++host = "smtp.gmail.com"
++port = 587
++sender = "you@example.com"
++recipient = "you@example.com"
++password = "abcdefghijklmnop"     # 16 chars, no spaces, no angle brackets
++```
++
++`sender` must be the **same Google Account** the App Password was generated on.
++
++:::tip Allowlist outbound IPs
++If your SMTP server requires IP allowlisting, enable [static egress IPs](../pipeline-operations/job-configuration.md#static-egress-ips) so the job's outbound traffic uses a known set of source IPs.
++:::
++
++## Wire it into your pipeline
++
++```python
++import smtplib
++import time
++from datetime import datetime, timezone
++from email.message import EmailMessage
++
++import dlt
++from dlt.hub import run
++
++
++def send_email(subject: str, body: str) -> None:
++    host = dlt.secrets["notifications.email.host"]
++    port = int(dlt.secrets["notifications.email.port"])
++    sender = dlt.secrets["notifications.email.sender"]
++    recipient = dlt.secrets["notifications.email.recipient"]
++    password = dlt.secrets["notifications.email.password"]
++
++    msg = EmailMessage()
++    msg["Subject"] = subject
++    msg["From"] = sender
++    msg["To"] = recipient
++    msg.set_content(body)
++
++    with smtplib.SMTP(host, port) as s:
++        s.starttls()
++        s.login(sender, password)
++        s.send_message(msg)
++
++
++@run.pipeline("my_pipeline")
++def my_job():
++    pipeline = dlt.pipeline(
++        pipeline_name="my_pipeline",
++        destination="warehouse",
++        dataset_name="my_dataset",
++    )
++
++    started = time.time()
++    try:
++        load_info = pipeline.run(my_source())
++        send_email(
++            f"[dltHub] {pipeline.pipeline_name} succeeded",
++            "\n".join([
++                f"Pipeline:  {pipeline.pipeline_name}",
++                f"Status:    SUCCESS",
++                f"Finished:  {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S UTC}",
++                f"Duration:  {time.time() - started:.1f}s",
++                f"Load ID:   {load_info.loads_ids[-1]}",
++            ]),
++        )
++    except Exception as e:
++        try:
++            send_email(
++                f"[dltHub] {pipeline.pipeline_name} FAILED",
++                f"Pipeline:  {pipeline.pipeline_name}\nError:     {type(e).__name__}: {e}",
++            )
++        except Exception as mail_err:
++            print(f"Failed to send failure email: {mail_err}")
++        raise
++```
++
++Wrap the failure-path `send_email` in its own try/except: a broken alerting channel shouldn't mask the underlying pipeline error.
++
++## Deploy and trigger
++
++```sh
++uv run dlthub deploy                            # syncs code + SMTP credentials
++uv run dlthub run my_job                        # triggers the job, email lands on completion
++```
+diff --git a/docs/website/docs/hub/notifications/slack.md b/docs/website/docs/hub/notifications/slack.md
+new file mode 100644
+index 000000000..af651e6d8
+--- /dev/null
++++ b/docs/website/docs/hub/notifications/slack.md
+@@ -0,0 +1,85 @@
++---
++title: Send Slack notifications
++description: Notify Slack when a dltHub job succeeds or fails.
++keywords: [slack, notifications, alerting, hub, dltHub]
++---
++
++# Send Slack notifications
++
++dlt ships a small helper, `send_slack_message`, that posts to a Slack [incoming webhook](https://api.slack.com/messaging/webhooks). Combined with `pipeline.runtime_config.slack_incoming_hook`, it gives you a one-line way to alert a channel when a job finishes or fails.
++
++## Prerequisites
++
++Create an incoming webhook for the channel that should receive alerts:
++
++1. Open https://api.slack.com/messaging/webhooks.
++2. Create a new Slack app (or pick an existing one), enable **Incoming Webhooks**, and add a webhook to your workspace.
++3. Pick the destination channel. You'll get a URL of the form `https://hooks.slack.com/services/T…/B…/…`.
++
++The webhook URL itself is the credential, so treat it as a secret.
++
++## Store the webhook in your prod profile
++
++Add to `.dlt/prod.secrets.toml`:
++
++```toml
++[runtime]
++slack_incoming_hook = "https://hooks.slack.com/services/T…/B…/…"
++```
++
++dlt picks this up automatically and exposes it at runtime as `pipeline.runtime_config.slack_incoming_hook`. To also get notifications from local runs, mirror the same `[runtime]` block into `.dlt/dev.secrets.toml`.
++
++## Wire it into your pipeline
++
++```python
++import time
++from datetime import datetime, timezone
++
++import dlt
++from dlt.common.runtime.slack import send_slack_message
++from dlt.hub import run
++
++
++@run.pipeline("my_pipeline")
++def my_job():
++    pipeline = dlt.pipeline(
++        pipeline_name="my_pipeline",
++        destination="warehouse",
++        dataset_name="my_dataset",
++    )
++
++    hook = pipeline.runtime_config.slack_incoming_hook
++    started = time.time()
++    try:
++        load_info = pipeline.run(my_source())
++        if hook:
++            send_slack_message(
++                hook,
++                "\n".join([
++                    f":white_check_mark: *`{pipeline.pipeline_name}` succeeded*",
++                    f"*Finished:* {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S UTC}",
++                    f"*Duration:* {time.time() - started:.1f}s",
++                    f"*Load ID:* `{load_info.loads_ids[-1]}`",
++                ]),
++            )
++    except Exception as e:
++        if hook:
++            send_slack_message(
++                hook,
++                f":x: *`{pipeline.pipeline_name}` failed*: `{type(e).__name__}: {e}`",
++            )
++        raise
++```
++
++The `if hook:` check skips the Slack call when no webhook is configured. The same script works in any profile, whether you've set up notifications or not.
++
++:::tip Notify on schema changes
++You can also notify Slack whenever a load surfaces new tables or columns. The [dlt chess pipeline](../../examples/chess_production.md) shows this pattern by inspecting `schema_update` on each load package and posting a message when new tables or columns appear.
++:::
++
++## Deploy and trigger
++
++```sh
++uv run dlthub deploy                            # syncs code + prod secret
++uv run dlthub run my_job                        # triggers the job, posts to Slack on completion
++```
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 833336e32..a4de94d32 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -524,6 +524,11 @@ const sidebars = {
+       label: "Data discovery & serving",
+       items: ["hub/data-discovery/datasets", { type: "doc", id: "general-usage/dataset-access/marimo" }],
+     },
++    {
++      type: "category",
++      label: "Notifications",
++      items: ["hub/notifications/slack", "hub/notifications/email"],
++    },
+     {
+       type: "category",
+       label: "Platform capabilities",
+
+
+===== COMMIT f2c15d47 =====
+
+
+commit f2c15d47b
+Author: Shreyas
+Date: 2026-06-25
+
+    docs(hub): add secrets management page (#4124)
+
+diff --git a/docs/website/docs/general-usage/credentials/vaults.md b/docs/website/docs/general-usage/credentials/vaults.md
+index e8c7bd616..ee7a08dc4 100644
+--- a/docs/website/docs/general-usage/credentials/vaults.md
++++ b/docs/website/docs/general-usage/credentials/vaults.md
+@@ -130,7 +130,7 @@ enable_google_secrets = true  # google secrets provider is disabled by default
+ [providers.google_secrets]
+ only_secrets = false
+ only_toml_fragments = false
+-list_secrets = true  # we recommend pre-listing secrets to minimize calls to google backend
++list_secrets = false  # listing not available: dlt does direct lookups, needs only secretAccessor
+ ```
+   </TabItem>
+   <TabItem value="env">
+@@ -140,7 +140,7 @@ PROVIDERS__ENABLE_GOOGLE_SECRETS="true"
+ 
+ PROVIDERS__GOOGLE_SECRETS__ONLY_SECRETS="false"
+ PROVIDERS__GOOGLE_SECRETS__ONLY_TOML_FRAGMENTS="false"
+-PROVIDERS__GOOGLE_SECRETS__LIST_SECRETS="true"
++PROVIDERS__GOOGLE_SECRETS__LIST_SECRETS="false"
+ ```
+   </TabItem>
+ </Tabs>
+@@ -159,11 +159,29 @@ Secret names are normalized to contain letters, digits, hyphens (-), and undersc
+    * `destination.bigquery` → `destination-bigquery`
+    * `my_pipeline.dlt_secrets_toml` → `my_pipeline-dlt_secrets_toml`
+    
+- Below you will find a few examples.
++Below you will find examples grouped by storage type, simplest first.
++
++### Store your whole `secrets.toml` (simplest)
++
++**secret name: `dlt_secrets_toml`**
++
++One secret holding your `secrets.toml` content, written exactly as you would locally. dlt probes this key first, so no naming convention is needed.
++
++```toml
++[destination.motherduck.credentials]
++password = "<motherduck_token>"
++database = "<database>"
++```
++
++The value can hold as many sections as you like, your whole `secrets.toml` or just the one credential block you need (as above). You can also scope it to a single pipeline with a secret named `<pipeline_name>-dlt_secrets_toml`.
++
++### Store per-section fragments
++
++Each secret's value is a TOML block with its own `[section]` header.
+ 
+ **secret name: `destination`**
+ 
+-```toml 
++```toml
+ [destination]
+ postgres.credentials = "postgresql://loader:***@host:5432/postgres"
+ ```
+@@ -177,10 +195,10 @@ private_key = "-----BEGIN PRIVATE KEY-----\n....\n-----END PRIVATE KEY-----\n"
+ client_email = "....gserviceaccount.com"
+ ```
+ 
+-
+ **secret name: `destination-filesystem`**
+ 
+ (whole `filesystem` destination configuration)
++
+ ```toml
+ [destination.filesystem]
+ bucket_url = "s3://bucket/path"
+@@ -198,7 +216,9 @@ aws_secret_access_key = "..."
+ connection_url = "mongodb+srv://user:***@host/db?authSource=admin&tls=true"
+ ```
+ 
+-You can also store single values (more calls required):
++### Store single values
++
++Each secret's value is a bare string with no TOML header. This requires more vault calls.
+ 
+ For example, the following keys would be fetched similarly to environment variables:
+ 
+@@ -208,18 +228,6 @@ For example, the following keys would be fetched similarly to environment variab
+ * `destination-bigquery-credentials-client_email`
+ * `destination-bigquery-location`
+ 
+-**Naming convention for Google Secrets**
+-
+-Secret names are normalized to contain letters, digits, hyphens (-), and underscores (_).
+-
+-* Punctuation (except `-` and `_`) and whitespace are removed.
+-* Sections are joined with hyphens, for example:
+-   * `destination.bigquery.credentials.project_id` → `destination-bigquery-credentials-project_id`
+-   * `sources.pipedrive.pipedrive_api_key` → `sources-pipedrive-pipedrive_api_key`
+-   * `destination.bigquery` → `destination-bigquery`
+-   * `my_pipeline.dlt_secrets_toml` → `my_pipeline-dlt_secrets_toml`
+-:::
+-
+ ### Notes on `list_secrets`
+ 
+ When `list_secrets=true`, the provider will pre-list all secret names to skip lookups for non-existent keys.
+diff --git a/docs/website/docs/hub/pipeline-operations/secrets-management.md b/docs/website/docs/hub/pipeline-operations/secrets-management.md
+new file mode 100644
+index 000000000..c9f5d7f22
+--- /dev/null
++++ b/docs/website/docs/hub/pipeline-operations/secrets-management.md
+@@ -0,0 +1,101 @@
++---
++title: Secrets management
++description: How dltHub handles your secrets, and how to manage them safely in production with vaults and access controls.
++keywords: [secrets, secrets management, vault, encryption, google secret manager, credentials, hub, dltHub]
++---
++
++# Secrets management
++
++Pipelines deployed to dltHub need access to credentials (warehouse passwords, API keys, tokens) at run time. This page explains how dltHub handles those secrets for you, and the options you have for managing them yourself in production.
++
++There are two broad approaches:
++
++- **Let dltHub manage your secrets.** Put them in your workspace config and deploy. dltHub encrypts and stores them for you. This is the default and needs no extra setup.
++- **Bring your own vault.** Keep secrets in an external secret manager (e.g. Google Secret Manager) and have dlt fetch them at run time. Recommended for production.
++
++## How dltHub handles your secrets
++
++Your secrets never live in plaintext on the platform. When you deploy, your configuration is transmitted over an encrypted channel and stored **encrypted at rest** in a secure, isolated store. That store can be reached by **only a single vault service identity, running inside a private network (VPC)**, so nothing else can touch it. At run time, your pipeline runner is granted **short-lived access** to only the secrets that run needs.
++
++dltHub workspaces use **profiles** to separate environments. Deployed pipelines run under the `prod` profile, so put production secrets in `.dlt/prod.secrets.toml` and development secrets in `.dlt/dev.secrets.toml`. See [profiles](profiles.md) for how `dev`, `prod`, and `access` profiles work and when each is used.
++
++For stronger isolation, especially in production, keep the secret values in your own vault instead.
++
++## Use your own vault: Google Secret Manager
++
++The most robust pattern for production is to keep your actual secret values in an external vault and let dlt fetch them at run time, so your `secrets.toml` holds only the small set of credentials needed to *reach* the vault, never the secrets themselves. dlt supports **Google Secret Manager** today; other vaults (AWS Secrets Manager, Azure Key Vault) are straightforward to add and welcome as contributions.
++
++### 1. Add the dependency
++
++dlt's Google Secret Manager provider requires `google-api-python-client`. Add it to your project dependencies so the deployed runner installs it too. Installing it only into your local environment will make the deployed run fail.
++
++In `pyproject.toml`:
++
++```toml
++dependencies = [
++    "dlt[hub]>=1.17.0",
++    "google-api-python-client",
++]
++```
++
++Then refresh your lockfile (`uv lock`) before deploying.
++
++### 2. Create a Google service account and store your secrets
++
++These steps are the same for OSS dlt and dltHub. See [Configure Google Secret Provider](../../general-usage/credentials/vaults.md#configure-google-secret-provider) in the OSS docs for:
++
++- Creating a GCP service account with `roles/secretmanager.secretAccessor` and downloading its JSON key.
++- Adding secrets to Google Secret Manager, including `dlt_secrets_toml` to store your `secrets.toml` as a single secret.
++- The [naming convention](../../general-usage/credentials/vaults.md#naming-convention-for-google-secrets) for individual secrets.
++
++### 3. Point dlt at the vault from your workspace
++
++In `.dlt/secrets.toml`, enable the provider and add **only** the service-account credentials from the JSON key file you created. The actual secrets (your warehouse token, etc.) stay in the vault:
++
++```toml
++[providers]
++enable_google_secrets = true
++
++[providers.google_secrets]
++only_secrets = false
++list_secrets = false
++
++[providers.google_secrets.credentials]
++project_id = "<project_id>"
++client_email = "<...>@<project_id>.iam.gserviceaccount.com"
++private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
++```
++
++You can also configure this with environment variables. See [Activate Google Secret Provider](../../general-usage/credentials/vaults.md#activate-google-secret-provider) for the equivalent setup.
++
++### 4. Deploy and run
++
++```sh
++uv run dlthub deploy
++uv run dlthub run my_job
++```
++
++`dlthub deploy` syncs your code and the vault bootstrap config; the runner then fetches the actual secrets from Google Secret Manager at run time. The secret values themselves are never stored in your deployed config.
++
++## Harden access with static egress IPs
++
++If your vault, or the warehouse it holds credentials for, supports IP allowlisting, restrict it so it only accepts traffic from your dltHub runners. Opt in per job by adding `require={"static_egress_ips": True}` to the job's `@run.pipeline` decorator:
++
++```py
++@run.pipeline(my_pipeline, require={"static_egress_ips": True})
++def my_job():
++    ...
++```
++
++Then allowlist your region's dltHub egress IP set on the resource. See [Static egress IPs](job-configuration.md#static-egress-ips) for the current IP lists by region.
++
++## On the roadmap
++
++A built-in dltHub vault is on the roadmap, so you'll be able to manage secrets natively without wiring up an external provider.
++
++## See also
++
++- [Adding credentials](../../walkthroughs/add_credentials.md): general guide to dlt credentials.
++- [Vaults](../../general-usage/credentials/vaults.md): OSS reference for vault providers.
++- [Profiles](profiles.md): how `dev`, `prod`, and `access` profiles separate environments.
++- [Static egress IPs](job-configuration.md#static-egress-ips): pin job outbound traffic to known IPs for vault and destination allowlisting.
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 2266895c1..833336e32 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -507,6 +507,7 @@ const sidebars = {
+         "hub/pipeline-operations/profiles",
+         "hub/pipeline-operations/overview",
+         "hub/pipeline-operations/workspace-setup",
++        "hub/pipeline-operations/secrets-management",
+         "hub/pipeline-operations/deployments",
+         "hub/pipeline-operations/triggers",
+         "hub/pipeline-operations/job-configuration",
+
+
+===== COMMIT 554ac276 =====
+
+
+commit 554ac276d
+Author: Tim Hable
+Date: 2026-06-23
+
+    Additional copy options (#4088)
+
+diff --git a/dlt/destinations/impl/redshift/configuration.py b/dlt/destinations/impl/redshift/configuration.py
+index 454ec834f..29566b937 100644
+--- a/dlt/destinations/impl/redshift/configuration.py
++++ b/dlt/destinations/impl/redshift/configuration.py
+@@ -27,6 +27,7 @@ class RedshiftClientConfiguration(PostgresClientConfiguration):
+ 
+     staging_iam_role: Optional[str] = None
+     has_case_sensitive_identifiers: bool = False
++    additional_copy_options: Optional[list[str]] = None
+ 
+     def fingerprint(self) -> str:
+         """Returns a fingerprint of the configured host."""
+diff --git a/dlt/destinations/impl/redshift/factory.py b/dlt/destinations/impl/redshift/factory.py
+index fc2035139..8806846f7 100644
+--- a/dlt/destinations/impl/redshift/factory.py
++++ b/dlt/destinations/impl/redshift/factory.py
+@@ -179,6 +179,7 @@ class redshift(Destination[RedshiftClientConfiguration, "RedshiftClient"]):
+         credentials: Union[RedshiftCredentials, Dict[str, Any], str] = None,
+         staging_iam_role: Optional[str] = None,
+         has_case_sensitive_identifiers: bool = False,
++        additional_copy_options: Optional[list[str]] = None,
+         destination_name: str = None,
+         environment: str = None,
+         **kwargs: Any,
+@@ -192,6 +193,7 @@ class redshift(Destination[RedshiftClientConfiguration, "RedshiftClient"]):
+                 a connection string in the format `redshift://user:password@host:port/database`. Defaults to None.
+             staging_iam_role (Optional[str], optional): IAM role to use for staging data in S3. Defaults to None.
+             has_case_sensitive_identifiers (bool, optional): Whether case sensitive identifiers are enabled for the database. Defaults to False.
++            additional_copy_options (Optional[list[str]], optional): Additional Redshift COPY options.
+             destination_name (str, optional): Name of the destination. Defaults to None.
+             environment (str, optional): Environment name. Defaults to None.
+             **kwargs (Any): Additional arguments passed to the destination config.
+@@ -200,6 +202,7 @@ class redshift(Destination[RedshiftClientConfiguration, "RedshiftClient"]):
+             credentials=credentials,
+             staging_iam_role=staging_iam_role,
+             has_case_sensitive_identifiers=has_case_sensitive_identifiers,
++            additional_copy_options=additional_copy_options,
+             destination_name=destination_name,
+             environment=environment,
+             **kwargs,
+diff --git a/dlt/destinations/impl/redshift/redshift.py b/dlt/destinations/impl/redshift/redshift.py
+index 1129d530c..0e7f2586f 100644
+--- a/dlt/destinations/impl/redshift/redshift.py
++++ b/dlt/destinations/impl/redshift/redshift.py
+@@ -83,9 +83,11 @@ class RedshiftCopyFileLoadJob(CopyRemoteFileLoadJob):
+         file_path: str,
+         staging_credentials: Optional[CredentialsConfiguration] = None,
+         staging_iam_role: str = None,
++        additional_copy_options: Optional[list[str]] = None,
+     ) -> None:
+         super().__init__(file_path, staging_credentials)
+         self._staging_iam_role = staging_iam_role
++        self.additional_copy_options = additional_copy_options or []
+         self._job_client: "RedshiftClient" = None
+ 
+     def run(self) -> None:
+@@ -116,6 +118,7 @@ class RedshiftCopyFileLoadJob(CopyRemoteFileLoadJob):
+         file_type = ""
+         dateformat = ""
+         compression = ""
++        additional_copy_options = "\n                ".join(self.additional_copy_options)
+         if file_format == "jsonl":
+             file_type = "FORMAT AS JSON 'auto'"
+             dateformat = "dateformat 'auto' timeformat 'auto'"
+@@ -147,7 +150,9 @@ class RedshiftCopyFileLoadJob(CopyRemoteFileLoadJob):
+                 {dateformat}
+                 {compression}
+                 {credentials}
+-                {region} MAXERROR 0;""")
++                {region}
++                {additional_copy_options}
++                MAXERROR 0;""")
+ 
+ 
+ class RedshiftMergeJob(SqlMergeFollowupJob):
+@@ -216,6 +221,7 @@ class RedshiftClient(InsertValuesJobClient, SupportsStagingDestination):
+                 file_path,
+                 staging_credentials=self.config.staging_config.credentials,
+                 staging_iam_role=self.config.staging_iam_role,
++                additional_copy_options=self.config.additional_copy_options,
+             )
+         return job
+ 
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/redshift.md b/docs/website/docs/dlt-ecosystem/destinations/redshift.md
+index 5911ca3b5..7b13aab7f 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/redshift.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/redshift.md
+@@ -122,6 +122,13 @@ If the S3 bucket is in a different region than your Redshift cluster:
+ - For Parquet files, cross-region COPY operations are not supported by Redshift, so the region setting will be ignored
+ :::
+ 
++### Additional COPY Options
++You can append additional Redshift [COPY options/Data conversion Parameters](https://docs.aws.amazon.com/redshift/latest/dg/copy-parameters-data-conversion.html) to staged loads with `additional_copy_options`. For example:
++```toml
++[destination.redshift]
++additional_copy_options = ["FILLRECORD", "NULL AS 'null_string'"]
++```
++
+ ## Identifier names and case sensitivity
+ * Up to 127 characters
+ * Case insensitive
+diff --git a/tests/load/redshift/test_redshift_client.py b/tests/load/redshift/test_redshift_client.py
+index 818be11a8..2d01f1b4f 100644
+--- a/tests/load/redshift/test_redshift_client.py
++++ b/tests/load/redshift/test_redshift_client.py
+@@ -61,24 +61,32 @@ def test_redshift_factory() -> None:
+     assert client.config.has_case_sensitive_identifiers is False
+     assert client.capabilities.has_case_sensitive_identifiers is False
+     assert client.capabilities.casefold_identifier is str.lower
++    assert client.config.additional_copy_options is None
+ 
+     # set args explicitly
+-    dest = redshift(has_case_sensitive_identifiers=True, staging_iam_role="LOADER")
++    dest = redshift(
++        has_case_sensitive_identifiers=True,
++        staging_iam_role="LOADER",
++        additional_copy_options=["FILLRECORD"],
++    )
+     client = dest.client(schema, RedshiftClientConfiguration()._bind_dataset_name("dataset"))
+     assert client.config.staging_iam_role == "LOADER"
+     assert client.config.has_case_sensitive_identifiers is True
+     assert client.capabilities.has_case_sensitive_identifiers is True
+     assert client.capabilities.casefold_identifier is str
++    assert client.config.additional_copy_options == ["FILLRECORD"]
+ 
+     # set args via config
+     os.environ["DESTINATION__STAGING_IAM_ROLE"] = "LOADER"
+     os.environ["DESTINATION__HAS_CASE_SENSITIVE_IDENTIFIERS"] = "True"
++    os.environ["DESTINATION__REDSHIFT__ADDITIONAL_COPY_OPTIONS"] = '["FILLRECORD"]'
+     dest = redshift()
+     client = dest.client(schema, RedshiftClientConfiguration()._bind_dataset_name("dataset"))
+     assert client.config.staging_iam_role == "LOADER"
+     assert client.config.has_case_sensitive_identifiers is True
+     assert client.capabilities.has_case_sensitive_identifiers is True
+     assert client.capabilities.casefold_identifier is str
++    assert client.config.additional_copy_options == ["FILLRECORD"]
+ 
+ 
+ @skipifpypy
+
+
+===== COMMIT 9899c3bf =====
+
+
+commit 9899c3bfe
+Author: Elisabeth Reitmayr
+Date: 2026-06-23
+
+    fix(dashboard): keep the pipeline selector when no pipeline is selected (#4096)
+
+diff --git a/dlt/_workspace/cli/_pipeline_command.py b/dlt/_workspace/cli/_pipeline_command.py
+index 25366194e..ecacc6482 100644
+--- a/dlt/_workspace/cli/_pipeline_command.py
++++ b/dlt/_workspace/cli/_pipeline_command.py
+@@ -35,7 +35,7 @@ def list_pipelines(pipelines_dir: str = None, verbosity: int = 1) -> None:
+                    - 0: Only show count summary
+                    - 1+: Show full list with last run times
+     """
+-    pipelines_dir, pipelines = utils.list_local_pipelines(pipelines_dir)
++    pipelines_dir, pipelines, _ = utils.list_local_pipelines(pipelines_dir)
+ 
+     if len(pipelines) > 0:
+         if verbosity == 0:
+diff --git a/dlt/_workspace/cli/utils.py b/dlt/_workspace/cli/utils.py
+index dda598aaf..ddeae7bdf 100644
+--- a/dlt/_workspace/cli/utils.py
++++ b/dlt/_workspace/cli/utils.py
+@@ -4,7 +4,15 @@ import os
+ import platform
+ import shutil
+ import subprocess
+-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
++from typing import (
++    Any,
++    Callable,
++    Dict,
++    FrozenSet,
++    List,
++    Optional,
++    Tuple,
++)
+ 
+ import dlt
+ from dlt.common.pipeline import get_dlt_pipelines_dir
+@@ -91,7 +99,7 @@ def list_local_pipelines(
+     sort_by_trace: bool = True,
+     additional_pipelines: List[str] = None,
+     run_dir: Optional[str] = None,
+-) -> Tuple[str, List[TPipelineListItem]]:
++) -> Tuple[str, List[TPipelineListItem], List[str]]:
+     """Get the local pipelines directory and the list of pipeline names in it.
+ 
+     Args:
+@@ -99,14 +107,20 @@ def list_local_pipelines(
+         sort_by_trace: Whether to sort the pipelines by the latest timestamp of trace.
+         additional_pipelines: Extra pipeline names to include in the list.
+         run_dir: When set, only return pipelines whose initial_cwd matches this path.
++
++    Returns:
++        The pipelines directory, the pipeline list items, and the names discovered on
++        disk before extras are merged in.
+     """
+     pipelines_dir = pipelines_dir or get_dlt_pipelines_dir()
+     storage = FileStorage(pipelines_dir)
+ 
+     try:
+-        pipelines = storage.list_folder_dirs(".", to_root=False)
++        local_pipeline_names = storage.list_folder_dirs(".", to_root=False)
+     except Exception:
+-        pipelines = []
++        local_pipeline_names = []
++
++    pipelines = list(local_pipeline_names)
+ 
+     if additional_pipelines:
+         for pipeline in additional_pipelines:
+@@ -118,6 +132,11 @@ def list_local_pipelines(
+         pipelines = [
+             p for p in pipelines if _get_pipeline_initial_cwd(pipelines_dir, p) == abs_project_dir
+         ]
++        local_pipeline_names = [
++            p
++            for p in local_pipeline_names
++            if _get_pipeline_initial_cwd(pipelines_dir, p) == abs_project_dir
++        ]
+ 
+     # check last trace timestamp and create dict
+     pipelines_with_timestamps: List[TPipelineListItem] = []
+@@ -129,7 +148,7 @@ def list_local_pipelines(
+     if sort_by_trace:
+         pipelines_with_timestamps.sort(key=lambda x: x["timestamp"], reverse=True)
+ 
+-    return pipelines_dir, pipelines_with_timestamps
++    return pipelines_dir, pipelines_with_timestamps, local_pipeline_names
+ 
+ 
+ def date_from_timestamp_with_ago(
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index ebe7ac6b5..b592a267d 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -39,6 +39,7 @@ with app.setup:
+ def home(
+     dlt_profile_select: mo.ui.dropdown,
+     dlt_pipeline_select: mo.ui.multiselect,
++    dlt_local_pipeline_names: List[str],
+     dlt_pipelines_dir: str,
+     dlt_refresh_button: mo.ui.run_button,
+     dlt_pipeline_name: str,
+@@ -61,7 +62,7 @@ def home(
+             dlt_config = utils.pipeline.resolve_dashboard_config(dlt_pipeline)
+         except Exception:
+             _result = utils.home.render_pipeline_header_row(
+-                dlt_pipeline_name, dlt_profile_select, dlt_pipeline_select, [dlt_refresh_button]
++                dlt_pipeline_name, dlt_profile_select, dlt_pipeline_select, []
+             )
+             _result.append(
+                 utils.ui.error_callout(
+@@ -88,9 +89,15 @@ def home(
+     else:
+         try:
+             dlt_config = utils.pipeline.resolve_dashboard_config(None)
+-            _result = utils.home.render_no_pipelines_home(
+-                dlt_profile_select,
+-            )
++            if dlt_local_pipeline_names:
++                _result = utils.home.render_no_pipeline_selected_home(
++                    dlt_profile_select,
++                    dlt_pipeline_select,
++                )
++            else:
++                _result = utils.home.render_no_pipelines_home(
++                    dlt_profile_select,
++                )
+         except Exception:
+             _result = [
+                 utils.ui.error_callout(
+@@ -672,7 +679,8 @@ def utils_discover_pipelines(
+     # discover pipelines and build selector
+     dlt_pipelines_dir: str = ""
+     dlt_all_pipelines: List[TPipelineListItem] = []
+-    dlt_pipelines_dir, dlt_all_pipelines = list_local_pipelines(
++    dlt_local_pipeline_names: List[str] = []
++    dlt_pipelines_dir, dlt_all_pipelines, dlt_local_pipeline_names = list_local_pipelines(
+         mo_cli_arg_pipelines_dir,
+         additional_pipelines=[mo_cli_arg_pipeline, mo_query_var_pipeline_name],
+     )
+@@ -694,7 +702,7 @@ def utils_discover_pipelines(
+         on_change=lambda value: mo.query_params().set("pipeline", str(value[0]) if value else None),
+     )
+ 
+-    return dlt_all_pipelines, dlt_pipeline_select, dlt_pipelines_dir
++    return dlt_all_pipelines, dlt_local_pipeline_names, dlt_pipeline_select, dlt_pipelines_dir
+ 
+ 
+ @app.cell(hide_code=True)
+diff --git a/dlt/_workspace/helpers/dashboard/strings.py b/dlt/_workspace/helpers/dashboard/strings.py
+index 18efc237f..4d0055f53 100644
+--- a/dlt/_workspace/helpers/dashboard/strings.py
++++ b/dlt/_workspace/helpers/dashboard/strings.py
+@@ -52,6 +52,10 @@ No pipelines found yet. A pipeline shows up here once it has run, or after you r
+ from its destination (see the [sync docs]({_sync_help_url})).
+ """
+ 
++home_no_pipeline_selected = (
++    "No pipeline selected. Choose a pipeline from the dropdown above to inspect it."
++)
++
+ home_workspace_label = " Workspace: {}"
+ home_open_working_dir_button = "Open pipeline working directory"
+ home_open_local_data_button = "Open local data location"
+diff --git a/dlt/_workspace/helpers/dashboard/utils/home.py b/dlt/_workspace/helpers/dashboard/utils/home.py
+index c8d4b2618..6e81e2d6f 100644
+--- a/dlt/_workspace/helpers/dashboard/utils/home.py
++++ b/dlt/_workspace/helpers/dashboard/utils/home.py
+@@ -69,23 +69,47 @@ def home_header_row(
+     )
+ 
+ 
+-def render_no_pipelines_home(
++def _render_home_callout(
+     dlt_profile_select: mo.ui.dropdown,
++    message: str,
++    right_control: Any = None,
+ ) -> List[mo.Html]:
+-    """Render a minimal landing shown when no pipelines are available to inspect.
+-
+-    The pipeline dropdown is omitted because there is nothing to select.
+-    """
++    """Shared landing scaffold: section marker, header row and an info callout."""
+     return [
+         utils.ui.section_marker(strings.app_section_name, has_content=True),
+-        home_header_row(dlt_profile_select),
++        home_header_row(dlt_profile_select, right_control),
+         mo.callout(
+-            mo.md(strings.home_no_pipelines),
++            mo.md(message),
+             kind="info",
+         ),
+     ]
+ 
+ 
++def render_no_pipelines_home(
++    dlt_profile_select: mo.ui.dropdown,
++) -> List[mo.Html]:
++    """Render a minimal landing shown when no pipelines are available to inspect.
++
++    The pipeline dropdown is omitted because there is nothing to select.
++    """
++    return _render_home_callout(dlt_profile_select, strings.home_no_pipelines)
++
++
++def render_no_pipeline_selected_home(
++    dlt_profile_select: mo.ui.dropdown,
++    dlt_pipeline_select: mo.ui.multiselect,
++) -> List[mo.Html]:
++    """Render the landing shown when pipelines exist but none is selected.
++
++    The pipeline dropdown stays visible so the user can re-select a pipeline.
++    """
++    return _render_home_callout(
++        dlt_profile_select,
++        strings.home_no_pipeline_selected,
++        right_control=dlt_pipeline_select,
++    )
++
++
+ def render_pipeline_header_row(
+     dlt_pipeline_name: str,
+     dlt_profile_select: mo.ui.dropdown,
+diff --git a/dlt/_workspace/mcp/tools/data_tools.py b/dlt/_workspace/mcp/tools/data_tools.py
+index 9f21dda35..f85f46090 100644
+--- a/dlt/_workspace/mcp/tools/data_tools.py
++++ b/dlt/_workspace/mcp/tools/data_tools.py
+@@ -47,7 +47,7 @@ def list_pipelines() -> List[str]:
+     ctx = active_run_context()
+     # in OSS context (no profiles), filter to pipelines created in this project
+     project_dir = None if isinstance(ctx, ProfilesRunContext) else ctx.local_dir
+-    _, pipelines = list_local_pipelines(sort_by_trace=False, run_dir=project_dir)
++    _, pipelines, _ = list_local_pipelines(sort_by_trace=False, run_dir=project_dir)
+     return [p["name"] for p in pipelines]
+ 
+ 
+diff --git a/dlt/helpers/marimo/_pipeline_selector.py b/dlt/helpers/marimo/_pipeline_selector.py
+index 8228e9efd..ca124ce68 100644
+--- a/dlt/helpers/marimo/_pipeline_selector.py
++++ b/dlt/helpers/marimo/_pipeline_selector.py
+@@ -10,7 +10,7 @@ with app.setup:
+ 
+ @app.cell
+ def pipeline_locations():
+-    _pipelines_dir, _pipelines = list_local_pipelines()
++    _pipelines_dir, _pipelines, _ = list_local_pipelines()
+     pipelines_locations = {p["name"]: _pipelines_dir + "/" + p["name"] for p in _pipelines}
+     return (pipelines_locations,)
+ 
+diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
+index 79b239322..99ea12176 100644
+--- a/tests/e2e/helpers/dashboard/test_e2e.py
++++ b/tests/e2e/helpers/dashboard/test_e2e.py
+@@ -69,6 +69,22 @@ def _close_sections(page: Page, skip_section: str = None) -> None:
+             page.get_by_role("switch", name=s).uncheck()
+ 
+ 
++def _pipeline_selector(page: Page) -> Any:
++    """Locator for the pipeline multiselect trigger (a popover button in shadow DOM)."""
++    return page.locator("marimo-multiselect").locator('[aria-haspopup="dialog"]')
++
++
++def _toggle_pipeline(page: Page, pipeline_name: str) -> None:
++    """Open the pipeline multiselect and toggle the given option.
++
++    With `max_selections=1` this selects the pipeline when it is not the current
++    one and deselects it when it is, so it covers both selecting and clearing.
++    """
++    _pipeline_selector(page).click()
++    page.get_by_role("option", name=pipeline_name, exact=True).click()
++    page.keyboard.press("Escape")
++
++
+ def test_page_overview(page: Page, fruit_pipeline: Any):
+     _open_pipeline(page, "fruit_pipeline")
+ 
+@@ -474,3 +490,97 @@ def test_no_pipelines_home(page: Page):
+             expect(page.get_by_text("No pipelines found yet").first).to_be_visible(timeout=20000)
+             # the (empty) pipeline dropdown is hidden
+             expect(page.get_by_text(app_strings.app_pipeline_select_label)).to_have_count(0)
++
++
++def test_deselect_pipeline_keeps_selector(page: Page):
++    """Clearing the pipeline keeps the dropdown and shows a neutral hint, not the empty landing."""
++    test_port = 2723
++    with isolated_workspace("pipelines"):
++        alpha = dlt.pipeline(pipeline_name="alpha", destination="duckdb")
++        alpha.run(fruitshop_source().with_resources("customers"))
++        time.sleep(1)
++        beta = dlt.pipeline(pipeline_name="beta", destination="duckdb")
++        beta.run(fruitshop_source().with_resources("inventory"))
++
++        with start_dashboard(port=test_port):
++            page.goto(f"http://localhost:{test_port}")
++            expect(page.get_by_role("heading", name=re.compile(r"Pipeline\s+beta"))).to_be_visible(
++                timeout=20000
++            )
++
++            _toggle_pipeline(page, "beta")
++
++            expect(page.get_by_text(app_strings.app_pipeline_select_label)).to_have_count(1)
++            expect(page.get_by_text("No pipeline selected").first).to_be_visible(timeout=15000)
++            expect(page.get_by_text("No pipelines found yet")).to_have_count(0)
++            expect(page.get_by_text(app_strings.browse_data.title)).to_have_count(0)
++
++            _toggle_pipeline(page, "alpha")
++            expect(page.get_by_role("heading", name=re.compile(r"Pipeline\s+alpha"))).to_be_visible(
++                timeout=15000
++            )
++
++
++def test_switch_pipeline_no_error_flash(page: Page):
++    """Switching A->B (a transient empty selection) lands on B with no error or stale hint."""
++    test_port = 2724
++    with isolated_workspace("pipelines"):
++        alpha = dlt.pipeline(pipeline_name="alpha", destination="duckdb")
++        alpha.run(fruitshop_source().with_resources("customers"))
++        time.sleep(1)
++        beta = dlt.pipeline(pipeline_name="beta", destination="duckdb")
++        beta.run(fruitshop_source().with_resources("inventory"))
++
++        with start_dashboard(port=test_port):
++            page.goto(f"http://localhost:{test_port}")
++            expect(page.get_by_role("heading", name=re.compile(r"Pipeline\s+beta"))).to_be_visible(
++                timeout=20000
++            )
++
++            _toggle_pipeline(page, "alpha")
++
++            expect(page.get_by_role("heading", name=re.compile(r"Pipeline\s+alpha"))).to_be_visible(
++                timeout=15000
++            )
++            expect(
++                page.get_by_text(app_strings.home_error_attach_pipeline.format("alpha"))
++            ).to_have_count(0)
++            expect(page.get_by_text("No pipeline selected")).to_have_count(0)
++
++
++def test_empty_workspace_bad_url_deselect_shows_no_pipelines(page: Page):
++    """An empty workspace opened with a bad ?pipeline= must show the no-pipelines landing once cleared."""
++    test_port = 2726
++    with isolated_workspace("pipelines"):
++        with start_dashboard(port=test_port):
++            page.goto(f"http://localhost:{test_port}/?pipeline=ghost")
++            expect(
++                page.get_by_text(app_strings.home_error_attach_pipeline.format("ghost")).first
++            ).to_be_visible(timeout=20000)
++
++            _toggle_pipeline(page, "ghost")
++
++            expect(page.get_by_text("No pipelines found yet").first).to_be_visible(timeout=15000)
++            expect(page.get_by_text("No pipeline selected")).to_have_count(0)
++            expect(page.get_by_text(app_strings.app_pipeline_select_label)).to_have_count(0)
++
++
++def test_bad_pipeline_url_keeps_selector(page: Page):
++    """An unknown ?pipeline= shows an attach error but keeps the dropdown so the user recovers."""
++    test_port = 2725
++    with isolated_workspace("pipelines"):
++        beta = dlt.pipeline(pipeline_name="beta", destination="duckdb")
++        beta.run(fruitshop_source().with_resources("inventory"))
++
++        with start_dashboard(port=test_port):
++            page.goto(f"http://localhost:{test_port}/?pipeline=ghost")
++            expect(
++                page.get_by_text(app_strings.home_error_attach_pipeline.format("ghost")).first
++            ).to_be_visible(timeout=20000)
++            expect(page.get_by_text(app_strings.app_pipeline_select_label)).to_have_count(1)
++            expect(page.get_by_role("button", name=app_strings.app_refresh_button)).to_have_count(0)
++
++            _toggle_pipeline(page, "beta")
++            expect(page.get_by_role("heading", name=re.compile(r"Pipeline\s+beta"))).to_be_visible(
++                timeout=15000
++            )
+diff --git a/tests/workspace/helpers/dashboard/conftest.py b/tests/workspace/helpers/dashboard/conftest.py
+index ad8893ef3..c36d75b69 100644
+--- a/tests/workspace/helpers/dashboard/conftest.py
++++ b/tests/workspace/helpers/dashboard/conftest.py
+@@ -4,6 +4,8 @@ from pathlib import Path
+ import pytest
+ import tempfile
+ 
++from dlt._workspace.helpers.dashboard import strings
++
+ from tests.workspace.helpers.dashboard.example_pipelines import (
+     create_success_pipeline_duckdb,
+     create_success_pipeline_filesystem,
+@@ -19,6 +21,22 @@ from tests.workspace.helpers.dashboard.example_pipelines import (
+ )
+ 
+ 
++def _visible_prefix(markdown_text: str) -> str:
++    """First plain-text run of a markdown landing string, before any markup.
++
++    marimo renders the landing strings as markdown (backticks become `<code>`,
++    links become `<a>`), so only this prefix appears verbatim in the rendered
++    output while staying tied to the source-of-truth copy in `strings.py`.
++    """
++    prefix = markdown_text.strip().split("`")[0].split(".")[0].strip()
++    assert prefix, f"no plain-text prefix in landing string: {markdown_text!r}"
++    return prefix
++
++
++NO_PIPELINES_TEXT = _visible_prefix(strings.home_no_pipelines)
++NO_TRACE_TEXT = _visible_prefix(strings.app_pipeline_no_trace)
++
++
+ # resolver to resolve strings to pipelines
+ @pytest.fixture
+ def pipeline(request):
+diff --git a/tests/workspace/helpers/dashboard/test_all_cells.py b/tests/workspace/helpers/dashboard/test_all_cells.py
+index b41a651aa..4c493d563 100644
+--- a/tests/workspace/helpers/dashboard/test_all_cells.py
++++ b/tests/workspace/helpers/dashboard/test_all_cells.py
+@@ -1,12 +1,16 @@
+ import os
+-from typing import List
++from typing import Any, Dict, List, Optional, cast
+ 
+-from dlt._workspace.helpers.dashboard import dlt_dashboard
++import pytest
++
++import dlt
++from dlt._workspace.helpers.dashboard import dlt_dashboard, strings
+ 
+ from marimo._ast.cell import Cell
+ import marimo as mo
+ from marimo._runtime.control_flow import MarimoStopError
+ from tests.utils import get_test_storage_root
++from tests.workspace.helpers.dashboard.conftest import NO_PIPELINES_TEXT, NO_TRACE_TEXT
+ 
+ global_defaults = {
+     "dlt_query_params": {},
+@@ -33,9 +37,12 @@ global_defaults = {
+     "dlt_query": "",
+     "dlt_loads_table": None,
+     "dlt_all_pipelines": [],
++    "dlt_local_pipeline_names": [],
+     "mo_cli_arg_with_test_identifiers": True,
+ }
+ 
++_DEFAULT_PIPELINES_DIR: str = cast(str, global_defaults["dlt_pipelines_dir"])
++
+ 
+ def test_run_all_cells():
+     """
+@@ -63,3 +70,126 @@ def test_run_all_cells():
+             print(f"Failed running cell {cell.name}: {e}")
+             print(f"Missing args: {missing_args}")
+             raise e
++
++
++def _run_home(
++    *,
++    dlt_pipeline_name: Any,
++    dlt_all_pipelines: List[Dict[str, str]],
++    dlt_local_pipeline_names: Optional[List[str]] = None,
++    dlt_pipelines_dir: str = _DEFAULT_PIPELINES_DIR,
++) -> str:
++    """Run the home cell with the given selection state and return its rendered text."""
++    if dlt_local_pipeline_names is None:
++        dlt_local_pipeline_names = [p["name"] for p in dlt_all_pipelines]
++
++    output, _ = cast(
++        Any,
++        dlt_dashboard.home.run(
++            dlt_profile_select=mo.ui.dropdown(["dev"]),
++            dlt_pipeline_select=mo.ui.multiselect(
++                [p["name"] for p in dlt_all_pipelines],
++                label=strings.app_pipeline_select_label,
++            ),
++            dlt_local_pipeline_names=dlt_local_pipeline_names,
++            dlt_pipelines_dir=dlt_pipelines_dir,
++            dlt_refresh_button=mo.ui.run_button(label=strings.app_refresh_button),
++            dlt_pipeline_name=dlt_pipeline_name,
++            dlt_file_watcher=None,
++        ),
++    )
++    return output.text if output is not None else ""
++
++
++def test_home_no_pipeline_selected(success_pipeline_duckdb: dlt.Pipeline):
++    """Pipelines exist but none selected: the cell picks the neutral hint, not the empty landing."""
++    html = _run_home(
++        dlt_pipeline_name=None,
++        dlt_all_pipelines=[{"name": success_pipeline_duckdb.pipeline_name}],
++        dlt_pipelines_dir=success_pipeline_duckdb.pipelines_dir,
++    )
++    assert strings.home_no_pipeline_selected in html
++    assert NO_PIPELINES_TEXT not in html
++
++
++def test_home_no_pipelines_at_all():
++    """Empty workspace: the cell picks the no-pipelines landing."""
++    html = _run_home(dlt_pipeline_name=None, dlt_all_pipelines=[])
++    assert NO_PIPELINES_TEXT in html
++    assert strings.home_no_pipeline_selected not in html
++
++
++def test_home_phantom_pipeline_shows_empty_landing():
++    """A ?pipeline= name with no directory on disk is not treated as an existing pipeline."""
++    html = _run_home(
++        dlt_pipeline_name=None,
++        dlt_all_pipelines=[{"name": "ghost"}],
++        dlt_local_pipeline_names=[],
++    )
++    assert NO_PIPELINES_TEXT in html
++    assert strings.home_no_pipeline_selected not in html
++
++
++def test_home_pipeline_selected(success_pipeline_duckdb: dlt.Pipeline):
++    """A pipeline is selected: render its home view, neither landing hint present."""
++    html = _run_home(
++        dlt_pipeline_name=success_pipeline_duckdb.pipeline_name,
++        dlt_all_pipelines=[{"name": success_pipeline_duckdb.pipeline_name}],
++        dlt_pipelines_dir=success_pipeline_duckdb.pipelines_dir,
++    )
++    assert NO_PIPELINES_TEXT not in html
++    assert strings.home_no_pipeline_selected not in html
++    assert strings.app_refresh_button in html
++
++
++def test_home_attach_error_keeps_selector_without_refresh():
++    """A pipeline that cannot be attached shows the error and keeps the selector, no refresh."""
++    html = _run_home(dlt_pipeline_name="ghost", dlt_all_pipelines=[{"name": "ghost"}])
++    assert strings.home_error_attach_pipeline.format("ghost") in html
++    assert strings.app_pipeline_select_label in html
++    assert strings.app_refresh_button not in html
++
++
++_SECTION_SWITCH_DEFAULTS = {
++    "dlt_section_info_switch": mo.ui.switch(value=True),
++    "dlt_section_schema_switch": mo.ui.switch(value=True),
++    "dlt_section_state_switch": mo.ui.switch(value=True),
++    "dlt_section_trace_switch": mo.ui.switch(value=True),
++    "dlt_section_loads_switch": mo.ui.switch(value=True),
++    "dlt_trace_steps_table": None,
++    "dlt_config": None,
++}
++
++
++@pytest.mark.parametrize(
++    "cell_name",
++    [
++        "section_info",
++        "section_schema",
++        "section_state",
++        "section_trace",
++        "section_loads",
++    ],
++)
++def test_sections_render_no_content_without_pipeline(cell_name: str):
++    """Deselecting a pipeline leaves no stale section content (marker stays empty)."""
++    cell = getattr(dlt_dashboard, cell_name)
++    defaults = {**global_defaults, **_SECTION_SWITCH_DEFAULTS, "dlt_pipeline": None}
++    run_args = {k: v for k, v in defaults.items() if k in cell.refs}
++    output, _ = cast(Any, cell.run(**run_args))
++    text = output.text if output is not None else ""
++    assert "has-content" not in text
++
++
++def test_home_selected_pipeline_never_ran_stays_on_selected_path(
++    never_ran_pipline: dlt.Pipeline,
++):
++    """A selected pipeline with no trace shows its no-trace hint, not a landing hint."""
++    html = _run_home(
++        dlt_pipeline_name=never_ran_pipline.pipeline_name,
++        dlt_all_pipelines=[{"name": never_ran_pipline.pipeline_name}],
++        dlt_pipelines_dir=never_ran_pipline.pipelines_dir,
++    )
++    assert NO_TRACE_TEXT in html
++    assert NO_PIPELINES_TEXT not in html
++    assert strings.home_no_pipeline_selected not in html
+diff --git a/tests/workspace/helpers/dashboard/test_cli_utils.py b/tests/workspace/helpers/dashboard/test_cli_utils.py
+index ee5186f3e..0195970a5 100644
+--- a/tests/workspace/helpers/dashboard/test_cli_utils.py
++++ b/tests/workspace/helpers/dashboard/test_cli_utils.py
+@@ -17,7 +17,7 @@ from tests.workspace.helpers.dashboard.example_pipelines import (
+ @pytest.mark.parametrize("pipeline", ALL_PIPELINES, indirect=True)
+ def test_get_pipelines(pipeline: dlt.Pipeline):
+     """Test getting local pipelines"""
+-    pipelines_dir, pipelines = cli_utils.list_local_pipelines(pipeline.pipelines_dir)
++    pipelines_dir, pipelines, _ = cli_utils.list_local_pipelines(pipeline.pipelines_dir)
+     assert pipelines_dir == pipeline.pipelines_dir
+     assert len(pipelines) == 1
+     assert pipelines[0]["name"] == pipeline.pipeline_name
+@@ -25,7 +25,7 @@ def test_get_pipelines(pipeline: dlt.Pipeline):
+ 
+ def test_get_local_pipelines_with_temp_dir(temp_pipelines_dir):
+     """Test getting local pipelines with temporary directory"""
+-    pipelines_dir, pipelines = cli_utils.list_local_pipelines(temp_pipelines_dir)
++    pipelines_dir, pipelines, _ = cli_utils.list_local_pipelines(temp_pipelines_dir)
+ 
+     assert pipelines_dir == temp_pipelines_dir
+     assert len(pipelines) == 3  # success_pipeline_1, success_pipeline_2, _dlt_internal
+@@ -45,7 +45,7 @@ def test_get_local_pipelines_with_temp_dir(temp_pipelines_dir):
+ def test_get_local_pipelines_empty_dir():
+     """Test getting local pipelines from empty directory"""
+     with tempfile.TemporaryDirectory() as temp_dir:
+-        pipelines_dir, pipelines = cli_utils.list_local_pipelines(temp_dir)
++        pipelines_dir, pipelines, _ = cli_utils.list_local_pipelines(temp_dir)
+ 
+         assert pipelines_dir == temp_dir
+         assert pipelines == []
+@@ -54,12 +54,28 @@ def test_get_local_pipelines_empty_dir():
+ def test_get_local_pipelines_nonexistent_dir():
+     """Test getting local pipelines from nonexistent directory"""
+     nonexistent_dir = "/nonexistent/directory"
+-    pipelines_dir, pipelines = cli_utils.list_local_pipelines(nonexistent_dir)
++    pipelines_dir, pipelines, _ = cli_utils.list_local_pipelines(nonexistent_dir)
+ 
+     assert pipelines_dir == nonexistent_dir
+     assert pipelines == []
+ 
+ 
++def test_get_local_pipelines_returns_local_names_without_additional(temp_pipelines_dir):
++    """Returned local names only include pipeline directories discovered on disk."""
++    pipelines_dir, pipelines, local_pipeline_names = cli_utils.list_local_pipelines(
++        temp_pipelines_dir,
++        additional_pipelines=["ghost", "..", "/etc"],
++    )
++
++    assert pipelines_dir == temp_pipelines_dir
++    assert "ghost" in {p["name"] for p in pipelines}
++    assert set(local_pipeline_names) == {
++        "success_pipeline_1",
++        "success_pipeline_2",
++        "_dlt_internal",
++    }
++
++
+ @pytest.mark.parametrize("pipeline", ALL_PIPELINES, indirect=True)
+ def test_get_pipeline_last_run(pipeline: dlt.Pipeline):
+     """Test getting the last run of a pipeline"""
+@@ -76,7 +92,7 @@ def test_get_pipeline_last_run(pipeline: dlt.Pipeline):
+ 
+ def test_integration_get_local_pipelines_with_sorting(temp_pipelines_dir):
+     """Test integration scenario with multiple pipelines sorted by timestamp"""
+-    pipelines_dir, pipelines = cli_utils.list_local_pipelines(
++    pipelines_dir, pipelines, _ = cli_utils.list_local_pipelines(
+         temp_pipelines_dir, sort_by_trace=True
+     )
+ 
+diff --git a/tests/workspace/helpers/dashboard/test_home.py b/tests/workspace/helpers/dashboard/test_home.py
+new file mode 100644
+index 000000000..a1dde52c3
+--- /dev/null
++++ b/tests/workspace/helpers/dashboard/test_home.py
+@@ -0,0 +1,32 @@
++import marimo as mo
++
++from dlt._workspace.helpers.dashboard import strings
++from dlt._workspace.helpers.dashboard.utils import home
++
++from tests.workspace.helpers.dashboard.conftest import NO_PIPELINES_TEXT
++
++
++def _profile_select() -> mo.ui.dropdown:
++    return mo.ui.dropdown(["dev"])
++
++
++def _pipeline_select() -> mo.ui.multiselect:
++    return mo.ui.multiselect(["my_pipeline"], label=strings.app_pipeline_select_label)
++
++
++def test_render_no_pipeline_selected_home_keeps_dropdown():
++    """The deselected landing keeps the pipeline dropdown and shows the neutral hint."""
++    html = mo.vstack(
++        home.render_no_pipeline_selected_home(_profile_select(), _pipeline_select())
++    ).text
++    assert strings.app_pipeline_select_label in html
++    assert strings.home_no_pipeline_selected in html
++    assert NO_PIPELINES_TEXT not in html
++
++
++def test_render_no_pipelines_home_omits_dropdown():
++    """Regression guard for the scaffold refactor: empty workspace omits the dropdown."""
++    html = mo.vstack(home.render_no_pipelines_home(_profile_select())).text
++    assert strings.app_pipeline_select_label not in html
++    assert NO_PIPELINES_TEXT in html
++    assert strings.home_no_pipeline_selected not in html
+diff --git a/tests/workspace/helpers/dashboard/test_pipeline_operations.py b/tests/workspace/helpers/dashboard/test_pipeline_operations.py
+index e0756a302..bd06d157e 100644
+--- a/tests/workspace/helpers/dashboard/test_pipeline_operations.py
++++ b/tests/workspace/helpers/dashboard/test_pipeline_operations.py
+@@ -1,7 +1,8 @@
++from typing import Set
++
+ import pytest
+ import marimo as mo
+ import dlt
+-from typing import Set
+ 
+ from dlt._workspace.helpers.dashboard.config import DashboardConfiguration
+ from dlt._workspace.helpers.dashboard.utils.pipeline import (
+diff --git a/tests/workspace/mcp/test_mcp_tools.py b/tests/workspace/mcp/test_mcp_tools.py
+index 1e8bf662d..5f0739ba2 100644
+--- a/tests/workspace/mcp/test_mcp_tools.py
++++ b/tests/workspace/mcp/test_mcp_tools.py
+@@ -55,11 +55,11 @@ def test_list_pipelines(pokemon_pipeline_context: RunContextBase) -> None:
+ 
+ def test_list_pipelines_project_dir_filter(pokemon_pipeline_context: RunContextBase) -> None:
+     local_dir = pokemon_pipeline_context.local_dir
+-    _, pipelines = list_local_pipelines(sort_by_trace=False, run_dir=local_dir)
++    _, pipelines, _ = list_local_pipelines(sort_by_trace=False, run_dir=local_dir)
+     assert any(p["name"] == "rest_api_pokemon" for p in pipelines)
+ 
+     # a different project_dir should filter it out
+-    _, pipelines = list_local_pipelines(sort_by_trace=False, run_dir="/nonexistent/path")
++    _, pipelines, _ = list_local_pipelines(sort_by_trace=False, run_dir="/nonexistent/path")
+     assert not any(p["name"] == "rest_api_pokemon" for p in pipelines)
+ 
+ 
+
+
+===== COMMIT b462ecb2 =====
+
+
+commit b462ecb20
+Author: rudolfix
+Date: 2026-06-23
+
+    fixes windows path for griffe tests (#4104)
+
+diff --git a/tools/tests/test_check_api_breaking.py b/tools/tests/test_check_api_breaking.py
+index e762e1181..7fe171848 100644
+--- a/tools/tests/test_check_api_breaking.py
++++ b/tools/tests/test_check_api_breaking.py
+@@ -1,6 +1,6 @@
+ """Tests for tools/check_api_breaking.py."""
+ 
+-from pathlib import Path
++from pathlib import Path, PureWindowsPath, WindowsPath
+ from types import SimpleNamespace
+ from typing import Any, Type
+ 
+@@ -20,14 +20,16 @@ def test_breakage_source_file_direct() -> None:
+     obj = SimpleNamespace(
+         is_alias=False, relative_package_filepath=Path("dlt/pipeline/pipeline.py")
+     )
+-    assert _breakage_source_file(_breakage(obj)) == "dlt/pipeline/pipeline.py"
++    assert _breakage_source_file(_breakage(obj)) == str(Path("dlt/pipeline/pipeline.py"))
+ 
+ 
+ def test_breakage_source_file_alias_uses_parent() -> None:
+     """An alias is attributed to its parent's file, not its own."""
+-    parent = SimpleNamespace(relative_package_filepath=Path("dlt/__init__.py"))
+-    alias = SimpleNamespace(is_alias=True, parent=parent)
+-    assert _breakage_source_file(_breakage(alias)) == "dlt/__init__.py"
++    parent = SimpleNamespace(relative_package_filepath=Path("dlt"))
++    alias = SimpleNamespace(
++        is_alias=True, parent=parent, relative_package_filepath=Path("dlt/__init__.py")
++    )
++    assert _breakage_source_file(_breakage(alias)) == "dlt"
+ 
+ 
+ @pytest.mark.parametrize("exc", [ValueError, AttributeError])
+@@ -46,7 +48,7 @@ def test_public_api_reports_roots_and_sources() -> None:
+     root_to_names, source_files = public_api()
+     assert set(root_to_names) == set(PUBLIC_API_ROOTS)
+     # every root contributes at least its own __init__.py
+-    assert "dlt/__init__.py" in source_files
++    assert str(Path("dlt/__init__.py")) in source_files
+     assert all(f.endswith(".py") for f in source_files)
+ 
+ 
+
+
+===== COMMIT fde46923 =====
+
+
+commit fde469238
+Author: Adam Johnston
+Date: 2026-06-21
+
+    Fix logging more frequent than log_period (#3962)
+
+diff --git a/dlt/common/runtime/collector.py b/dlt/common/runtime/collector.py
+index ef6168243..e1176a909 100644
+--- a/dlt/common/runtime/collector.py
++++ b/dlt/common/runtime/collector.py
+@@ -160,7 +160,6 @@ class LogCollector(Collector):
+                 total=total,
+             )
+             self.messages[counter_key] = None
+-            self.last_log_time = None
+         else:
+             counter_info = self.counter_info[counter_key]
+             if inc_total:
+@@ -255,7 +254,8 @@ class LogCollector(Collector):
+         self.counters = defaultdict(int)
+         self.counter_info = {}
+         self.messages = {}
+-        self.last_log_time = self._clock()
++        # log immediately on the first update
++        self.last_log_time = None
+ 
+     def _stop(self) -> None:
+         self.on_log()
+diff --git a/tests/common/runtime/test_collector.py b/tests/common/runtime/test_collector.py
+index dbe4b8c94..383267feb 100644
+--- a/tests/common/runtime/test_collector.py
++++ b/tests/common/runtime/test_collector.py
+@@ -1,7 +1,8 @@
++import io
+ from collections import defaultdict
+ 
+ import pytest
+-from dlt.common.runtime.collector import NullCollector, DictCollector, Collector
++from dlt.common.runtime.collector import NullCollector, DictCollector, LogCollector, Collector
+ 
+ 
+ def test_null_collector() -> None:
+@@ -46,3 +47,27 @@ def test_dict_collector_reset_counters():
+ 
+     with DictCollector()("test2") as collector:
+         assert collector.counters == defaultdict(int)
++
++
++def test_log_collector_respects_log_period() -> None:
++    # adding more counters do not dump them all immediately
++    clock = [0.0]
++    buf = io.StringIO()
++    collector = LogCollector(log_period=10.0, logger=buf, dump_system_stats=False)
++    collector._clock = lambda: clock[0]  # type: ignore[assignment]
++
++    with collector("Extract"):
++        # first update logs immediately so the step shows up at once
++        collector.update("resource_0", inc=1)
++        assert buf.getvalue().count("Extract") == 1
++        # many new counters within the same period add no further logs
++        for i in range(1, 100):
++            collector.update(f"resource_{i}", inc=1)
++        assert buf.getvalue().count("Extract") == 1
++        # crossing log_period emits exactly one more log
++        clock[0] = 10.0
++        collector.update("resource_100", inc=1)
++        assert buf.getvalue().count("Extract") == 2
++
++    # _stop always emits a final log
++    assert buf.getvalue().count("Extract") == 3
+
+
+===== COMMIT a9eda0a9 =====
+
+
+commit a9eda0a9a
+Author: Filipe Silva
+Date: 2026-06-21
+
+    feat: clickhouse staging-optimized (#3927)
+
+diff --git a/dlt/destinations/impl/clickhouse/clickhouse.py b/dlt/destinations/impl/clickhouse/clickhouse.py
+index 98481e59b..86ecf884b 100644
+--- a/dlt/destinations/impl/clickhouse/clickhouse.py
++++ b/dlt/destinations/impl/clickhouse/clickhouse.py
+@@ -1,6 +1,6 @@
+ from copy import deepcopy
+ from textwrap import dedent
+-from typing import Any, Dict, Literal, Optional, List, Sequence, cast
++from typing import Any, Dict, Iterable, Literal, Optional, List, Sequence, cast
+ from urllib.parse import ParseResult, urlparse
+ 
+ import clickhouse_connect
+@@ -31,6 +31,8 @@ from dlt.common.schema.utils import (
+ from dlt.common.storages import FileStorage
+ from dlt.common.storages.configuration import FilesystemConfiguration, ensure_canonical_az_url
+ from dlt.common.storages.fsspec_filesystem import AZURE_BLOB_STORAGE_PROTOCOLS
++from dlt.common.storages.load_package import ParsedLoadJobFileName
++from dlt.common.destination.exceptions import DestinationTerminalException
+ from dlt.destinations.exceptions import LoadJobTerminalException
+ from dlt.destinations.impl.clickhouse.configuration import (
+     ClickHouseClientConfiguration,
+@@ -62,7 +64,7 @@ from dlt.destinations.job_client_impl import (
+ )
+ from dlt.destinations.job_impl import ReferenceFollowupJobRequest
+ from dlt.destinations.sql_client import SqlClientBase
+-from dlt.destinations.sql_jobs import SqlMergeFollowupJob
++from dlt.destinations.sql_jobs import SqlMergeFollowupJob, SqlStagingReplaceFollowupJob
+ from dlt.destinations.utils import get_deterministic_temp_table_name
+ from dlt.destinations.path_utils import get_file_format_and_compression
+ 
+@@ -296,6 +298,29 @@ class ClickHouseMergeJob(SqlMergeFollowupJob):
+         return False
+ 
+ 
++class ClickHouseStagingReplaceJob(SqlStagingReplaceFollowupJob):
++    """Atomic staging-optimized replace via `EXCHANGE TABLES`.
++
++    Requires the destination database to use the `Atomic` or `Shared` engine.
++    The previous destination data lands in the staging slot after the swap; dlt
++    truncates staging tables at the start of the next load.
++    """
++
++    @classmethod
++    def generate_sql(
++        cls,
++        table_chain: Sequence[PreparedTableSchema],
++        sql_client: SqlClientBase[Any],
++    ) -> List[str]:
++        sql: List[str] = []
++        for table in table_chain:
++            with sql_client.with_staging_dataset():
++                staging_table_name = sql_client.make_qualified_table_name(table["name"])
++            table_name = sql_client.make_qualified_table_name(table["name"])
++            sql.append(f"EXCHANGE TABLES {staging_table_name} AND {table_name}")
++        return sql
++
++
+ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestination):
+     def __init__(
+         self,
+@@ -348,6 +373,42 @@ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
+     ) -> List[FollowupJobRequest]:
+         return [ClickHouseMergeJob.from_table_chain(table_chain, self.sql_client)]
+ 
++    def _create_replace_followup_jobs(
++        self, table_chain: Sequence[PreparedTableSchema]
++    ) -> List[FollowupJobRequest]:
++        root_table = table_chain[0]
++        if root_table["x-replace-strategy"] == "staging-optimized":  # type: ignore[typeddict-item]
++            return [ClickHouseStagingReplaceJob.from_table_chain(table_chain, self.sql_client)]
++        return super()._create_replace_followup_jobs(table_chain)
++
++    def verify_schema(
++        self,
++        only_tables: Iterable[str] = None,
++        new_jobs: Iterable[ParsedLoadJobFileName] = None,
++    ) -> List[PreparedTableSchema]:
++        loaded_tables = super().verify_schema(only_tables, new_jobs)
++        # probe the database engine early so staging-optimized fails fast at init,
++        # before any data is extracted or loaded into staging
++        if any(
++            table.get("x-replace-strategy") == "staging-optimized" for table in loaded_tables
++        ):
++            self._verify_database_supports_exchange()
++        return loaded_tables
++
++    def _verify_database_supports_exchange(self) -> None:
++        # `EXCHANGE TABLES` is only supported on Atomic and Shared database engines
++        result = self.sql_client.execute_sql(
++            "SELECT engine FROM system.databases WHERE name = currentDatabase()"
++        )
++        engine = result[0][0] if result else "unknown"
++        if engine not in ("Atomic", "Shared"):
++            raise DestinationTerminalException(
++                "ClickHouse replace_strategy='staging-optimized' requires the Atomic or Shared"
++                f" database engine to use EXCHANGE TABLES (current: {engine}). Either choose"
++                " 'insert-from-staging' or 'truncate-and-insert', or recreate the database with"
++                " ENGINE = Atomic."
++            )
++
+     def _get_column_def_sql(self, c: TColumnSchema, table: PreparedTableSchema = None) -> str:
+         # Build column definition.
+         # The primary key and sort order definition is defined outside column specification.
+diff --git a/dlt/destinations/impl/clickhouse/factory.py b/dlt/destinations/impl/clickhouse/factory.py
+index f274cf74d..9589671fb 100644
+--- a/dlt/destinations/impl/clickhouse/factory.py
++++ b/dlt/destinations/impl/clickhouse/factory.py
+@@ -226,7 +226,11 @@ class clickhouse(Destination[ClickHouseClientConfiguration, "ClickHouseClient"])
+         caps.supports_truncate_command = True
+ 
+         caps.supported_merge_strategies = ["delete-insert", "scd2"]
+-        caps.supported_replace_strategies = ["truncate-and-insert", "insert-from-staging"]
++        caps.supported_replace_strategies = [
++            "truncate-and-insert",
++            "insert-from-staging",
++            "staging-optimized",
++        ]
+         caps.enforces_nulls_on_alter = False
+ 
+         caps.sqlglot_dialect = "clickhouse"
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+index 1623a0b25..ce2e01a8a 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+@@ -112,6 +112,8 @@ select_sequential_consistency = 1                       # Ensures read-after-wri
+ 
+ All [write dispositions](../../general-usage/incremental-loading#choosing-a-write-disposition) are supported.
+ 
++If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be atomically swapped with the staging tables via [`EXCHANGE TABLES`](https://clickhouse.com/docs/en/sql-reference/statements/exchange) (requires `Atomic` or `Shared` database engine).
++
+ ## Data loading
+ 
+ Data is loaded into ClickHouse using the most efficient method depending on the data source:
+diff --git a/tests/load/clickhouse/test_clickhouse_configuration.py b/tests/load/clickhouse/test_clickhouse_configuration.py
+index ee6b3562f..bd9ca3163 100644
+--- a/tests/load/clickhouse/test_clickhouse_configuration.py
++++ b/tests/load/clickhouse/test_clickhouse_configuration.py
+@@ -1,8 +1,10 @@
+ from typing import Iterator
+ 
+ import pytest
++from pytest_mock import MockerFixture
+ 
+ from dlt.common.configuration.resolve import resolve_configuration
++from dlt.common.destination.exceptions import DestinationTerminalException
+ from dlt.common.libs.sql_alchemy_compat import make_url
+ from dlt.common.utils import custom_environ, digest128
+ from dlt.destinations import clickhouse
+@@ -146,3 +148,28 @@ def test_client_table_name_and_paths(client: ClickHouseClient) -> None:
+     parts = client.sql_client.make_qualified_table_name_path("test_table", quote=False)
+     assert parts[0] in databases
+     assert parts[1] == f"{dataset_name}###test_table"
++
++
++@pytest.mark.parametrize("engine", ["Atomic", "Shared"])
++def test_staging_optimized_accepts_supported_engines(
++    client: ClickHouseClient, mocker: MockerFixture, engine: str
++) -> None:
++    mocker.patch.object(client.sql_client, "execute_sql", return_value=[(engine,)])
++    client._verify_database_supports_exchange()
++
++
++@pytest.mark.parametrize("engine", ["Ordinary", "Replicated", "Lazy"])
++def test_staging_optimized_rejects_unsupported_engines(
++    client: ClickHouseClient, mocker: MockerFixture, engine: str
++) -> None:
++    mocker.patch.object(client.sql_client, "execute_sql", return_value=[(engine,)])
++    with pytest.raises(DestinationTerminalException, match="Atomic or Shared"):
++        client._verify_database_supports_exchange()
++
++
++def test_staging_optimized_rejects_missing_engine(
++    client: ClickHouseClient, mocker: MockerFixture
++) -> None:
++    mocker.patch.object(client.sql_client, "execute_sql", return_value=[])
++    with pytest.raises(DestinationTerminalException, match="unknown"):
++        client._verify_database_supports_exchange()
+diff --git a/tests/load/pipeline/test_replace_disposition.py b/tests/load/pipeline/test_replace_disposition.py
+index 79124d6e5..d51ca76d0 100644
+--- a/tests/load/pipeline/test_replace_disposition.py
++++ b/tests/load/pipeline/test_replace_disposition.py
+@@ -408,6 +408,11 @@ def test_replace_sql_queries(
+ 
+         destination_spy = mocker.spy(MsSqlStagingReplaceJob, "generate_sql")
+ 
++    elif dest_type == "clickhouse":
++        from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseStagingReplaceJob
++
++        destination_spy = mocker.spy(ClickHouseStagingReplaceJob, "generate_sql")
++
+     pipeline = destination_config.setup_pipeline(
+         f"insert_from_staging_test_{uniq_id()}", dev_mode=True
+     )
+@@ -439,7 +444,7 @@ def test_replace_sql_queries(
+             )
+ 
+     elif replace_strategy == "staging-optimized":
+-        if dest_type in ["postgres", "mssql"]:
++        if dest_type in ["postgres", "mssql", "clickhouse"]:
+             assert destination_spy.call_count == 1
+         else:
+             assert clone_sql_generator_spy.call_count == 1
+
+
+===== COMMIT bffc2dab =====
+
+
+commit bffc2dabb
+Author: Yash Singh
+Date: 2026-06-19
+
+    fix(common): use ISO week/year in detect_datetime_format so week-date cursors round-trip (#4061)
+
+diff --git a/dlt/common/time.py b/dlt/common/time.py
+index 0393d9db2..4723a5a24 100644
+--- a/dlt/common/time.py
++++ b/dlt/common/time.py
+@@ -383,9 +383,9 @@ def detect_datetime_format(value: str) -> Optional[str]:
+         re.compile(r"^\d{4}-\d{2}-\d{2}$"): "%Y-%m-%d",  # Date only
+         re.compile(r"^\d{4}-\d{2}$"): "%Y-%m",  # Year and month
+         re.compile(r"^\d{4}$"): "%Y",  # Year only
+-        # Week-based date formats
+-        re.compile(r"^\d{4}-W\d{2}$"): "%Y-W%W",  # Week-based date
+-        re.compile(r"^\d{4}-W\d{2}-\d{1}$"): "%Y-W%W-%u",  # Week-based date with day
++        # Week-based date formats (ISO 8601: week-numbering year %G + ISO week %V)
++        re.compile(r"^\d{4}-W\d{2}$"): "%G-W%V",  # Week-based date
++        re.compile(r"^\d{4}-W\d{2}-\d{1}$"): "%G-W%V-%u",  # Week-based date with day
+         # Ordinal date formats (day of year)
+         re.compile(r"^\d{4}-\d{3}$"): "%Y-%j",  # Ordinal date
+         # Compact formats (no dashes)
+diff --git a/tests/common/storages/test_local_filesystem.py b/tests/common/storages/test_local_filesystem.py
+index 6f84762d7..abc95ad70 100644
+--- a/tests/common/storages/test_local_filesystem.py
++++ b/tests/common/storages/test_local_filesystem.py
+@@ -53,7 +53,7 @@ def test_local_path_win_configuration(bucket_url: str, file_url: str) -> None:
+     last_err: Exception = None
+     for attempt in range(3 if is_unc else 1):
+         try:
+-            assert FilesystemConfiguration.make_file_url(bucket_url) == file_url
++            assert FilesystemConfiguration.make_file_url(bucket_url).lower() == file_url.lower()
+             break
+         except OSError as e:
+             last_err = e
+@@ -64,7 +64,8 @@ def test_local_path_win_configuration(bucket_url: str, file_url: str) -> None:
+ 
+     c = resolve_configuration(FilesystemConfiguration(bucket_url))
+     assert c.protocol == "file"
+-    assert c.bucket_url == file_url
++    # bucket_url is normalized via make_file_url, so it carries the same canonicalized case
++    assert c.bucket_url.lower() == file_url.lower()
+     assert FilesystemConfiguration.make_local_path(c.bucket_url) == str(
+         pathlib.Path(bucket_url).resolve()
+     )
+diff --git a/tests/common/test_time.py b/tests/common/test_time.py
+index b5feecd6b..1d9cf59f7 100644
+--- a/tests/common/test_time.py
++++ b/tests/common/test_time.py
+@@ -427,8 +427,8 @@ def test_datetime_to_timestamp_helpers(
+         ("2024-10-20", "%Y-%m-%d"),  # Date only
+         ("2024-10", "%Y-%m"),  # Year and month
+         ("2024", "%Y"),  # Year only
+-        ("2024-W42", "%Y-W%W"),  # Week-based date
+-        ("2024-W42-5", "%Y-W%W-%u"),  # Week-based date with day
++        ("2024-W42", "%G-W%V"),  # Week-based date
++        ("2024-W42-5", "%G-W%V-%u"),  # Week-based date with day
+         ("2024-293", "%Y-%j"),  # Ordinal date
+         ("20241020", "%Y%m%d"),  # Compact date format
+         # ("202410", "%Y%m"),  # Compact year and month format NOTE: does not pass with pendulum < 3.0.0
+@@ -439,6 +439,28 @@ def test_detect_datetime_format(value, expected_format) -> None:
+     assert ensure_pendulum_datetime_utc(value) is not None
+ 
+ 
++@pytest.mark.parametrize(
++    "value",
++    [
++        # ISO week dates around year boundaries where the ISO week-numbering year
++        # differs from the calendar year. `%W`/`%Y` produce the wrong week here,
++        # only `%V`/`%G` round-trip.
++        "2026-W01",  # ISO week 1 of 2026 starts 2025-12-29
++        "2026-W01-1",
++        "2020-W53",  # 2020 has 53 ISO weeks
++        "2021-W01",
++        "2024-W42",
++        "2024-W42-5",
++    ],
++)
++def test_detect_datetime_format_week_roundtrip(value: str) -> None:
++    # the detected format must reproduce the original string when used to render
++    # the value parsed from it (this is how lag re-serializes string cursors)
++    fmt = detect_datetime_format(value)
++    parsed = ensure_pendulum_datetime_non_utc(value)
++    assert datetime_obj_to_str(parsed, fmt) == value
++
++
+ @pytest.mark.parametrize(
+     "datetime_str, datetime_format, expected_value",
+     [
+diff --git a/tests/extract/test_lag.py b/tests/extract/test_lag.py
+index 7a3e34ca9..ef6204cbd 100644
+--- a/tests/extract/test_lag.py
++++ b/tests/extract/test_lag.py
+@@ -211,6 +211,13 @@ def test_apply_lag_to_pendulum_date(
+         # String date - YYYYMMDD format
+         (1, "20230115", max, "20230114"),
+         (1, "20230115", min, "20230116"),
++        # ISO week dates crossing a year boundary where the week-numbering year
++        # differs from the calendar year (regression guard for %V vs %W detection)
++        (604800, "2026-W01", max, "2025-W52"),
++        (604800, "2026-W01", min, "2026-W02"),
++        (86400, "2026-W01-1", min, "2026-W01-2"),
++        (604800, "2020-W53", min, "2021-W01"),
++        (604800, "2021-W01", max, "2020-W53"),
+     ],
+     ids=[
+         "string_datetime_utc_max_1hour",
+@@ -225,6 +232,11 @@ def test_apply_lag_to_pendulum_date(
+         "string_date_iso_min_7days",
+         "string_date_compact_max_1day",
+         "string_date_compact_min_1day",
++        "string_week_iso_max_boundary",
++        "string_week_iso_min_boundary",
++        "string_week_iso_day_min",
++        "string_week_iso_53_min",
++        "string_week_iso_max_to_53",
+     ],
+ )
+ def test_apply_lag_to_str_value(
+
+
+===== COMMIT 07e8d3d5 =====
+
+
+commit 07e8d3d5a
+Author: rudolfix
+Date: 2026-06-19
+
+    removes 0x0 from postgres INSERT strings, splits INSERT lines only by \n (#4086)
+
+diff --git a/dlt/common/data_writers/escape.py b/dlt/common/data_writers/escape.py
+index e6237d45e..6303820bd 100644
+--- a/dlt/common/data_writers/escape.py
++++ b/dlt/common/data_writers/escape.py
+@@ -8,7 +8,9 @@ from dlt.common.pendulum import pendulum
+ from dlt.common.time import reduce_pendulum_datetime_precision
+ 
+ # use regex to escape characters in single pass
+-SQL_ESCAPE_DICT = {"'": "''", "\\": "\\\\", "\n": "\\n", "\r": "\\r"}
++# NUL (\x00) is stripped: postgres/redshift cannot store it in text and duckdb cannot parse it
++# inside an inline string literal (the query is a NUL-terminated string)
++SQL_ESCAPE_DICT = {"'": "''", "\\": "\\\\", "\n": "\\n", "\r": "\\r", "\x00": ""}
+ 
+ 
+ def _make_sql_escape_re(escape_dict: Dict[str, str]) -> re.Pattern:  # type: ignore[type-arg]
+diff --git a/dlt/destinations/insert_job_client.py b/dlt/destinations/insert_job_client.py
+index 1a11fed88..04c1a41ab 100644
+--- a/dlt/destinations/insert_job_client.py
++++ b/dlt/destinations/insert_job_client.py
+@@ -65,7 +65,12 @@ class InsertValuesLoadJob(RunnableLoadJob, HasFollowupJobs):
+                     until_nl = until_nl[: -len(sep)] + ";"  # replace the separator with ";"
+                 if max_rows is not None:
+                     # mssql has a limit of 1000 rows per INSERT, so we need to split into separate statements
+-                    values_rows = content.splitlines(keepends=True)
++                    # split on the newline row separator only; str.splitlines() also breaks on
++                    # \v \f \x1c-\x1e \x85   which may appear unescaped inside string values
++                    parts = content.split("\n")
++                    values_rows = [row + "\n" for row in parts[:-1]]
++                    if parts[-1]:
++                        values_rows.append(parts[-1])
+                     len_rows = len(values_rows)
+                     processed = 0
+                     # Chunk by max_rows - 1 for simplicity because one more row may be added
+diff --git a/tests/load/test_insert_job_client.py b/tests/load/test_insert_job_client.py
+index 44dde5187..8b383536e 100644
+--- a/tests/load/test_insert_job_client.py
++++ b/tests/load/test_insert_job_client.py
+@@ -302,6 +302,83 @@ def test_query_split(client: InsertValuesJobClient, file_storage: FileStorage) -
+     assert mocked_fragments.call_count == 1
+ 
+ 
++@pytest.mark.parametrize(
++    "client",
++    destinations_configs(
++        default_sql_configs=True, subset=["duckdb", "postgres", "redshift", "motherduck"]
++    ),
++    indirect=True,
++    ids=lambda x: x.name,
++)
++def test_insert_nul_in_string(client: InsertValuesJobClient, file_storage: FileStorage) -> None:
++    # an embedded NUL (eg. coming from mongo) cannot be stored in these engines via an inline
++    # INSERT literal - the query is parsed as a NUL-terminated string. the escaper strips it
++    user_table_name = prepare_table(client)
++    canonical_name = client.sql_client.make_qualified_table_name(user_table_name)
++    nul_value = client.capabilities.escape_literal("hello\x00world")
++    insert_sql = "INSERT INTO {}(_dlt_id, _dlt_root_id, sender_id, timestamp, text)\nVALUES\n"
++    insert_values = (
++        f"('{uniq_id()}', '{uniq_id()}', '90238094809sajlkjxoiewjhduuiuehd',"
++        f" '{str(pendulum.now())}', {nul_value});"
++    )
++    expect_load_file(
++        client,
++        file_storage,
++        insert_sql + insert_values,
++        user_table_name,
++        file_format="insert_values",
++    )
++    rows = client.sql_client.execute_sql(f"SELECT text FROM {canonical_name}")
++    # NUL stripped, the rest of the string is preserved
++    assert rows[0][0] == "helloworld"
++
++
++@pytest.mark.parametrize(
++    "client",
++    destinations_configs(default_sql_configs=True, subset=DEFAULT_SUBSET),
++    indirect=True,
++    ids=lambda x: x.name,
++)
++def test_insert_unicode_line_separators(
++    client: InsertValuesJobClient, file_storage: FileStorage
++) -> None:
++    # characters that str.splitlines() treats as line boundaries but the writer does not escape.
++    # they must not split a VALUES row when the loader reassembles statements on the max_rows path
++    weird = "a b c\x85d\x0be\x0cf\x1cg\x1dh\x1ei"
++    writer_type = client.capabilities.insert_values_writer_type
++    if writer_type == "default":
++        pre, post, sep = ("(", ")", ",\n")
++    elif writer_type == "select_union":
++        pre, post, sep = ("SELECT ", "", " UNION ALL\n")
++
++    user_table_name = prepare_table(client)
++    canonical_name = client.sql_client.make_qualified_table_name(user_table_name)
++    # build 4 rows, the third carries the weird value in text
++    rows = []
++    for i in range(4):
++        text_value = client.capabilities.escape_literal(weird if i == 2 else f"plain{i}")
++        rows.append(
++            pre
++            + f"'{i}', '{uniq_id()}', '90238094809sajlkjxoiewjhduuiuehd',"
++            f" '{str(pendulum.now().add(seconds=i))}', {text_value}"
++            + post
++        )
++    insert_sql = "INSERT INTO {}(_dlt_id, _dlt_root_id, sender_id, timestamp, text)\n"
++    if writer_type == "default":
++        insert_sql += "VALUES\n"
++    insert_sql += sep.join(rows) + ";"
++
++    # force the max_rows (splitlines) reassembly branch; caps are a per-instance attr so safe to mock
++    client.sql_client.capabilities.max_rows_per_insert = 2
++    expect_load_file(client, file_storage, insert_sql, user_table_name, file_format="insert_values")
++
++    count = client.sql_client.execute_sql(f"SELECT COUNT(1) FROM {canonical_name}")[0][0]
++    assert count == 4
++    stored = client.sql_client.execute_sql(f"SELECT text FROM {canonical_name} ORDER BY _dlt_id")
++    # the weird value round-trips intact, not split across rows
++    assert weird in [row[0] for row in stored]
++
++
+ def assert_load_with_max_query(
+     client: InsertValuesJobClient,
+     file_storage: FileStorage,
+
+
+===== COMMIT 14f4af5f =====
+
+
+commit 14f4af5f8
+Author: Alberto
+Date: 2026-06-19
+

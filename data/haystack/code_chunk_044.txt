@@ -1,0 +1,3119 @@
+# First transformation: mask email addresses
+def mask_email(record):
+    record["email"] = hashlib.sha256(record["email"].encode()).hexdigest()
+    return record
+
+# Second transformation: enrich with full name
+def enrich_full_name(record):
+    record["full_name"] = f"{record['first_name']} {record['last_name']}"
+    return record
+
+# Attach transformations explicitly controlling their order
+transformed_users = (
+    user_data()
+    .add_map(enrich_full_name)  # By default, this would be at the end
+    .add_map(mask_email, insert_at=1)  # Explicitly run masking first after extraction
+)
+
+# Verify the transformed data
+for user in transformed_users:
+    print(user)
+```
+
+Expected output
+
+```py
+{'id': 1, 'first_name': 'John', 'last_name': 'Doe', 'email': '<hashed_value>', 'full_name': 'John Doe'}
+{'id': 2, 'first_name': 'Jane', 'last_name': 'Smith', 'email': '<hashed_value>', 'full_name': 'Jane Smith'}
+```
+
+By explicitly using `insert_at=1`, the email masking step (`mask_email`) is executed right after data extraction and before enrichment. This ensures sensitive data is handled securely at the earliest stage possible.
+
+## Incremental behavior with `insert_at`
+
+Use `insert_at` to control when your transformation runs in the pipeline and ensure it executes before incremental filtering. See [incremental loading documentation](../../general-usage/incremental/cursor#transform-records-before-incremental-processing) for more details.
+
+## Filling missing data for incremental loading
+
+Use `add_map` to ensure records are compatible with incremental loading.
+
+If the incremental cursor field (e.g., `updated_at`) is missing, you can provide a fallback like `created_at`. This ensures all records have a valid cursor value and can be processed correctly by the incremental step.
+
+[In this example](../../general-usage/incremental/cursor#transform-records-before-incremental-processing), the third record is made incremental-ready by assigning it a fallback `updated_at` value. This ensures it isn't skipped by the incremental loader.
+
+## `add_map` vs `add_yield_map`
+
+The difference between `add_map` and `add_yield_map` matters when a transformation returns multiple records from a single input.
+
+### **`add_map`**
+
+- Use `add_map` when you want to transform each item into exactly one item.
+- Think of it like modifying or enriching a row.
+- You use a regular function that returns one modified item.
+- Great for adding fields or changing structure.
+
+```py
+import dlt
+
+@dlt.resource
+def resource():
+    yield [{"name": "Alice"}, {"name": "Bob"}]
+
+def add_greeting(item):
+    item["greeting"] = f"Hello, {item['name']}!"
+    return item
+
+resource.add_map(add_greeting)
+
+for row in resource():
+    print(row)
+```
+
+Output
+
+```sh
+{'name': 'Alice', 'greeting': 'Hello, Alice!'}
+{'name': 'Bob', 'greeting': 'Hello, Bob!'}
+```
+
+### **`add_yield_map`**
+
+- Use `add_yield_map` when you want to turn one item into multiple items, or possibly no items.
+- Your function is a generator that uses yield.
+- Great for pivoting nested data, flattening lists, or filtering rows.
+
+Example
+
+```py
+import dlt
+
+@dlt.resource
+def resource():
+    yield [
+        {"name": "Alice", "hobbies": ["reading", "chess"]},
+        {"name": "Bob", "hobbies": ["cycling"]}
+    ]
+
+def expand_hobbies(item):
+    for hobby in item["hobbies"]:
+        yield {"name": item["name"], "hobby": hobby}
+
+resource.add_yield_map(expand_hobbies)
+
+for row in resource():
+    print(row)
+```
+
+Output
+
+```sh
+{'name': 'Alice', 'hobby': 'reading'}
+{'name': 'Alice', 'hobby': 'chess'}
+{'name': 'Bob', 'hobby': 'cycling'}
+```
+
+## Best practices for using `add_map`
+
+- **Keep transformations simple:**
+    Functions passed to `add_map` run on each record and should be stateless and lightweight. Use them for tasks like string cleanup or basic calculations. For heavier operations (like per-record API calls), batch the work or move it outside `add_map`, for example into a transformer resource or a post-load step.
+
+- **Use the right tool for the job:**
+    Use `add_map` for one-to-one record transformations. If you need to drop records, use `add_filter` instead of returning `None` in a map function. To split or expand one record into many, use `add_yield_map`.
+
+- **Chain transformations when needed:**
+    Since `add_map` and `add_filter` return the resource object, you can chain multiple transformations in sequence. Just be mindful of the order, they execute in the order they are added unless you explicitly control it using `insert_at`.
+
+- **Ordering with `insert_at`:**
+    When using multiple transforms and built-in steps (like incremental loading), control their order with `insert_at`.
+
+    Pipeline steps are zero-indexed in the order they are added. Index `0` is usually the initial data extraction. To run a custom map first, set `insert_at=1`. For multiple custom steps, assign different indices (e.g., one at `1`, another at `2`). If you're unsure about the order, iterate over the resource or check the `dlt` logs to confirm how steps are applied.
+
+- **Advanced consideration - data formats**
+    Most `dlt` sources yield dictionaries or lists of them. However, some backends, such as PyArrow, may return data as NumPy arrays or Arrow tables. In these cases, your `add_map` or `add_yield_map` function must handle the input format, possibly by converting it to a list of dicts or a pandas DataFrame. This is an advanced scenario, but important if your transformation fails due to unexpected input types.
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/transformations/dbt/dbt.md =====
+
+---
+title: Transform data with dbt
+description: Transforming the data loaded by a dlt pipeline with dbt
+keywords: [transform, dbt, runner, dbt cloud]
+---
+# Transform data with dbt
+
+[dbt](https://github.com/dbt-labs/dbt-core) is a framework that allows for the simple structuring of your transformations into DAGs. The benefits of using dbt include:
+
+- End-to-end cross-db compatibility for dlt→dbt pipelines.
+- Ease of use by SQL analysts, with a low learning curve.
+- High flexibility and configurability in usage, supports templating, can run backfills, etc.
+- Support for testing and accelerated troubleshooting.
+
+## dbt runner in dlt
+
+You can run dbt with `dlt` by using the dbt runner.
+
+The dbt runner:
+
+- Can create a virtual environment for dbt on the fly;
+- Can run a dbt package from online sources (e.g., GitHub) or from local files;
+- Passes configuration and credentials to dbt, so you do not need to handle them separately from `dlt`, enabling dbt to configure on the fly.
+
+## How to use the dbt runner
+
+For an example of how to use the dbt runner, see the [jaffle shop example](https://github.com/dlt-hub/dlt/blob/devel/docs/examples/archive/dbt_run_jaffle.py).
+Included below is another example where we run a `dlt` pipeline and then a dbt package via `dlt`:
+
+:::info
+Docstrings are available to read in your IDE.
+:::
+
+```py
+# Load all Pipedrive endpoints to the pipedrive_raw dataset
+pipeline = dlt.pipeline(
+    pipeline_name='pipedrive',
+    destination='bigquery',
+    dataset_name='pipedrive_raw'
+)
+
+load_info = pipeline.run(pipedrive_source())
+print(load_info)
+
+# Create a transformation on a new dataset called 'pipedrive_dbt'
+# We created a local dbt package
+# and added pipedrive_raw to its sources.yml
+# The destination for the transformation is passed in the pipeline
+pipeline = dlt.pipeline(
+    pipeline_name='pipedrive',
+    destination='bigquery',
+    dataset_name='pipedrive_dbt'
+)
+
+# Make or restore venv for dbt, using the latest dbt version
+# NOTE: If you have dbt installed in your current environment, just skip this line
+#       and the `venv` argument to dlt.dbt.package()
+venv = dlt.dbt.get_venv(pipeline)
+
+# Get runner, optionally pass the venv
+dbt = dlt.dbt.package(
+    pipeline,
+    "pipedrive/dbt_pipedrive/pipedrive",
+    venv=venv
+)
+
+# Run the models and collect any info
+# If running fails, the error will be raised with a full stack trace
+models = dbt.run_all()
+
+# On success, print the outcome
+for m in models:
+    print(
+        f"Model {m.model_name} materialized" +
+        f" in {m.time}" +
+        f" with status {m.status}" +
+        f" and message {m.message}"
+    )
+```
+
+## How to run dbt runner without pipeline
+
+You can use the dbt runner without a dlt pipeline. The example below will clone and run **jaffle shop** using a dbt profile that you supply.
+It assumes that dbt is installed in the current Python environment and the `profile.yml` is in the same folder as the Python script.
+
+```py notype
+import os
+
+from dlt.helpers.dbt import create_runner
+
+runner = create_runner(
+    None,  # use current virtual env to run dlt
+    None,  # we do not need dataset name and we do not pass any credentials in environment to dlt
+    working_dir=".",  # the package below will be cloned to current dir
+    package_location="https://github.com/dbt-labs/jaffle_shop.git",
+    package_profiles_dir=os.path.abspath(
+        "."
+    ),  # profiles.yml must be placed in this dir
+    package_profile_name="duckdb_dlt_dbt_test",  # name of the profile
+)
+
+models = runner.run_all()
+```
+
+Here's an example **duckdb** profile:
+
+```yaml
+duckdb_dlt_dbt_test:
+  target: analytics
+  outputs:
+    analytics:
+      type: duckdb
+      # Schema: "{{ var('destination_dataset_name', var('source_dataset_name')) }}"
+      path: "duckdb_dlt_dbt_test.duckdb"
+      extensions:
+        - httpfs
+        - parquet
+```
+
+You can run the example with dbt debug log: `RUNTIME__LOG_LEVEL=DEBUG python dbt_standalone.py`
+
+## dbt Cloud
+
+### API client
+
+The dbt Cloud Client is a Python class designed to interact with the dbt Cloud API (version 2).
+It provides methods to perform various operations on dbt Cloud, such as triggering job runs and retrieving job run statuses.
+
+```py
+from dlt.helpers.dbt_cloud import DBTCloudClientV2
+
+# Initialize the client
+client = DBTCloudClientV2(api_token="YOUR_API_TOKEN", account_id="YOUR_ACCOUNT_ID")
+
+# Example: Trigger a job run
+job_run_id = client.trigger_job_run(job_id=1234, data={"cause": "Triggered via API"})
+print(f"Job run triggered successfully. Run ID: {job_run_id}")
+
+# Example: Get run status
+run_status = client.get_run_status(run_id=job_run_id)
+print(f"Job run status: {run_status['status_humanized']}")
+```
+
+### Helper functions
+
+These Python functions provide an interface to interact with the dbt Cloud API.
+They simplify the process of triggering and monitoring job runs in dbt Cloud.
+
+#### `run_dbt_cloud_job()`
+
+This function triggers a job run in dbt Cloud using the specified configuration.
+It supports various customization options and allows for monitoring the job's status.
+
+```py
+from dlt.helpers.dbt_cloud import run_dbt_cloud_job
+
+# Trigger a job run with default configuration
+status = run_dbt_cloud_job()
+
+# Trigger a job run with additional data
+additional_data = {
+    "git_sha": "abcd1234",
+    "schema_override": "custom_schema",
+    # ... other parameters
+}
+status = run_dbt_cloud_job(job_id=1234, data=additional_data, wait_for_outcome=True)
+```
+
+#### `get_dbt_cloud_run_status()`
+
+If you have already started a job run and have a run ID, then you can use the `get_dbt_cloud_run_status` function.
+
+This function retrieves the full information about a specific dbt Cloud job run.
+It also supports options for waiting until the run is complete.
+
+```py
+from dlt.helpers.dbt_cloud import get_dbt_cloud_run_status
+
+# Retrieve status for a specific run
+status = get_dbt_cloud_run_status(run_id=1234, wait_for_outcome=True)
+```
+
+### Set credentials
+
+#### secrets.toml
+
+When using dlt locally, we recommend using the `.dlt/secrets.toml` method to set credentials.
+
+If you used the `dlt init` command, then the `.dlt` folder has already been created.
+Otherwise, create a `.dlt` folder in your working directory and a `secrets.toml` file inside it.
+
+This is where you store sensitive information securely, like access tokens. Keep this file safe.
+
+Use the following format for dbt Cloud API authentication:
+
+```toml
+[dbt_cloud]
+api_token = "set me up!" # required for authentication
+account_id = "set me up!" # required for both helper functions
+job_id = "set me up!" # optional only for the run_dbt_cloud_job function (you can pass this explicitly as an argument to the function)
+run_id = "set me up!" # optional for the get_dbt_cloud_run_status function (you can pass this explicitly as an argument to the function)
+```
+
+#### Environment variables
+
+dlt supports reading credentials from the environment.
+
+If dlt tries to read this from environment variables, it will use a different naming convention.
+
+For environment variables, all names are capitalized and sections are separated with a double underscore "__".
+
+For example, for the above secrets, we would need to put into the environment:
+
+```sh
+DBT_CLOUD__API_TOKEN
+DBT_CLOUD__ACCOUNT_ID
+DBT_CLOUD__JOB_ID
+```
+
+For more information, read the [Credentials](../../../general-usage/credentials/index.md) documentation.
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/transformations/dlthub.md =====
+
+---
+title: Transformations with dltHub
+description: Python-defined transformations that run eagerly on your compute or lazily on the warehouse with dlt.hub.transformation
+keywords: [transformations, dlthub, ibis, sql, incremental, lazy, eager]
+---
+# Transformations with dltHub
+
+[dltHub](../../hub/transformations/index.md) extends `dlt` with `@dlt.hub.transformation` — transformations defined in Python that run **eagerly** on your compute (e.g. local DuckDB, Pandas, Polars, or Arrow) or **lazily** on the warehouse — the same code, executed where it makes the most sense. A transformation is a resource that takes a `dlt.Dataset` and yields an Ibis expression, a `Relation`, or a plain SQL query; `dlt` compiles it to the destination SQL dialect and materializes the result into a table. When source and target share the same physical location, no data is transferred to the machine running the pipeline.
+
+The example below incrementally appends new rows from the `orders` table to `recent_orders` — each run picks up after the last processed `created_at`:
+
+```py
+import dlt
+import pendulum
+
+@dlt.hub.transformation(
+    write_disposition="merge",
+    primary_key="id",
+    incremental=dlt.sources.incremental(
+        "created_at",
+        initial_value=pendulum.datetime(2000, 1, 1, tz="UTC"),
+    ),
+)
+def recent_orders(dataset: dlt.Dataset) -> Any:
+    yield dataset.table("orders")
+
+pipeline.run(recent_orders(pipeline.dataset()))
+```
+
+A few highlights:
+
+- **Eager or lazy execution** — run transformations eagerly on your own compute (pull data as DataFrames/Arrow tables and process them in Python) or lazily as SQL pushed down to the warehouse, where nothing leaves the destination. You pick per transformation; the decorator stays the same.
+- **Incremental out of the box** — stateful cursors (as above) or scheduler-set `[start, end)` windows for idempotent retries and partition backfills on the [dltHub platform](../../hub/pipeline-operations/triggers.md#scheduler-driven-intervals).
+- **Schema evolution and lineage** — result tables evolve automatically and column-level hints are forwarded from source to transformed tables.
+- **Write in what you know** — Ibis expressions, raw SQL, or [Pandas/Polars DataFrames and Arrow tables](../../hub/transformations/index.md#using-pandas-or-polars-dataframes-and-arrow-tables).
+- **Full resource semantics** — `write_disposition`, `primary_key`, merge loading, and grouping transformations into sources all work as with regular resources.
+
+See the [dltHub transformations docs](../../hub/transformations/index.md) for the full guide. Use of dltHub is subject to a commercial [dltHub License](../../hub/license.md).
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/transformations/encryption.md =====
+
+---
+title: Data security and encryption
+description: Transforming the data for encryption in transit, client-side encryption, and encryption at rest.
+keywords: [transform, data security, encryption]
+---
+# Data security and encryption
+
+The modern data landscape requires robust security measures to protect sensitive information throughout its lifecycle. Organizations must implement comprehensive encryption strategies to safeguard data against increasingly sophisticated threats
+
+## Encryption throughout the lifecycle
+
+Data is vulnerable both while moving between systems (in transit) and when stored at rest. dlt addresses both needs:
+
+- **Data in transit**:
+
+    During transfers, data can be intercepted or tampered with. Employing secure protocols (e.g., SSL/TLS) or encrypted connection strings prevents unauthorized access and ensures confidentiality.
+
+- **Client-side encryption**:
+
+    Encrypting data on the client side before transmission adds an extra layer of security. By using libraries like AWS Encryption SDK, Google Tink, or Azure Key Vault, organizations can ensure that data is encrypted before it leaves the source, maintaining control over encryption keys and safeguarding sensitive information throughout its journey.
+
+- **Data at rest / Server-side encryption**:
+
+    Even if a storage system is compromised, encryption at rest prevents unauthorized access. dlt can leverage disk encryption (e.g., BitLocker, FileVault, dm-crypt/LUKS) or the destination’s server-side encryption to keep data safe on the local machine and in the cloud.
+
+This layered approach ensures comprehensive protection, covering every stage of data’s journey from extraction to storage.
+
+## Client-side encryption
+
+### Why client-side encryption?
+
+Client-side encryption empowers you to encrypt data before it ever leaves your environment. This ensures that:
+
+- **You maintain full control of encryption keys** (often managed through KMS solutions like AWS KMS, Google Cloud KMS, or Azure Key Vault).
+- **Data remains protected** during transit and while stored at the destination, even if the destination’s security is compromised.
+
+### Common client-side encryption tools
+
+- AWS Encryption SDK
+- Tink by Google
+- Azure Key Vault & Blob Client-Side Encryption
+- OpenSSL
+
+## Encryption in transit and server-side encryption
+
+### Encrypted partitions for dlt’s working directory
+
+Because dlt extracts and processes data locally before loading it to a destination, the files on your local disk contain sensitive data. Encrypting the partition where these files reside ensures your data is protected at rest on the local system. You can use the following systems to safeguard your data at rest.
+
+- **Windows**: BitLocker
+- **macOS**: FileVault
+- **Linux**: dm-crypt/LUKS, Loop-AES
+
+### Encryption in transit
+
+Encrypting data while it travels to the destination is equally important. With dlt, you can configure your connection string to enforce encryption. Depending on the target database or storage, options might include:
+
+- Adding `Encrypt=yes` and `encrypt=true` to your **connection string** to ensure TLS/SSL is used for all communication.
+- Using secure protocols such as HTTPS for cloud-based destinations.
+
+### Server-side encryption
+
+Server-side encryption (SSE) complements your client-side encryption measures by encrypting data once it arrives at the destination. Popular services include:
+
+- **Amazon S3 SSE**: Offers SSE-S3 (using AWS-managed keys) or SSE-KMS (using customer-managed keys in AWS KMS).
+- **BigQuery**: Provides options for customer-managed encryption keys (CMEK), allowing for more granular key management.
+
+## Managing encryption in dlt
+
+### Steps for setting up encrypted pipelines
+
+1. **Provision encryption keys**: Use your preferred cloud KMS or on-prem solution to create and manage cryptographic keys.
+2. **Integrate with Client-Side Libraries**: Install and configure the relevant encryption SDK (e.g., AWS Encryption SDK) in your environment.
+3. **Incorporate encryption logic**: Modify your dlt resource functions to encrypt sensitive fields before they are loaded to the destination.
+4. **Test and validate**: Ensure that your data is encrypted and can be decrypted correctly using your keys.
+
+Below is an example showing how to encrypt specific fields in a nested data structure using AWS KMS before loading data with dlt. The same principle can be applied to other encryption libraries, such as Google Tink or Azure Key Vault.
+
+:::note
+For demonstration purposes, we have included "KMS_KEY_ARN", "aws_access_key_id", and "aws_secret_access_key" in the script. However, it is best practice to store these in dlt `secrets.toml` or a secure vault.
+:::
+
+```py
+import boto3
+import dlt
+import aws_encryption_sdk
+from aws_encryption_sdk import CommitmentPolicy
+from aws_encryption_sdk.key_providers.kms import KMSMasterKey
+
+# Define the KMS Key ARN
+KMS_KEY_ARN = (
+    "arn:aws:kms:<region>:<number>:key/<key>"
+)
+
+# Create a boto3 client for AWS KMS
+kms_client = boto3.client(
+    "kms",
+    region_name="<region-name>",
+    aws_access_key_id="your aws access key",
+    aws_secret_access_key="your aws secret key",
+)
+
+# Create the KMS Master Key
+master_key = KMSMasterKey(key_id=KMS_KEY_ARN, client=kms_client)
+
+# Instantiate the AWS Encryption SDK client
+client = aws_encryption_sdk.EncryptionSDKClient(
+    commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT
+)
+
+#Encryption function
+def encryption_func(record):
+    """
+    Encrypts the 'security_key' for each child in a given record.
+    """
+    for child in record.get("children", []):
+        # Convert the security key to bytes for encryption
+        key_to_encrypt = str(child["security_key"]).encode("utf-8")
+        try:
+            # Encrypt the security key using the provided master key
+            ciphertext, _ = client.encrypt(
+                source=key_to_encrypt, key_provider=master_key
+            )
+            # Replace the plain key with the encrypted data in hex format
+            child["security_key"] = ciphertext.hex()
+        except Exception as e:
+            print(
+                f"Failed to encrypt security key for child_id {child['child_id']}: {e}"
+            )
+            raise
+    return record
+
+
+# Define the raw data structure
+raw_data = [
+    {
+        "parent_id": 1,
+        "parent_name": "Alice",
+        "children": [
+            {"child_id": 1, "child_name": "Child 1", "security_key": 12345},
+            {"child_id": 2, "child_name": "Child 2", "security_key": 67891},
+        ],
+    },
+    {
+        "parent_id": 2,
+        "parent_name": "Bob",
+        "children": [
+            {"child_id": 3, "child_name": "Child 3", "security_key": 999111}
+        ],
+    },
+]
+
+#dlt resource
+@dlt.resource(name="data_test", write_disposition={"disposition": "replace"})
+def data_source():
+    yield from raw_data
+
+
+if __name__ == "__main__":
+    # Apply the encryption transformation using add_map
+    data_encrypted = data_source().add_map(encryption_func)
+
+    # Configure and run the pipeline
+    pipeline = dlt.pipeline(
+        pipeline_name="pipeline",
+        destination="duckdb",
+        dataset_name="dataset",
+    )
+    load_info = pipeline.run(data_encrypted)
+    print(load_info)
+```
+
+In this code:
+
+- The AWS Encryption SDK is used to encrypt the `security_key` field before loading the data with dlt.
+- You can adapt this pattern to encrypt other sensitive fields or integrate different encryption libraries.
+- Various encryption methods can be employed for client-side encryption.
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/transformations/index.md =====
+
+---
+title: Overview
+description: dlt supports both ETL and ELT transformation patterns
+keywords: [elt, etl, transformer, transformations]
+---
+# Overview
+
+`dlt` supports both Extract, Transform, Load (ETL) and Extract, Load, Transform (ELT) patterns.
+
+:::tip
+Transform your data with `@dlt.hub.transformation` — eagerly on your compute or lazily as SQL pushed down to the warehouse, with incremental processing out of the box.
+See the [dltHub transformations overview](dlthub.md) or follow the [full guide](../../hub/transformations/index.md).
+:::
+
+In ETL, the data is transformed before being loaded into the destination. This is useful for light processing such as adding columns, removing sensitive data, or type casting. `dlt` offers built-in utilities like `add_map()` and custom processors via `@dlt.transformer`
+
+In ELT, the data is loaded as-is in the destination. This raw data is transformed directly on the destination where more powerful compute is available (e.g., data warehouse, data lake). `dlt` supports this via several patterns.
+
+The two approaches can be used together in a single project.
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/transformations/python.md =====
+
+---
+title: Transform data in Python with Arrow tables or DataFrames
+description: Transforming data loaded by a dlt pipeline with Pandas or Polars DataFrames and Arrow tables
+keywords: [transform, pandas, polars, arrow]
+---
+# Transform data in Python with Arrow tables or DataFrames
+
+You can transform your data in Python using Pandas DataFrames, Arrow tables, or Polars DataFrames. To get started, please read the [dataset docs](../../general-usage/dataset-access/dataset).
+
+## Interactively transforming your data in Python
+
+Using the methods explained in the [dataset docs](../../general-usage/dataset-access/dataset), you can fetch data from your destination into a DataFrame or Arrow table in your local Python process and work with it interactively. This even works for filesystem destinations:
+
+The example below reads GitHub reactions data from the `issues` table and
+counts the reaction types.
+
+```py
+pipeline = dlt.pipeline(
+    pipeline_name="github_pipeline",
+    destination="duckdb",
+    dataset_name="github_reactions",
+    dev_mode=True
+)
+
+# get a data frame of all reactions from the dataset
+github_issues = pipeline.dataset().table("issues")
+reactions = github_issues.select(
+    "reactions__+1", "reactions__-1", "reactions__laugh", "reactions__hooray", "reactions__rocket"
+).df()
+
+# calculate and print out the sum of all reactions
+counts = reactions.sum(0).sort_values(0, ascending=False)  # ty: ignore
+print(counts)
+
+# alternatively, you can fetch the data as an arrow table
+reactions = github_issues.select(
+    "reactions__+1", "reactions__-1", "reactions__laugh", "reactions__hooray", "reactions__rocket"
+).arrow()
+# ... do transformations on the arrow table
+```
+
+### Using Ibis
+
+Ibis is a powerful portable Python dataframe library. Learn more about what it is and how to use it in the [official documentation](https://ibis-project.org/).
+
+`dlt` provides an easy way to hand over your loaded dataset to an Ibis backend connection. The returned object is a native Ibis connection to the destination, which you can use to read and even transform data. Note that the Ibis expression language is querying-first: you can materialize query results into new tables (e.g. with `create_table`) but for row-level DML you should use the [`dlt` SQL client](sql.md).
+
+:::tip
+Not all destinations supported by `dlt` have an equivalent Ibis backend. Natively supported destinations include DuckDB (including Motherduck), Postgres (Redshift is supported via the Postgres backend for Ibis versions lower than 10.4.0), Snowflake, Clickhouse, MSSQL (including Synapse), and BigQuery. The filesystem destination is supported via the [Filesystem SQL client](sql.md#the-filesystem-sql-client); please install the DuckDB backend for Ibis to use it. Mutating data with Ibis on the filesystem will not result in any actual changes to the persisted files.
+:::
+
+To use the Ibis backend, you will need to have the `ibis-framework` package with the correct Ibis extra installed. The following example will install the DuckDB backend:
+
+```sh
+pip install ibis-framework[duckdb]
+```
+
+`dlt` datasets have a helper method to return an Ibis connection to the destination they live on:
+
+```py
+# get the dataset from the pipeline
+dataset = pipeline.dataset()
+dataset_name = pipeline.dataset_name
+
+# get the native ibis connection from the dataset
+ibis_connection = dataset.ibis()
+
+# list all tables in the dataset
+# NOTE: You need to provide the dataset name to ibis, in ibis datasets are named databases
+print(ibis_connection.list_tables(database=dataset_name))
+
+# get the items table
+table = ibis_connection.table("items", database=dataset_name)
+
+# print the first 10 rows
+print(table.limit(10).execute())
+
+# Visit the ibis docs to learn more about the available methods
+```
+
+:::caution Breaking change in dlt 1.25.0
+`dataset.ibis()` now passes all schemas from the dataset to the Ibis backend. On filesystem destinations, this means Ibis will see tables from every schema in the dataset and not just the default one. If two schemas define the same table name, the Ibis table will contain rows from both schemas combined. To get the previous single-schema behavior, create the dataset with an explicit schema: `pipeline.dataset(schema="my_schema").ibis()`.
+:::
+
+## Persisting your transformed data
+
+Since dlt supports Arrow tables, Pandas or Polars DataFrames from resources directly, you can use the same pipeline to load the transformed data back into the destination.
+
+### A simple example
+
+A simple example that creates a new table from an existing user table but only with columns that do not contain private information. Note that we use the `iter_arrow()` method on the relation to iterate over the arrow table instead of fetching it all at once.
+
+```py
+pipeline = dlt.pipeline(
+    pipeline_name="users_pipeline",
+    destination="duckdb",
+    dataset_name="users_raw",
+    dev_mode=True
+)
+
+# get user relation with only a few columns selected, but omitting email and name
+users = pipeline.dataset().table("users").select("age", "amount_spent", "country")
+
+# load the data into a new table called users_clean in the same dataset
+pipeline.run(users.iter_arrow(chunk_size=1000), table_name="users_clean")
+```
+
+### A more complex example
+
+The example above could easily be done in SQL. Let's assume you'd like to actually do in Python some Arrow transformations. For this we will create a resource from which we can yield the modified Arrow tables. The same is possibly with DataFrames.
+
+```py notype
+import pyarrow.compute as pc
+
+pipeline = dlt.pipeline(
+    pipeline_name="users_pipeline",
+    destination="duckdb",
+    dataset_name="users_raw",
+    dev_mode=True
+)
+
+# NOTE: this resource will work like a regular resource and support write_disposition, primary_key, etc.
+# NOTE: For selecting only users above 18, we could also use the filter method on the relation with ibis expressions
+@dlt.resource(table_name="users_clean")
+def users_clean():
+    users = pipeline.dataset().table("users")
+    for arrow_table in users.iter_arrow(chunk_size=1000):
+
+        # we want to filter out users under 18
+        age_filter = pc.greater_equal(arrow_table["age"], 18)
+        arrow_table = arrow_table.filter(age_filter)
+
+        # we want to hash the email column
+        arrow_table = arrow_table.append_column("email_hash", pc.sha256(arrow_table["email"]))
+
+        # we want to remove the email column and name column
+        arrow_table = arrow_table.drop(["email", "name"])
+
+        # yield the transformed arrow table
+        yield arrow_table
+
+
+pipeline.run(users_clean())
+```
+
+### A Polars example
+
+You can also use Polars for transformations. Polars DataFrames and LazyFrames are automatically converted to Arrow tables when yielded from a resource.
+
+```py
+import polars as pl
+
+pipeline = dlt.pipeline(
+    pipeline_name="users_pipeline",
+    destination="duckdb",
+    dataset_name="users_raw",
+    dev_mode=True
+)
+
+@dlt.resource(table_name="users_clean")
+def users_clean():
+    users = pipeline.dataset().table("users")
+    for arrow_table in users.iter_arrow(chunk_size=1000):
+        # convert to Polars for transformation
+        df = pl.from_arrow(arrow_table)
+
+        # filter out users under 18
+        df = df.filter(pl.col("age") >= 18)
+
+        # drop sensitive columns
+        df = df.drop(["email", "name"])
+
+        # yield the Polars DataFrame directly; dlt converts it to Arrow
+        yield df
+
+
+pipeline.run(users_clean())
+```
+
+## Other transforming tools
+
+If you want to transform your data before loading, you can use Python. If you want to transform the
+data after loading, you can use Pandas or one of the following:
+
+1. [dbt.](dbt/dbt.md) (recommended)
+2. [`dlt` SQL client.](sql.md)
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/transformations/sql.md =====
+
+---
+title: Access and transform data with SQL
+description: Access and transform the data loaded by a dlt pipeline with the dlt SQL client
+keywords: [transform, sql, sql client, dml]
+---
+# The `dlt` SQL client
+
+Most `dlt` destinations use an implementation of the `SqlClientBase` class to connect to the physical destination to which your data is loaded. DDL statements, data insert or update commands, as well as SQL merge and replace queries, are executed via a connection on this client. It also is used for reading data for the [dashboard app](../../hub/ingestion/dashboard.md) and [data access via `dlt` datasets](../../general-usage/dataset-access/dataset.md).
+
+All SQL destinations make use of an SQL client; additionally, the filesystem has a special implementation of the SQL client which you can read about [below](#the-filesystem-sql-client).
+
+:::note
+This page contains technical details about the implementation of the SQL client as well as information on how to use low-level APIs. If you simply want to query your data, it's advised to use [`dlt` datasets](../../general-usage/dataset-access/dataset.md) or the [dashboard app](../../hub/ingestion/dashboard.md).
+:::
+
+## Executing a query on the SQL client
+
+You can access the SQL client of your destination via the `sql_client` method on your pipeline. The code below shows how to use the SQL client to execute a query.
+
+```py
+pipeline = dlt.pipeline(destination="bigquery", dataset_name="crm")
+with pipeline.sql_client() as client:  # ty: ignore
+    with client.execute_query(
+        "SELECT id, name, email FROM customers WHERE id = %s",
+        10
+    ) as cursor:
+        # get all data from the cursor as a list of tuples
+        print(cursor.fetchall())
+```
+
+## Retrieving the data in different formats
+
+The cursor returned by `execute_query` has several methods for retrieving the data. The supported formats are Python tuples, Pandas DataFrame, and Arrow table.
+
+The code below shows how to retrieve the data as a Pandas DataFrame and then manipulate it in memory:
+
+```py
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+with pipeline.sql_client() as client:  # ty: ignore
+    with client.execute_query(
+        'SELECT "reactions__+1", "reactions__-1", reactions__laugh, reactions__hooray, reactions__rocket FROM issues'
+    ) as cursor:
+        # calling `df` on a cursor, returns the data as a pandas DataFrame
+        reactions = cursor.df()
+
+counts = reactions.sum(0).sort_values(0, ascending=False)  # ty: ignore
+```
+
+## Supported methods on the cursor
+
+- `fetchall()`: returns all rows as a list of tuples;
+- `fetchone()`: returns a single row as a tuple;
+- `fetchmany(size=None)`: returns a number of rows as a list of tuples; if no size is provided, all rows are returned;
+- `df(chunk_size=None, **kwargs)`: returns the data as a Pandas DataFrame; if `chunk_size` is provided, the data is retrieved in chunks of the given size;
+- `arrow(chunk_size=None, **kwargs)`: returns the data as an Arrow table; if `chunk_size` is provided, the data is retrieved in chunks of the given size;
+- `iter_fetch(chunk_size: int)`: iterates over the data in chunks of the given size as lists of tuples;
+- `iter_df(chunk_size: int)`: iterates over the data in chunks of the given size as Pandas DataFrames;
+- `iter_arrow(chunk_size: int)`: iterates over the data in chunks of the given size as Arrow tables.
+
+:::info
+Which retrieval method you should use very much depends on your use case and the destination you are using. Some drivers for our destinations provided by their vendors natively support Arrow or Pandas DataFrames; in these cases, we will use that interface. If they do not, `dlt` will convert lists of tuples into these formats.
+:::
+
+## The filesystem SQL client
+
+The filesystem destination implements a special but extremely useful version of the SQL client. While during a normal pipeline run, the filesystem does not make use of an SQL client but rather copies the files resulting from a load into the folder or bucket you have specified, it is possible to query this data using SQL via this client. For this to work, `dlt` uses an in-memory `DuckDB` database instance and makes your filesystem tables available as views on this database. For the most part, you can use the filesystem SQL client just like any other SQL client. `dlt` uses sqlglot to discover which tables you are trying to access and, as mentioned above, `DuckDB` to make them queryable.
+
+The code below shows how to use the filesystem SQL client to query the data:
+
+```py
+pipeline = dlt.pipeline(destination="filesystem", dataset_name="my_dataset")
+with pipeline.sql_client() as client:   # ty: ignore
+    with client.execute_query("SELECT * FROM my_table") as cursor:
+        print(cursor.fetchall())
+```
+
+A few things to know or keep in mind when using the filesystem SQL client:
+
+- The SQL database you are actually querying is an in-memory database, so if you do any kind of mutating queries, these will not be persisted to your folder or bucket.
+- You must have loaded your data as `JSONL`, `Parquet`, `CSV` files or `delta`/`iceberg` tables for this SQL client to work. For optimal performance, you should use `Parquet` files or open table formats, as `DuckDB` is able to only read the bytes needed to execute your query from a folder or bucket in this case.
+- Keep in mind that if you do any filtering, sorting, or full table loading with the SQL client, the in-memory `DuckDB` instance will have to download and query a lot of data from your bucket or folder if you have a large table.
+- If you are accessing data on a bucket, `dlt` will temporarily store your credentials in `DuckDB` to let it connect to the bucket.
+- Some combinations of buckets and table formats may not be fully supported at this time.
+- Multi-schema support (dlt 1.25.0+): When a dataset includes multiple schemas, the filesystem SQL client creates views that span all schemas. If the same table name exists in multiple schemas at different physical locations (e.g. when the layout includes `{schema_name}/`), views are combined. If they share the same location, columns are merged into a single view. This means queries may return rows from multiple schemas — use `pipeline.dataset(schema="name")` to restrict to one schema.
+
+### Control data freshness
+
+`sqlclient` creates views in which the data is immutable (each next query will access the same data). Such "snapshots" are created by:
+
+* globbing the table files once - when view is created
+* using the newest iceberg metadata to create view
+
+Updating views may be costly (globbing, re-reading iceberg metadata) so your best option is to create new `sql_client` (or `pipeline.dataset()`) instance
+when you need fresh data. Alternatively you can enable autorefresh mode which will re-create view on each query:
+
+```py
+from dlt.destination import filesystem
+
+pipeline = dlt.pipeline(destination=filesystem(always_refresh_views=True), dataset_name="my_dataset")
+with pipeline.sql_client() as client:   # ty: ignore
+    with client.execute_query("SELECT * FROM my_table") as cursor:
+        print(cursor.fetchall())
+        # pipeline.run() here and get updated data
+        print(cursor.fetchall())
+```
+
+Note: `delta` tables are by default on autorefresh which is implemented by delta core and seems to be pretty efficient.
+
+## Transform data with DML statements
+
+A simple alternative to dbt is to query the data using the `dlt` SQL client and then perform the
+transformations using SQL statements in Python. The `execute_sql` method allows you to execute any SQL statement,
+including statements that change the database schema or data in the tables. In the example below, we
+insert a row into the `customers` table. Note that the syntax is the same as for any standard `dbapi`
+connection.
+
+:::info
+This method will work for all SQL destinations supported by `dlt`, but not for the filesystem destination - its SQL client runs on an in-memory database, so [mutating queries are not persisted](#the-filesystem-sql-client).
+:::
+
+Typically you will use this type of transformation if you can create or update tables directly from existing tables
+without any need to insert data from your Python environment.
+
+The example below creates a new table `aggregated_sales` that contains the total and average sales for each category and region
+
+```py
+pipeline = dlt.pipeline(destination="duckdb", dataset_name="crm")
+
+# NOTE: this is the duckdb sql dialect, other destinations may use different expressions
+with pipeline.sql_client() as client:  # ty: ignore
+    client.execute_sql(
+        """ CREATE OR REPLACE TABLE aggregated_sales AS
+            SELECT
+                category,
+                region,
+                SUM(amount) AS total_sales,
+                AVG(amount) AS average_sales
+            FROM
+                sales
+            GROUP BY
+                category,
+                region;
+    """)
+```
+
+You can also use the `execute_sql` method to run select queries. The data is returned as a list of rows, with the elements of a row
+corresponding to selected columns. A more convenient way to extract data is to use dlt datasets.
+
+```py
+try:
+    with pipeline.sql_client() as client:    # ty: ignore
+        res = client.execute_sql(
+            "SELECT id, name, email FROM customers WHERE id = %s",
+            10
+        )
+        # Prints column values of the first row
+        print(res[0])  # ty: ignore
+except Exception:
+    ...
+```
+
+## Other transforming tools
+
+If you want to transform your data before loading, you can use Python. If you want to transform the
+data after loading, you can use SQL or one of the following:
+
+1. [dbt](dbt/dbt.md) (recommended).
+2. [Python with DataFrames or Arrow tables](python.md).
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/verified-sources/_source-info-header.md =====
+
+import Admonition from "@theme/Admonition";
+import Link from '../../_book-onboarding-call.md';
+
+<Admonition type="note" title="Need help deploying these sources or figuring out how to run them in your data stack?">
+<a href="https://dlthub.com/community">Join our Slack community</a> or <Link/>.
+</Admonition>
+
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/verified-sources/airtable.md =====
+
+---
+title: Airtable
+description: dlt verified source for Airtable
+keywords: [airtable api, airtable verified source, airtable]
+---
+# Airtable
+
+import Header from './_source-info-header.md';
+
+<Header/>
+
+[Airtable](https://www.airtable.com/) is a cloud-based platform that merges spreadsheet and database functionalities for easy
+data management and collaboration.
+
+This Airtable `dlt` verified source and
+[pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/airtable_pipeline.py)
+loads data using the “Airtable API” to the destination of your choice.
+
+Sources and resources that can be loaded using this verified source are:
+
+| Name              | Description                                 |
+| ----------------- | ------------------------------------------- |
+| airtable_source   | Retrieves tables from an Airtable base      |
+| airtable_resource | Retrieves data from a single Airtable table |
+
+## Setup guide
+
+### Grab Airtable personal access tokens
+
+1. Click your account icon in the top-right.
+1. Choose "Developer Hub" from the dropdown.
+1. Select "Personal access token" on the left, then "Create new token".
+1. Name it appropriately.
+1. Add read scopes for "data records" and "schema bases".
+1. Add a base to specify the desired base for data access.
+1. Hit "Create token" and save the displayed token securely for credential use.
+
+> Note: The Airtable UI, which is described here, might change.
+> The full guide is available at [this link.](https://airtable.com/developers/web/guides/personal-access-tokens)
+
+### Grab Airtable IDs
+
+Upon logging into Airtable and accessing your base or table, you'll notice a URL in your browser's address bar resembling:
+
+```sh
+https://airtable.com/appve10kl227BIT4GV/tblOUnZVLFWbemTP1/viw3qtF76bRQC3wKx/rec9khXgeTotgCQ62?blocks=hide
+```
+
+Between each slash, you'll find identifiers for the base, table, and view
+as explained in [this documentation on finding Airtable IDs](https://support.airtable.com/docs/finding-airtable-ids):
+
+- Base IDs start with "app", currently set to "appve10kl227BIT4GV".
+
+- Table IDs start with "tbl", currently set to "tblOUnZVLFWbemTP1".
+
+- View IDs start with "viw", currently set to "viw3qtF76bRQC3wKx".
+
+- Record IDs start with "rec", currently set to "rec9khXgeTotgCQ62".
+
+  ![Airtable IDs](docs_images/Airtable_ids.jpeg)
+
+### Initialize the verified source
+
+To get started with your data pipeline, follow these steps:
+
+1. Enter the following command:
+
+   ```sh
+   dlt init airtable duckdb
+   ```
+
+   [This command](../../reference/command-line-interface) will initialize
+   [the pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/airtable_pipeline.py)
+   with Airtable as the [source](../../general-usage/source) and [duckdb](../destinations/duckdb.md)
+   as the [destination](../destinations).
+
+1. If you'd like to use a different destination, simply replace `duckdb` with the name of your
+   preferred [destination](../destinations).
+
+1. After running this command, a new directory will be created with the necessary files and
+   configuration settings to get started.
+
+### Add credentials
+
+1. In the `.dlt` folder, there's a file called `secrets.toml`. It's where you store sensitive
+   information securely, like access tokens. Keep this file safe.
+
+   Use the following format for service account authentication:
+
+      ```toml
+      [sources.airtable]
+      access_token = "Please set me up!" # Please set me up!
+      ```
+
+1. Finally, enter credentials for your chosen destination as per the [docs](../destinations/).
+
+1. Next, you need to configure ".dlt/config.toml", which looks like:
+
+   ```toml
+   [sources.airtable]
+   base_id = "Please set me up!"       # The ID of the base.
+   table_names = ["Table1","Table2"]   # A list of table IDs or table names to load.
+   ```
+
+   > Optionally, you can also input "base_id" and "table_names" in the script, as in the pipeline
+   > example.
+
+For more information, read the [General Usage: Credentials.](../../general-usage/credentials)
+
+## Run the pipeline
+
+1. Before running the pipeline, ensure that you have installed all the necessary dependencies by
+   running the command:
+
+   ```sh
+   pip install -r requirements.txt
+   ```
+
+1. You're now ready to run the pipeline! To get started, run the following command:
+
+   ```sh
+   python airtable_pipeline.py
+   ```
+
+1. Once the pipeline has finished running, you can verify that everything loaded correctly by using
+   the following command:
+
+   ```sh
+   dlt pipeline <pipeline_name> show
+   ```
+
+   For example, the `pipeline_name` for the above pipeline example is `airtable`, you
+   may also use any custom name instead.
+
+For more information, read the guide on [how to run a pipeline](../../walkthroughs/run-a-pipeline).
+
+## Sources and resources
+
+`dlt` works on the principle of [sources](../../general-usage/source) and
+[resources](../../general-usage/resource).
+
+### Source `airtable_source`
+
+This function retrieves tables from a given Airtable base.
+
+```py
+from typing import Iterable
+from dlt.extract import DltResource
+
+@dlt.source
+def airtable_source(
+    base_id: str = dlt.config.value,
+    table_names: list[str] | None = None,
+    access_token: str = dlt.secrets.value,
+) -> Iterable[DltResource]:
+   ...
+```
+
+`base_id`: The base's unique identifier.
+
+`table_names`: A list of either table IDs or user-defined table names to load. If not specified, all
+tables in the schema are loaded.
+
+`access_token`: Your personal access token for authentication.
+
+### Resource `airtable_resource`
+
+This function retrieves data from a single Airtable table.
+
+```py
+import pyairtable
+from dlt.extract import DltResource
+
+def airtable_resource(
+    api: pyairtable.Api,
+    base_id: str,
+    table: dict[str, Any],
+) -> DltResource:
+   ...
+```
+
+`table`: Airtable metadata, excluding actual records.
+
+## Customization
+
+### Create your own pipeline
+
+If you wish to create your own pipelines, you can leverage source and resource methods from this verified source.
+
+1. Configure the pipeline by specifying the pipeline name, destination, and dataset as follows:
+
+   ```py
+   pipeline = dlt.pipeline(
+        pipeline_name="airtable",  # Use a custom name if desired
+        destination="duckdb",      # Choose the appropriate destination (e.g., duckdb, redshift, post)
+        dataset_name="airtable_data"  # Use a custom name if desired
+   )
+   ```
+
+1. To load the entire base:
+
+   ```py notype
+   base_id = "Please set me up!"     # The ID of the base.
+
+   airtables = airtable_source(base_id=base_id)
+   load_info = pipeline.run(airtables, write_disposition="replace")
+   ```
+
+1. To load selected tables from a base table:
+
+   ```py notype
+   base_id = "Please set me up!"     # The ID of the base.
+   table_names = ["Table1", "Table2"] # A list of table IDs or table names to load.
+
+   airtables = airtable_source(
+      base_id = base_id,
+      table_names = table_names
+   )
+   load_info = pipeline.run(airtables, write_disposition = "replace")
+   ```
+
+   > You have the option to use table names or table IDs in the code above, in place of "Table1" and
+   > "Table2".
+
+1. To load data and apply hints to a specific column:
+
+   ```py notype
+   base_id = "Please set me up!"       # The ID of the base.
+   table_names = ["Table1", "Table2"]   # A list of table IDs or table names to load.
+   resource_name = "Please set me up!" # The table name we want to apply hints.
+   field_name = "Please set me up!"    # The table field name for which we want to apply hints.
+
+   airtables = airtable_source(
+        base_id="Please set me up!",
+        table_names=["Table1", "Table2"],
+   )
+
+   airtables.resources[resource_name].apply_hints(
+        primary_key=field_name,
+        columns={field_name: {"data_type": "text"}},
+   )
+   load_info = pipeline.run(airtables, write_disposition="replace")
+   print(load_info)
+   ```
+
+<!--@@@DLT_TUBA airtable-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/verified-sources/amazon_kinesis.md =====
+
+---
+title: Amazon Kinesis
+description: dlt verified source for Amazon Kinesis
+keywords: [amazon kinesis, verified source]
+---
+# Amazon Kinesis
+
+import Header from './_source-info-header.md';
+
+<Header/>
+
+[Amazon Kinesis](https://docs.aws.amazon.com/streams/latest/dev/key-concepts.html) is a cloud-based service for real-time data streaming and analytics, enabling the processing and analysis of large streams of data in real time.
+
+Our AWS Kinesis [verified source](https://github.com/dlt-hub/verified-sources/tree/master/sources/kinesis) loads messages from Kinesis streams to your preferred [destination](../../dlt-ecosystem/destinations/).
+
+Resources that can be loaded using this verified source are:
+
+| Name           | Description                             |
+| -------------- | --------------------------------------- |
+| kinesis_stream | Load messages from the specified stream |
+
+:::tip
+You can check out our pipeline example [here](https://github.com/dlt-hub/verified-sources/blob/master/sources/kinesis_pipeline.py).
+:::
+
+## Setup guide
+
+### Grab credentials
+
+To use this verified source, you need an AWS `Access key` and `Secret access key`, which can be obtained as follows:
+
+1. Sign in to your AWS Management Console.
+1. Navigate to the IAM (Identity and Access Management) dashboard.
+1. Select "Users" and choose your IAM username.
+1. Click on the "Security Credentials" tab.
+1. Choose "Create Access Key".
+1. Download or copy the Access Key ID and Secret Access Key for future use.
+
+:::info
+The AWS UI, which is described here, might change. The full guide is available at this [link](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html).
+:::
+
+### Initialize the verified source
+
+To get started with your data pipeline, follow these steps:
+
+1. Enter the following command:
+
+   ```sh
+   dlt init kinesis duckdb
+   ```
+
+   [This command](../../reference/command-line-interface) will initialize [the pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/kinesis_pipeline.py) with Kinesis as the [source](../../general-usage/source) and [duckdb](../destinations/duckdb.md) as the [destination](../destinations).
+
+1. If you'd like to use a different destination, simply replace `duckdb` with the name of your preferred [destination](../destinations).
+
+1. After running this command, a new directory will be created with the necessary files and configuration settings to get started.
+
+### Add credentials
+
+1. In the `.dlt` folder, there's a file called `secrets.toml`. It's where you store sensitive information securely, like access tokens. Keep this file safe. Here's its format for service account authentication:
+
+   ```toml
+   # Put your secret values and credentials here.
+   # Note: Do not share this file and do not push it to GitHub!
+   [sources.kinesis.credentials]
+   aws_access_key_id="AKIA********"
+   aws_secret_access_key="K+o5mj********"
+   region_name="please set me up!" # aws region name
+   ```
+
+1. Optionally, you can configure `stream_name`. Update `.dlt/config.toml`:
+
+   ```toml
+   [sources.kinesis]
+   stream_name = "please set me up!" # Stream name (Optional).
+   ```
+
+1. Replace the value of `aws_access_key_id` and `aws_secret_access_key` with the one that [you copied above](#grab-credentials). This will ensure that the verified source can access your Kinesis resource securely.
+
+1. Next, follow the instructions in [Destinations](../destinations/duckdb) to add credentials for your chosen destination. This will ensure that your data is properly routed to its final destination.
+
+For more information, read [Credentials](../../general-usage/credentials).
+
+## Run the pipeline
+
+1. Before running the pipeline, ensure that you have installed all the necessary dependencies by
+   running the command:
+
+   ```sh
+   pip install -r requirements.txt
+   ```
+
+2. You're now ready to run the pipeline! To get started, run the following command:
+
+   ```sh
+   python kinesis_pipeline.py
+   ```
+
+3. Once the pipeline has finished running, you can verify that everything loaded correctly by using
+   the following command:
+
+   ```sh
+   dlt pipeline <pipeline_name> show
+   ```
+
+   For example, the `pipeline_name` for the above pipeline example is `kinesis_pipeline`. You may
+   also use any custom name instead.
+
+For more information, read [Run a pipeline.](../../walkthroughs/run-a-pipeline)
+
+## Sources and resources
+
+`dlt` works on the principle of [sources](../../general-usage/source) and
+[resources](../../general-usage/resource).
+
+### Resource `kinesis_stream`
+
+This resource reads a Kinesis stream and yields messages. It supports
+[incremental loading](../../general-usage/incremental-loading) and parses messages as JSON by
+default.
+
+```py notype
+@dlt.resource(
+    name=lambda args: args["stream_name"],
+    primary_key="_kinesis_msg_id",
+)
+def kinesis_stream(
+    stream_name: str = dlt.config.value,
+    credentials: AwsCredentials = dlt.secrets.value,
+    last_msg: Optional[dlt.sources.incremental[StrStr]] = dlt.sources.incremental(
+        "_kinesis", last_value_func=max_sequence_by_shard
+    ),
+    initial_at_timestamp: TAnyDateTime = 0.0,
+    max_number_of_messages: int = None,
+    milliseconds_behind_latest: int = 1000,
+    parse_json: bool = True,
+    chunk_size: int = 1000,
+) -> Iterable[TDataItem]:
+    ...
+```
+
+`stream_name`: Name of the Kinesis stream. Defaults to config/secrets if unspecified.
+
+`credentials`: Credentials for Kinesis access. Uses secrets or local credentials if not provided.
+
+`last_msg`: Mapping from shard_id to a message sequence for incremental loading.
+
+`initial_at_timestamp`: Starting timestamp for AT_TIMESTAMP or LATEST iterator; defaults to 0.
+
+`max_number_of_messages`: Max messages per run; may exceed by chunk_size. Default: None (no limit).
+
+`milliseconds_behind_latest`: Milliseconds to lag behind shard top; default is 1000.
+
+`parse_json`: Parses messages as JSON if True. Default: False.
+
+`chunk_size`: Records fetched per request; default is 1000.
+
+### How does it work?
+
+You create a resource `kinesis_stream` by passing the stream name and a few other options. The
+resource will have the same name as the stream. When you iterate this resource (or pass it to
+`pipeline.run` records), it will query Kinesis for all the shards in the requested stream. For each
+ shard, it will create an iterator to read messages:
+
+1. If `initial_at_timestamp` is present, the resource will read all messages after this timestamp.
+2. If `initial_at_timestamp` is 0, only the messages at the tip of the stream are read.
+3. If no initial timestamp is provided, all messages will be retrieved (from the TRIM HORIZON).
+
+The resource stores all message sequences per shard in the state. If you run the resource again, it
+will load messages incrementally:
+
+1. For all shards that had messages, only messages after the last message are retrieved.
+2. For shards that didn't have messages (or new shards), the last run time is used to get messages.
+
+Please check the `kinesis_stream` [docstring](https://github.com/dlt-hub/verified-sources/blob/master/sources/kinesis/__init__.py#L31-L46)
+for additional options, i.e., to limit the number of messages
+returned or to automatically parse JSON messages.
+
+### Kinesis message format
+
+The `_kinesis` dictionary in the message stores the message envelope, including shard id, sequence,
+partition key, etc. The message contains `_kinesis_msg_id`, which is the primary key: a hash over
+(shard id + message sequence number). With `parse_json` set to True (default), the Data field is parsed;
+if False, `data` is returned as bytes.
+
+## Customization
+
+### Create your own pipeline
+
+If you wish to create your own pipelines, you can leverage source and resource methods from this verified source.
+
+1. Configure the [pipeline](../../general-usage/pipeline) by specifying the pipeline name, destination, and dataset as follows:
+
+   ```py
+   pipeline = dlt.pipeline(
+       pipeline_name="kinesis_pipeline",  # Use a custom name if desired
+       destination="duckdb",  # Choose the appropriate destination (e.g., duckdb, redshift, post)
+       dataset_name="kinesis"  # Use a custom name if desired
+   )
+   ```
+
+1. To load messages from a stream from the last one hour:
+
+   ```py notype
+   # The resource below will take its name from the stream name,
+   # it can be used multiple times. By default, it assumes that data is JSON and parses it,
+   # here we disable that to just get bytes in data elements of the message.
+   kinesis_stream_data = kinesis_stream(
+       "kinesis_source_name",
+       parse_json=False,
+       initial_at_timestamp=pendulum.now().subtract(hours=1),
+   )
+   info = pipeline.run(kinesis_stream_data)
+   print(info)
+   ```
+
+1. For incremental Kinesis streams, to fetch only new messages:
+
+   ```py notype
+   # Running pipeline will get only new messages.
+   info = pipeline.run(kinesis_stream_data)
+   message_counts = pipeline.last_trace.last_normalize_info.row_counts
+   if "kinesis_source_name" not in message_counts:
+       print("No messages in kinesis")
+   else:
+       print(pipeline.last_trace.last_normalize_info)
+   ```
+
+1. To parse JSON with a simple decoder:
+
+   ```py notype
+   def _maybe_parse_json(item: TDataItem) -> TDataItem:
+       try:
+           item.update(json.loadb(item["data"]))
+       except Exception:
+           pass
+       return item
+
+   info = pipeline.run(kinesis_stream_data.add_map(_maybe_parse_json))
+   print(info)
+   ```
+
+1. To read Kinesis messages and send them somewhere without using a pipeline:
+
+   ```py notype
+   from dlt.common.configuration.container import Container
+   from dlt.common.pipeline import StateInjectableContext
+
+   STATE_FILE = "kinesis_source_name.state.json"
+
+   # Load the state if it exists.
+   if os.path.exists(STATE_FILE):
+       with open(STATE_FILE, "rb") as rf:
+           state = json.typed_loadb(rf.read())
+   else:
+       # Provide new state.
+       state = {}
+
+   with Container().injectable_context(
+       StateInjectableContext(state=state)
+   ) as managed_state:
+       # dlt resources/source is just an iterator.
+       for message in kinesis_stream_data:
+           # Here you can send the message somewhere.
+           print(message)
+           # Save state after each message to have full transaction load.
+           # DynamoDB is also OK.
+           with open(STATE_FILE, "wb") as wf:
+               json.typed_dump(managed_state.state, wf)
+           print(managed_state.state)
+   ```
+
+<!--@@@DLT_TUBA kinesis-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md =====
+
+---
+title: Dataframe (pandas, pyarrow, polars)
+description: dlt source for Arrow tables, Pandas dataframes, and Polars DataFrames
+keywords: [arrow, pandas, polars, parquet, source, schema mismatch]
+---
+# Arrow table / Pandas / Polars
+
+import Header from './_source-info-header.md';
+
+<Header/>
+
+You can load data directly from an Arrow table, Pandas dataframe, or Polars DataFrame.
+This is supported by all destinations, but it is especially recommended when using destinations that support the Parquet file format natively (e.g., [Snowflake](../destinations/snowflake.md) and [Filesystem](../destinations/filesystem.md)).
+See the [destination support](#destination-support) section for more information.
+
+When used with a Parquet supported destination, this is a more performant way to load structured data since `dlt` bypasses many processing steps normally involved in passing JSON objects through the pipeline.
+`dlt` automatically translates the Arrow table's schema to the destination table's schema and writes the table to a parquet file, which gets uploaded to the destination without any further processing.
+
+## Usage
+
+To write an Arrow source, pass any `pyarrow.Table`, `pyarrow.RecordBatch`, `pandas.DataFrame`, `polars.DataFrame`, or `polars.LazyFrame` object (or list thereof) to the pipeline's `run` or `extract` method, or yield table(s)/dataframe(s) from a `@dlt.resource` decorated function.
+
+This example loads a Pandas dataframe to a Snowflake table:
+
+```py
+import dlt
+from dlt.common import pendulum
+import pandas as pd
+
+
+df = pd.DataFrame({
+    "order_id": [1, 2, 3],
+    "customer_id": [1, 2, 3],
+    "ordered_at": [pendulum.DateTime(2021, 1, 1, 4, 5, 6), pendulum.DateTime(2021, 1, 3, 4, 5, 6), pendulum.DateTime(2021, 1, 6, 4, 5, 6)],
+    "order_amount": [100.0, 200.0, 300.0],
+})
+
+pipeline = dlt.pipeline("orders_pipeline", destination="snowflake")
+
+pipeline.run(df, table_name="orders")
+```
+
+Note that Pandas indexes are not saved by default (up from `dlt` version 1.4.1). If for some reason you need the destination,
+use `Table.from_pandas` with `preserve_index` set to True to explicitly convert the dataframe into arrow table.
+
+A `pyarrow` table can be loaded in the same way:
+
+```py
+import pyarrow as pa
+
+# Create dataframe and pipeline same as above
+...
+
+table = pa.Table.from_pandas(df)
+pipeline.run(table, table_name="orders")
+```
+
+### Polars
+
+You can yield Polars DataFrames and LazyFrames directly from a `@dlt.resource`. They are automatically converted to Arrow tables before extraction, so all Arrow-based optimizations (Parquet direct loading, schema translation, etc.) apply.
+
+```py
+import dlt
+import polars as pl
+
+df = pl.DataFrame({
+    "order_id": [1, 2, 3],
+    "customer_id": [1, 2, 3],
+    "order_amount": [100.0, 200.0, 300.0],
+})
+
+pipeline = dlt.pipeline("orders_pipeline", destination="duckdb")
+pipeline.run(df, table_name="orders")
+```
+
+LazyFrames are collected automatically before conversion:
+
+```py
+import dlt
+import polars as pl
+
+@dlt.resource
+def orders():
+    lf = pl.scan_csv("orders.csv")
+    # filter lazily; dlt collects and converts to Arrow on extraction
+    yield lf.filter(pl.col("amount") > 100)
+
+pipeline = dlt.pipeline("orders_pipeline", destination="duckdb")
+pipeline.run(orders)
+```
+
+Note: The data in the table must be compatible with the destination database as no data conversion is performed. Refer to the documentation of the destination for information about supported data types.
+
+## Destination support
+
+Destinations that support the Parquet format natively will have the data files uploaded directly as possible. Rewriting files can be avoided completely in many cases.
+
+When the destination does not support Parquet, the rows are extracted from the table and written in the destination's native format (usually `insert_values`), and this is generally much slower
+as it requires processing the table row by row and rewriting data to disk.
+
+The output file format is chosen automatically based on the destination's capabilities, so you can load arrow, pandas, or polars frames to any destination, but performance will vary.
+
+### Destinations that support parquet natively for direct loading
+
+* duckdb / motherduck / ducklake
+* redshift
+* bigquery
+* snowflake
+* filesystem
+* athena
+* databricks
+* dremio
+* synapse
+* lance/lancedb
+
+## Handling schema mismatches across batches
+
+When a resource yields multiple Arrow tables, DataFrames, or Polars DataFrames, `dlt` concatenates them before writing to disk. By default, all batches must have **identical schemas** — any type difference (e.g., `int64` vs `float64`) raises an `ArrowInvalid` error. This is common when reading multiple source files where pandas infers slightly different types per file.
+
+The `arrow_concat_promote_options` setting controls how type differences are resolved:
+
+| Value              | Behavior                                                                                                                                                                                                                                                                                               |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `"none"` (default) | Requires identical schemas (zero-copy concatenation). Any schema difference — type **or** nullability — fails with a clear error and the file is **not** rotated.                                                                                                                                      |
+| `"default"`        | Reconciles nullability but allows **no** type differences: a parquet file is rotated on any type change. Lossless.                                                                                                                                                                                     |
+| `"permissive"`     | If a unified schema exists (a common type exists for every column across all schemas), performs an **unsafe** cast of each batch into the first encountered schema — which may lose data/precision. Rotates only when no unified schema exists (e.g. cross-family types such as `timestamp` vs `int`). |
+
+In every mode the **first schema written to a file wins** — later batches are cast into it (or rotated to a new file) — and that first schema's metadata is preserved.
+
+```toml
+[sources.data_writer]
+arrow_concat_promote_options = "permissive"
+```
+
+```sh
+DATA_WRITER__ARROW_CONCAT_PROMOTE_OPTIONS=permissive
+```
+
+`dlt` will concatenate and cast batches according to promotion settings.
+If schema promotion is not possible - file will be rotated and incompatible batches will be split over many parquet files. A final data
+coercion will be performed by particular destination.
+
+:::note
+Setting this to anything other than `"none"` disables zero-copy concatenation, which may increase memory usage for large batches. This maps directly to the `promote_options` parameter of [`pyarrow.concat_tables`](https://arrow.apache.org/docs/python/generated/pyarrow.concat_tables.html).
+:::
+
+:::warning
+`"permissive"` may change data: widening promotions such as `int64` → `double` lose precision for large integers. It is **not recommended for `decimal` columns** - you may lose bits of precision if first table in a batch has lower precision than later emitted tables. Use **default** and let dlt to rotate parquet files.
+:::
+
+## Add `_dlt_load_id` and `_dlt_id` to your tables
+
+`dlt` does not add any data lineage columns by default when loading Arrow tables. This is to give the best performance and avoid unnecessary data copying.
+
+But if you need them, the `_dlt_load_id` (ID of the load operation when the row was added) and `_dlt_id` (unique ID for the row) columns can be added respectively with the following configuration options:
+
+```toml
+[normalize.parquet_normalizer]
+add_dlt_load_id = true
+add_dlt_id = true
+```
+
+Keep in mind that enabling these incurs some performance overhead:
+
+- `add_dlt_load_id` has minimal overhead since the column is added to the arrow table in memory during the `extract` stage, before the parquet file is written to disk
+- `add_dlt_id` adds the column during the `normalize` stage after the file has been extracted to disk. The file needs to be read back from disk in chunks, processed, and rewritten with new columns
+
+## Incremental loading with Arrow tables
+
+You can use incremental loading with Arrow tables, Pandas DataFrames, and Polars DataFrames.
+Usage is the same as with other dlt resources. Refer to the [incremental loading](../../general-usage/incremental-loading.md) guide for more information.
+
+Example:
+
+```py
+import dlt
+from dlt.common import pendulum
+import pandas as pd
+
+# Create a resource that yields a dataframe, using the `ordered_at` field as an incremental cursor
+@dlt.resource(primary_key="order_id")
+def orders(ordered_at = dlt.sources.incremental('ordered_at')):
+    # Get a dataframe/arrow table from somewhere
+    # If your database supports it, you can use the last_value to filter data at the source.
+    # Otherwise, it will be filtered automatically after loading the data.
+    df = _get_orders(since=ordered_at.last_value)  # ty: ignore[unresolved-reference]
+    yield df
+
+pipeline = dlt.pipeline("orders_pipeline", destination="snowflake")
+pipeline.run(orders)
+# Run again to load only new data
+pipeline.run(orders)
+```
+
+:::tip
+Look at the [Connector X + Arrow Example](../../examples/connector_x_arrow/) to see how to load data from production databases fast.
+:::
+
+## Loading JSON documents
+
+If you want to skip the default `dlt` JSON normalizer, you can use any available method to convert JSON documents into tabular data.
+
+* **pandas** has `read_json` and `json_normalize` methods
+* **pyarrow** can infer the table schema and convert JSON files into tables with `read_json`
+* **duckdb** can do the same with `read_json_auto`
+
+```py
+import duckdb
+
+conn = duckdb.connect()
+table = conn.execute("SELECT * FROM read_json_auto('./json_file_path')").fetch_arrow_table()
+```
+
+Note that **duckdb** and **pyarrow** methods will generate [nested types](#loading-nested-types) for nested data, which are only partially supported by `dlt`.
+
+## Supported Arrow data types
+
+The Arrow data types are translated to dlt data types as follows:
+
+| Arrow type        | dlt type    | Notes                                                      |
+| ----------------- | ----------- | ---------------------------------------------------------- |
+| `string`          | `text`      |                                                            |
+| `float`/`double`  | `double`    |                                                            |
+| `boolean`         | `bool`      |                                                            |
+| `timestamp`       | `timestamp` | Precision is determined by the unit of the timestamp.      |
+| `date`            | `date`      |                                                            |
+| `time<bit_width>` | `time`      | Precision is determined by the unit of the time.           |
+| `int<bit_width>`  | `bigint`    | Precision is determined by the bit width.                  |
+| `binary`          | `binary`    |                                                            |
+| `decimal`         | `decimal`   | Precision and scale are determined by the type properties. |
+| `struct`          | `json`      |                                                            |
+|                   |             |                                                            |
+
+## Loading nested types
+
+All struct types are represented as `json` and will be loaded as JSON (if the destination permits) or a string. Currently, we do not support **struct** types,
+even if they are present in the destination (except **BigQuery** which can be [configured to handle them](../destinations/bigquery.md#use-bigquery-schema-autodetect-for-nested-fields))
+
+If you want to represent nested data as separate tables, you must yield DataFrames and Arrow tables as records. In the examples above:
+
+```py notype
+# yield pandas DataFrame as records
+pipeline.run(df.to_dict(orient='records'), table_name="orders")
+
+# yield arrow table
+pipeline.run(table.to_pylist(), table_name="orders")
+
+# yield polars DataFrame as records
+pipeline.run(df.to_dicts(), table_name="orders")
+```
+
+Pandas, Arrow and Polars all allow streaming records in batches.
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/verified-sources/asana.md =====
+
+---
+title: Asana
+description: dlt verified source for Asana API
+keywords: [asana api, verified source, asana]
+---
+# Asana
+
+import Header from './_source-info-header.md';
+
+<Header/>
+
+[Asana](https://asana.com) is a widely used web-based project management and collaboration tool that helps teams stay
+organized, focused, and productive. With Asana, team members can easily create, assign, and track
+tasks, set deadlines, and communicate with each other in real-time.
+
+When you use Asana, you can create various resources like "projects", "tasks", "users",
+"workspaces", and others mentioned below to help you manage your work effectively.
+
+Resources that can be loaded using this verified source are:
+
+| Name       | Description                                                                                           |
+| ---------- | ----------------------------------------------------------------------------------------------------- |
+| workspaces | People, materials, or assets required to complete a task or project successfully                      |
+| projects   | Collections of tasks and related information                                                          |
+| sections   | Used to organize tasks within a project into smaller groups or categories                             |
+| tags       | Labels that can be attached to tasks, projects, or conversations to help categorize and organize them |
+| stories    | Updates or comments that team members can add to a task or project                                    |
+| teams      | Groups of individuals who work together to complete projects and tasks                                |
+| users      | Individuals who have access to the Asana platform                                                     |
+
+To get a complete list of sub-endpoints that can be loaded, see
+[asana_dlt/settings.py.](https://github.com/dlt-hub/verified-sources/blob/master/sources/asana_dlt/settings.py)
+
+## Setup guide
+
+### Grab credentials
+
+1. To start, head to [the Asana developer console](https://app.asana.com/-/developer_console).
+1. Next, click the "Create new token" button in the "Personal Access Token" section.
+1. Give your access token a name that is meaningful to you, and take a moment to read and agree to
+   the API terms and conditions.
+1. After that, click "Create token" and you're all set!
+1. Now, copy your Access token safely as it is only displayed once.
+1. This token will be used to configure `.dlt/secrets.toml`, so keep it secure and don't share it
+   with anyone.
+
+> Note: The Asana UI, which is described here, might change.
+The full guide is available at [this link.](https://developers.asana.com/docs/authentication)
+
+### Initialize the verified source
+
+To get started with your data pipeline, follow these steps:
+
+1. Enter the following command:
+
+   ```sh
+   dlt init asana_dlt duckdb
+   ```
+
+   [This command](../../reference/command-line-interface) will initialize
+   [the pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/asana_dlt_pipeline.py)
+   with Asana as the [source](../../general-usage/source) and [duckdb](../destinations/duckdb.md) as
+   the [destination](../destinations).
+
+1. If you'd like to use a different destination, simply replace `duckdb` with the name of your
+   preferred [destination](../destinations).
+
+1. After running this command, a new directory will be created with the necessary files and
+   configuration settings to get started.
+
+### Add credentials
+
+1. Inside the `.dlt` folder, you'll find a file called `secrets.toml`, which is where you can
+   securely store your access tokens and other sensitive information. It's important to handle this
+   file with care and keep it safe. Here's what the file looks like:
+
+   ```toml
+   [sources.asana_dlt]
+   access_token = "access_token"
+   ```
+
+1. Replace the value of `access_token` with the one that [you copied above](asana#grab-credentials).
+   This will ensure that your data pipeline can access your Asana resources securely.
+1. Finally, follow the instructions in the
+   [destination documentation](../../dlt-ecosystem/destinations) to add credentials for your chosen
+   destination. This will ensure that your data is properly routed to its final destination.
+
+For more information, read the [General Usage: Credentials.](../../general-usage/credentials)
+
+## Run the pipeline
+
+1. Before running the pipeline, ensure that you have installed all the necessary dependencies by
+   running the command:
+
+   ```sh
+   pip install -r requirements.txt
+   ```
+
+1. You're now ready to run the pipeline! To get started, run the following command:
+
+   ```sh
+   python asana_dlt_pipeline.py
+   ```
+
+1. Once the pipeline has finished running, you can verify that everything loaded correctly by using
+   the following command:
+
+   ```sh
+   dlt pipeline <pipeline_name> show
+   ```
+
+   For example, the `pipeline_name` for the above pipeline example is `asana`, you may also use any
+   custom name instead.
+
+For more information, read the guide on [how to run a pipeline](../../walkthroughs/run-a-pipeline).
+
+## Sources and resources
+
+`dlt` works on the principle of [sources](../../general-usage/source) and
+[resources](../../general-usage/resource).
+
+### Default endpoints
+
+You can write your own pipelines to load data to a destination using this verified source. However,
+it is important to note the complete list of the default endpoints given in
+[asana_dlt/settings.py.](https://github.com/dlt-hub/verified-sources/blob/master/sources/asana_dlt/settings.py)
+
+### Source `asana_source`
+
+This is a `dlt.source` function, which returns a list of DltResource objects: "workspaces",
+"projects", "sections","tags","tasks","stories", "teams", and "users".
+
+```py notype
+@dlt.source
+def asana_source(access_token: str = dlt.secrets.value) -> Any:
+    return [
+      workspaces, projects, sections, tags, tasks, stories, teams, users,
+    ]
+```
+
+`access_token`: Token required to authenticate the Asana API. This token is defined in the
+`.dlt/secret.toml` file.
+
+### Resource `workspaces`
+
+This is a `dlt.resource` function, which returns collections of tasks and related information.
+
+```py notype
+@dlt.resource(write_disposition="replace")
+def workspaces(
+    access_token: str = dlt.secrets.value,
+    fields: Iterable[str] = WORKSPACE_FIELDS
+) -> Iterable[TDataItem]:
+    yield from get_client(access_token).workspaces.find_all(opt_fields=",".join(fields))
+```
+
+`access_token`: Token required to authenticate the Asana API. This token is defined in the
+`.dlt/secret.toml` file.
+
+`fields`: A list of workspace fields to be fetched from `asana_dlt/settings.py`. For example, "gid",
+"name", "is_organization", etc.
+
+To fetch all workspaces from Asana, the function uses the
+`get_client(access_token).workspaces.find_all` method. The `opt_fields` parameter is set to a string
+of all fields joined by commas. A generator is used with the `yield from` statement to provide each
+workspace from the iterator obtained. This enables the workspaces to be consumed one by one.
+
+### Resource-transformer `projects`
+
+In addition to these source and resource functions, there are seven transformer functions for various endpoints like "projects", "sections", "tags", "tasks", "stories", "teams", and "users". The transformer functions transform or process data from one or more resources.
+
+The transformer function `projects` processes data from the `workspaces` resource. It fetches and returns a list of projects for a given workspace from Asana.
+
+```py notype
+@dlt.transformer(
+    data_from=workspaces,
+    write_disposition="replace",
+)
+@dlt.defer
+def projects(
+    workspace: TDataItem,
+    access_token: str = dlt.secrets.value,
+    fields: Iterable[str] = PROJECT_FIELDS,
+) -> Iterable[TDataItem]:
+    ...
+```
+
+`workspace`: The data item from the 'workspaces' resource.
+
+`access_token`: Token required to authenticate the Asana API. This token is defined in the `.dlt/secret.toml` file.
+
+`fields`: A list of workspace fields to be fetched from `asana_dlt/settings.py`. For example, "name", "members", "completed", etc.
+
+It uses the `@dlt.defer` decorator to enable parallel run in a thread pool.
+
+### Resource-transformer `tasks`
+
+This [incremental](../../general-usage/incremental-loading.md) resource-transformer fetches all tasks for a given project from Asana.
+
+```py notype
+@dlt.transformer(data_from=projects, write_disposition="merge", primary_key="gid")
+def tasks(
+    project_array: list[TDataItem],
+    access_token: str = dlt.secrets.value,
+    modified_at: dlt.sources.incremental[str] = dlt.sources.incremental(
+        "modified_at", initial_value=START_DATE_STRING
+    ),
+    fields: Iterable[str] = TASK_FIELDS,
+) -> Iterable[TDataItem]:
+    ...
+```
+
+`workspace`: The data item from the 'projects' resource.
+
+`access_token`: Token required to authenticate the Asana API. This token is defined in the `.dlt/secret.toml` file.
+
+`modified_at`: The date from which to fetch modified tasks.
+
+`fields`: A list of workspace fields to be fetched from `asana_dlt/settings.py`. For example, "name", "assignee", "completed", etc.
+
+## Customization
+
+### Create your own pipeline
+
+If you wish to create your own pipelines, you can leverage source and resource methods from this verified source.
+
+To create your data pipeline using single loading for the "workspaces" and "projects" endpoints, follow these steps:
+
+1. Configure the pipeline by specifying the pipeline name, destination, and dataset as follows:
+
+   ```py
+   pipeline = dlt.pipeline(
+       pipeline_name="asana_pipeline",  # Use a custom name if desired
+       destination="duckdb",  # Choose the appropriate destination (e.g., duckdb, redshift, post)
+       dataset_name="asana_dataset"  # Use a custom name if desired
+   )
+   ```
+
+   To read more about pipeline configuration, please refer to our [documentation](../../general-usage/pipeline).
+
+1. To load the data from all the fields, you can utilize the `asana_source` method as follows:
+
+   ```py notype
+   load_data = asana_source()
+   ```
+
+1. Use the method `pipeline.run()` to execute the pipeline.
+
+   ```py notype
+   load_info = pipeline.run(load_data)
+   # print the information on data that was loaded
+   print(load_info)
+   ```
+
+1. To use the method `pipeline.run()` to load custom endpoints "workspaces" and "projects", the above script may be modified as:
+
+   ```py notype
+   load_info = pipeline.run(load_data.with_resources("workspaces", "projects"))
+   # print the information on data that was loaded
+   print(load_info)
+   ```
+
+<!--@@@DLT_TUBA asana_dlt-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/verified-sources/chess.md =====
+
+---
+title: Chess.com
+description: dlt verified source for Chess.com API
+keywords: [chess.com api, chess.com verified source, verified source, chess.com, chess]
+---
+# Chess.com
+
+import Header from './_source-info-header.md';
+
+<Header/>
+
+[Chess.com](https://www.chess.com/) is an online platform that offers services for chess
+enthusiasts. It includes online chess games, tournaments, lessons, and more.
+
+Resources that can be loaded using this verified source are:
+
+| Name             | Description                                                              |
+| ---------------- | ------------------------------------------------------------------------ |
+| players_profiles | retrieves player profiles for a list of player usernames                 |
+| players_archives | retrieves URL to game archives for specified players                     |
+| players_games    | retrieves players' games that happened between start_month and end_month |
+
+## Setup guide
+
+### Grab credentials
+
+[Chess.com API](https://www.chess.com/news/view/published-data-api) is a public API that does not
+require authentication or including secrets in `secrets.toml`.
+
+### Initialize the verified source
+
+To get started with your data pipeline, follow these steps:
+
+1. Enter the following command:
+
+   ```sh
+   dlt init chess duckdb
+   ```
+
+   [This command](../../reference/command-line-interface) will initialize
+   [the pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/chess_pipeline.py)
+   with Chess.com as the [source](../../general-usage/source) and
+   [duckdb](../destinations/duckdb.md) as the [destination](../destinations).
+
+1. If you'd like to use a different destination, simply replace `duckdb` with the name of your
+   preferred [destination](../destinations).
+
+1. After running this command, a new directory will be created with the necessary files and
+   configuration settings to get started.
+
+### Add credentials
+
+To add credentials to your destination, follow the instructions in the
+[destination](../../dlt-ecosystem/destinations) documentation. This will ensure that your data is
+properly routed to its final destination.
+
+For more information, read the [General Usage: Credentials.](../../general-usage/credentials)
+
+## Run the pipeline
+
+1. Before running the pipeline, ensure that you have installed all the necessary dependencies by
+   running the command:
+
+   ```sh
+   pip install -r requirements.txt
+   ```
+
+1. You're now ready to run the pipeline! To get started, run the following command:
+
+   ```sh
+   python chess_pipeline.py
+   ```
+
+1. Once the pipeline has finished running, you can verify that everything loaded correctly by using
+   the following command:
+
+   ```sh
+   dlt pipeline <pipeline_name> show
+   ```
+
+   For example, the `pipeline_name` for the above pipeline example is `chess_pipeline`, you may also
+   use any custom name instead.
+
+For more information, read the guide on [how to run a pipeline](../../walkthroughs/run-a-pipeline).
+
+## Sources and resources
+
+`dlt` works on the principle of [sources](../../general-usage/source) and
+[resources](../../general-usage/resource).
+
+### Source `source`
+
+This is a `dlt.source` function for the Chess.com API named "chess", which returns a sequence of
+DltResource objects. We'll discuss these in subsequent sections as resources.
+
+```py notype
+dlt.source(name="chess")
+def source(
+    players: list[str], start_month: str = None, end_month: str = None
+) -> Sequence[DltResource]:
+    return (
+        players_profiles(players),
+        players_archives(players),
+        players_games(players, start_month=start_month, end_month=end_month),
+        players_online_status(players),
+    )
+```
+
+`players`: This is a list of player usernames for which you want to fetch data.
+
+`start_month` and `end_month`: These optional parameters specify the time period for which you want
+to fetch game data (in "YYYY/MM" format).
+
+### Resource `players_profiles`
+
+This is a `dlt.resource` function, which returns player profiles for a list of player usernames.
+
+```py notype
+@dlt.resource(write_disposition="replace")
+def players_profiles(players: list[str]) -> Iterator[TDataItem]:
+
+    @dlt.defer
+    def _get_profile(username: str) -> TDataItem:
+        return _get_path_with_retry(f"player/{username}")
+    
+    for username in players:
+        yield _get_profile(username)
+```
+
+`players`: This is a list of player usernames for which you want to fetch profile data.
+
+It uses the `@dlt.defer` decorator to enable parallel run in a thread pool.
+
+### Resource `players_archives`
+
+This is a `dlt.resource` function, which returns a URL to game archives for specified players.
+
+```py
+from typing import Iterator
+from dlt.common.typing import TDataItem
+
+@dlt.resource(write_disposition="replace", selected=False)
+def players_archives(players: list[str]) -> Iterator[list[TDataItem]]:
+    ...
+```
+
+`players`: This is a list of player usernames for which you want to fetch archives.
+
+`selected=False`: This parameter means that this resource is not selected by default when the pipeline
+runs.
+
+### Resource `players_games`
+
+This incremental resource takes data from players and returns games for the last month if not
+specified otherwise.
+
+```py
+from typing import Iterator
+from dlt.common.typing import TDataItems
+
+@dlt.resource(write_disposition="append")
+def players_games(
+    players: list[str], start_month: str = None, end_month: str = None
+) -> Iterator[TDataItems]:
+    # gets a list of already checked (loaded) archives.
+    checked_archives = dlt.current.resource_state().setdefault("archives", [])
+    yield {}  # return your retrieved data here
+```
+
+`players`: This is a list of player usernames for which you want to fetch games.
+
+The list `checked_archives` is used to load new archives and skip the ones already loaded. It uses state
+to initialize a list called "checked_archives" from the current resource
+[state](../../general-usage/state).
+
+### Resource `players_online_status`
+
+The `players_online_status` is a `dlt.resource` function that checks the current online status of multiple chess players. It
+retrieves their username, status, last login date, and check time.
+
+## Customization
+
+### Create your own pipeline
+
+If you wish to create your own pipelines, you can leverage source and resource methods from this verified source.
+
+To create your data loading pipeline for players and load data, follow these steps:
+
+1. Configure the pipeline by specifying the pipeline name, destination, and dataset as follows:
+
+   ```py
+   pipeline = dlt.pipeline(
+       pipeline_name="chess_pipeline", # Use a custom name if desired
+       destination="duckdb", # Choose the appropriate destination (e.g., duckdb, redshift, post)
+       dataset_name="chess_players_games_data", # Use a custom name if desired
+   )
+   ```
+
+   To read more about pipeline configuration, please refer to our [documentation](../../general-usage/pipeline).
+
+1. To load the data from all the resources for specific players (e.g., for November), you can utilize the `source` method as follows:
+
+   ```py
+   # Loads games for Nov 2022
+   source_instance = chess_source(
+       ["magnuscarlsen", "vincentkeymer", "dommarajugukesh", "rpragchess"],
+       start_month="2022/11",
+       end_month="2022/11",
+   )
+   ```
+
+1. Use the method `pipeline.run()` to execute the pipeline.
+
+   ```py notype
+   info = pipeline.run(source_instance)
+   # print the information on data that was loaded
+   print(info)
+   ```
+
+1. To load data from specific resources like "players_games" and "player_profiles", modify the above code as:
+
+   ```py notype
+   info = pipeline.run(source_instance.with_resources("players_games", "players_profiles"))
+   # print the information on data that was loaded
+   print(info)
+   ```
+
+<!--@@@DLT_TUBA chess-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/verified-sources/facebook_ads.md =====
+
+---
+title: Facebook Ads
+description: dlt verified source for Facebook Ads
+keywords: [facebook ads api, verified source, facebook ads]
+---
+# Facebook Ads
+
+import Header from './_source-info-header.md';
+
+<Header/>
+
+Facebook Ads is the advertising platform that lets businesses and individuals create targeted ads on
+Facebook and its affiliated apps like Instagram and Messenger.
+
+This Facebook `dlt` verified source and
+[pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/facebook_ads_pipeline.py)
+loads data using the [Facebook Marketing API](https://developers.facebook.com/products/marketing-api/) to the destination of your choice.
+
+The endpoints that this verified source supports are:
+
+| Name              | Description                                                                    |
+| ----------------- | ------------------------------------------------------------------------------ |
+| campaigns         | A structured marketing initiative that focuses on a specific objective or goal |
+| ad_sets           | A subset or group of ads within a campaign                                     |
+| ads               | An individual advertisement that is created and displayed within an ad set     |
+| creatives         | Visual and textual elements that make up an advertisement                      |
+| ad_leads          | Information collected from users who have interacted with lead generation ads  |
+| facebook_insights | Data on audience demographics, post reach, and engagement metrics              |
+
+To get a complete list of sub-endpoints that can be loaded, see
+[facebook_ads/settings.py.](https://github.com/dlt-hub/verified-sources/blob/master/sources/facebook_ads/settings.py)
+
+## Setup guide
+
+### Grab credentials
+
+#### Grab `Account ID`
+
+1. Ensure that you have Ads Manager active for your Facebook account.
+1. Find your account ID, which is a long number. You can locate it by clicking on the Account
+   Overview dropdown in Ads Manager or by checking the link address. For example,
+   [https://adsmanager.facebook.com/adsmanager/manage/accounts?act=10150974068878324](https://adsmanager.facebook.com/adsmanager/manage/accounts?act=10150974068878324).
+1. Note this account ID as it will further be used in configuring dlt.
+
+#### Grab `Access_Token`
+
+1. Sign up for a developer account on
+   [developers.facebook.com](https://developers.facebook.com/).
+1. Log in to your developer account and click on "My Apps" in the top right corner.
+1. Create an app, select "Other" as the type, choose "Business" as the category, and click "Next".
+1. Enter the name of your app and select the associated business manager account.
+1. Go to the "Basic" settings in the left-hand side menu.
+1. Copy the "App ID" and "App secret" and paste them as "client_id" and "client_secret" in the
+   secrets.toml file in the .dlt folder.
+1. Next, obtain a short-lived access token at [https://developers.facebook.com/tools/explorer/](https://developers.facebook.com/tools/explorer/).
+1. Select the created app, add "ads_read" and "lead_retrieval" permissions, and generate a
+   short-lived access token.
+1. Copy the access token and update it in the `.dlt/secrets.toml` file.
+
+#### Exchange short-lived token for a long-lived token
+
+By default, Facebook access tokens have a short lifespan of one hour. To exchange a short-lived Facebook access token for a long-lived token, update the `.dlt/secrets.toml` with client_id and client_secret, and execute the provided Python code.
+
+```py
+from facebook_ads import get_long_lived_token
+print(get_long_lived_token("your short-lived token"))
+```
+
+Replace the `access_token` in the `.dlt/secrets.toml` file with the long-lived token obtained from the above code snippet.
+
+To retrieve the expiry date and the associated scopes of the token, you can use the following command:
+
+```py
+from facebook_ads import debug_access_token
+debug_access_token()
+```
+
+We highly recommend you add the token expiration timestamp to get notified a week before token expiration that you need to rotate it. Right now, the notifications are sent to the logger with error level. In `config.toml` / `secrets.toml`:
+
+```toml
+[sources.facebook_ads]
+access_token_expires_at=1688821881
+```
+
+> Note: The Facebook UI, which is described here, might change.
+The full guide is available at [this link.](https://developers.facebook.com/docs/marketing-apis/overview/authentication)
+
+### Initialize the verified source
+
+To get started with your data pipeline, follow these steps:
+
+1. Enter the following command:
+
+   ```sh
+   dlt init facebook_ads duckdb
+   ```
+
+   [This command](../../reference/command-line-interface) will initialize [the pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/facebook_ads_pipeline.py) with Facebook Ads as the [source](../../general-usage/source) and [duckdb](../destinations/duckdb.md) as the [destination](../destinations).
+
+1. If you'd like to use a different destination, simply replace `duckdb` with the name of your preferred [destination](../destinations).
+
+1. After running this command, a new directory will be created with the necessary files and configuration settings to get started.
+
+### Add credential
+
+1. Inside the `.dlt` folder, you'll find a file called `secrets.toml`, which is where you can securely store your access tokens and other sensitive information. It's important to handle this file with care and keep it safe. Here's what the file looks like:
+
+   ```toml
+   # put your secret values and credentials here
+   # do not share this file and do not push it to github
+   [sources.facebook_ads]
+   access_token="set me up!"
+   ```
+
+1. Replace the access_token value with the [previously copied one](facebook_ads.md#grab-credentials) to ensure secure access to your Facebook Ads resources.
+
+1. Next, follow the [destination documentation](../../dlt-ecosystem/destinations) instructions to add credentials for your chosen destination, ensuring proper routing of your data to the final destination.
+
+1. It is strongly recommended to add the token expiration timestamp to your `config.toml` or `secrets.toml` file.
+
+1. Next, store your pipeline configuration details in the `.dlt/config.toml`.
+
+   Here's what the `config.toml` looks like:
+
+   ```toml
+   [sources.facebook_ads]
+   account_id = "Please set me up!"
+   ```
+
+1. Replace the value of the "account id" with the one [copied above](#grab-account-id).
+
+For more information, read the [General Usage: Credentials.](../../general-usage/credentials)
+
+## Run the pipeline
+
+1. Before running the pipeline, ensure that you have installed all the necessary dependencies by
+   running the command:
+
+   ```sh
+   pip install -r requirements.txt
+   ```
+
+2. You're now ready to run the pipeline! To get started, run the following command:
+
+   ```sh
+   python facebook_ads_pipeline.py
+   ```
+
+3. Once the pipeline has finished running, you can verify that everything loaded correctly by using
+   the following command:
+
+   ```sh
+   dlt pipeline <pipeline_name> show
+   ```
+
+   For example, the `pipeline_name` for the above pipeline example is `facebook_ads`. You may also
+   use any custom name instead.
+
+For more information, read the guide on [how to run a pipeline](../../walkthroughs/run-a-pipeline).
+
+## Sources and resources
+
+`dlt` works on the principle of [sources](../../general-usage/source) and
+[resources](../../general-usage/resource).
+
+### Default endpoints
+
+You can write your own pipelines to load data to a destination using this verified source. However,
+it is important to note the complete list of the default endpoints given in
+[facebook_ads/settings.py.](https://github.com/dlt-hub/verified-sources/blob/master/sources/facebook_ads/settings.py)
+
+### Source `facebook_ads_source`
+
+This function returns a list of resources to load campaigns, ad sets, ads, creatives, and ad leads
+data from the Facebook Marketing API.
+
+```py
+from collections.abc import Sequence
+from dlt.extract import DltResource
+
+@dlt.source(name="facebook_ads")
+def facebook_ads_source(
+    account_id: str = dlt.config.value,
+    access_token: str = dlt.secrets.value,
+    chunk_size: int = 50,
+    request_timeout: float = 300.0,
+    app_api_version: str = None,
+) -> Sequence[DltResource]:
+   ...
+```
+
+`account_id`: Account ID associated with the ad manager, configured in "config.toml".
+
+`access_token`: Access token associated with the Business Facebook App, configured in
+"secrets.toml".
+
+`chunk_size`: The size of the page and batch request. You may need to decrease it if you request a lot
+of fields. Defaults to 50.
+
+`request_timeout`: Connection timeout. Defaults to 300.0.
+
+`app_api_version`: A version of the Facebook API required by the app for which the access tokens
+were issued, e.g., 'v17.0'. Defaults to the _facebook_business_ library default version.
+
+### Resource `ads`
+
+The ads function fetches ad data. It retrieves ads from a specified account with specific fields and
+states.
+
+```py notype
+@dlt.resource(primary_key="id", write_disposition="replace")
+def ads(
+    fields: Sequence[str] = DEFAULT_AD_FIELDS,
+    states: Sequence[str] = None,
+    chunk_size: int = 50
+) -> Iterator[TDataItems]:
+
+  yield _get_data_chunked(account.get_ads, fields, states, chunk_size)
+```
+
+`fields`: Retrieves fields for each ad. For example, “id”, “name”, “adset_id”, etc.
+
+`states`: The possible states include "Active," "Paused," "Pending Review," "Disapproved,"
+"Completed," and "Archived."
+
+### Resources for `facebook_ads_source`
+
+Similar to resource `ads`, the following resources have been defined in the `__init__.py` for source
+`facebook_ads_source`:
+
+| Resource     | Description                                                          |
+| ------------ | -------------------------------------------------------------------- |
+| campaigns    | Fetches all `DEFAULT_CAMPAIGN_FIELDS`                                |
+| ad_sets      | Fetches all `DEFAULT_ADSET_FIELDS`                                   |
+| leads        | Fetches all `DEFAULT_LEAD_FIELDS`, uses `@dlt.transformer` decorator |
+| ad_creatives | Fetches all `DEFAULT_ADCREATIVE_FIELDS`                              |
+
+The default fields are defined in
+[facebook_ads/settings.py](https://github.com/dlt-hub/verified-sources/blob/master/sources/facebook_ads/settings.py)
+
+### Source `facebook_insights_source`
+
+This function returns a list of resources to load facebook_insights.
+
+```py notype
+@dlt.source(name="facebook_ads")
+def facebook_insights_source(
+    account_id: str = dlt.config.value,
+    access_token: str = dlt.secrets.value,
+    initial_load_past_days: int = 30,
+    fields: Sequence[str] = DEFAULT_INSIGHT_FIELDS,
+    attribution_window_days_lag: int = 7,
+    time_increment_days: int = 1,
+    breakdowns: TInsightsBreakdownOptions = "ads_insights_age_and_gender",
+    action_breakdowns: Sequence[str] = ALL_ACTION_BREAKDOWNS,
+    level: TInsightsLevels = "ad",
+    action_attribution_windows: Sequence[str] = ALL_ACTION_ATTRIBUTION_WINDOWS,
+    batch_size: int = 50,
+    request_timeout: int = 300,
+    app_api_version: str = None,
+) -> DltResource:
+   ...
+```
+
+`account_id`: Account ID associated with ads manager, configured in _config.toml_.
+
+`access_token`: Access token associated with the Business Facebook App, configured in _secrets.toml_.
+
+`initial_load_past_days`: How many past days (starting from today) to initially load. Defaults to 30.
+
+`fields`: A list of fields to include in each report. Note that the “breakdowns” option adds fields automatically. Defaults to DEFAULT_INSIGHT_FIELDS.
+
+`attribution_window_days_lag`: Attribution window in days. The reports in the attribution window are refreshed on each run. Defaults to 7.
+
+`time_increment_days`: The report aggregation window in days. Use 7 for weekly aggregation. Defaults to 1.
+
+`breakdowns`: Presents with common aggregations. See [settings.py](https://github.com/dlt-hub/verified-sources/blob/master/sources/facebook_ads/settings.py) for details. Defaults to "ads_insights_age_and_gender".
+
+`action_breakdowns`: Action aggregation types. See [settings.py](https://github.com/dlt-hub/verified-sources/blob/master/sources/facebook_ads/settings.py) for details. Defaults to ALL_ACTION_BREAKDOWNS.
+
+`level`: The granularity level. Defaults to "ad".
+
+`action_attribution_windows`: Attribution windows for actions. Defaults to ALL_ACTION_ATTRIBUTION_WINDOWS.
+
+`batch_size`: Page size when reading data from a particular report. Defaults to 50.
+
+`request_timeout`: Connection timeout. Defaults to 300.
+
+`app_api_version`: A version of the Facebook API required by the app for which the access tokens were issued, e.g., 'v17.0'. Defaults to the facebook_business library default version.
+
+### Resource `facebook_insights`
+
+This function fetches Facebook insights data incrementally from a specified start date until the current date, in day steps.
+
+```py notype
+@dlt.resource(primary_key=INSIGHTS_PRIMARY_KEY, write_disposition="merge")
+def facebook_insights(
+    date_start: dlt.sources.incremental[str] = dlt.sources.incremental(
+        "date_start", initial_value=START_DATE_STRING
+    )
+) -> Iterator[TDataItems]:
+   ...
+```
+
+`date_start`: Parameter sets the initial value for the "date_start" parameter in dlt.sources.incremental. It is based on the last pipeline run or defaults to today's date minus the specified number of days in the "initial_load_past_days" parameter.
+
+## Customization
+
+### Create your own pipeline
+
+If you wish to create your own pipelines, you can leverage source and resource methods from this verified source.
+
+1. Configure the pipeline by specifying the pipeline name, destination, and dataset as follows:
+
+   ```py
+   pipeline = dlt.pipeline(
+       pipeline_name="facebook_ads",  # Use a custom name if desired
+       destination="duckdb",  # Choose the appropriate destination (e.g., duckdb, redshift, post)
+       dataset_name="facebook_ads_data"  # Use a custom name if desired
+   )
+   ```
+
+   To read more about pipeline configuration, please refer to our [documentation](../../general-usage/pipeline).
+
+1. To load all the data from campaigns, ad sets, ads, ad creatives, and leads:
+
+   ```py
+   load_data = facebook_ads_source()
+   load_info = pipeline.run(load_data)
+   print(load_info)
+   ```
+
+1. To merge the Facebook Ads with the state "DISAPPROVED" and with ads state "PAUSED", you can do the following:
+
+   ```py
+   load_data = facebook_ads_source()
+   # It is recommended to enable root key propagation on a source that is not a merge one by default. This is not required if you always use merge but below we start with replace
+   load_data.root_key = True
+
+   # Load only disapproved ads
+   load_data.ads.bind(states=("DISAPPROVED",))
+   load_info = pipeline.run(load_data.with_resources("ads"), write_disposition="replace")
+   print(load_info)
+
+   # Here we merge the paused ads but the disapproved ads stay there!
+   load_data = facebook_ads_source()
+   load_data.ads.bind(states=("PAUSED",))
+   load_info = pipeline.run(load_data.with_resources("ads"), write_disposition="merge")
+   print(load_info)
+   ```
+
+   In the above steps, we first load the "ads" data with the "DISAPPROVED" state in _replace_ mode and then merge the ads data with the "PAUSED" state on that.
+
+1. To load data with a custom field, for example, to load only "id" from Facebook ads, you can do the following:
+
+   ```py
+   load_data = facebook_ads_source()
+   # Only loads ad ids, works the same for campaigns, leads, etc.
+   load_data.ads.bind(fields=("id",))
+   load_info = pipeline.run(load_data.with_resources("ads"))
+   print(load_info)
+   ```
+
+1. This pipeline includes an enrichment transformation called `enrich_ad_objects` that you can apply to any resource to obtain additional data per object using `object.get_api`. The following code demonstrates how to enrich objects by adding an enrichment transformation that includes additional fields.
+
+   ```py notype
+   # You can reduce the chunk size for smaller requests
+   load_data = facebook_ads_source(chunk_size=2)
+
+   # Request only the "id" field for ad_creatives
+   load_data.ad_creatives.bind(fields=("id",))
+
+   # Add a transformation to the ad_creatives resource
+   load_data.ad_creatives.add_step(
+       # Specify the AdCreative object type and request the desired fields
+       enrich_ad_objects(AdCreative, DEFAULT_ADCREATIVE_FIELDS)
+   )
+
+   # Run the pipeline with the ad_creatives resource
+   load_info = pipeline.run(load_data.with_resources("ad_creatives"))
+
+   print(load_info)
+   ```
+
+   In the above code, the "load_data" object represents the Facebook Ads source, and we specify the desired chunk size for the requests. We then bind the "id" field for the "ad_creatives" resource using the "bind()" method.
+
+   To enrich the ad_creatives objects, we add a transformation using the "add_step()" method. The "enrich_ad_objects" function is used to specify the AdCreative object type and request the fields defined in _DEFAULT_ADCREATIVE_FIELDS_.
+
+   Finally, we run the pipeline with the ad_creatives resource and store the load information in the `load_info`.
+
+1. You can also load insights reports incrementally with defined granularity levels, fields, breakdowns, etc., as defined in the `facebook_insights_source`. This function generates daily reports for a specified number of past days.
+
+   ```py notype
+   load_data = facebook_insights_source(
+       initial_load_past_days=30,
+       attribution_window_days_lag=7,
+       time_increment_days=1
+   )
+   load_info = pipeline.run(load_data)
+   print(load_info)
+   ```
+
+> By default, daily reports are generated from `initial_load_past_days` ago to today. On subsequent runs, only new reports are loaded, with the past `attribution_window_days_lag` days (default is 7) being refreshed to accommodate any changes. You can adjust `time_increment_days` to change report frequency (default set to one).
+
+<!--@@@DLT_TUBA facebook_ads-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/verified-sources/filesystem/index.md =====
+
+---
+title: Cloud storage and filesystem
+description: dlt-verified source for reading files from cloud storage and local file system
+keywords: [file system, files, filesystem, readers source, cloud storage, object storage, local file system]
+---
+# Cloud storage and filesystem
+
+import Header from '../_source-info-header.md';
+
+<Header/>
+
+The filesystem source allows seamless loading of files from the following locations:
+
+* AWS S3
+* Google Cloud Storage
+* Google Drive
+* Azure Blob Storage
+* remote filesystem (via SFTP)
+* local filesystem
+* Public CDN
+
+The filesystem source natively supports [CSV](../../file-formats.md#csv), [Parquet](../../file-formats.md#parquet), and [JSONL](../../file-formats.md#jsonl) files and allows customization for loading any type of structured file.
+
+Filesystem source allows loading files from remote locations (AWS S3, Google Cloud Storage, Google Drive, Azure Blob Storage, SFTP server) or the local filesystem seamlessly. Filesystem source natively supports [CSV](../../file-formats.md#csv), [Parquet](../../file-formats.md#parquet), and [JSONL](../../file-formats.md#jsonl) files and allows customization for loading any type of structured files.
+
+To load unstructured data (PDF, plain text, e-mail), please refer to the [unstructured data source](https://github.com/dlt-hub/verified-sources/tree/master/sources/unstructured_data).
+
+## How filesystem source works
+
+The Filesystem source doesn't just give you an easy way to load data from both remote and local files — it also comes with a powerful set of tools that let you customize the loading process to fit your specific needs.
+
+Filesystem source loads data in two steps:
+
+1. It [accesses the files](#1-initialize-a-filesystem-resource) in your remote or local file storage without actually reading the content yet. At this point, you can [filter files by metadata or name](#7-filter-files). You can also set up [incremental loading](#5-incremental-loading) to load only new files.
+2. [The reader](#2-choose-the-right-reader) reads the files' content and yields the records. At this step, you can filter out the actual data, enrich records with metadata from files, or [perform incremental loading](#load-new-records-based-on-a-specific-column) based on the file content.
+
+For the most common cases we provide `readers` source that does the above in a single step.
+
+## Quick example
+
+Let's see how to load a parquet file from a public website. The following example downloads a single file of yellow taxi trip records from the [NYC Taxi & Limousine Commission](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) website and loads it into DuckDB.
+
+```py
+import datetime as dt
+
+import dlt
+from dlt.sources.filesystem import filesystem, read_parquet
+
+filesystem_resource = filesystem(
+  bucket_url="https://d37ci6vzurychx.cloudfront.net/trip-data",
+  file_glob=f"yellow_tripdata_{(dt.datetime.now() - dt.timedelta(days=90)).strftime('%Y-%m')}.parquet",
+)
+filesystem_pipe = filesystem_resource | read_parquet()
+
+# We load the data into the table_name table
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run(filesystem_pipe.with_name("yellow_tripdata"))
+print(load_info)
+print(pipeline.last_trace.last_normalize_info)  # ty: ignore[unresolved-attribute]
+```
+
+This section illustrates how to perform an efficient incremental load of Parquet files from a remote source, specifically an S3 bucket.
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_parquet
+
+filesystem_resource = filesystem(
+  bucket_url="s3://my-bucket/files",
+  file_glob="**/*.parquet",
+  incremental=dlt.sources.incremental("modification_date")
+)
+filesystem_pipe = filesystem_resource | read_parquet()
+
+# We load the data into the table_name table
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run(filesystem_pipe.with_name("table_name"))
+print(load_info)
+print(pipeline.last_trace.last_normalize_info)  # ty: ignore[unresolved-attribute]
+```
+
+With `readers` source:
+
+```py
+import dlt
+from dlt.sources.filesystem import readers
+
+parquet_files = readers(
+  bucket_url="s3://my-bucket/files",
+  file_glob="**/*.parquet",
+  incremental=dlt.sources.incremental("modification_date")
+).read_parquet()
+
+# We load the data into the table_name table
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run(parquet_files.with_name("table_name"))
+print(load_info)
+print(pipeline.last_trace.last_normalize_info)  # ty: ignore[unresolved-attribute]
+```
+
+## Setup
+
+### Prerequisites
+
+Please make sure the `dlt` library is installed. Refer to the [installation guide](../../../intro.md).
+
+### Initialize the filesystem source
+
+To get started with your data pipeline, follow these steps:
+
+1. Enter the following command:
+
+   ```sh
+   dlt init filesystem duckdb
+   ```
+
+   The [dlt init command](../../../reference/command-line-interface.md) will initialize
+   [the pipeline example](https://github.com/dlt-hub/verified-sources/blob/master/sources/filesystem_pipeline.py)
+   with the filesystem as the source and [duckdb](../../destinations/duckdb.md) as the destination.
+
+2. If you would like to use a different destination, simply replace `duckdb` with the name of your
+   preferred [destination](../destinations).
+
+3. After running this command, a new directory will be created with the necessary files and
+   configuration settings to get started.
+
+## Configuration
+
+### Get credentials
+
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="aws"
+  values={[
+    {"label": "AWS S3", "value": "aws"},
+    {"label": "GCS/GDrive", "value": "gcp"},
+    {"label": "Azure", "value": "azure"},
+    {"label": "SFTP", "value": "sftp"},
+    {"label": "Local filesystem", "value": "local"},
+]}>
+
+<TabItem value="aws">
+
+To get AWS keys for S3 access:
+
+1. Access IAM in the AWS Console.
+2. Select "Users", choose a user, and open "Security credentials".
+3. Click "Create access key" for AWS ID and Secret Key.
+
+For more info, see
+[AWS official documentation.](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html)
+
+</TabItem>
+
+<TabItem value="gcp">
+
+To get GCS/GDrive access:
+
+1. Log in to [console.cloud.google.com](http://console.cloud.google.com/).
+2. Create a [service account](https://cloud.google.com/iam/docs/service-accounts-create#creating).
+3. Enable "Cloud Storage API" / "Google Drive API"; see
+   [Google's guide](https://support.google.com/googleapi/answer/6158841?hl=en).
+4. In IAM & Admin > Service Accounts, find your account, click the three-dot menu > "Manage Keys" >
+   "ADD KEY" > "CREATE" to get a JSON credential file.
+5. Grant the service account appropriate permissions for cloud storage access.
+6. In the case of GDrive, share the respective folders/files with the service account.
+
+For more info, see how to
+[create a service account](https://support.google.com/a/answer/7378726?hl=en).
+
+</TabItem>
+
+<TabItem value="azure">
+
+To obtain Azure blob storage access:
+
+1. Go to the Azure Portal (portal.azure.com).
+2. Select "Storage accounts" > your storage.
+3. Click "Settings" > "Access keys".
+4. View the account name and two keys (primary/secondary). Keep keys confidential.
+
+For more info, see
+[Azure official documentation](https://learn.microsoft.com/en-us/azure/storage/common/storage-account-keys-manage?tabs=azure-portal).
+
+</TabItem>
+
+<TabItem value="sftp">
+
+dlt supports several authentication methods:
+
+1. Key-based authentication
+2. SSH Agent-based authentication
+3. Username/Password authentication
+4. GSS-API authentication
+
+Learn more about SFTP authentication options in the [SFTP section](../destinations/filesystem#sftp). To obtain credentials, contact your server administrator.
+</TabItem>
+
+<TabItem value="local">
+You don't need any credentials for the local filesystem.
+</TabItem>
+
+</Tabs>
+
+### Add credentials to dlt pipeline
+
+To provide credentials to the filesystem source, you can use [any method available](../../../general-usage/credentials/setup.md) in dlt.
+One of the easiest ways is to use configuration files. The `.dlt` folder in your working directory contains two files: `config.toml` and `secrets.toml`. Sensitive information, like passwords and access tokens, should only be put into `secrets.toml`, while any other configuration, like the path to a bucket, can be specified in `config.toml`.
+
+<Tabs
+  groupId="filesystem-type"
+  defaultValue="aws"
+  values={[
+    {"label": "AWS S3", "value": "aws"},
+    {"label": "GCS/GDrive", "value": "gcp"},
+    {"label": "Azure", "value": "azure"},
+    {"label": "SFTP", "value": "sftp"},
+    {"label": "Local filesystem", "value": "local"},
+]}>
+
+<TabItem value="aws">
+
+```toml
+# secrets.toml
+[sources.filesystem.credentials]
+aws_access_key_id="Please set me up!"
+aws_secret_access_key="Please set me up!"
+
+# config.toml
+[sources.filesystem]
+bucket_url="s3://<bucket_name>/<path_to_files>/"
+```
+
+</TabItem>
+
+<TabItem value="azure">
+
+```toml
+# secrets.toml
+[sources.filesystem.credentials]
+azure_storage_account_name="Please set me up!"
+azure_storage_account_key="Please set me up!"
+
+# config.toml
+[sources.filesystem]
+bucket_url="az://<container_name>/<path_to_files>/"
+```
+
+</TabItem>
+
+<TabItem value="gcp">
+
+```toml
+# secrets.toml
+[sources.filesystem.credentials]
+client_email="Please set me up!"
+private_key="Please set me up!"
+project_id="Please set me up!"
+
+# config.toml
+# gdrive
+[gdrive_pipeline_name.sources.filesystem]
+bucket_url="gdrive://<folder_name>/<subfolder_or_file_path>/" # set file_glob="" if file path
+
+# config.toml
+# Google storage
+[gstorage_pipeline_name.sources.filesystem]
+bucket_url="gs://<bucket_name>/<path_to_files>/"
+```
+
+</TabItem>
+
+<TabItem value="sftp">
+
+Learn how to set up SFTP credentials for each authentication method in the [SFTP section](../destinations/filesystem#sftp).
+For example, in the case of key-based authentication, you can configure the source the following way:
+
+```toml
+# secrets.toml
+[sources.filesystem.credentials]
+sftp_username = "foo"
+sftp_key_filename = "/path/to/id_rsa"     # Replace with the path to your private key file
+sftp_key_passphrase = "your_passphrase"   # Optional: passphrase for your private key
+
+# config.toml
+[sources.filesystem]
+bucket_url = "sftp://[hostname]/[path]"
+```
+
+</TabItem>
+
+<TabItem value="local">
+
+You can use both native local filesystem paths and the `file://` URI. Absolute, relative, and UNC Windows paths are supported.
+
+You could provide an absolute filepath:
+
+```toml
+# config.toml
+[sources.filesystem]
+bucket_url='file://Users/admin/Documents/csv_files'
+```
+
+Or skip the schema and provide the local path in a format native to your operating system. For example, for Windows:
+
+```toml
+[sources.filesystem]
+bucket_url='~\Documents\csv_files\'
+```
+
+</TabItem>
+
+</Tabs>
+
+You can also specify the credentials using environment variables. The name of the corresponding environment variable should be slightly different from the corresponding name in the TOML file. Simply replace dots `.` with double underscores `__`:
+
+```sh
+export SOURCES__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID = "Please set me up!"
+export SOURCES__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY = "Please set me up!"
+```
+
+:::tip
+dlt supports more ways of authorizing with cloud storage, including identity-based and default credentials. To learn more about adding credentials to your pipeline, please refer to the [Configuration and secrets section](../../../general-usage/credentials/complex_types.md#gcp-credentials).
+:::
+
+## Usage
+
+The filesystem source is quite unique since it provides you with building blocks for loading data from files. First, it iterates over files in the storage and then processes each file to yield the records. Usually, you need two resources:
+
+1. The `filesystem` resource enumerates files in a selected bucket using a glob pattern, returning details as `FileItem` in customizable page sizes.
+2. One of the available transformer resources to process each file in a specific transforming function and yield the records.
+
+### 1. Initialize a `filesystem` resource
+
+:::note
+If you use just the `filesystem` resource, it will only list files in the storage based on glob parameters and yield the files [metadata](#fileitem-fields). The `filesystem` resource itself does not read or copy files.
+:::
+
+All parameters of the resource can be specified directly in code:
+
+```py
+from dlt.sources.filesystem import filesystem
+
+filesystem_source = filesystem(
+  bucket_url="file://Users/admin/Documents/csv_files",
+  file_glob="*.csv"
+)
+```
+
+or taken from the config:
+
+* python code:
+
+  ```py
+  from dlt.sources.filesystem import filesystem
+
+  filesystem_source = filesystem()
+  ```
+
+* configuration file:
+
+  ```toml
+  [sources.filesystem]
+  bucket_url="file://Users/admin/Documents/csv_files"
+  file_glob="*.csv"
+  ```
+
+Full list of `filesystem` resource parameters:
+
+* `bucket_url` - full URL of the bucket (could be a relative path in the case of the local filesystem).
+* `credentials` - cloud storage credentials of `AbstractFilesystem` instance (should be empty for the local filesystem). We recommend not specifying this parameter in the code, but putting it in a secrets file instead.
+* `file_glob` -  file filter in glob format. Defaults to listing all non-recursive files in the bucket URL.
+
+  :::info
+  If the `bucket_url` is a specific file path, set `file_glob=""`.
+  :::
+
+* `files_per_page` - number of files processed at once. The default value is `100`.
+* `extract_content` - if true, the content of the file will be read and returned in the resource. The default value is `False`.
+* `fetch_file_info` - if true, dlt reads `size_in_bytes` and `modification_date` that the listing does not
+  report. The default value is `False`.
+
+  :::note
+  Only the `http` and `https` filesystems need this parameter. HTTP has no listing protocol. fsspec builds
+  the file list from the HTML index page, which reports neither size nor modification date. Without
+  `fetch_file_info`, these files have no `size_in_bytes`. Their `modification_date` is the time of the
+  listing. With `fetch_file_info`, dlt makes one extra request per file to read both values.
+  :::
+
+### 2. Choose the right reader
+
+The current implementation of the filesystem source natively supports three file types: CSV, Parquet, and JSONL.
+You can apply any of the above or [create your own readers](#create-your-own-readers). To apply the selected transformer resource, use pipe notation `|`:
+
+```py
+from dlt.sources.filesystem import filesystem, read_csv
+
+filesystem_pipe = filesystem(
+  bucket_url="file://Users/admin/Documents/csv_files",
+  file_glob="*.csv"
+) | read_csv()
+```
+
+#### Available readers
+
+- `read_csv()` - processes CSV files using [Pandas](https://pandas.pydata.org/). Control batch size with `chunksize` (defaults to 10000 rows). Accepts additional `**pandas_kwargs` passed to `pd.read_csv()`.
+- `read_jsonl()` - processes JSONL files chunk by chunk. Control batch size with `chunksize` (defaults to 1000 lines per batch).
+- `read_parquet()` - processes Parquet files using [PyArrow](https://arrow.apache.org/docs/python/). Control memory usage with `chunksize` (defaults to 1000 rows per batch). Set `use_pyarrow=True` to yield native `pyarrow.RecordBatch` objects instead of Python dictionaries for zero-copy operations.
+- `read_csv_duckdb()` - processes CSV files using DuckDB, which usually shows better performance than Pandas. Control batch size with `chunk_size` (defaults to 5000 rows). Set `use_pyarrow=True` to yield Arrow format instead of JSON. Accepts additional `**duckdb_kwargs` passed to DuckDB's `read_csv()`.
+
+:::tip
+We advise that you give each resource a [specific name](../../../general-usage/resource.md#duplicate-and-rename-resources) before loading with `pipeline.run`. This will ensure that data goes to a table with the name you want and that each pipeline uses a [separate state for incremental loading.](../../../general-usage/state.md#read-and-write-pipeline-state-in-a-resource)
+:::
+
+### 3. Create and run a pipeline
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_csv
+
+filesystem_pipe = filesystem(bucket_url="file://Users/admin/Documents/csv_files", file_glob="*.csv") | read_csv()
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+info = pipeline.run(filesystem_pipe)
+print(info)
+```
+
+For more information on how to create and run the pipeline, read the [Walkthrough: Run a pipeline](../../../walkthroughs/run-a-pipeline.md).
+
+### 4. Apply hints
+
+```py
+import dlt
+from dlt.sources.filesystem import filesystem, read_csv
+
+filesystem_pipe = filesystem(bucket_url="file://Users/admin/Documents/csv_files", file_glob="*.csv") | read_csv()
+# Tell dlt to merge on date
+filesystem_pipe.apply_hints(write_disposition="merge", merge_key="date")
+
+# We load the data into the table_name table
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+load_info = pipeline.run(filesystem_pipe.with_name("table_name"))
+print(load_info)
+```
+
+### 5. Incremental loading
+
+Here are a few simple ways to load your data incrementally:
+

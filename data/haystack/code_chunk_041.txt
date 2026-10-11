@@ -1,0 +1,3146 @@
+  :::warning
+  `bigint` maps to BigQuery's **INT64** data type.
+  Automatic partitioning requires converting an INT64 column to a UNIX timestamp, which `GENERATE_ARRAY` doesn't natively support.
+  With a 10,000 partition limit, we can’t cover the full INT64 range.
+  Instead, we set 86,400-second boundaries to enable daily partitioning.
+  This captures typical values, but extremely large/small outliers go to an `__UNPARTITIONED__` catch-all partition.
+  :::
+
+* `cluster` - creates cluster column(s). Many columns per table are supported and only when a new table is created.
+
+:::warning
+**Deprecation Notice:**
+Per-column `cluster` hints are deprecated and will be removed in a future release.
+**To migrate, use the `cluster` argument of the `bigquery_adapter` instead.**
+See the [example below](#use-an-adapter-to-apply-hints-to-a-resource) for how to specify clustering columns with the adapter.
+:::
+
+### Table and column identifiers
+
+BigQuery uses case-sensitive identifiers by default, and this is what `dlt` assumes. If the dataset you use has case-insensitive identifiers (you have such an option
+when you create it), make sure that you use a case-insensitive [naming convention](../../general-usage/naming-convention.md#case-sensitive-and-insensitive-destinations) or you tell `dlt` about it so identifier collisions are properly detected.
+
+```toml
+[destination.bigquery]
+has_case_sensitive_identifiers=false
+```
+
+You have an option to allow `dlt` to set the case sensitivity for newly created datasets. In that case, it will follow the case sensitivity of the current
+naming convention (i.e., the default **snake_case** will create a dataset with case-insensitive identifiers).
+
+```toml
+[destination.bigquery]
+should_set_case_sensitivity_on_new_dataset=true
+```
+
+The option above is off by default.
+
+## Staging support
+
+BigQuery supports GCS as a file staging destination. `dlt` will upload files in the parquet format to GCS and ask BigQuery to copy their data directly into the database.
+Please refer to the [Google Storage filesystem documentation](./filesystem.md#google-storage) to learn how to set up your GCS bucket with the bucket_url and credentials.
+If you use the same service account for GCS and your BigQuery deployment, you do not need to provide additional authentication for BigQuery to be able to read from your bucket.
+
+Alternatively to parquet files, you can specify jsonl as the staging file format. For this, set the `loader_file_format` argument of the `run` command of the pipeline to `jsonl`.
+
+### BigQuery/GCS staging example
+
+```py
+# Create a dlt pipeline that will load
+# chess player data to the BigQuery destination
+# via a GCS bucket.
+pipeline = dlt.pipeline(
+    pipeline_name='chess_pipeline',
+    destination='bigquery',
+    staging='filesystem', # Add this to activate the staging location.
+    dataset_name='player_data'
+)
+```
+
+## Additional destination options
+
+You can configure the data location and various timeouts as shown below. This information is not a secret so it can be placed in `config.toml` as well:
+
+```toml
+[destination.bigquery]
+location="US"
+http_timeout=15.0
+file_upload_timeout=1800.0
+retry_deadline=60.0
+```
+
+* `location` sets the [BigQuery data location](https://cloud.google.com/bigquery/docs/locations) (default: **US**)
+* `http_timeout` sets the timeout when connecting and getting a response from the BigQuery API (default: **15 seconds**)
+* `file_upload_timeout` is a timeout for file upload when loading local files: the total time of the upload may not exceed this value (default: **30 minutes**, set in seconds)
+* `retry_deadline` is a deadline for a [DEFAULT_RETRY used by Google](https://cloud.google.com/python/docs/reference/storage/1.39.0/retry_timeout)
+* `ignore_unknown_values` is a configuration option that allows BigQuery to ignore rows with unknown or unexpected values during data loading. When enabled, rows containing fields that are not defined in the schema will be skipped instead of causing the entire load job to fail. This can be useful when dealing with inconsistent or evolving data sources.
+
+### dbt support
+
+This destination [integrates with dbt](../transformations/dbt/dbt.md) via [dbt-bigquery](https://github.com/dbt-labs/dbt-bigquery).
+Credentials, if explicitly defined, are shared with `dbt` along with other settings like **location**, retries, and timeouts.
+In the case of implicit credentials (i.e., available in a cloud function), `dlt` shares the `project_id` and delegates obtaining credentials to the `dbt` adapter.
+
+### Syncing of dlt state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+## BigQuery adapter
+
+You can use the `bigquery_adapter` to add BigQuery-specific hints to a resource.
+These hints influence how data is loaded into BigQuery tables, such as specifying partitioning, clustering, and numeric column rounding modes.
+Hints can be defined at both the column level and table level.
+
+The adapter updates the DltResource with metadata about the destination column and table DDL options.
+
+### Use an adapter to apply hints to a resource
+
+Here is an example of how to use the `bigquery_adapter` method to apply hints to a resource on both the column level and table level:
+
+```py
+
+import dlt
+from dlt.destinations.adapters import bigquery_adapter
+
+
+@dlt.resource(
+    columns=[
+        {"name": "event_date", "data_type": "date"},
+        {"name": "user_id", "data_type": "bigint"},
+        # Other columns.
+    ]
+)
+def event_data():
+    yield from [
+        {"event_date": datetime.date.today() + datetime.timedelta(days=i)} for i in range(100)
+    ]
+
+
+# Apply column options.
+bigquery_adapter(
+    event_data, partition="event_date", cluster=["event_date", "user_id"]
+)
+
+# Apply table level options.
+bigquery_adapter(event_data, table_description="Dummy event data.")
+
+# Load data in "streaming insert" mode (only available with
+# write_disposition="append").
+bigquery_adapter(event_data, insert_api="streaming")
+```
+
+In the example above, the adapter specifies that `event_date` should be used for partitioning and both `event_date` and `user_id` should be used for clustering (in the given order) when the table is created.
+
+Some things to note with the adapter's behavior:
+
+- You can only partition on one column (refer to [supported hints](#supported-column-hints)).
+- You can cluster on as many columns as you would like.
+- Sequential adapter calls on the same resource accumulate parameters, akin to an OR operation, for a unified execution.
+
+:::warning
+At the time of writing, table level options aren't supported for `ALTER` operations.
+
+Note that `bigquery_adapter` updates the resource *in place*, but returns the resource for convenience, i.e., both the following are valid:
+
+```py
+from dlt.destinations.adapters import bigquery_adapter
+
+bigquery_adapter(my_resource, partition="partition_column_name")
+my_resource = bigquery_adapter(my_resource, partition="partition_column_name")
+```
+
+Refer to the [full API specification](../../api_reference/dlt/destinations/impl/bigquery/bigquery_adapter) for more details.
+:::
+
+<!--@@@DLT_TUBA bigquery-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/clickhouse.md =====
+
+---
+title: ClickHouse
+description: ClickHouse `dlt` destination
+keywords: [ clickhouse, destination, data warehouse ]
+---
+# ClickHouse
+
+## Install dlt with ClickHouse
+
+To install the dlt library with ClickHouse dependencies:
+
+```sh
+pip install "dlt[clickhouse]"
+```
+
+<!--@@@DLT_DESTINATION_CAPABILITIES clickhouse-->
+
+## Setup guide
+
+### 1. Initialize the dlt project
+
+Let's start by initializing a new `dlt` project as follows:
+
+```sh
+dlt init chess clickhouse
+```
+
+`dlt init` command will initialize your pipeline with chess as the source and ClickHouse as the destination.
+
+The above command generates several files and directories, including `.dlt/secrets.toml` and a requirements file for ClickHouse. You can install the necessary dependencies specified in the requirements file by executing it as follows:
+
+```sh
+pip install -r requirements.txt
+```
+
+or with `pip install "dlt[clickhouse]"`, which installs the `dlt` library and the necessary dependencies for working with ClickHouse as a destination.
+
+### 2. Setup ClickHouse database
+
+To load data into ClickHouse, you need to create a ClickHouse database. While we recommend asking our GPT-4 assistant for details, we've provided a general outline of the process below:
+
+1. You can use an existing ClickHouse database or create a new one.
+
+2. To create a new database, connect to your ClickHouse server using the `clickhouse-client` command line tool or a SQL client of your choice.
+
+3. Run the following SQL commands to create a new database, user, and grant the necessary permissions:
+
+   ```sql
+   CREATE DATABASE IF NOT EXISTS dlt;
+   CREATE USER dlt IDENTIFIED WITH sha256_password BY 'Dlt*12345789234567';
+   GRANT CREATE, ALTER, SELECT, DELETE, DROP, TRUNCATE, OPTIMIZE, SHOW, INSERT, dictGet ON dlt.* TO dlt;
+   GRANT SELECT ON INFORMATION_SCHEMA.COLUMNS TO dlt;
+   GRANT CREATE TEMPORARY TABLE, S3 ON *.* TO dlt;
+   ```
+
+### 3. Add credentials
+
+1. Next, set up the ClickHouse credentials in the `.dlt/secrets.toml` file as shown below:
+
+   ```toml
+   [destination.clickhouse.credentials]
+   database = "dlt"                         # The database name you created.
+   username = "dlt"                         # ClickHouse username, default is usually "default".
+   password = "Dlt*12345789234567"          # ClickHouse password, if any.
+   host = "localhost"                       # ClickHouse server host.
+   port = 9000                              # ClickHouse native TCP protocol port, default is 9000.
+   http_port = 8443                         # ClickHouse HTTP port, default is 9000.
+   secure = 1                               # Set to 1 if using HTTPS, else 0.
+   ```
+
+   :::info Network Ports
+    The `http_port` parameter specifies the port number to use when connecting to the ClickHouse server's HTTP interface.
+    The default non-secure HTTP port for ClickHouse is `8123`.
+    This is different from the default port `9000`, which is used for the native TCP protocol.
+
+    You must additionally set `http_port` if you are not using external staging (i.e., you don't set the `staging` destination parameter in your pipeline). This is because dlt's built-in ClickHouse local storage staging uses the [clickhouse-connect](https://github.com/ClickHouse/clickhouse-connect) library, which communicates with ClickHouse over HTTP.
+
+    Make sure your ClickHouse server is configured to accept HTTP connections on the port specified by `http_port`. For example:
+
+  - If you set `http_port = 8123` (default non-secure HTTP port), then ClickHouse should be listening for HTTP requests on port 8123.
+  - If you set `http_port = 8443`, then ClickHouse should be listening for secure HTTPS requests on port 8443.
+
+   If you're using external staging, you can omit the `http_port` parameter, since clickhouse-connect will not be used in this case.
+
+   For local development and testing with ClickHouse running locally, it is recommended to use the default non-secure HTTP port `8123` by setting `http_port=8123` or omitting the parameter.
+
+   Please see the [ClickHouse network port documentation](https://clickhouse.com/docs/en/guides/sre/network-ports) for further reference.
+   :::
+
+2. You can pass a database connection string similar to the one used by the `clickhouse-driver` library. The credentials above will look like this:
+
+   ```toml
+   # Keep it at the top of your TOML file, before any section starts
+   destination.clickhouse.credentials="clickhouse://dlt:Dlt*12345789234567@localhost:9000/dlt?secure=1"
+   ```
+
+### 3. Add configuration options
+
+You can set the following configuration options in the `.dlt/secrets.toml` file:
+
+```toml
+[destination.clickhouse]
+dataset_table_separator = "___"                         # The default separator for dataset table names from the dataset.
+table_engine_type = "merge_tree"                        # The default table engine to use.
+dataset_sentinel_table_name = "dlt_sentinel_table"      # The default name for sentinel tables.
+staging_use_https = true                                # Whether to connect to the staging bucket via https (defaults to True)
+select_sequential_consistency = 1                       # Ensures read-after-write consistency on ClickHouse Cloud (defaults to 1)
+```
+
+### Session timezone
+
+ClickHouse uses the server timezone unless you set one. `session_timezone` sets it per connection. It
+does not change the column types that `CREATE TABLE` produces: `dlt` writes the zone into the type
+itself, as `DateTime64(6, 'UTC')`.
+
+```toml
+[destination.clickhouse.credentials]
+session_timezone = "Europe/Berlin"
+```
+
+## Write disposition
+
+All [write dispositions](../../general-usage/incremental-loading#choosing-a-write-disposition) are supported.
+
+If you set the [`replace` strategy](../../general-usage/full-loading.md) to `staging-optimized`, the destination tables will be atomically swapped with the staging tables via [`EXCHANGE TABLES`](https://clickhouse.com/docs/en/sql-reference/statements/exchange) (requires `Atomic`, `Replicated` or `Shared` database engine).
+
+## Data loading
+
+Data is loaded into ClickHouse using the most efficient method depending on the data source:
+
+- For local files, the `clickhouse-connect` library is used to directly load files into ClickHouse tables using the `INSERT` command.
+- For files in remote storage like S3, Google Cloud Storage, or Azure Blob Storage, ClickHouse table functions like `s3`, `gcs`, and `azureBlobStorage` are used to read the files and insert the data into tables.
+
+### Read-after-write consistency
+
+By default, dlt sets `select_sequential_consistency=1` on all ClickHouse connections. This ensures
+that `SELECT` queries always see the results of preceding writes, even on ClickHouse Cloud
+(SharedMergeTree) or self-hosted clusters where queries may be routed to different nodes. If you are
+running read-only workloads and want to avoid the small metadata check overhead, set it to `0` in
+your configuration:
+
+```toml
+[destination.clickhouse]
+select_sequential_consistency = 0
+```
+
+### Merge on replicated clusters
+
+When merging tables that have nested children, `dlt` creates short-lived temp tables to stage delete
+keys and insert keys. The temp tables follow the configured `table_engine_type` so the staged rows replicate the same way the destination tables do. Single-table merges use lightweight `DELETE` directly
+and don't need temp tables.
+
+## Datasets
+
+ClickHouse does not support multiple datasets in one database; dlt relies on datasets to exist for multiple reasons.
+To make ClickHouse work with `dlt`, tables generated by `dlt` in your ClickHouse database will have their names prefixed with the dataset name, separated by
+the configurable `dataset_table_separator`.
+Additionally, a special sentinel table that doesn't contain any data will be created, so dlt knows which virtual datasets already exist in a
+clickhouse
+destination.
+
+:::tip
+`dataset_name` is optional for ClickHouse. When skipped `dlt` will create all tables without prefix. Note that staging dataset
+tables will still be prefixed with `_staging` (or other name that you configure).
+:::
+
+## Supported file formats
+
+- [JSONL](../file-formats.md#jsonl) is the preferred format for both direct loading and staging.
+- [Parquet](../file-formats.md#parquet) is supported for both direct loading and staging.
+
+The `clickhouse` destination has a few specific deviations from the default SQL destinations:
+
+1. ClickHouse has an experimental `object` datatype, but we've found it to be a bit unpredictable, so the dlt `clickhouse` destination will load the `json` datatype to a `text` column.
+   If you need
+   this feature, get in touch with our Slack community, and we will consider adding it.
+2. ClickHouse does not support the `time` datatype. Time will be loaded to a `text` column.
+3. ClickHouse does not support the `binary` datatype. Binary will be loaded to a `text` column. When loading from JSONL, this will be a base64 string; when loading from parquet, this will be
+   the `binary` object converted to `text`.
+4. ClickHouse accepts adding columns to a populated table that aren’t null.
+5. ClickHouse can produce rounding errors under certain conditions when using the float/double datatype. Make sure to use decimal if you can’t afford to have rounding errors. Loading the value 12.7001 to a double column with the loader file format jsonl set will predictably produce a rounding error, for example.
+
+## Supported column hints
+
+ClickHouse supports the following [column hints](../../general-usage/schema#tables-and-columns):
+
+- `primary_key` - marks the column as part of the primary key. Multiple columns can have this hint to create a composite primary key.
+
+## Choosing a table engine
+
+dlt defaults to the `MergeTree` table engine. You can specify an alternate table engine in two ways:
+
+### Setting a default table engine in the configuration
+
+You can set a default table engine for all resources and dlt tables by adding the `table_engine_type` parameter to your ClickHouse credentials in the `.dlt/secrets.toml` file:
+
+```toml
+[destination.clickhouse]
+# ... (other configuration options)
+table_engine_type = "merge_tree"                        # The default table engine to use.
+```
+
+### Setting the table engine for specific resources
+
+You can also set the table engine for specific resources using the clickhouse_adapter, which will override the default engine set in `.dlt/secrets.toml` for that resource:
+
+```py
+from dlt.destinations.adapters import clickhouse_adapter
+
+@dlt.resource()
+def my_resource():
+    ...
+
+clickhouse_adapter(my_resource, table_engine_type="merge_tree")
+```
+
+Supported values for `table_engine_type` are:
+
+- `merge_tree` (default) - creates tables using the `MergeTree` engine, suitable for most use cases. [Learn more about MergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree).
+- `shared_merge_tree` - creates tables using the `SharedMergeTree` engine, optimized for cloud-native environments with shared storage. This table is **only** available on ClickHouse Cloud, and it is the default selection if `merge_tree` is selected. [Learn more about SharedMergeTree](https://clickhouse.com/docs/en/cloud/reference/shared-merge-tree).
+- `replicated_merge_tree` - creates tables using the `ReplicatedMergeTree` engine, which supports data replication across multiple nodes for high availability. [Learn more about ReplicatedMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replication). This defaults to `shared_merge_tree` on ClickHouse Cloud.
+- `replacing_merge_tree` - creates tables using the `ReplacingMergeTree` engine, which deduplicates rows with the same sorting key during background merges. See [native deduplication with ReplacingMergeTree](#native-deduplication-with-replacingmergetree) below. [Learn more about ReplacingMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replacingmergetree).
+- Experimental support for the `Log` engine family with `stripe_log` and `tiny_log`.
+
+For local development and testing with ClickHouse running locally, the `MergeTree` engine is recommended.
+
+### Native deduplication with ReplacingMergeTree
+
+When loading data with `append` write disposition, you can use ClickHouse's `ReplacingMergeTree` engine to handle deduplication and deletes at the storage engine level — without using dlt's `merge` write disposition. This is useful when you want ClickHouse to manage upserts natively, for example when appending CDC events or syncing data from an external source where rows may repeat.
+
+To enable this, combine `replacing_merge_tree` with dlt column hints:
+
+- **`primary_key`** — defines the dedup key. Rows with the same key are considered duplicates.
+- **`dedup_sort`** (optional) — specifies the version column. ClickHouse keeps the row with the **highest** value in this column. Must be a non-nullable `UInt*`, `Date`, or `DateTime` type. If omitted, ClickHouse uses last-write-wins semantics (the most recently inserted row survives).
+- **`hard_delete`** (optional) — specifies a `UInt8` deletion marker column. Rows where this column is `1` are filtered out when querying with `FINAL`. To physically remove deleted rows during background merges, set the `clean_deleted_rows` table setting (see example below). Requires `dedup_sort` to be set (ClickHouse constraint: `is_deleted` requires a version column).
+
+dlt automatically wires these hints into the `ReplacingMergeTree` engine parameters.
+
+:::note Dedup key and sorting key
+In ClickHouse, `ReplacingMergeTree` deduplicates based on the `ORDER BY` columns, not `PRIMARY KEY`. When no explicit sorting key is set via `clickhouse_adapter(sort=...)`, ClickHouse defaults `ORDER BY` to `PRIMARY KEY`, so `primary_key` effectively controls deduplication. However, if you set a custom sorting key with `clickhouse_adapter(sort=...)`, that sorting key becomes the dedup key and may override your `primary_key` intent. Avoid combining `sort` with `replacing_merge_tree` unless you want the sorting key to define which rows are duplicates.
+:::
+
+```py
+import dlt
+from dlt.destinations.adapters import clickhouse_adapter
+
+@dlt.resource(
+    write_disposition="append",
+    primary_key="id",
+    columns={
+        "version": {"dedup_sort": "desc", "nullable": False},
+        "is_deleted": {"hard_delete": True, "nullable": False},
+    },
+)
+def events(data):
+    yield from data
+
+clickhouse_adapter(
+    events,
+    table_engine_type="replacing_merge_tree",
+    settings={"clean_deleted_rows": "Always"},
+)
+
+pipeline = dlt.pipeline("my_pipeline", destination="clickhouse")
+
+# first load
+pipeline.run(events([
+    {"id": 1, "name": "Alice", "version": 1, "is_deleted": False},
+    {"id": 2, "name": "Bob", "version": 1, "is_deleted": False},
+]))
+
+# second load: update Alice, delete Bob
+pipeline.run(events([
+    {"id": 1, "name": "Alice Updated", "version": 2, "is_deleted": False},
+    {"id": 2, "name": "Bob", "version": 2, "is_deleted": True},
+]))
+```
+
+This generates `ENGINE = ReplacingMergeTree(version, is_deleted)`, so ClickHouse keeps only the row with the highest `version` per `id`. The `clean_deleted_rows` setting tells ClickHouse to physically remove rows marked as deleted during background merges.
+
+:::caution Data consistency
+`ReplacingMergeTree` deduplicates during **background merges**, which happen asynchronously. Until a merge runs, duplicate rows may be visible in queries. To get consistent (deduplicated) results, use the `FINAL` modifier:
+
+```sql
+SELECT * FROM my_table FINAL
+```
+
+Without `clean_deleted_rows`, rows with `is_deleted=1` are only filtered out by `FINAL` queries but remain physically stored. With `clean_deleted_rows='Always'`, ClickHouse removes them during merges.
+
+This is different from dlt's `merge` write disposition, which deduplicates immediately during loading via explicit SQL statements. Choose `ReplacingMergeTree` when eventual consistency is acceptable and you want ClickHouse to manage deduplication natively.
+:::
+
+## Sorting and partitioning
+
+You can use the `clickhouse_adapter` to specify a [sorting](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree#order_by) and/or [partition](https://clickhouse.com/docs/engines/table-engines/mergetree-family/custom-partitioning-key) key:
+
+```py
+from dlt.destinations.adapters import clickhouse_adapter
+
+@dlt.resource
+def my_resource():
+    ...
+
+clickhouse_adapter(
+   my_resource,
+   sort="updated_at",
+   partition="org",
+)
+```
+
+`sort` and `partition` are used to generate the `ORDER BY` and `PARTITION BY` clauses of the table creation statement, and they accept either a **sequence of column names** or a **SQL expression**:
+
+1. **sequence of column names:** recommended if column transformations are not required
+2. **SQL expression:** use if column transformations are required
+
+The two examples below show both approaches to adapt `my_resource`:
+
+```py
+@dlt.resource(
+   columns={
+      "timestamp": {"nullable": False},
+      "town": {"nullable": False},
+      "street": {"nullable": False}
+   }
+)
+def my_resource():
+    ...
+```
+
+### Example 1: sequence of column names
+
+```py
+from dlt.destinations.adapters import clickhouse_adapter
+
+clickhouse_adapter(
+   my_resource,
+   sort=["timestamp", "street"],
+   partition=["town"]
+)
+```
+
+Corresponding SQL:
+
+```sql
+CREATE TABLE ...
+...
+ORDER BY (timestamp, street)
+PARTITION by town
+```
+
+### Example 2: SQL expression
+
+```py
+from dlt.destinations.adapters import clickhouse_adapter
+
+clickhouse_adapter(
+   my_resource,
+   sort="(upper(town), street)",
+   partition="toYYYYMMDD(timestamp)"
+)
+```
+
+Corresponding SQL:
+
+```sql
+CREATE TABLE ...
+...
+ORDER BY (upper(town), street)
+PARTITION BY toYYYYMMDD(timestamp)
+```
+
+### Usage notes
+
+SQL expressions are used **as is** to generate the SQL clauses. Hence, when providing a SQL expression, use normalized column names:
+
+```py
+from dlt.destinations.adapters import clickhouse_adapter
+
+@dlt.resource(columns={"TIMESTAMP": {"nullable": False}})  # non-normalized column name (upper case)
+def my_resource():
+    ...
+
+clickhouse_adapter(my_resource, partition="toYYYYMMDD(timestamp)")  # RIGHT: normalized column name (lower case)
+
+clickhouse_adapter(my_resource, partition="toYYYYMMDD(TIMESTAMP)")  # WRONG: non-normalized column name (lower case)
+```
+
+:::note
+
+- The sorting/partitioning key can only be set when the table is first created. The value for `sort`/`partition` is ignored for existing tables.
+- We explicitly mark the sorting/partition columns as **not nullable** in the examples above, because, by default, ClickHouse does not allow nullable columns in the sorting/partition key. Set `allow_nullable_key` to `True` in your [table settings](#mergetree-table-settings) if you insist on nullable key columns.
+:::
+
+### `sort` and `partition` column hints
+
+`dlt` automatically creates `sort`/`partition` [column hints](../../general-usage/schema.md#tables-and-columns) for columns present in the `sort`/`partition` value provided to `clickhouse_adapter` (when this value is a SQL expression, we parse it to extract the column names).
+
+Although it's possible to set `sort`/`partition` column hints directly, we recommend using `clickhouse_adapter` instead.
+
+If you still choose to set `sort`/`partition` column hints yourself, know that:
+
+- columns are added to the `ORDER BY`/`PARTITION BY` clause in order of appearance in the schema
+- they may be overridden/removed if you also use `clickhouse_adapter`: the adapter takes precedence, and it will set column hints in accordance with the values provided to its `sort`/`partition` parameters
+
+## MergeTree table settings
+
+Use the `settings` parameter of the `clickhouse_adapter` to specify [MergeTree settings](https://clickhouse.com/docs/operations/settings/merge-tree-settings) for the table:
+
+```py
+from dlt.destinations.adapters import clickhouse_adapter
+
+@dlt.resource
+def my_resource():
+    ...
+
+clickhouse_adapter(
+   my_resource,
+   settings = {
+      "allow_nullable_key": True,
+      "max_suspicious_broken_parts": 500,
+      "deduplicate_merge_projection_mode": "ignore"
+   }
+)
+```
+
+The `settings` parameter is used to generate the `SETTINGS` clause of the table creation statement:
+
+```sql
+CREATE TABLE ...
+...
+SETTINGS allow_nullable_key = true, max_suspicious_broken_parts = 500, deduplicate_merge_projection_mode = 'ignore'
+```
+
+## Column codecs
+
+Use the `codecs` parameter of the `clickhouse_adapter` to specify [codecs](https://clickhouse.com/docs/sql-reference/statements/create/table#column_compression_codec) for the table's columns:
+
+```py
+from dlt.destinations.adapters import clickhouse_adapter
+
+@dlt.resource
+def my_resource():
+    ...
+
+clickhouse_adapter(
+   my_resource,
+   codecs = {
+      "town": "ZSTD(3)",
+      "number": "Delta, ZSTD(2)"
+   }
+)
+```
+
+The codecs are used in the table creation statement as follows:
+
+```sql
+CREATE TABLE my_resource
+(
+   `town` String CODEC(ZSTD(3)),
+   `street` String, -- no codec specified
+   `number` Int64 CODEC(Delta, ZSTD(2))
+)
+...
+```
+
+## Staging support
+
+ClickHouse supports Amazon S3, Google Cloud Storage, and Azure Blob Storage as file staging destinations.
+
+`dlt` will upload Parquet or JSONL files to the staging location and use ClickHouse table functions to load the data directly from the staged files.
+
+Please refer to the filesystem documentation to learn how to configure credentials for the staging destinations:
+
+- [Amazon S3](./filesystem.md#aws-s3)
+- [Google Cloud Storage](./filesystem.md#google-storage)
+- [Azure Blob Storage](./filesystem.md#azure-blob-storage)
+
+To run a pipeline with staging enabled:
+
+```py
+pipeline = dlt.pipeline(
+  pipeline_name='chess_pipeline',
+  destination='clickhouse',
+  staging='filesystem',  # add this to activate staging
+  dataset_name='chess_data'
+)
+```
+
+### Using Google Cloud or S3-compatible storage as a staging area
+
+dlt supports using S3-compatible storage services, including Google Cloud Storage (GCS), as a staging area when loading data into ClickHouse.
+This is handled automatically by
+ClickHouse's [GCS table function](https://clickhouse.com/docs/en/sql-reference/table-functions/gcs), which dlt uses under the hood.
+
+The ClickHouse GCS table function only supports authentication using Hash-based Message Authentication Code (HMAC) keys, which is compatible with the Amazon S3 API.
+To enable this, GCS provides an S3
+compatibility mode that emulates the S3 API, allowing ClickHouse to access GCS buckets via its S3 integration.
+
+For detailed instructions on setting up S3-compatible storage with dlt, including AWS S3, MinIO, Tigris, and Cloudflare R2, refer to
+the [dlt documentation on filesystem destinations](../../dlt-ecosystem/destinations/filesystem#using-s3-compatible-storage).
+
+To set up GCS staging with HMAC authentication in dlt:
+
+1. Create HMAC keys for your GCS service account by following the [Google Cloud guide](https://cloud.google.com/storage/docs/authentication/managing-hmackeys#create).
+
+2. Configure the HMAC keys (`aws_access_key_id` and `aws_secret_access_key`) as well as `endpoint_url` in your dlt project's ClickHouse destination settings in `config.toml`, similar to how you would configure AWS S3 credentials:
+
+```toml
+[destination.filesystem]
+bucket_url = "s3://my_awesome_bucket"
+
+[destination.filesystem.credentials]
+aws_access_key_id = "JFJ$$*f2058024835jFffsadf"
+aws_secret_access_key = "DFJdwslf2hf57)%$02jaflsedjfasoi"
+project_id = "my-awesome-project"
+endpoint_url = "https://storage.googleapis.com"
+```
+
+:::warning
+When configuring the `bucket_url` for S3-compatible storage services like Google Cloud Storage (GCS) with ClickHouse in dlt, ensure that the URL is prepended with `s3://` instead of `gs://`. This is
+because the ClickHouse GCS table function requires the use of HMAC credentials, which are compatible with the S3 API. Prepending with `s3://` allows the HMAC credentials to integrate properly with
+dlt's staging mechanisms for ClickHouse.
+:::
+
+When using S3 for a staging area you can alternatively have ClickHouse authenticate using Role-based access with the
+[supported](https://clickhouse.com/docs/sql-reference/table-functions/s3#using-s3-credentials-clickhouse-cloud) `extra_credentials` argument by setting this with the destination credentials:
+
+```py
+import dlt
+from dlt.destinations import clickhouse
+
+destination = clickhouse(
+  credentials={
+    # Other credentials you need
+    "s3_extra_credentials": {
+      'role_arn': 'arn:your:role' # The AWS Role assumed by ClickHouse
+    }
+  }
+)
+
+pipeline = dlt.pipeline(
+  pipeline_name='chess_pipeline',
+  destination=destination,
+  staging='filesystem',  # add this to activate staging
+  dataset_name='chess_data'
+)
+```
+
+### dbt support
+
+Integration with [dbt](../transformations/dbt/dbt.md) is generally supported via dbt-clickhouse but not tested by us. Note how
+we support datasets by prefixing the table names. You should take it into account when writing models (or use empty dataset to avoid prefixing).
+
+### Syncing of `dlt` state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+<!--@@@DLT_TUBA clickhouse-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/community-destinations.md =====
+
+---
+title: Community Destinations
+description: Community-contributed destinations for dlt
+keywords: [community, destination, contributions]
+---
+# Community Destinations
+
+We've got several destinations contributed by our community. [They are not part of the `dlt` library](https://github.com/dlt-hub/dlt/blob/devel/CONTRIBUTING.md#before-you-begin), instead we list them below.
+
+:::caution Caveat Emptor
+**Use at your own risk:** These are community-maintained forks of `dlt` that are not officially supported by the dlt team. While they extend dlt's functionality to additional databases, they may not receive the same level of testing, maintenance, or security updates as the core library. Always review the code and test thoroughly before using in production environments.
+:::
+
+## Starrocks
+
+by: [phaethon](https://github.com/phaethon)
+
+Implementation of Starrocks support as a separate destination. Starrocks is an MPP (Massively Parallel Processing) database designed for real-time analytics. This adapter implements two loading methods:
+
+- **Stream Load**: Direct streaming of data into Starrocks
+- **INSERT INTO SELECT FROM FILES**: Loading data from S3-compatible staging storage for improved performance with large datasets
+
+Code:
+[https://github.com/phaethon/dlt/tree/starrocks](https://github.com/phaethon/dlt/tree/starrocks)
+
+PR with discussion:
+[https://github.com/dlt-hub/dlt/pull/2518](https://github.com/dlt-hub/dlt/pull/2518)
+
+## Clickhouse Distributed
+
+by: [zstipanicev](https://github.com/zstipanicev)
+
+When Clickhouse is deployed with replicas and distributed tables, standard DDL & DML statements need to be modified to work across the cluster. This implementation adds:
+
+- **ON CLUSTER** clauses to DDL statements to execute across all nodes
+- Creation of **base table and distributed table pairs** (base tables use ReplicatedMergeTree, distributed tables use Distributed engine)
+- Modified ALTER, DROP, DELETE, UPDATE, and TRUNCATE operations to work with both table types
+- Configuration options for cluster name, database prefixes, and table name patterns
+
+This allows dlt to work seamlessly with sharded and replicated Clickhouse setups.
+
+Code:
+[https://github.com/zstipanicev/dlt/tree/feat/2200-add-clickhouse-distributed-support](https://github.com/zstipanicev/dlt/tree/feat/2200-add-clickhouse-distributed-support)
+
+PR with discussion:
+[https://github.com/dlt-hub/dlt/pull/2573](https://github.com/dlt-hub/dlt/pull/2573)
+
+## CrateDB
+
+by: [CrateDB](https://github.com/crate)
+
+CrateDB is a distributed SQL database built on top of Lucene, designed for real-time analytics on large datasets. This destination adapter wraps the PostgreSQL adapter with CrateDB-specific adjustments:
+
+- Compatibility with CrateDB's PostgreSQL wire protocol
+- Workarounds for system column naming restrictions (underscore-prefixed columns)
+- Support for CrateDB's **REFRESH TABLE** statements for consistency
+- Adjusted transaction handling for CrateDB's limited transaction support
+
+Code:
+[https://github.com/crate/dlt-cratedb](https://github.com/crate/dlt-cratedb)
+
+Original PR with discussion (currently on hiatus):
+[https://github.com/dlt-hub/dlt/pull/2733](https://github.com/dlt-hub/dlt/pull/2733)
+
+## Hotdata.dev
+
+by: [Hotdata](https://github.com/hotdata-dev)
+
+Hotdata is a high-concurrency SQL execution layer built on Apache DataFusion for AI agents and data-intensive applications. This destination adapter loads data into Hotdata through its HTTP API:
+
+- Automatic creation and reuse of instant databases
+- Native append, replace, and merge/upsert write modes
+- Compatible with PostgreSQL, DuckDB, and Snowflake SQL for server-side queries
+- Parquet-native loading and Arrow-native results
+
+Code:
+[https://github.com/hotdata-dev/hotdata-dlt-destination](https://github.com/hotdata-dev/hotdata-dlt-destination)
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/databricks.md =====
+
+---
+title: Databricks
+description: Databricks `dlt` destination
+keywords: [Databricks, destination, data warehouse]
+---
+# Databricks
+
+*Big thanks to Evan Phillips and [swishbi.com](https://swishbi.com/) for contributing code, time, and a test environment.*
+
+This Databricks destination will load your data into Databricks Delta tables using one of the supported [cloud storage options](#staging-support). You can access your data using Unity Catalog.
+
+There are two options to run dlt pipelines and load data:
+
+* Run dlt pipelines in any environment by providing credentials for both Databricks and your cloud storage.
+* Run dlt pipelines directly within [Databricks notebooks](#direct-load-databricks-managed-volumes) without explicitly providing credentials.
+
+Databricks supports both **Delta** (default) and **Apache Iceberg** table formats. See the [table_format](#apache-iceberg-tables) section for details on using Iceberg tables.
+
+## Install dlt with Databricks
+
+To install the dlt library with Databricks dependencies:
+
+```sh
+pip install "dlt[databricks]"
+```
+
+<!--@@@DLT_DESTINATION_CAPABILITIES databricks-->
+
+## Set up your Databricks workspace
+
+To use the Databricks destination, you need:
+
+* A Databricks workspace with a Unity Catalog metastore connected
+* A Gen 2 Azure storage account and container
+
+If you already have your Databricks workspace set up, you can skip to the [Loader setup guide](#loader-setup-guide).
+
+### 1. Create a Databricks workspace in Azure
+
+1. Create a Databricks workspace in Azure
+
+    In your Azure Portal, search for Databricks and create a new workspace. In the "Pricing Tier" section, select "Premium" to be able to use the Unity Catalog.
+
+2. Create an ADLS Gen 2 storage account
+
+    Search for "Storage accounts" in the Azure Portal and create a new storage account.
+    Make sure it's a Data Lake Storage Gen 2 account by enabling "hierarchical namespace" when creating the account. Refer to the [Azure documentation](https://learn.microsoft.com/en-us/azure/storage/blobs/create-data-lake-storage-account) for further information.
+
+3. Create a container in the storage account
+
+    In the storage account, create a new container. This will be used as a datastore for your Databricks catalog.
+
+4. Create an Access Connector for Azure Databricks
+
+    This will allow Databricks to access your storage account.
+    In the Azure Portal, search for "Access Connector for Azure Databricks" and create a new connector.
+
+5. Grant access to your storage container
+
+    Navigate to the storage container you created earlier and select "Access control (IAM)" in the left-hand menu.
+
+    Add a new role assignment and select "Storage Blob Data Contributor" as the role. Under "Members" select "Managed Identity" and add the Databricks Access Connector you created in the previous step.
+
+### 2. Set up a metastore and Unity Catalog
+
+1. Now go to your Databricks workspace
+
+    To get there from the Azure Portal, search for "Databricks", select your Databricks, and click "Launch Workspace".
+
+2. In the top right corner, click on your email address and go to "Manage Account"
+
+3. Go to "Data" and click on "Create Metastore"
+
+    Name your metastore and select a region.
+    If you'd like to set up a storage container for the whole metastore, you can add your ADLS URL and Access Connector Id here. You can also do this on a granular level when creating the catalog.
+
+    In the next step, assign your metastore to your workspace.
+
+4. Go back to your workspace and click on "Catalog" in the left-hand menu
+
+5. Click "+ Add" and select "Add Storage Credential"
+
+    Create a name and paste in the resource ID of the Databricks Access Connector from the Azure portal.
+    It will look something like this: `/subscriptions/<subscription_id>/resourceGroups/<resource_group>/providers/Microsoft.Databricks/accessConnectors/<connector_name>`
+
+6. Click "+ Add" again and select "Add external location"
+
+    Set the URL of your storage container. This should be in the form: `abfss://<container_name>@<storage_account_name>.dfs.core.windows.net/<path>`
+
+    Once created, you can test the connection to make sure the container is accessible from Databricks.
+
+7. Now you can create a catalog
+
+    Go to "Catalog" and click "Create Catalog". Name your catalog and select the storage location you created in the previous step.
+
+## Authentication
+
+`dlt` currently supports two options for authentication:
+
+1. [OAuth2](#using-oauth2) (recommended) allows you to authenticate to Databricks using a service principal via OAuth2 M2M.
+2. [Access token](#using-access-token) approach using a developer access token. This method may be deprecated in the future by Databricks.
+
+### Using OAuth2
+
+You can authenticate to Databricks using a service principal via OAuth2 M2M. To enable it:
+
+1. Follow the instructions in the Databricks documentation: [Authenticate access to Databricks using OAuth M2M](https://docs.databricks.com/en/dev-tools/auth/oauth-m2m.html)
+to create a service principal and retrieve the `client_id` and `client_secret`.
+
+2. Once you have the service principal credentials, update your credentials with any of the options shown below:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+```toml
+# secrets.toml
+[destination.databricks.credentials]
+server_hostname = "MY_DATABRICKS.azuredatabricks.net"
+http_path = "/sql/1.0/warehouses/12345"
+catalog = "my_catalog"
+client_id = "XXX"
+client_secret = "XXX"
+```
+
+  </TabItem>
+
+<TabItem value="env">
+
+```sh
+export DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME="MY_DATABRICKS.azuredatabricks.net"
+export DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH="/sql/1.0/warehouses/12345"
+export DESTINATION__DATABRICKS__CREDENTIALS__CATALOG="my_catalog"
+export DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID="XXX"
+export DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET="XXX"
+```
+
+  </TabItem>
+
+<TabItem value="code">
+
+```py
+import os
+
+# Do not set up the secrets directly in the code!
+# What you can do is reassign env variables.
+os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "MY_DATABRICKS.azuredatabricks.net"
+os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"]="/sql/1.0/warehouses/12345"
+os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"]="my_catalog"
+os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID"]=os.environ.get("CLIENT_ID", "")
+os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET"]=os.environ.get("CLIENT_SECRET", "")
+```
+
+</TabItem>
+</Tabs>
+
+### Using access token
+
+To create your access token:
+
+1. Click your email in the top right corner and go to "User Settings". Go to "Developer" -> "Access Tokens".
+Generate a new token and save it.
+2. Set up credentials in a desired way:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+```toml
+# secrets.toml
+[destination.databricks.credentials]
+server_hostname = "MY_DATABRICKS.azuredatabricks.net"
+http_path = "/sql/1.0/warehouses/12345"
+catalog = "my_catalog"
+access_token = "XXX"
+```
+
+  </TabItem>
+
+<TabItem value="env">
+
+```sh
+export DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME="MY_DATABRICKS.azuredatabricks.net"
+export DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH="/sql/1.0/warehouses/12345"
+export DESTINATION__DATABRICKS__CREDENTIALS__CATALOG="my_catalog"
+export DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN="XXX"
+```
+
+  </TabItem>
+
+<TabItem value="code">
+
+```py
+import os
+
+# Do not set up the secrets directly in the code!
+# What you can do is reassign env variables.
+os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "MY_DATABRICKS.azuredatabricks.net"
+os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"]="/sql/1.0/warehouses/12345"
+os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"]="my_catalog"
+os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"]=os.environ.get("ACCESS_TOKEN", "")
+```
+
+</TabItem>
+</Tabs>
+
+## Loader setup guide
+
+1. Initialize a project with a pipeline that loads to Databricks by running
+
+```sh
+dlt init chess databricks
+```
+
+2. Install the necessary dependencies for Databricks by running
+
+```sh
+pip install -r requirements.txt
+```
+
+This will install dlt with the `databricks` extra, which contains the Databricks Python dbapi client.
+
+3. Enter your credentials into `.dlt/secrets.toml`.
+
+This should include your connection parameters and your authentication credentials.
+
+You can find your server hostname and HTTP path in the Databricks workspace dashboard. Go to "SQL Warehouses", select your warehouse (default is called "Starter Warehouse"), and go to "Connection details".
+
+Example:
+
+```toml
+[destination.databricks.credentials]
+server_hostname = "MY_DATABRICKS.azuredatabricks.net"
+http_path = "/sql/1.0/warehouses/12345"
+client_id = "XXX"
+client_secret = "XXX"
+catalog = "my_catalog"
+```
+
+You can find other options for specifying credentials in the [Authentication section](#authentication).
+
+See [Staging support](#staging-support) for authentication options when `dlt` copies files from buckets.
+
+### Using default credentials
+
+If none of auth methods above is configured, `dlt` attempts to get authorization from the Databricks workspace context. The context may
+come, for example, from a Notebook (runtime) or via standard set of env variables that Databricks Python sdk recognizes (i.e. **DATABRICKS_TOKEN** or **DATABRICKS_HOST**)
+
+When `server_hostname` or `http_path` are not provided, `dlt` attempts to derive them automatically:
+
+1. **Notebook cluster context** (tried first): when running inside a Databricks Notebook, `dlt` reads `server_hostname` from the workspace URL and constructs `http_path` from the workspace ID and cluster ID of the compute attached to the notebook. This allows dlt to use the notebook's own cluster without requiring a SQL warehouse.
+2. **SQL warehouse discovery** (fallback): if the cluster context is not available (e.g., running outside a notebook, or on a Shared Access Mode cluster), `dlt` looks for an available SQL warehouse. We use default warehouse id (**DATABRICKS_WAREHOUSE_ID**) if set (via env variable), or the first one on the warehouse's list.
+
+### Session configuration
+
+`session_configuration` holds SQL configuration parameters that `dlt` passes to
+`databricks.sql.connect`. `dlt` applies them to every session it opens:
+
+```toml
+[destination.databricks.credentials.session_configuration]
+ansi_mode = "true"
+```
+
+The session timezone has its own setting, which sets `spark.sql.session.timeZone`:
+
+```toml
+[destination.databricks.credentials]
+session_timezone = "Europe/Berlin"
+```
+
+`None` is the default value. It keeps the timezone of the warehouse. A `spark.sql.session.timeZone`
+key set directly in `session_configuration` takes precedence.
+
+:::note
+The connector applies `session_configuration` as Spark conf, so the
+[`TIMEZONE`](https://docs.databricks.com/aws/en/sql/language-manual/parameters/timezone) SQL parameter
+has no effect there. Only `spark.sql.session.timeZone` changes the session timezone.
+:::
+
+## Write disposition
+
+All write dispositions are supported.
+
+## Data loading
+
+To load data into Databricks, you must set up a staging filesystem by configuring an Amazon S3 or Azure Blob Storage bucket. Parquet is the default file format used for data uploads. As an alternative to Parquet, you can switch to using JSONL.
+
+dlt will upload the data in Parquet files (or JSONL, if configured) to the bucket and then use `COPY INTO` statements to ingest the data into Databricks.
+
+For more information on staging, see the [Staging support](#staging-support) section below.
+
+## Supported file formats
+
+* [Parquet](../file-formats.md#parquet) supported when staging is enabled.
+* [JSONL](../file-formats.md#jsonl) supported when staging is enabled (see limitations below).
+
+The JSONL format has some limitations when used with Databricks:
+
+1. The following data types are not supported when using the JSONL format with `databricks`: `decimal`, `json`, `date`, `binary`. Use `parquet` if your data contains these types.
+2. The `bigint` data type with precision is not supported with the JSONL format.
+
+## Direct Load (Databricks Managed Volumes)
+
+`dlt` now supports **Direct Load**, enabling pipelines to run seamlessly from **Databricks Notebooks** without external staging. When executed in a Databricks Notebook, `dlt` uses the notebook context for configuration if not explicitly provided.
+
+Direct Load also works **outside Databricks**, requiring explicit configuration of `server_hostname`, `http_path`, `catalog`, and authentication (`client_id`/`client_secret` for OAuth or `access_token` for token-based authentication).
+
+The example below demonstrates how to load data directly from a **Databricks Notebook**. Simply specify the **Databricks catalog** and optionally a **fully qualified volume name** (recommended for production) – the remaining configuration comes from the notebook context:
+
+```py
+import dlt
+from dlt.destinations import databricks
+from dlt.sources.rest_api import rest_api_source
+
+# Fully qualified Databricks managed volume (recommended for production)
+# - dlt assumes the named volume already exists
+staging_volume_name = "dlt_ci.dlt_tests_shared.static_volume"
+
+bricks = databricks(credentials={"catalog": "dlt_ci"}, staging_volume_name=staging_volume_name)
+
+pokemon_source = rest_api_source(
+    {
+        "client": {"base_url": "https://pokeapi.co/api/v2/"},
+        "resource_defaults": {"endpoint": {"params": {"limit": 1000}}},
+        "resources": ["pokemon"],
+    }
+)
+
+pipeline = dlt.pipeline(
+    pipeline_name="rest_api_example",
+    dataset_name="rest_api_data",
+    destination=bricks,
+)
+
+load_info = pipeline.run(pokemon_source)
+print(load_info)
+print(pipeline.dataset().pokemon.df())
+```
+
+- If **no** *staging_volume_name* **is provided**, dlt creates a **default volume** automatically.
+- **For production**, explicitly setting *staging_volume_name* is recommended.
+- The volume is used as a **temporary location** to store files before loading.
+
+:::warning Module conflict
+When using dlt within Databricks Notebooks, you may encounter naming conflicts with Databricks' built-in Delta Live Tables (DLT) module.
+To avoid these conflicts, follow the steps in the [Troubleshooting section](#troubleshooting) below.
+:::
+
+:::tip
+You can delete staged files **immediately** after loading by setting the following config option:
+
+```toml
+[destination.databricks]
+keep_staged_files = false
+```
+
+:::
+
+## Supported hints
+
+### Supported table hints
+
+Databricks supports the following table hints:
+
+- `description` - Uses the description to add comment to the table. This can also be done by using the adapter parameter `table_comment`.
+
+Databricks supports the following column hints:
+
+- `primary_key` - adds a primary key constraint to the column in Unity Catalog (requires `create_indexes=true`, see the note below).
+- `description` - adds a description to the column. This can also be done by using the adapter parameter `table_comment`.
+- `references` - adds a foreign key constraint to the column in Unity Catalog (requires `create_indexes=true`, see the note below).
+- `not_null` - adds a not null constraint to the column.
+- `cluster` - adds a clustering constraint to the column. This can also be done by using the adapter parameter `cluster`.
+
+:::note
+If you want to enforce constraints on the tables, you can set the `create_indexes` option to `true`. This will add PRIMARY KEY and FOREIGN KEY constraints to the tables if the hints primary key and references are set.
+
+```toml
+[destination.databricks]
+# Add PRIMARY KEY and FOREIGN KEY constraints to tables
+create_indexes=true
+```
+
+:::
+
+:::note
+Table and column comments (from `description` or the `table_comment`/`column_comment` adapter hints) are emitted by default. dlt system tables (`_dlt_*`) are never annotated. Set `create_comments` to `false` to disable all comment/description DDL.
+
+```toml
+[destination.databricks]
+# Do not emit COMMENT clauses for tables and columns
+create_comments=false
+```
+
+:::
+
+For additional hints specific to Databricks, see the [Databricks adapter](#databricks-adapter) section.
+
+## Staging support
+
+Databricks supports both Amazon S3, Azure Blob Storage, and Google Cloud Storage as staging locations. `dlt` will upload files in Parquet format to the staging location and will instruct Databricks to load data from there.
+
+### Databricks and Amazon S3
+
+Please refer to the [S3 documentation](./filesystem.md#aws-s3) for details on connecting your S3 bucket with the `bucket_url` and `credentials`.
+
+Example to set up Databricks with S3 as a staging destination:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+```toml
+# secrets.toml
+[destination.filesystem]
+bucket_url = "s3://your-bucket-name"
+
+[destination.filesystem.credentials]
+aws_access_key_id="XXX"
+aws_secret_access_key="XXX"
+```
+
+  </TabItem>
+
+<TabItem value="env">
+
+```sh
+export DESTINATION__FILESYSTEM__BUCKET_URL="s3://your-bucket-name"
+export DESTINATION__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID="XXX"
+export DESTINATION__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY="XXX"
+```
+
+  </TabItem>
+
+<TabItem value="code">
+
+```py
+import os
+
+# Do not set up the secrets directly in the code!
+# What you can do is reassign env variables.
+os.environ["DESTINATION__FILESYSTEM__BUCKET_URL"] = "s3://your-bucket-name"
+os.environ["DESTINATION__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID"] = os.environ.get("AWS_ACCESS_KEY_ID", "")
+os.environ["DESTINATION__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY"] = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+```
+
+</TabItem>
+</Tabs>
+
+### Databricks and Azure Blob Storage
+
+Refer to the [Azure Blob Storage filesystem documentation](./filesystem.md#azure-blob-storage) for details on connecting your Azure Blob Storage container with the `bucket_url` and `credentials`.
+
+To enable support for Azure Blob Storage with dlt, make sure to install the necessary dependencies by running:
+
+```sh
+pip install "dlt[az]"
+```
+
+:::note
+Databricks requires that you use ABFS URLs in the following format: `abfss://container_name@storage_account_name.dfs.core.windows.net/path`.
+dlt is able to adapt the other representation (i.e., `az://container-name/path`), but we recommend that you use the correct form.
+:::
+
+Example to set up Databricks with Azure as a staging destination:
+
+<Tabs
+  groupId="config-provider-type"
+  defaultValue="toml"
+  values={[
+    {"label": "TOML config provider", "value": "toml"},
+    {"label": "Environment variables", "value": "env"},
+    {"label": "In the code", "value": "code"},
+]}>
+
+  <TabItem value="toml">
+
+```toml
+# secrets.toml
+[destination.filesystem]
+bucket_url = "abfss://container_name@storage_account_name.dfs.core.windows.net/path"
+
+[destination.filesystem.credentials]
+azure_storage_account_name="XXX"
+azure_storage_account_key="XXX"
+```
+
+  </TabItem>
+
+<TabItem value="env">
+
+```sh
+export DESTINATION__FILESYSTEM__BUCKET_URL="abfss://container_name@storage_account_name.dfs.core.windows.net/path"
+export DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME="XXX"
+export DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY="XXX"
+```
+
+  </TabItem>
+
+<TabItem value="code">
+
+```py
+import os
+
+# Do not set up the secrets directly in the code!
+# What you can do is reassign env variables.
+os.environ["DESTINATION__FILESYSTEM__BUCKET_URL"] = "abfss://container_name@storage_account_name.dfs.core.windows.net/path"
+os.environ["DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME"] = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "")
+os.environ["DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY"] = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY", "")
+```
+
+</TabItem>
+</Tabs>
+
+### Databricks and Google Cloud Storage
+
+In order to load from Google Cloud Storage stage, you must set up the credentials via a **named credential**. See below. Databricks does not allow you to pass Google Credentials explicitly in SQL statements.
+
+### Use external locations and stored credentials
+
+`dlt` forwards bucket credentials to the `COPY INTO` SQL command by default. You may prefer to use [external locations or stored credentials instead](https://docs.databricks.com/en/sql/language-manual/sql-ref-external-locations.html#external-location) that are stored on the Databricks side.
+
+If you set up an external location for your staging path, you can tell `dlt` to use it:
+
+```toml
+[destination.databricks]
+is_staging_external_location=true
+```
+
+If you set up Databricks credentials named, for example, **credential_x**, you can tell `dlt` to use them:
+
+```toml
+[destination.databricks]
+staging_credentials_name="credential_x"
+```
+
+Both options are available from code:
+
+```py
+import dlt
+
+bricks = dlt.destinations.databricks(staging_credentials_name="credential_x")
+```
+
+## Additional destination capabilities
+
+### dbt support
+
+This destination [integrates with dbt](../transformations/dbt/dbt.md) via [dbt-databricks](https://github.com/databricks/dbt-databricks).
+
+### Syncing of `dlt` state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+### Databricks user agent
+
+We enable Databricks to identify that the connection is created by `dlt`.
+Databricks will use this user agent identifier to better understand the usage patterns associated with dlt integration. The connection identifier is `dltHub_dlt`.
+
+## Databricks Zerobus
+
+By default, `dlt` uses [COPY INTO](https://docs.databricks.com/aws/en/sql/language-manual/delta-copy-into) statements to load data. It is also possible to ingest data using [Databricks Zerobus](https://docs.databricks.com/aws/en/ingestion/zerobus-overview). This is only supported for the `append` write disposition.
+
+### Enable Zerobus
+
+:::note
+Databricks Zerobus is currently supported on Linux and Windows only. macOS is not supported because the `databricks-zerobus-ingest-sdk` package does not publish macOS wheels.
+:::
+
+```toml
+[destination.databricks]
+insert_api = "zerobus"
+
+[destination.databricks.credentials]
+catalog = "your-catalog"
+server_hostname = "adb-1234567890123456.7.azuredatabricks.net"
+http_path = "/sql/1.0/warehouses/1234567890abcdef"
+client_id = "your-client-id"
+client_secret = "your-client-secret"
+
+[destination.databricks.zerobus]
+endpoint_url = "https://<your-zerobus-endpoint>"
+```
+
+See the Databricks guide on [how to construct your Zerobus endpoint URL](https://docs.databricks.com/aws/en/ingestion/zerobus-ingest#get-your-workspace-url-and-zerobus-ingest-endpoint).
+
+### Dedicated Zerobus Service Principal
+
+By default, `dlt` uses the `client_id` and `client_secret` from `destination.databricks.credentials` for both the regular Databricks SQL connection and the Zerobus stream.
+
+If you want the Zerobus connection to use a different service principal, configure `destination.databricks.zerobus.credentials` explicitly:
+
+```toml
+[destination.databricks.credentials]
+client_id = "your-sql-client-id"
+client_secret = "your-sql-client-secret"
+
+[destination.databricks.zerobus.credentials]
+client_id = "your-zerobus-client-id"
+client_secret = "your-zerobus-client-secret"
+```
+
+Concerns are separated as follows:
+
+1. **SQL principal** — defined in `destination.databricks.credentials`: authenticates the regular Databricks SQL connection, creates or updates the table, and grants the [necessary privileges](https://docs.databricks.com/aws/en/ingestion/zerobus-ingest#create-a-service-principal-and-grant-permissions) to the Zerobus principal
+2. **Zerobus principal** — defined in `destination.databricks.zerobus.credentials`: authenticates the Zerobus stream that ingests data into the table
+
+### Tune batch size and stream options
+
+`batch_size` controls how many records `dlt` sends in each Zerobus batch. `stream_options` are mapped to `ArrowStreamConfigurationOptions` and passed to the Zerobus SDK when creating the stream.
+
+```toml
+[destination.databricks.zerobus]
+batch_size = 100_000  # default is 25_000
+stream_options = {ipc_compression = "NONE"}  # default `ipc_compression` is `ZSTD`
+```
+
+:::note
+In our internal benchmarking, a batch size of 25_000 with `ZSTD` compression performed best. Since this depends on the workload, you may want to experiment with different settings.
+:::
+
+### File formats and type support
+
+Both `parquet` and `jsonl` are supported. We strongly recommend `parquet` for best performance and the broadest data type support.
+
+| File format | Unsupported with `zerobus`         |
+| ----------- | ---------------------------------- |
+| `parquet`   | `decimal`, `wei`                   |
+| `jsonl`     | `decimal`, `wei`, `binary`, `json` |
+
+### Concurrent Zerobus streams
+
+`dlt` opens one Zerobus stream per load job. When a load is split into multiple jobs, multiple Zerobus streams can run at the same time. This can increase throughput and reduce load times.
+
+See the [Load](../../reference/performance.md#load) section of the performance guide to learn how to split a load into multiple concurrent jobs. As with batch size, the right setting depends on your workload.
+
+### Other notes
+
+- Zerobus provides *at-least-once* guarantees, so a destination table may contain duplicates
+- `dlt` uses Arrow-backed Zerobus messages (as opposed to JSON- or protobuf-backed messages)
+- `dlt` system tables always use `copy_into`, even when you set `insert_api` to `zerobus`
+
+## Databricks adapter
+
+You can use the `databricks_adapter` function to add Databricks-specific hints to a resource. These hints influence how data is loaded into Databricks tables, such as adding comments and tags. Hints can be defined at both the column level and table level.
+
+The adapter updates the DltResource with metadata about the destination column and table DDL options.
+
+### Supported hints (adapter)
+
+Table-level hints:
+
+- `cluster`: Column name(s) to cluster the table by, or `"AUTO"` for automatic clustering
+- `partition`: Column name(s) to partition the table by (Note: Cannot be used together with `cluster`)
+- `table_format`: Table format - `"DELTA"` (default) or `"ICEBERG"` for Apache Iceberg tables
+- `table_comment`: Adds a comment to the table. Supports basic markdown format [basic-syntax](https://www.markdownguide.org/cheat-sheet/#basic-syntax)
+- `table_tags`: Adds tags to the table. Supports a list of strings and/or key-value pairs
+- `table_properties`: Dictionary of table properties for Delta Lake optimization (TBLPROPERTIES)
+- `insert_api`: Ingestion backend for `append` write disposition. Can be `"copy_into"` or `"zerobus"`. Overrides the destination-wide `insert_api` setting for the resource.
+
+**Column-level hints:**
+
+- `column_hints`: Dictionary of column-specific hints
+  - `column_comment`: Adds a comment to the column. Supports basic markdown format [basic-syntax](https://www.markdownguide.org/cheat-sheet/#basic-syntax)
+  - `column_tags`: Adds tags to the column. Supports a list of strings and/or key-value pairs
+
+### Use an adapter to apply hints to a resource
+
+Here is an example of how to use the `databricks_adapter` function to apply hints to a resource on both the column level and table level:
+
+```py
+import dlt
+from dlt.destinations.adapters import databricks_adapter
+
+@dlt.resource(
+    columns=[
+        {"name": "event_date", "data_type": "date"},
+        {"name": "user_id", "data_type": "bigint"},
+        # Other columns.
+    ]
+)
+def event_data():
+    yield from [
+        {"event_date": datetime.date.today() + datetime.timedelta(days=i)} for i in range(100)
+    ]
+
+# Apply table and column options.
+databricks_adapter(
+    event_data,
+
+    # Table level options.
+    table_comment="Dummy event data.",
+    table_tags=["pii", {"cost_center": "12345"}],
+
+    # Column level options.
+    column_hints={
+        "event_date": {"column_comment": "The date of the event"},
+        "user_id": {
+            "column_comment": "The id of the user",
+            "column_tags": ["pii", {"cost_center": "12345"}]
+        },
+    },
+)
+```
+
+### Override the insert API for one resource
+
+Use `databricks_adapter(..., insert_api=...)` when you want a resource to use a different insert API than the rest of the destination.
+
+```py
+import dlt
+from dlt.destinations.adapters import databricks_adapter
+
+@dlt.resource(write_disposition="append")
+def events():
+    yield from [{"id": 1}, {"id": 2}]
+
+databricks_adapter(events, insert_api="zerobus")
+```
+
+This hint only applies to `append` loads. Use `insert_api="copy_into"` to opt a resource out of a destination-wide Zerobus default.
+
+### Advanced examples
+
+#### Clustering and partitioning
+
+```py
+import dlt
+from dlt.destinations.adapters import databricks_adapter
+
+@dlt.resource
+def sales_data():
+    yield from [
+        {"sale_date": "2024-01-01", "region": "US", "product_id": 1, "amount": 100.50},
+        {"sale_date": "2024-01-02", "region": "EU", "product_id": 2, "amount": 200.75},
+        # More data...
+    ]
+
+# Use AUTO clustering for automatic optimization
+databricks_adapter(
+    sales_data,
+    cluster="AUTO",  # Let Databricks automatically choose optimal clustering
+    table_comment="Sales data with automatic clustering"
+)
+
+# Or specify manual clustering and partitioning
+@dlt.resource
+def partitioned_sales():
+    yield from sales_data()
+
+databricks_adapter(
+    partitioned_sales,
+    partition=["year", "month"],  # Partition by year and month columns
+    # Note: Cannot use cluster with partition in Databricks
+    table_comment="Partitioned sales data"
+)
+```
+
+#### Table properties for Delta Lake optimization
+
+```py
+import dlt
+from dlt.destinations.adapters import databricks_adapter
+
+@dlt.resource
+def high_volume_events():
+    yield from iter(()) # Your event generator
+
+databricks_adapter(
+    high_volume_events,
+    table_properties={
+        # Delta Lake optimization properties
+        "delta.appendOnly": True,  # Table is append-only
+        "delta.logRetentionDuration": "30 days",  # Keep logs for 30 days
+        "delta.dataSkippingStatsColumns": "event_date,user_id,event_type",  # Columns for data skipping
+        "delta.autoOptimize.optimizeWrite": True,  # Enable optimize write
+        "delta.autoOptimize.autoCompact": True,  # Enable auto compaction
+
+        # Custom properties for metadata
+        "custom.team": "data-engineering",
+        "custom.sla": "tier-1",
+        "custom.refresh_frequency": "hourly"
+    },
+    cluster="event_date",
+    table_comment="High-volume event stream with Delta optimizations"
+)
+```
+
+#### Apache Iceberg tables
+
+Databricks supports Apache Iceberg table format, which provides benefits like better schema evolution and time travel capabilities.
+
+Important notes:
+
+- ICEBERG tables support the same data types as Delta tables
+- Delta Lake-specific table properties (e.g., `delta.dataSkippingStatsColumns`, `delta.appendOnly`) cannot be used with ICEBERG tables - validation occurs at load time to prevent incompatible configurations
+
+```py
+import dlt
+from dlt.destinations.adapters import databricks_adapter
+
+@dlt.resource
+def customer_data():
+    yield from iter(())  # Your customer data source
+
+# Create an Iceberg table for better schema evolution
+databricks_adapter(
+    customer_data,
+    table_format="ICEBERG",  # Use Apache Iceberg format
+    table_properties={
+        # Iceberg-specific properties (note: Delta properties are not supported)
+        "write.format.default": "parquet",
+        "write.parquet.compression-codec": "snappy"
+    },
+    table_comment="Customer data in Iceberg format for schema evolution"
+)
+```
+
+#### Complete example with all features
+
+```py
+import dlt
+from dlt.destinations.adapters import databricks_adapter
+
+@dlt.resource(
+    columns=[
+        {"name": "transaction_date", "data_type": "date"},
+        {"name": "customer_id", "data_type": "bigint"},
+        {"name": "amount", "data_type": "decimal"},
+        {"name": "region", "data_type": "text"},
+        {"name": "year", "data_type": "bigint"},
+        {"name": "month", "data_type": "bigint"}
+    ]
+)
+def transactions():
+    yield from iter(())  # your data generator
+
+# Apply comprehensive Databricks optimizations
+databricks_adapter(
+    transactions,
+
+    # Partitioning for efficient data organization
+    partition=["year", "month"],
+
+    # Note: Cannot use both partition and cluster together in Databricks
+    # cluster=["region", "customer_id"],  # Would need separate table without partitioning
+
+    # Table format (DELTA is default)
+    table_format="DELTA",
+
+    # Table properties for performance tuning
+    table_properties={
+        "delta.appendOnly": False,
+        "delta.dataSkippingStatsColumns": "transaction_date,amount,customer_id",
+        "delta.autoOptimize.optimizeWrite": True,
+        "delta.targetFileSize": "128mb",
+        "custom.owner": "finance-team"
+    },
+
+    # Table documentation
+    table_comment="Financial transactions with optimized storage",
+    table_tags=["financial", {"compliance": "sox"}],
+
+    # Column documentation
+    column_hints={
+        "customer_id": {
+            "column_comment": "Unique customer identifier",
+            "column_tags": ["pii"]
+        },
+        "amount": {
+            "column_comment": "Transaction amount in USD"
+        }
+    }
+)
+```
+
+## Troubleshooting
+
+Use the following steps to avoid conflicts with Databricks' built-in Delta Live Tables (DLT) module and enable dltHub integration.
+
+### Enable dlt on serverless (16.x)
+
+Live Tables (DLT) are not available on serverless but the import machinery that is patching DLT is still there in form of import hooks. You
+can temporarily disable this machinery to import `dlt` and use it afterwards. In a notebook cell (assuming that `dlt` is already installed):
+
+```sh
+%restart_python
+```
+
+```py
+import sys
+
+# dlt patching hook is the first one on the list
+metas = list(sys.meta_path)
+sys.meta_path = metas[1:]
+
+# remove RUNTIME - uncomment on dlt before 1.18.0
+# import os
+# del os.environ["RUNTIME"]
+
+import dlt  # noqa: E402
+
+sys.meta_path = metas  # restore post import hooks
+
+# use dlt
+info = dlt.run([1, 2, 3], destination=dlt.destinations.filesystem("_data"), table_name="digits")
+print(info)
+```
+
+### Enable dlt on a cluster
+
+#### 1. Add an `init` script
+
+To ensure compatibility with the dltHub's dlt package in Databricks, add an `init` script that runs at cluster startup. This script installs the dlt package from dltHub, renames Databricks’ built-in DLT module to avoid naming conflicts, and updates internal references to allow continued use under the alias `dlt_dbricks`.
+
+1. In your Databricks workspace directory, create a new file named `init.sh` and add the following content:
+
+```sh
+#! /bin/bash
+
+# move Databricks' dlt package to a different folder name
+mv /databricks/spark/python/dlt/ /databricks/spark/python/dlt_dbricks
+
+# Replace all mentions of `dlt` with `dlt_dbricks` so that Databricks' dlt
+# can be used as `dlt_dbricks` in the notebook instead
+find /databricks/spark/python/dlt_dbricks/ -type f -exec sed -i 's/from dlt/from dlt_dbricks/g' {} \;
+
+# Replace mentions of `dlt` with `dlt_dbricks` in DeltaLiveTablesHook.py to
+# avoid import errors
+sed -i "s/'dlt'/'dlt_dbricks'/g" /databricks/python_shell/dbruntime/DeltaLiveTablesHook.py
+sed -i "s/from dlt/from dlt_dbricks/g" /databricks/python_shell/dbruntime/DeltaLiveTablesHook.py
+
+# Install dltHub dlt
+pip install dlt
+```
+
+2. Go to your cluster, click Edit, scroll down to Advanced Options, and open the Init Scripts tab.
+
+3. Under Source, choose Workspace, then browse to your `init.sh` file and click Add.
+
+4. Click Confirm to apply the change. The cluster will restart automatically.
+
+:::warning
+The location of `DeltaLiveTablesHook.py` might change when a new Databricks runtime version is released.
+
+The following locations have been confirmed for the two latest LTS runtime versions:
+
+- 16.4 LTS: /databricks/python_shell/lib/dbruntime/dlt/hook.py
+- 15.4 LTS: /databricks/python_shell/lib/dbruntime/DeltaLiveTablesHook.py
+:::
+
+#### 2. Remove preloaded databricks modules in the notebook
+
+After the cluster starts, Databricks may partially import its built-in Delta Live Tables (DLT) modules, which can interfere with the dlt package from dltHub.
+
+To ensure a clean environment, add the following code at the top of your notebook:
+
+```py
+import sys
+import types
+
+# 1 Drop Databricks' post-import hook
+sys.meta_path = [h for h in sys.meta_path if 'PostImportHook' not in repr(h)]
+
+# 2️ Purge half-initialized Delta-Live-Tables modules
+for name, module in list(sys.modules.items()):
+    if not isinstance(module, types.ModuleType):
+        continue
+    if getattr(module, '__file__', '').startswith('/databricks/spark/python/dlt'):
+        del sys.modules[name]
+```
+
+This ensures the dlt package from dltHub is used instead of the built-in Databricks DLT module.
+
+:::warning
+It is best practice to use an `init.sh` script.
+
+Modifying `sys.meta_path` or `sys.modules` is fragile and may break after Databricks updates, potentially causing unexpected issues.
+If this workaround is necessary, validate your setup after each platform upgrade.
+:::
+
+<!--@@@DLT_TUBA databricks-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/delta-iceberg.md =====
+
+---
+title: Delta Lake
+description: Delta dlt destination
+keywords: [delta, destination, data warehouse]
+---
+# Delta table format
+
+dlt supports writing [Delta](https://delta.io/) tables when using the [filesystem](./filesystem.md) destination.
+
+## How it works
+
+dlt uses the [deltalake](https://pypi.org/project/deltalake/) library to write Delta tables. One or multiple Parquet files are prepared during the extract and normalize steps. In the load step, these Parquet files are exposed as an Arrow data structure and fed into `deltalake`.
+
+## Delta dependencies
+
+You need the `deltalake` package to use this format:
+
+```sh
+pip install "dlt[deltalake]"
+```
+
+You also need `pyarrow>=17.0.0`:
+
+```sh
+pip install 'pyarrow>=17.0.0'
+```
+
+## Set table format
+
+Set the `table_format` argument to `delta` when defining your resource:
+
+```py
+@dlt.resource(table_format="delta")
+def my_delta_resource():
+    ...
+```
+
+or when calling `run` on your pipeline:
+
+```py
+pipeline.run(my_resource, table_format="delta")
+```
+
+:::note
+dlt always uses Parquet as `loader_file_format` when using the `delta` table format. Any setting of `loader_file_format` is disregarded.
+:::
+
+## Table format partitioning
+
+Delta tables can be partitioned by specifying one or more `partition` column hints. This example partitions a Delta table by the `foo` column:
+
+```py
+@dlt.resource(
+  table_format="delta",
+  columns={"foo": {"partition": True}}
+)
+def my_delta_resource():
+    ...
+```
+
+:::note
+Delta uses [Hive-style partitioning](https://delta.io/blog/pros-cons-hive-style-partionining/).
+:::
+
+:::warning
+Partition evolution (changing partition columns after a table has been created) is not supported.
+:::
+
+## Table access helper functions
+
+You can use the `get_delta_tables` helper function to access native table objects. These are `deltalake` [DeltaTable](https://delta-io.github.io/delta-rs/api/delta_table/) objects.
+
+```py
+from dlt.common.libs.deltalake import get_delta_tables
+
+# get dictionary of DeltaTable objects
+delta_tables = get_delta_tables(pipeline)
+
+# execute operations on DeltaTable objects
+delta_tables["my_delta_table"].optimize.compact()
+delta_tables["another_delta_table"].optimize.z_order(["col_a", "col_b"])
+# delta_tables["my_delta_table"].vacuum()
+# etc.
+```
+
+## Table truncation
+
+When dlt truncates a Delta table — with [`refresh="drop_data"`](../../general-usage/pipeline.md#refresh-pipeline-data-and-state) or for tables in a `replace` chain that receive no data — it runs a transactional delete that commits a new table version with no rows. The table, its schema, and version history stay intact, so readers are never exposed to a partially deleted table. Physical Parquet files are retained for time travel until you run `vacuum`.
+
+## Google Cloud Storage authentication
+
+Note that not all authentication methods are supported when using Delta table format on Google Cloud Storage:
+
+- [Service Account](bigquery.md#setup-guide) - ✅ Supported
+- [Application Default Credentials](bigquery.md#using-default-credentials) - ✅ Supported
+- [OAuth](../destinations/bigquery.md#oauth-20-authentication) - ❌ Not supported
+
+## Table format `merge` support
+
+dlt supports the [`upsert`](../../general-usage/merge-loading.md#upsert-strategy), [`insert-only`](../../general-usage/merge-loading.md#insert-only-strategy), and [`cdc`](../../general-usage/merge-loading.md#cdc-strategy) merge strategies for `delta`.
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "upsert"},
+    primary_key="my_primary_key",
+    table_format="delta"
+)
+def my_upsert_resource():
+    ...
+```
+
+### Known limitations
+
+- dlt merges each Delta table on its own. The merge of a nested table does not use the rows of its parent table.
+- `upsert` and `cdc` support the [`hard_delete`](../../general-usage/merge-loading.md#delete-records) hint only for tables without nested tables. With nested tables, dlt stops before the load starts. `insert-only` ignores the `hard_delete` hint.
+- `cdc` supports the [merge conditions](../../general-usage/merge-loading.md#merge-conditions), and `upsert` supports `source_filter`, only for tables without nested tables. `cdc` does not support `merge_key`.
+- `upsert` does not delete records from nested tables.
+  - This means updates to JSON columns that involve element removals are not propagated. For example, if you first load `{"key": 1, "nested": [1, 2]}` and then load `{"key": 1, "nested": [1]}`, then the record for element `2` will not be deleted from the nested table.
+  - `cdc` deletes these records, because it treats the load as a complete snapshot.
+
+By default, dlt runs Delta table upserts in streamed mode to reduce memory pressure. To enable the use of source table statistics to derive an early pruning predicate, set:
+
+```toml
+[destination.filesystem]
+deltalake_streamed_exec = false
+```
+
+## Delta table format storage options and configuration
+
+You can pass storage options and configuration by configuring both `destination.filesystem.deltalake_storage_options` and
+`destination.filesystem.deltalake_configuration`:
+
+```toml
+[destination.filesystem]
+deltalake_configuration = '{"delta.enableChangeDataFeed": "true", "delta.minWriterVersion": "7"}'
+deltalake_storage_options = '{"AWS_S3_LOCKING_PROVIDER": "dynamodb", "DELTA_DYNAMO_TABLE_NAME": "custom_table_name"}'
+```
+
+dlt passes these as arguments to the `write_deltalake` method in the `deltalake` library (`deltalake_configuration` maps to `configuration` and `deltalake_storage_options` maps to `storage_options`). Look at their [documentation](https://delta-io.github.io/delta-rs/api/delta_writer/#deltalake.write_deltalake) to see which options can be used.
+
+You don't need to specify credentials here. dlt merges the required credentials with the options you provided before passing it as `storage_options`.
+
+:::warning
+When using `s3`, you need to specify storage options to [configure](https://delta-io.github.io/delta-rs/usage/writing/writing-to-s3-with-locking-provider/) locking behavior.
+:::
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/destination.md =====
+
+---
+title: Reverse ETL
+description: Custom `dlt` destination function for reverse ETL
+keywords: [reverse etl, sink, function, decorator, destination, custom destination]
+---
+# Custom destination: Reverse ETL
+
+The `dlt` destination decorator allows you to receive all data passing through your pipeline in a simple function. This can be extremely useful for reverse ETL, where you are pushing data back to an API.
+
+You can also use this for sending data to a queue or a simple database destination that is not yet supported by `dlt`, although be aware that you will have to manually handle your own migrations in this case.
+
+It will also allow you to simply get a path to the files of your normalized data. So, if you need direct access to parquet or jsonl files to copy them somewhere or push them to a database, you can do this here too.
+
+## Install `dlt` for reverse ETL
+
+To install `dlt` without additional dependencies:
+
+```sh
+pip install dlt
+```
+
+<!--@@@DLT_DESTINATION_CAPABILITIES destination-->
+
+## Set up a destination function for your pipeline
+
+The custom destination decorator differs from other destinations in that you do not need to provide connection credentials, but rather you provide a function that gets called for all items loaded during a pipeline run or load operation. With the `@dlt.destination`, you can convert any function that takes two arguments into a `dlt` destination.
+
+A very simple dlt pipeline that pushes a list of items into a destination function might look like this:
+
+```py
+import dlt
+from dlt.common.typing import TDataItems
+from dlt.common.schema import TTableSchema
+
+@dlt.destination(batch_size=10)
+def my_destination(items: TDataItems, table: TTableSchema) -> None:
+    print(table["name"])
+    print(items)
+
+pipeline = dlt.pipeline("custom_destination_pipeline", destination=my_destination)
+pipeline.run([1, 2, 3], table_name="items")
+```
+
+:::tip
+
+1. You can also remove the typing information (`TDataItems` and `TTableSchema`) from this example. Typing is generally useful to know the shape of the incoming objects, though.
+2. There are a few other ways to declare custom destination functions for your pipeline described below.
+:::
+
+### `@dlt.destination`, custom destination function, and signature
+
+The full signature of the destination decorator plus its function is the following:
+
+```py
+from dlt.common.typing import TDataItems
+from dlt.common.schema.typing import TTableSchema
+
+@dlt.destination(
+    batch_size=10,
+    loader_file_format="jsonl",
+    name="my_custom_destination",
+    naming_convention="direct",
+    max_table_nesting=0,
+    skip_dlt_columns_and_tables=True,
+    max_parallel_load_jobs=5,
+    loader_parallelism_strategy="table-sequential",
+)
+def my_destination(items: TDataItems, table: TTableSchema) -> None:
+    ...
+```
+
+### Decorator arguments
+
+* The `batch_size` parameter on the destination decorator defines how many items per function call are batched together and sent as an array. If you set a batch size of `0`, instead of passing in actual data items, you will receive one call per load job with the path of the file as the items argument. You can then open and process that file in any way you like.
+* The `loader_file_format` parameter on the destination decorator defines the format in which files are stored in the load package before being sent to the destination function. This can be `jsonl` or `parquet`.
+* The `name` parameter on the destination decorator defines the name of the destination that gets created by the destination decorator.
+* The `naming_convention` parameter on the destination decorator defines the name of the destination that gets created by the destination decorator. This controls how table and column names are normalized. The default is `direct`, which will keep all names the same.
+* The `max_table_nesting` parameter on the destination decorator defines how deep the normalizer will go to normalize nested fields in your data to create subtables. This overwrites any settings on your `source` and is set to zero to not create any nested tables by default.
+* The `skip_dlt_columns_and_tables` parameter on the destination decorator defines whether internal tables and columns will be fed into the custom destination function. This is set to `True` by default.
+* The `max_parallel_load_jobs` parameter will define how many load jobs will run in parallel in threads. If you have a destination that only allows five connections at a time, you can set this value to 5, for example.
+* The `loader_parallelism_strategy` parameter will control how load jobs are parallelized. Set to `parallel`, the default, jobs will be parallelized no matter which table is being loaded to. `table-sequential` will parallelize loading but only ever have one load job per table at a time, `sequential` will run all load jobs sequentially on the main thread.
+
+:::note
+Settings above ensure that the shape of the data you receive in the destination function is as close as possible to what you see in the data source.
+
+* The custom destination sets the `max_table_nesting` to 0 by default, which means no sub-tables will be generated during the normalization phase.
+* The custom destination also skips all internal tables and columns by default. If you need these, set `skip_dlt_columns_and_tables` to False.
+:::
+
+### Custom destination function
+
+* The `items` parameter on the custom destination function contains the items being sent into the destination function.
+* The `table` parameter contains the schema table the current call belongs to, including all table hints and columns. For example, the table name can be accessed with `table["name"]`.
+* You can also add config values and secrets to the function arguments, see below!
+
+## Add configuration, credentials, and other secrets to the destination function
+
+The destination decorator supports settings and secrets variables. If you, for example, plan to connect to a service that requires an API secret or a login, you can do the following:
+
+```py
+from dlt.common.typing import TDataItems
+from dlt.common.schema.typing import TTableSchema
+
+@dlt.destination(batch_size=10, loader_file_format="jsonl", name="my_destination")
+def my_destination(items: TDataItems, table: TTableSchema, api_key: str = dlt.secrets.value) -> None:
+    ...
+```
+
+You can then set a config variable in your `.dlt/secrets.toml` like so:
+
+```toml
+[destination.my_destination]
+api_key="<my-api-key>"
+```
+
+Custom destinations follow the same configuration rules as [regular named destinations](../../general-usage/destination.md#configure-a-destination)
+
+## Use the custom destination in `dlt` pipeline
+
+There are multiple ways to pass the custom destination function to the `dlt` pipeline:
+- Directly reference the destination function
+
+  ```py
+  from dlt.common.typing import TDataItems
+  from dlt.common.schema.typing import TTableSchema
+
+  @dlt.destination(batch_size=10)
+  def local_destination_func(items: TDataItems, table: TTableSchema) -> None:
+      ...
+
+  # Reference function directly
+  p = dlt.pipeline("my_pipe", destination=local_destination_func)
+  ```
+
+  Like for [regular destinations](../../general-usage/destination.md#pass-explicit-credentials), you are allowed to pass configuration and credentials
+  explicitly to the destination function.
+
+  ```py
+  import os
+  from dlt.common.typing import TDataItems
+  from dlt.common.schema.typing import TTableSchema
+
+  @dlt.destination(batch_size=10, loader_file_format="jsonl", name="my_destination")
+  def my_destination(items: TDataItems, table: TTableSchema, api_key: str = dlt.secrets.value) -> None:
+      ...
+
+  p = dlt.pipeline("my_pipe", destination=my_destination(api_key=os.getenv("API_KEY", "")))
+  ```
+
+- Via the `dlt.destination()` function that initializes the destination. In this case, don't use the decorator for the destination function.
+
+  ```py
+  # File my_destination.py
+  from dlt.common.typing import TDataItems
+  from dlt.common.schema.typing import TTableSchema
+
+  # Don't use the decorator
+  def local_destination_func(items: TDataItems, table: TTableSchema) -> None:
+      ...
+
+  # Via dlt.destination() that initializes the destination
+  p = dlt.pipeline(
+      "my_pipe",
+      destination=dlt.destination(
+          "my_destination", destination_callable=local_destination_func
+      )
+  )
+  ```
+
+- Via a fully qualified string to function location (this can be set in `config.toml` or through environment variables). The destination function should be located in another file.
+
+  ```py
+  # File my_pipeline.py
+
+  # Fully qualified string to function location
+  p = dlt.pipeline(
+      "my_pipe",
+      destination=dlt.destination(
+          "my_destination", destination_callable="my_destination.local_destination_func"
+      )
+  )
+  ```
+
+## Adjust batch size and retry policy for atomic loads
+
+The destination keeps a local record of how many `DataItems` were processed, so if you, for example, use the custom destination to push `DataItems` to a remote API, and this
+API becomes unavailable during the load resulting in a failed `dlt` pipeline run, you can repeat the run of your pipeline at a later moment and the custom destination will **restart from the whole batch that failed**. We are preventing any data from being lost, but you can still get duplicated data if you committed half of the batch, for example, to a database and then failed.
+**Keeping the batch atomicity is on you**. For this reason, it makes sense to choose a batch size that you can process in one transaction (say one API request or one database transaction) so that if this request or transaction fails repeatedly, you can repeat it at the next run without pushing duplicate data to your remote location. For systems that
+are not transactional and do not tolerate duplicated data, you can use a batch of size 1.
+
+Destination functions that raise exceptions are retried 5 times before giving up (`load.raise_on_max_retries` config option). If you run the pipeline again, it will resume loading before extracting new data.
+
+If your exception derives from `DestinationTerminalException`, the whole load job will be marked as failed and not retried again.
+
+:::warning
+If you wipe out the pipeline folder (where job files and destination state are saved), you will not be able to restart from the last failed batch.
+However, it is fairly easy to back up and restore the pipeline directory, [see details below](#manage-pipeline-state-for-incremental-loading).
+:::
+
+## Increase or decrease loading parallelism
+
+Calls to the destination function by default will be executed on multiple threads, so you need to make sure you are not using any non-thread-safe nonlocal or global variables from outside your destination function. If you need to have all calls executed from the same thread, you can set the `workers` [config variable of the load step](../../reference/performance.md#load) to 1.
+
+:::tip
+For performance reasons, we recommend keeping the multithreaded approach and making sure that you, for example, are using thread-safe connection pools to a remote database or queue.
+:::
+
+## Write disposition
+
+`@dlt.destination` will forward all normalized `DataItems` encountered during a pipeline run to the custom destination function, so there is no notion of "write dispositions."
+
+## CLI and dashboard limitations
+
+Custom destination callables cannot be resolved from a process different than the one that originally ran the pipeline. This means that CLI commands like `dlt pipeline info` and `dlt pipeline show` will work only partially for custom destinations.
+
+## Staging support
+
+`@dlt.destination` does not support staging files in remote locations before being called at this time. If you need this feature, please let us know.
+
+## Manage pipeline state for incremental loading
+
+Custom destinations do not have a general mechanism to restore pipeline state. This will impact data sources that rely on the state being kept, i.e., all incremental resources.
+If you wipe the pipeline directory (i.e., by deleting a folder or running on AWS Lambda or GitHub Actions where you get a clean runner), the progress of the incremental loading is lost. On the next run, you will re-acquire the data from the beginning.
+
+While we are working on a pluggable state storage, you can fix the problem above by:
+
+1. Not wiping the pipeline directory. For example, if you run your pipeline on an EC instance periodically, the state will be preserved.
+2. By doing a restore/backup of the pipeline directory before/after it runs. This is way easier than it sounds, and [here's a script you can reuse](https://gist.github.com/rudolfix/ee6e16d8671f26ac4b9ffc915ad24b6e).
+
+## What's next
+
+* Check out our [Custom BigQuery Destination](../../examples/custom_destination_bigquery/) example.
+* Need help with building a custom destination? Ask your questions in our [Slack Community](https://dlthub.com/community) technical help channel.
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/dremio.md =====
+
+---
+title: Dremio
+description: Dremio `dlt` destination
+keywords: [dremio, iceberg, aws, glue catalog]
+---
+# Dremio
+
+## Install dlt with Dremio
+
+To install the dlt library with Dremio and s3 dependencies:
+
+```sh
+pip install "dlt[dremio,s3]"
+```
+
+<!--@@@DLT_DESTINATION_CAPABILITIES dremio-->
+
+## Setup guide
+
+### 1. Initialize the dlt project
+
+Let's start by initializing a new dlt project as follows:
+
+   ```sh
+   dlt init chess dremio
+   ```
+
+  :::info
+  This command will initialize your pipeline with chess as the source and aws dremio as the destination using the filesystem staging destination.
+  :::
+
+### 2. Setup bucket storage and Dremio credentials
+
+First, install dependencies by running:
+
+```sh
+pip install -r requirements.txt
+```
+
+or with `pip install "dlt[dremio,s3]"` which will install `s3fs`, `pyarrow`, and `botocore` packages.
+
+To edit the `dlt` credentials file with your secret info, open `.dlt/secrets.toml`. You will need to provide a `bucket_url` which holds the uploaded parquet files.
+
+The TOML file looks like this:
+
+```toml
+[destination.filesystem]
+bucket_url = "s3://[your_bucket_name]" # replace with your bucket name,
+
+[destination.filesystem.credentials]
+aws_access_key_id = "please set me up!" # copy the access key here
+aws_secret_access_key = "please set me up!" # copy the secret access key here
+
+[destination.dremio]
+staging_data_source = "<staging-data-source>" # the name of the "Object Storage" data source in Dremio containing the s3 bucket
+
+[destination.dremio.credentials]
+username = "<username>"  # the Dremio username
+password = "<password or pat token>"  # Dremio password or PAT token
+database = "<database>" # the name of the "data source" set up in Dremio where you want to load your data
+host = "localhost" # the Dremio hostname
+port = 32010 # the Dremio Arrow Flight grpc port
+drivername="grpc" # either 'grpc' or 'grpc+tls'
+```
+
+You can also pass a SqlAlchemy-like connection like below:
+
+```toml
+[destination.dremio]
+staging_data_source="s3_staging"
+credentials="grpc://<username>:<password>@<host>:<port>/<data_source>"
+```
+
+If you have your credentials stored in `~/.aws/credentials`, just remove the **[destination.filesystem.credentials]** and **[destination.dremio.credentials]** sections above and `dlt` will fall back to your **default** profile in local credentials. If you want to switch the profile, pass the profile name as follows (here: `dlt-ci-user`):
+
+```toml
+[destination.filesystem.credentials]
+profile_name="dlt-ci-user"
+```
+
+## Write disposition
+
+`dremio` destination handles the write dispositions as follows:
+
+- `append`
+- `replace`
+- `merge`
+
+:::note
+The `merge` write disposition uses the default DELETE/UPDATE/INSERT strategy to merge data into the destination. Be aware that Dremio does not support transactions, so a partial pipeline failure can result in the destination table being in an inconsistent state. The `merge` write disposition will eventually be implemented using [MERGE INTO](https://docs.dremio.com/current/reference/sql/commands/apache-iceberg-tables/apache-iceberg-merge/) to resolve this issue.
+:::
+
+## Data loading
+
+Data loading happens by copying staged parquet files from an object storage bucket to the destination table in Dremio using [COPY INTO](https://docs.dremio.com/cloud/reference/sql/commands/copy-into-table/) statements. The destination table format is specified by the storage format for the data source in Dremio. Typically, this will be Apache Iceberg.
+
+:::warning
+Dremio cannot load `fixed_len_byte_array` columns from Parquet files.
+:::
+
+## Dataset creation
+
+Dremio does not support `CREATE SCHEMA` DDL statements.
+
+Therefore, "Metastore" data sources, such as Hive or Glue, require that the dataset schema exists prior to running the dlt pipeline. `dev_mode=True` is unsupported for these data sources.
+
+"Object Storage" data sources do not have this limitation.
+
+## Staging support
+
+Using a staging destination is mandatory when using the Dremio destination. If you do not set staging to `filesystem`, dlt will automatically do this for you.
+
+## Table partitioning and local sort
+
+Apache Iceberg table partitions and local sort properties can be configured as shown below:
+
+```py
+import dlt
+from dlt.common.schema import TColumnSchema
+
+@dlt.resource(
+    table_name="my_table",
+    columns=dict(
+        foo=TColumnSchema(partition=True),
+        bar=TColumnSchema(partition=True),
+        baz=TColumnSchema(sort=True),
+    ),
+)
+def my_table_resource():
+  ...
+```
+
+This will result in `PARTITION BY ("foo","bar")` and `LOCALSORT BY ("baz")` clauses being added to the `CREATE TABLE` DML statement.
+
+> ***Note:*** Table partition migration is not implemented. The table will need to be dropped and recreated to alter partitions or localsort.
+
+### Syncing of `dlt` state
+
+- This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+<!--@@@DLT_TUBA dremio-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/duckdb.md =====
+
+---
+title: DuckDB
+description: DuckDB `dlt` destination
+keywords: [duckdb, destination, data warehouse]
+---
+# DuckDB
+
+## Install dlt with DuckDB
+
+Install the dlt library with DuckDB dependencies:
+
+```sh
+pip install "dlt[duckdb]"
+```
+
+<!--@@@DLT_DESTINATION_CAPABILITIES duckdb-->
+
+## Setup guide
+
+1. Initialize a project with a pipeline that loads to DuckDB:
+
+```sh
+dlt init chess duckdb
+```
+
+2. Install the dependencies for DuckDB:
+
+```sh
+pip install -r requirements.txt
+```
+
+3. Run the pipeline:
+
+```sh
+python3 chess_pipeline.py
+```
+
+## Supported versions
+
+`dlt` supports `duckdb` version **0.9** and later. Below are a few notes on problems with particular versions observed
+in our tests:
+
+* `1.2.0` and `1.3.2` are verified stable versions where tests consistently pass
+* `iceberg_scan` does not work on `duckdb` versions above 1.2.1 and below 1.3.3 with azure blob storage (certain functions are not implemented)
+* do not use `1.3.0`. This version has a decimal problem and it segfaults on Windows. Some azure blob storage tests also crash.
+* [segfault on windows will be fixed in 1.4](https://github.com/duckdb/duckdb/issues/17971)
+
+## Write disposition
+
+The duckdb destination supports all write dispositions.
+
+## Data loading
+
+By default, `dlt` loads data with large `INSERT VALUES` statements, on 20 threads. Parquet is faster than `INSERT VALUES` and also loads on 20 threads. Parquet needs the `pyarrow` package.
+
+### Data types
+
+`duckdb` supports various [timestamp types](https://duckdb.org/docs/sql/data_types/timestamp.html). You set these types with the column flags `timezone` and `precision`, in the `dlt.resource` decorator or the `pipeline.run` method.
+
+- **Precision**: Supported precision values are 0, 3, 6, and 9 for fractional seconds. You cannot use `timezone` and `precision` together. `dlt` raises an error for that combination.
+- **Timezone**:
+  - `timezone=False` maps to `TIMESTAMP`.
+  - `timezone=True` (or the flag omitted, which defaults to `True`) maps to `TIMESTAMP WITH TIME ZONE` (`TIMESTAMPTZ`).
+
+#### Example precision: TIMESTAMP_MS
+
+```py
+@dlt.resource(
+    columns={"event_tstamp": {"data_type": "timestamp", "precision": 3}},
+    primary_key="event_id",
+)
+def events():
+    yield [{"event_id": 1, "event_tstamp": "2024-07-30T10:00:00.123"}]
+
+pipeline = dlt.pipeline(destination="duckdb")
+pipeline.run(events())
+```
+
+#### Example timezone: TIMESTAMP
+
+```py
+@dlt.resource(
+    columns={"event_tstamp": {"data_type": "timestamp", "timezone": False}},
+    primary_key="event_id",
+)
+def events():
+    yield [{"event_id": 1, "event_tstamp": "2024-07-30T10:00:00.123+00:00"}]
+
+pipeline = dlt.pipeline(destination="duckdb")
+pipeline.run(events())
+```
+
+### Name normalization
+
+`dlt` uses the standard **snake_case** naming convention to keep identical table and column identifiers across all destinations. **duckdb** accepts a wide range of characters in table and column names, for example emojis. To use them, switch to the **duck_case** naming convention, which accepts almost any string as an identifier:
+
+* The **duck_case** convention translates new line (`\n`), carriage return (`\r`), and double quotes (`"`) to an underscore (`_`).
+* The convention also translates consecutive underscores to a single `_`.
+
+Switch the naming convention in `config.toml`:
+
+```toml
+[schema]
+naming="duck_case"
+```
+
+Or set the env variable `SCHEMA__NAMING`, or set the value in code:
+
+```py
+dlt.config["schema.naming"] = "duck_case"
+```
+
+:::warning
+**duckdb** identifiers are **case-insensitive**, but display names preserve case. If you load JSON with
+`{"Column": 1, "column": 2}`, duckdb maps both keys to a single column. This creates a name collision.
+:::
+
+## Supported file formats
+
+You can configure the following file formats to load data into duckdb:
+
+* [insert-values](../file-formats.md#sql-insert) is used by default.
+* [Parquet](../file-formats.md#parquet) is supported.
+:::note
+`duckdb` cannot COPY many Parquet files to a single table from multiple threads. In this situation, dlt serializes the loads. Serialized Parquet loads can still be faster than `INSERT VALUES`.
+:::
+* [JSONL](../file-formats.md#jsonl)
+
+:::tip
+`duckdb` has [timestamp types](https://duckdb.org/docs/sql/data_types/timestamp.html) with resolutions from milliseconds to nanoseconds. However,
+only the microseconds resolution (the most commonly used) is time-zone-aware. By default, `dlt` generates timestamps with a time zone.
+Parquet loads then fail, because `duckdb` does not coerce time-zone-aware timestamps to naive timestamps.
+To disable the time zones, change the `dlt` [Parquet writer settings](../file-formats.md#writer-settings):
+
+```sh
+DATA_WRITER__TIMESTAMP_TIMEZONE=""
+```
+
+Timestamps written this way carry no offset, so `duckdb` reads them in the
+[session timezone](#session-timezone), which `dlt` keeps at UTC.
+:::
+
+## Supported column hints
+
+`duckdb` can create unique indexes for columns with `unique` hints. However, `dlt` disables this feature by default, because unique indexes make loading much slower.
+
+## Destination config
+
+By default, `dlt` creates a DuckDB database in the current working directory. The name is `<pipeline_name>.duckdb` (`chess.duckdb` in the example above).
+
+The `duckdb` credentials do not require any secret values. [You can pass the credentials and config explicitly](../../general-usage/destination.md#pass-explicit-credentials). For example:
+
+```py
+# will load data to files/data.db (relative path) database file
+p = dlt.pipeline(
+  pipeline_name='chess',
+  destination=dlt.destinations.duckdb("files/data.db"),
+  dataset_name='chess_data',
+  dev_mode=False
+)
+
+# will load data to /var/local/database.duckdb (absolute path)
+p = dlt.pipeline(
+  pipeline_name='chess',
+  destination=dlt.destinations.duckdb("/var/local/database.duckdb"),
+  dataset_name='chess_data',
+  dev_mode=False
+)
+```
+
+Named `duckdb` destinations create a database file in the current working directory as `<destination_name>.duckdb`. For example:
+
+```py
+# will load data to files/data.db (relative path) database file
+p = dlt.pipeline(
+  pipeline_name='chess',
+  destination=dlt.destinations.duckdb(destination_name="chessdb"),
+  dataset_name='chess_data',
+)
+```
+
+This code creates the database `chessdb.duckdb`.
+
+:::warning
+Do not give the dataset the same name as the database. The `duckdb` binder cannot tell the catalog and the schema apart. For
+example:
+
+```py
+pipeline = dlt.pipeline(
+        pipeline_name="dummy",
+        destination="duckdb",
+        dataset_name="dummy",
+    )
+```
+
+This code creates the database `dummy.duckdb` and the schema (dataset) `dummy`. `duckdb` cannot tell them apart and raises a Binder Error.
+:::
+
+The destination accepts a `duckdb` connection instance via `credentials`. You can open the database connection yourself and pass it to `dlt`.
+
+```py
+import duckdb
+
+db = duckdb.connect()
+p = dlt.pipeline(
+  pipeline_name="chess",
+  destination=dlt.destinations.duckdb(db),
+  dataset_name="chess_data",
+  dev_mode=False,
+)
+
+# Or if you would like to use an in-memory duckdb instance
+db = duckdb.connect(":memory:")
+p = pipeline_one = dlt.pipeline(
+  pipeline_name="in_memory_pipeline",
+  destination=dlt.destinations.duckdb(db),
+  dataset_name="chess_data",
+)
+
+# print(p.run(chess()))
+
+print(db.sql("DESCRIBE;"))
+
+# Example output
+# ┌──────────┬───────────────┬─────────────────────┬──────────────────────┬───────────────────────┬───────────┐
+# │ database │    schema     │        name         │     column_names     │     column_types      │ temporary │
+# │ varchar  │    varchar    │       varchar       │      varchar[]       │       varchar[]       │  boolean  │
+# ├──────────┼───────────────┼─────────────────────┼──────────────────────┼───────────────────────┼───────────┤
+# │ memory   │ chess_data    │ _dlt_loads          │ [load_id, schema_n…  │ [VARCHAR, VARCHAR, …  │ false     │
+# │ memory   │ chess_data    │ _dlt_pipeline_state │ [version, engine_v…  │ [BIGINT, BIGINT, VA…  │ false     │
+# │ memory   │ chess_data    │ _dlt_version        │ [version, engine_v…  │ [BIGINT, BIGINT, TI…  │ false     │
+# │ memory   │ chess_data    │ my_table            │ [a, _dlt_load_id, …  │ [BIGINT, VARCHAR, V…  │ false     │
+# └──────────┴───────────────┴─────────────────────┴──────────────────────┴───────────────────────┴───────────┘
+```
+
+:::note
+When your Python script exits, `duckdb` destroys the in-memory database and all its data.
+:::
+
+:::note
+`dlt` configures the connection you pass like the ones it opens itself: it sets `search_path` to the
+dataset and applies the settings from [Additional config](#additional-config) below.
+:::
+
+This destination accepts database connection strings in the format used by [duckdb-engine](https://github.com/Mause/duckdb_engine#configuration).
+
+You can configure a DuckDB destination with [secret / config values](../../general-usage/credentials), for example in a `secrets.toml` file:
+
+```toml
+destination.duckdb.credentials="duckdb:///_storage/test_quack.duckdb"
+```
+
+The **duckdb://** URL above creates a **relative** path to `_storage/test_quack.duckdb`. To define an **absolute** path, use four slashes: `duckdb:////_storage/test_quack.duckdb`.
+
+You can also skip the schema and pass the path directly:
+
+```toml
+destination.duckdb.credentials="_storage/test_quack.duckdb"
+```
+
+To place the database in the working directory of the pipeline, pass **:pipeline:** as the path. The name is
+`<pipeline_name>.duckdb`, or `<destination_name>.duckdb` for a named destination.
+
+1. Via `config.toml`
+
+```toml
+destination.duckdb.credentials=":pipeline:"
+```
+
+2. In Python code
+
+```py
+p = dlt.pipeline(
+  pipeline_name="my_pipeline",
+  destination=dlt.destinations.duckdb(":pipeline:"),
+)
+```
+
+### Additional config
+
+If you set the following config value, `dlt` creates unique indexes during loading:
+
+```toml
+[destination.duckdb]
+create_indexes=true
+```
+
+Add extensions, pragmas, and [local and global config](https://duckdb.org/docs/stable/configuration/overview.html#global-configuration-options) options to the config:
+
+```toml
+[destination.duckdb.credentials]
+extensions=["spatial"]
+pragmas=["enable_progress_bar", "enable_logging"]
+
+[destination.duckdb.credentials.global_config]
+azure_transport_option_type=true
+
+[destination.duckdb.credentials.local_config]
+errors_as_json=true
+```
+
+The config above runs these steps in order:
+
+* `LOAD spatial` — `dlt` loads the extension but does not install it.
+* the global config: `SET GLOBAL azure_transport_option_type=true`
+* the `statements`, if you set any
+* the pragmas: `PRAGMA enable_logging`
+* the local config: `SET SESSION errors_as_json=true`
+
+Internally, `dlt` opens a new `duckdb` connection and then dispenses separate sessions to worker threads with `cursor()`. `dlt` does this even when the calling thread is the thread that created the connection. `dlt` applies extensions and global config once, on the "original" connection, and `duckdb` propagates them to every session.
+
+#### Session timezone
+
+`dlt` sets `TimeZone` to `UTC` on every connection it opens, and each session it dispenses inherits
+it. This setting decides how `duckdb` reads values that arrive without a UTC offset, for example
+naive timestamps in Parquet. It also decides which timezone `duckdb` returns for `TIMESTAMPTZ`
+columns. It does not change the column types that `CREATE TABLE` produces.
+
+Set `session_timezone` to a different timezone. To keep the `duckdb` default, which is the machine
+timezone, set it to an empty string:
+
+```toml
+[destination.duckdb.credentials]
+session_timezone="Europe/Berlin"
+```
+
+`TimeZone` is a database-wide setting, so on a connection that you passed yourself it becomes the
+default for the sessions you open from it as well. A session that set its own `TimeZone` keeps it.
+
+#### SQL statements on each connection
+
+The `statements` option takes plain SQL for anything the options above cannot express, such as `INSTALL`, `ATTACH` and `CREATE SECRET`:
+
+```toml
+[destination.duckdb.credentials]
+statements=["INSTALL lance", "LOAD lance"]
+```
+
+The example pairs `INSTALL` with `LOAD` to keep both steps together. You can also load the extension with
+the `extensions` option instead.
+
+`dlt` runs these statements on the "original" connection, right after the extensions and global config.
+Like those two options, the statements run once and propagate to every session.
+
+This option is for database-scoped statements only. `INSTALL`, `LOAD`, `ATTACH`, `CREATE SECRET`,
+`CREATE SCHEMA` and `CREATE VIEW` all belong to the database. `SET SESSION` and `USE` apply only to the
+"original" connection. They do not propagate to the sessions, and `dlt` reports no error. Put session
+settings in `pragmas` and `local_config` instead.
+
+Such statements often carry credentials, so `dlt` treats `statements` as a secret. Put the value in
+`secrets.toml`, not `config.toml`.
+
+You can pass dictionaries and lists in environment variables. Write these values as Python literals, not as JSON.
+
+You can also pass additional options in code:
+
+```py
+import os
+import duckdb
+from dlt.destinations.impl.duckdb.configuration import DuckDbCredentials
+
+# install spatial
+duckdb.sql("INSTALL spatial;")
+
+# use Python list literal to pass complex env variable
+os.environ["DESTINATION__DUCKDB__CREDENTIALS__PRAGMAS"] = '["enable_logging"]'
+
+dest_ = dlt.destinations.duckdb(
+    DuckDbCredentials("duck.db", extensions=["spatial"], local_config={"errors_as_json": True})
+)
+```
+
+The code above installs **spatial** with `duckdb` directly, because `dlt` only loads an extension. The code then passes duckdb credentials to the destination constructor. The database file is **duck.db**, and the code enables logging and `json` error messages.
+
+## Data access after loading
+
+After a load, you can read and write the data with `with pipeline.sql_client() as con:`. This client wraps `DuckDBPyConnection`. See [duckdb docs](https://duckdb.org/docs/api/python/overview#persistent-storage) for details. If you want to **read** data, use [pipeline.dataset()](../../general-usage/dataset-access/dataset) instead of `sql_client`.
+
+## dbt support
+
+This destination [integrates with dbt](../transformations/dbt/dbt.md) via [dbt-duckdb](https://github.com/jwills/dbt-duckdb), which is a community-supported package. `dlt` shares the `duckdb` database with `dbt`. In rare cases, `dbt-duckdb` reports that the binary database format does not match the format it expects. To avoid this error, update the `duckdb` package in your `dlt` project with `pip install -U`.
+
+:::note
+`dlt` does not propagate extensions, pragmas, and config options to the dbt profile.
+:::
+
+### Syncing of `dlt` state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+<!--@@@DLT_TUBA duckdb-->
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/ducklake.md =====
+
+---
+title: DuckLake
+description: DuckLake destination (DuckDB + ducklake extension)
+keywords: [ducklake, duckdb, destination, data lake, lakehouse]
+---
+# DuckLake
+
+[DuckLake](https://ducklake.select/) is a lakehouse-style destination that builds on the DuckDB engine with the [ducklake extension](https://ducklake.select/docs/stable/duckdb/introduction). It stores your `dlt` tables as files on a filesystem or object store while keeping table metadata in a separate SQL catalog.
+
+In order to use ducklake you must provide the following infrastructure:
+
+- **catalog**: a SQL database that stores table/partition metadata (sqlite, duckdb, postgres, mysql are supported)
+- **storage**: a filesystem or object store holding table files (local files, s3, gcs, abfss, etc.)
+
+If you are looking for a managed ducklake infra, check the [Motherduck Ducklake support](motherduck.md#ducklake-setup). `dlt` is also able to set-up a local ducklake with `sqlite` as catalog fully automatically.
+
+<!--@@@DLT_DESTINATION_CAPABILITIES ducklake-->
+
+## Quick start
+
+- Install dlt with DuckDB dependencies:
+
+```sh
+pip install "dlt[ducklake]"
+```
+
+- Initialize new test pipeline
+
+```sh
+dlt init foo ducklake
+```
+
+`dlt init` will create a sample `secrets.toml` for **postgres** catalog and **s3** bucket storage. For local automatic setup comment out catalog and storage entries:
+
+```toml
+[destination.ducklake.credentials]
+ducklake_name="ducklake"  # we recommend explicit ducklake name
+```
+
+- Run a test pipeline that writes to a local DuckLake:
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="foo",
+    destination="ducklake",
+    dataset_name="lake_schema",
+    dev_mode=True,
+)
+
+info = pipeline.run(
+    [{"foo": 1}, {"foo": 2}],
+    table_name="table_foo",
+)
+print(info)
+print(pipeline.dataset().table_foo["foo"].df())
+```
+
+The console output will point you to where `sqlite` catalog database and data store were created:
+
+- `lake_catalog.sqlite` catalog in current working directory
+- `lake_catalog.files` folder with `lake_schema` subfolder for the dataset.
+
+## Configure Ducklake
+
+Pick your `ducklake_name` as described above. This name is the used:
+
+- as attach name for the ducklake - each ducklake connection starts with **:memory:** connection to which we `ATTACH` the ducklake
+- to set default folder name of the local filesystem storage and database file name for `sqlite` and `duckdb` (if no explicit configuration is provided)
+- as **postgres** schema name where catalog tables will be created (if postgres configured)
+
+### Configure catalog
+
+You have the following options when configuring the catalog
+
+- **sqlite**: very fast local catalog. You can set it up as follows:
+
+```toml
+[destination.ducklake.credentials]
+catalog="sqlite:///catalog_x.db"
+```
+
+Snippet above stores catalog in `catalog_x.db` in cwd. Refer to [sqlite](sqlalchemy.md) configuration in `sqlalchemy` destination which reused the same configuration structure.
+Note that we are not able to setup **sqlite** to write in parallel, even with `WAL` journaling.
+Parallel writes produce conflicts on practically every catalog transactions so we had to put loader in **sequential mode**.
+
+- **duckdb**: pretty fast and working **only in sequential mode** like **sqlite**. Parallel loads generate page faults and corrupt the catalog database.
+
+```toml
+[destination.ducklake.credentials]
+catalog="duckdb:///catalog_y.duckdb"
+```
+
+Refer to [duckdb](duckdb.md) configuration for more options.
+
+- **postgres**: currently the only catalog that can be considered production-grade with full parallelism support.
+
+```toml
+[destination.ducklake.credentials]
+catalog="postgres://loader:pass@localhost:5432/dlt_data"
+```
+
+`ducklake` will use postgres schema with the name of `ducklake_name` config option and create required tables automatically.
+
+- 🧪 **mysql**: uses the same code path as for **postgres** but we never tested it
+
+- 🧪 **Motherduck** is also available as a catalog database, starting with ducklake extension version 1.4 (experimental — expect rough edges).
+
+```toml
+[destination.ducklake.credentials]
+catalog="md:<your_motherduck_database>"
+```
+
+Double check that your Motherduck token is in your environment!
+
+### Configure storage
+
+**storage** config reuses configuration of [filesystem](filesystem.md) destination. You can pick the following options:
+
+- Local files: file:///path or a plain relative path
+- S3: s3://bucket/prefix
+- GCS: gs://bucket/prefix or gcs://bucket/prefix (**uses fsspec fallback**)
+- Azure ADLS Gen2: abfss://container@account.dfs.core.windows.net/prefix (**uses fsspec fallback**)
+
+Example s3 configuration:
+
+```toml
+[destination.ducklake.credentials]
+ducklake_name="lakehouse"
+catalog="postgres://loader:pass@localhost:5432/dlt_data"
+
+[destination.ducklake.credentials.storage]
+bucket_url="s3://dlt-ci-bucket"
+
+[destination.ducklake.credentials.storage.credentials]
+aws_access_key_id = "<configure me>" # fill this in!
+aws_secret_access_key = "<configure me>" # fill this in!
+```
+
+### Configure additional connection options, pragmas and extensions
+
+You can set additional connection options, pragmas, extensions and the session timezone - `ducklake` config reuses [duckdb config](duckdb.md#additional-config)
+
+```toml
+[destination.ducklake.credentials.global_config]
+ducklake_max_retry_count=100
+```
+
+### Metadata schema
+
+For SQL-based DuckLake catalogs, you can set `metadata_schema` to control the `METADATA_SCHEMA`
+option in the DuckLake `ATTACH` statement independently from `ducklake_name`. If omitted,
+`ducklake_name` is used. This is useful when connecting to an existing PostgreSQL-backed
+DuckLake catalog that stores metadata in the `public` schema.
+
+```toml
+[destination.ducklake.credentials]
+metadata_schema="public"
+```
+
+Or via environment variable
+`DESTINATION__DUCKLAKE__CREDENTIALS__METADATA_SCHEMA=public`, or in code:
+
+```py
+import dlt
+from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
+
+destination = dlt.destinations.ducklake(
+    credentials=DuckLakeCredentials(
+        catalog="postgresql://loader:loader@localhost:5432/dlt_data",
+        storage="s3://bucket/data",
+        metadata_schema="public",
+    ),
+)
+```
+
+### Override data path
+
+DuckLake stores file paths in the catalog relative to a base `DATA_PATH` that is set at creation time. When `override_data_path` is set to `True`, the `DATA_PATH` provided in the current connection replaces the stored one for both reads and writes. The stored value in the catalog is not modified.
+
+Typical use cases:
+
+- Populating a ducklake locally and then uploading the catalog and data files to remote storage together
+- Accessing the same catalog from different environments where the storage is at a different path (e.g., data replicated to another bucket)
+
+```toml
+[destination.ducklake]
+override_data_path=true
+```
+
+Or via environment variable `DESTINATION__DUCKLAKE__OVERRIDE_DATA_PATH=true`, or in code:
+
+```py
+import dlt
+from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
+
+destination = dlt.destinations.ducklake(
+    credentials=DuckLakeCredentials(
+        catalog="sqlite:///catalog.sqlite",
+        storage="s3://new-bucket/data",
+    ),
+    override_data_path=True,
+)
+```
+
+See the [DuckLake docs on connecting](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details on `OVERRIDE_DATA_PATH`.
+
+### Automatic migration
+
+When you attach a catalog that was created by an older `ducklake` extension version, DuckDB raises a catalog version mismatch error. Set `automatic_migration` to `True` to attach with `AUTOMATIC_MIGRATION true`, which makes DuckDB migrate the catalog schema to the installed extension's version on attach. The default is `False`, matching DuckDB's own default.
+
+```toml
+[destination.ducklake]
+automatic_migration=true
+```
+
+Or via environment variable `DESTINATION__DUCKLAKE__AUTOMATIC_MIGRATION=true`, or in code:
+
+```py
+import dlt
+
+destination = dlt.destinations.ducklake(automatic_migration=True)
+```
+
+:::caution
+Migration mutates the catalog schema irreversibly. This does not help with read-only / pre-release (v0.x) catalogs, which DuckDB cannot migrate in place — migrate those through a writable intermediate catalog instead.
+:::
+
+### Configure in code
+
+You can create ducklake destination instance and configure it in code. In most cases you will just set additional options while still using the configuration:
+
+```py
+import dlt
+
+# force parallel loads on sqlite
+ducklake = dlt.destinations.ducklake(loader_parallelism_strategy="parallel")
+pipeline = dlt.pipeline("test_factory", destination=ducklake, dataset_name="foo")
+```
+
+Above we force parallel loading on (default) sqlite catalog.
+
+`DuckLakeCredentials` have friendly constructor where you can pass [catalog and storage credentials](../../general-usage/credentials/complex_types.md)
+as shorthand strings and objects:
+
+```py
+import dlt
+from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
+
+# set ducklake credentials using shorthands, s3 bucket requires secrets in config
+credentials = DuckLakeCredentials(
+    "lake_catalog",
+    catalog="postgresql://loader:pass@localhost:5432/dlt_data",
+    storage="s3://dlt-ci-test-bucket/lake",
+)
+destination = dlt.destinations.ducklake(credentials=credentials)
+```
+
+```py notype
+import dlt
+from dlt.sources.credentials import ConnectionStringCredentials
+
+# set catalog name using connection string credentials
+catalog_credentials = ConnectionStringCredentials()
+# use duckdb with the default name
+catalog_credentials.drivername = "duckdb"
+credentials = DuckLakeCredentials(
+    "lake_catalog",
+    catalog=catalog_credentials,
+)
+```
+
+As mentioned above, `filesystem` and `ducklake` share the same configuration object. Configuration for the `filesystem` can be reused:
+
+```py notype
+
+# `filesystem` below is a pipeline with configured filesystem destination
+
+destination = dlt.destinations.ducklake(
+    credentials=DuckLakeCredentials(
+        "lake_catalog",
+        storage=filesystem.destination_client().config
+    )
+)
+```
+
+## Maintain ducklake
+
+### Data access
+
+You have read and write access to the data in ducklake. You can take native duckdb connection with attached catalog and authenticated
+storage using `sql_client`. This is demonstrated in examples below.
+
+[`pipeline.dataset()`](../../general-usage/dataset-access/dataset) and **ibis** handover are fully supported, giving you Python-native access to loaded data as Pandas DataFrames, PyArrow tables, or Python tuples.
+
+### Set catalog options
+
+Certain **ducklake** options are persisted in the catalog and are set differently than [connection options](#configure-additional-connection-options-pragmas-and-extensions). You can do that from code:
+
+```py notype
+import dlt
+import duckdb
+
+pipeline = dlt.pipeline(pipeline_name="foo", destination="ducklake", dataset_name="lake_schema")
+
+# set per thread output option before pipeline runs so options are applied
+with pipeline.sql_client() as client:
+    con: duckdb.DuckDBPyConnection = client.native_connection
+    # set option on `lake_catalog` we configured above
+    con.sql("CALL lake_catalog.set_option('per_thread_output', true)")
+```
+
+Above we set `per_thread_output` (1.4.x only) before pipeline runs.
+
+### Table maintenance
+
+`dlt` has a standard interface to access open tables and catalogs but this is not implemented for ducklake (yet). However in case of
+`ducklake` you just need configured and authorized connection which you can get after pipeline runs to do the maintenance.
+
+```py
+
+# pipeline.run(...)
+
+with pipeline.sql_client() as client:  # ty: ignore
+    print(client.execute_sql("CALL bucket_cat.merge_adjacent_files()"))
+```
+
+## Write disposition
+
+All write dispositions are supported. `upsert` and `insert-only` are supported on **duckdb 1.4.x** (without hard deletes for now)
+
+## Data loading
+
+By default, Parquet files and the `COPY` command are used to move local files to the remote storage,
+
+The **INSERT** format is also supported and will execute large INSERT queries directly into the remote database. This method is significantly slower and may exceed the maximum query size, so it is not advised.
+
+**partition** hint on a column is supported and works on **duckdb 1.4.x**. Simple identity partitions are created. Partition evolution is not supported.
+
+**parallel** loading is supported via thread pool for postgres catalog (and probably mysql). We could not use [recommended method](https://duckdb.org/docs/stable/guides/python/multiple_threads.html) because the threads were (dead)locking. We open separate in-memory database for each thread to which we attach the catalog.
+
+## dbt support
+
+Not supported. We'd need to handover secrets and `ATTACH` command which is not planned at this moment.
+
+## Syncing of `dlt` state
+
+This destination fully supports [dlt state sync](../../general-usage/state#syncing-state-with-destination).
+
+## ToDo
+
+* open table interface for table maintenance like we have for iceberg and delta.
+* better partitioning support.
+* Motherduck as catalog if possible.
+* implement callbacks that will be called on creation of :memory: database and `ATTACH` command so those can be fully customized.
+
+
+===== FILE: docs/website/docs/dlt-ecosystem/destinations/fabric.md =====
+
+---
+title: Fabric
+description: Microsoft Fabric Warehouse `dlt` destination
+keywords: [fabric, microsoft fabric, warehouse, destination, data warehouse, synapse]
+---
+# Microsoft Fabric Warehouse
+
+## Install dlt with Fabric
+
+To install the dlt library with Fabric Warehouse dependencies, use:
+
+```sh
+pip install "dlt[fabric]"
+```
+
+This will install `dlt` with the `mssql` extra, which contains all the dependencies required by the SQL Server client that Fabric uses.
+
+<!--@@@DLT_DESTINATION_CAPABILITIES fabric-->
+
+## Setup guide
+
+### Prerequisites
+
+The _Microsoft ODBC Driver for SQL Server_ must be installed to use this destination.
+This cannot be included with `dlt`'s Python dependencies, so you must install it separately on your system. You can find the official installation instructions [here](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server?view=sql-server-ver16).
+
+Supported driver versions:
+
+* `ODBC Driver 18 for SQL Server` (recommended)
+* `ODBC Driver 17 for SQL Server`
+
+You can also [configure the driver name](#additional-destination-options) explicitly.
+
+### Service Principal Authentication
+
+Fabric Warehouse requires Azure Active Directory Service Principal authentication. You'll need:
+
+1. **Tenant ID**: Your Azure AD tenant ID (GUID)
+2. **Client ID**: Application (service principal) client ID (GUID)
+3. **Client Secret**: Application client secret
+4. **Host**: Your Fabric warehouse SQL endpoint
+5. **Database**: The database name within your warehouse
+
+**Finding your SQL endpoint:**
+
+- In the Fabric portal, go to your warehouse **Settings**
+- Select **SQL endpoint**
+- Copy the **SQL connection string** - it should be in the format: `<guid>.datawarehouse.fabric.microsoft.com`
+
+### Create a pipeline
+

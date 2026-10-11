@@ -1,0 +1,2777 @@
+diff --git a/Makefile b/Makefile
+index e599c9905..6851f0b60 100644
+--- a/Makefile
++++ b/Makefile
+@@ -125,11 +125,6 @@ test-load-local-postgres:
+ test-common:
+ 	uv run pytest tests/common tests/normalize tests/extract tests/pipeline tests/reflection tests/sources tests/workspace tests/load/test_dummy_client.py tests/libs tests/destinations
+ 
+-reset-test-storage:
+-	-rm -r _storage
+-	mkdir _storage
+-	python3 tests/tools/create_storages.py
+-
+ build-library: dev
+ 	uv version
+ 	uv build
+diff --git a/dlt/_workspace/cli/_deploy_command.py b/dlt/_workspace/cli/_deploy_command.py
+index 82024e3c8..78c4ef1e3 100644
+--- a/dlt/_workspace/cli/_deploy_command.py
++++ b/dlt/_workspace/cli/_deploy_command.py
+@@ -80,6 +80,7 @@ class GithubActionDeployment(BaseDeployment):
+         run_on_push: bool = False,
+         run_manually: bool = False,
+         branch: Optional[str] = None,
++        **kwargs: Any,
+     ):
+         super().__init__(pipeline_script_path, location, branch)
+         self.schedule = schedule
+@@ -264,6 +265,7 @@ class AirflowDeployment(BaseDeployment):
+         location: str,
+         branch: Optional[str] = None,
+         secrets_format: Optional[str] = None,
++        **kwargs: Any,
+     ):
+         super().__init__(pipeline_script_path, location, branch)
+         self.secrets_format = secrets_format
+diff --git a/dlt/_workspace/cli/_dlt.py b/dlt/_workspace/cli/_dlt.py
+index bae469ce1..6636f0216 100644
+--- a/dlt/_workspace/cli/_dlt.py
++++ b/dlt/_workspace/cli/_dlt.py
+@@ -1,6 +1,6 @@
++import sys
+ from typing import Any, Sequence, Type, cast, List, Dict, Tuple
+ import argparse
+-import click
+ import rich_argparse
+ from rich.markdown import Markdown
+ 
+@@ -134,6 +134,15 @@ def _create_parser() -> Tuple[argparse.ArgumentParser, Dict[str, SupportsCliComm
+             " clear enough."
+         ),
+     )
++    parser.add_argument(
++        "--no-pwd",
++        default=False,
++        action="store_true",
++        help=(
++            "Do not add current working directory to sys.path. By default $pwd is added to "
++            "reproduce Python behavior when running scripts."
++        ),
++    )
+     subparsers = parser.add_subparsers(title="Available subcommands", dest="command")
+ 
+     # load plugins
+@@ -190,6 +199,9 @@ def main() -> int:
+             # switch to non-interactive if tty not connected
+             with maybe_no_stdin():
+                 display_run_context_info()
++                if not args.no_pwd:
++                    if "" not in sys.path:
++                        sys.path.insert(0, "")
+                 cmd.execute(args)
+         except Exception as ex:
+             docs_url = cmd.docs_url if hasattr(cmd, "docs_url") else DEFAULT_DOCS_URL
+@@ -204,7 +216,7 @@ def main() -> int:
+ 
+             # print exception if available
+             if raiseable_exception:
+-                click.secho(str(ex), err=True, fg="red")
++                fmt.secho(str(ex), err=True, fg="red")
+ 
+             fmt.note("Please refer to our docs at '%s' for further assistance." % docs_url)
+             if _debug.is_debug_enabled() and raiseable_exception:
+diff --git a/dlt/_workspace/cli/utils.py b/dlt/_workspace/cli/utils.py
+index ff0281b5a..76e4aa1f5 100644
+--- a/dlt/_workspace/cli/utils.py
++++ b/dlt/_workspace/cli/utils.py
+@@ -37,11 +37,8 @@ def display_run_context_info() -> None:
+         if run_context.default_profile != run_context.profile:
+             # print warning
+             fmt.echo(
+-                "Profile %s activated on %s"
+-                % (
+-                    fmt.style(run_context.profile, fg="yellow", reset=True),
+-                    fmt.bold(run_context.name),
+-                ),
++                "Profile `%s` is active."
++                % (fmt.style(run_context.profile, fg="yellow", reset=True),),
+                 err=True,
+             )
+ 
+diff --git a/docs/examples/custom_naming/custom_naming.py b/docs/examples/custom_naming/custom_naming.py
+index 96dc0f806..c06c7ec3a 100644
+--- a/docs/examples/custom_naming/custom_naming.py
++++ b/docs/examples/custom_naming/custom_naming.py
+@@ -18,7 +18,7 @@ There are two naming conventions in this example:
+ 
+ With this example you will learn to:
+ * Create a naming convention module with a recommended layout
+-* Use naming convention by explicitly passing it to `duckdb` destination factory
++* Use naming convention by explicitly passing module name to `postgres` destination factory
+ * Use naming convention by configuring it config.toml
+ * Changing the declared case sensitivity by overriding `is_case_sensitive` property
+ * Providing custom normalization logic by overriding `normalize_identifier` method
+@@ -28,12 +28,11 @@ With this example you will learn to:
+ import dlt
+ 
+ if __name__ == "__main__":
+-    # sql_cs_latin2 module
+-    import sql_cs_latin2  # type: ignore[import-not-found]
+-
+-    # create postgres destination with a custom naming convention. pass sql_cs_latin2 as module
+     # NOTE: ql_cs_latin2 is case sensitive and postgres accepts UNICODE letters in identifiers
+-    dest_ = dlt.destinations.postgres(naming_convention=sql_cs_latin2)
++    # create postgres destination with a custom naming convention. sql_cs_latin2 is an importable
++    # module
++    # import sql_cs_latin2  # is resolving in this context
++    dest_ = dlt.destinations.postgres(naming_convention="sql_cs_latin2")
+ 
+     # run a pipeline
+     pipeline = dlt.pipeline(
+diff --git a/docs/website/docs/general-usage/naming-convention.md b/docs/website/docs/general-usage/naming-convention.md
+index 6fa137127..d837e46f8 100644
+--- a/docs/website/docs/general-usage/naming-convention.md
++++ b/docs/website/docs/general-usage/naming-convention.md
+@@ -134,13 +134,16 @@ password="pass"
+ ```
+ The snippet above demonstrates how to apply a certain naming for an example `zendesk` source.
+ 
+-You can use naming conventions that you created yourself or got from other users. In that case, you should pass a full Python import path to the [module that contains the naming convention](#write-your-own-naming-convention):
+-```toml
+-[schema]
+-naming="tests.common.cases.normalizers.sql_upper"
++You can set the naming convention in your code via destination factory. This will overwrite destination's preferred convention and make it
++a default one for the whole pipeline:
++
++```py
++import dlt
++
++dest_ = dlt.destinations.postgres(naming_convention="sql_cs_v1")
+ ```
+-`dlt` will import `tests.common.cases.normalizers.sql_upper` and use the `NamingConvention` class found in it as the naming convention.
+ 
++You can use naming conventions that you created yourself or got from other users. In that case, you should pass a full Python import path to the [module that contains the naming convention](#write-your-own-naming-convention):
+ 
+ ### Available naming conventions
+ You can pick from a few built-in naming conventions.
+@@ -191,7 +194,32 @@ Custom naming conventions are classes that derive from `NamingConvention`, which
+ 1. Each naming convention resides in a separate Python module (file).
+ 2. The class is always named `NamingConvention`.
+ 
+-In that case, you can use a fully qualified module name in [schema configuration](#configure-naming-convention) or pass the module [explicitly](#configure-naming-convention).
++In that case, you can use a fully qualified module name in [schema configuration](#configure-naming-convention) or pass the module fully qualified name [explicitly](#configure-naming-convention).
++
++```toml
++[schema]
++naming="tests.common.cases.normalizers.sql_upper"
++```
++`dlt` will import `tests.common.cases.normalizers.sql_upper` and use the `NamingConvention` class found in it as the naming convention.
++
++:::tip
++Do not pass custom naming convention as modules if you do it explicitly. We recommend pattern below:
++```py
++import dlt
++
++dest_ = dlt.destinations.postgres(naming_convention="my_package.sql_cs_latin2")
++```
++
++⛔ avoid this or you may get pickle errors ie. when using parallel normalization:
++```py
++import dlt
++
++import my_package.sql_cs_latin2  # type: ignore[import-not-found]
++
++dest_ = dlt.destinations.postgres(naming_convention=my_package.sql_cs_latin2)
++```
++:::
++
+ 
+ We include [two examples](../examples/custom_naming) of naming conventions that you may find useful:
+ 
+diff --git a/docs/website/docs/reference/command-line-interface.md b/docs/website/docs/reference/command-line-interface.md
+index 8d1f4487a..2f65db8df 100644
+--- a/docs/website/docs/reference/command-line-interface.md
++++ b/docs/website/docs/reference/command-line-interface.md
+@@ -30,7 +30,7 @@ Creates, adds, inspects and deploys dlt pipelines. Further help is available at
+ **Usage**
+ ```sh
+ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+-    [--non-interactive] [--debug]
++    [--non-interactive] [--debug] [--no-pwd]
+     {telemetry,schema,pipeline,init,render-docs,deploy,dashboard,ai} ...
+ ```
+ 
+@@ -45,6 +45,7 @@ dlt [-h] [--version] [--disable-telemetry] [--enable-telemetry]
+ * `--enable-telemetry` - Enables telemetry before command is executed
+ * `--non-interactive` - Non interactive mode. default choices are automatically made for confirmations and prompts.
+ * `--debug` - Displays full stack traces on exceptions. useful for debugging if the output is not clear enough.
++* `--no-pwd` - Do not add current working directory to sys.path. by default $pwd is added to reproduce python behavior when running scripts.
+ 
+ **Available subcommands**
+ * [`telemetry`](#dlt-telemetry) - Shows telemetry status
+diff --git a/tests/workspace/cli/common/test_cli_invoke.py b/tests/workspace/cli/common/test_cli_invoke.py
+index 7a238f19b..1b816b9f8 100644
+--- a/tests/workspace/cli/common/test_cli_invoke.py
++++ b/tests/workspace/cli/common/test_cli_invoke.py
+@@ -148,6 +148,7 @@ def test_invoke_deploy_mock(script_runner: ScriptRunner) -> None:
+         assert _deploy_command.call_args[1] == {
+             "pipeline_script_path": "debug_pipeline.py",
+             "deployment_method": "github-action",
++            "no_pwd": False,
+             "repo_location": "https://github.com/dlt-hub/dlt-deploy-template.git",
+             "branch": None,
+             "command": "deploy",
+@@ -176,6 +177,7 @@ def test_invoke_deploy_mock(script_runner: ScriptRunner) -> None:
+         assert _deploy_command.call_args[1] == {
+             "pipeline_script_path": "debug_pipeline.py",
+             "deployment_method": "github-action",
++            "no_pwd": False,
+             "repo_location": "folder",
+             "branch": "branch",
+             "command": "deploy",
+@@ -197,6 +199,7 @@ def test_invoke_deploy_mock(script_runner: ScriptRunner) -> None:
+         assert _deploy_command.call_args[1] == {
+             "pipeline_script_path": "debug_pipeline.py",
+             "deployment_method": "airflow-composer",
++            "no_pwd": False,
+             "repo_location": "https://github.com/dlt-hub/dlt-deploy-template.git",
+             "branch": None,
+             "command": "deploy",
+@@ -212,6 +215,7 @@ def test_invoke_deploy_mock(script_runner: ScriptRunner) -> None:
+         assert _deploy_command.call_args[1] == {
+             "pipeline_script_path": "debug_pipeline.py",
+             "deployment_method": "airflow-composer",
++            "no_pwd": False,
+             "repo_location": "https://github.com/dlt-hub/dlt-deploy-template.git",
+             "branch": None,
+             "command": "deploy",
+
+
+===== COMMIT 0dcdcf0e =====
+
+
+commit 0dcdcf0e3
+Author: rudolfix
+Date: 2025-10-22
+
+    ignores native config values if config spec does not implement those (#3233)
+
+diff --git a/.github/workflows/test_common.yml b/.github/workflows/test_common.yml
+index 32f30ae16..bf3d4fdb9 100644
+--- a/.github/workflows/test_common.yml
++++ b/.github/workflows/test_common.yml
+@@ -63,11 +63,11 @@ jobs:
+           - os: windows-latest
+             python-version: "3.11"
+             shell: cmd
+-            pytest_args: '-m "not forked"'
++            pytest_args: '-m "not forked and not rfam"'
+           - os: windows-latest
+             python-version: "3.13"
+             shell: cmd
+-            pytest_args: '-m "not forked"'
++            pytest_args: '-m "not forked and not rfam"'
+ 
+     defaults:
+       run:
+diff --git a/dlt/_workspace/_templates/_core_source_templates/sql_database_pipeline.py b/dlt/_workspace/_templates/_core_source_templates/sql_database_pipeline.py
+index 8f751be0a..4dc26d7f4 100644
+--- a/dlt/_workspace/_templates/_core_source_templates/sql_database_pipeline.py
++++ b/dlt/_workspace/_templates/_core_source_templates/sql_database_pipeline.py
+@@ -9,7 +9,6 @@ from dlt.sources.credentials import ConnectionStringCredentials
+ 
+ from dlt.sources.sql_database import sql_database, sql_table, Table
+ 
+-from sqlalchemy.sql.sqltypes import TypeEngine
+ import sqlalchemy as sa
+ 
+ 
+@@ -105,46 +104,13 @@ def load_standalone_table_resource() -> None:
+         defer_table_reflect=True,
+     )
+ 
+-    # Run the resources together
+-    info = pipeline.extract([family, genome], write_disposition="merge")
++    # Run the resources together (just take one page of results to make it faster)
++    info = pipeline.extract([family.add_limit(1), genome.add_limit(1)], write_disposition="merge")
+     print(info)
+     # Show inferred columns
+     print(pipeline.default_schema.to_pretty_yaml())
+ 
+ 
+-def select_columns() -> None:
+-    """Uses table adapter callback to modify list of columns to be selected"""
+-    pipeline = dlt.pipeline(
+-        pipeline_name="rfam_database",
+-        destination="duckdb",
+-        dataset_name="rfam_data_cols",
+-        dev_mode=True,
+-    )
+-
+-    def table_adapter(table: Table) -> Table:
+-        print(table.name)
+-        if table.name == "family":
+-            # this is SqlAlchemy table. _columns are writable
+-            # let's drop updated column
+-            table._columns.remove(table.columns["updated"])  # type: ignore
+-        return table
+-
+-    family = sql_table(
+-        credentials="mysql+pymysql://rfamro@mysql-rfam-public.ebi.ac.uk:4497/Rfam",
+-        table="family",
+-        chunk_size=10,
+-        reflection_level="full_with_precision",
+-        table_adapter_callback=table_adapter,
+-    )
+-
+-    # also we do not want the whole table, so we add limit to get just one chunk (10 records)
+-    pipeline.run(family.add_limit(1))
+-    # only 10 rows
+-    print(pipeline.last_trace.last_normalize_info)
+-    # no "updated" column in "family" table
+-    print(pipeline.default_schema.to_pretty_yaml())
+-
+-
+ def select_with_end_value_and_row_order() -> None:
+     """Gets data from a table withing a specified range and sorts rows descending"""
+     pipeline = dlt.pipeline(
+@@ -347,9 +313,6 @@ if __name__ == "__main__":
+     # Load selected tables with different settings
+     # load_select_tables_from_database()
+ 
+-    # load a table and select columns
+-    # select_columns()
+-
+     # load_entire_database()
+     # select_with_end_value_and_row_order()
+ 
+diff --git a/dlt/common/configuration/resolve.py b/dlt/common/configuration/resolve.py
+index d29f3cff7..ec784118a 100644
+--- a/dlt/common/configuration/resolve.py
++++ b/dlt/common/configuration/resolve.py
+@@ -158,8 +158,10 @@ def _maybe_parse_native_value(
+                 .as_dict_nondefault()
+                 .items()
+             }
+-        except (ValueError, NotImplementedError) as v_err:
++        except ValueError as v_err:
+             raise InvalidNativeValue(type(config), type(native_value), embedded_sections, v_err)
++        except NotImplementedError:
++            pass
+ 
+     return native_value  # type: ignore[no-any-return]
+ 
+diff --git a/dlt/common/libs/pydantic.py b/dlt/common/libs/pydantic.py
+index 95ba06345..a938c7d07 100644
+--- a/dlt/common/libs/pydantic.py
++++ b/dlt/common/libs/pydantic.py
+@@ -385,7 +385,7 @@ def validate_and_filter_items(
+                     deleted.add(err_idx)
+                 else:
+                     raise NotImplementedError(
+-                        f"`{column_mode=:}` not implemented for Pydantic validation"
++                        f"`{data_mode=:}` not implemented for Pydantic validation"
+                     )
+ 
+         # validate again with error items removed
+diff --git a/dlt/common/schema/schema.py b/dlt/common/schema/schema.py
+index 6e955ae9f..651856d0d 100644
+--- a/dlt/common/schema/schema.py
++++ b/dlt/common/schema/schema.py
+@@ -418,13 +418,14 @@ class Schema:
+     def merge_hints(
+         self,
+         new_hints: Mapping[TColumnDefaultHint, Sequence[TSimpleRegex]],
++        replace: bool = False,
+         normalize_identifiers: bool = True,
+     ) -> None:
+-        """Merges existing default hints with `new_hints`. Normalizes names in column regexes if possible. Compiles setting at the end
++        """Merges or replace existing default hints with `new_hints`. Normalizes names in column regexes if possible. Compiles setting at the end
+ 
+         NOTE: you can manipulate default hints collection directly via `Schema.settings` as long as you call Schema._compile_settings() at the end.
+         """
+-        self._merge_hints(new_hints, normalize_identifiers)
++        self._merge_hints(new_hints, replace=replace, normalize_identifiers=normalize_identifiers)
+         self._compile_settings()
+ 
+     def update_preferred_types(
+@@ -813,6 +814,7 @@ class Schema:
+     def _merge_hints(
+         self,
+         new_hints: Mapping[TColumnDefaultHint, Sequence[TSimpleRegex]],
++        replace: bool = False,
+         normalize_identifiers: bool = True,
+     ) -> None:
+         """Used by `merge_hints method, does not compile settings at the end"""
+@@ -829,7 +831,7 @@ class Schema:
+         default_hints = self._settings.setdefault("default_hints", {})
+         # add `new_hints` to existing hints
+         for h, l in new_hints.items():
+-            if h in default_hints:
++            if h in default_hints and not replace:
+                 extend_list_deduplicated(default_hints[h], l, utils.canonical_simple_regex)
+             else:
+                 # set new hint type
+diff --git a/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py b/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
+index 09074301d..c33630f37 100644
+--- a/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
++++ b/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
+@@ -16,6 +16,7 @@ You can get a Spotify client ID and secret from https://developer.spotify.com/.
+ We'll learn how to:
+ - Use the [custom destination](../dlt-ecosystem/destinations/destination.md)
+ - Delegate the embeddings to LanceDB using OpenAI Embeddings
++- Use Pydantic for unified dlt and lancedb schema validation
+ """
+ 
+ __source_name__ = "spotify"
+@@ -59,10 +60,11 @@ os.environ["OPENAI_API_KEY"] = openai_api_key
+ 
+ 
+ class EpisodeSchema(LanceModel):
++    """Used for dlt and lance schema validation"""
++
+     id: str  # noqa: A003
+     name: str
+     description: str = func.SourceField()
+-    vector: Vector(func.ndims()) = func.VectorField()  # type: ignore[valid-type]
+     release_date: datetime.date
+     audio_preview_url: str
+     duration_ms: int
+@@ -71,6 +73,12 @@ class EpisodeSchema(LanceModel):
+     # there is more data but we are not using it ...
+ 
+ 
++class EpisodeSchemaVector(EpisodeSchema):
++    """Adds lance vector field"""
++
++    vector: Vector(func.ndims()) = func.VectorField()  # type: ignore[valid-type]
++
++
+ @dataclass(frozen=True)
+ class Shows:
+     monday_morning_data_chat: str = "3Km3lBNzJpc1nOTJUtbtMh"
+@@ -120,11 +128,20 @@ def spotify_shows(
+         yield dlt.resource(
+             client.paginate(url, params={"limit": 50}),
+             name=show_name,
+-            write_disposition="merge",
+             primary_key="id",
+             parallelized=True,
+             max_table_nesting=0,
+-        )
++            # reuse lance model to filter out all non-matching items and extra columns from spotify api
++            # 1. unknown columns are removed ("columns": "discard_value")
++            # 2. non validating items (ie. without id or url) are removed ("data_type": "discard_row")
++            # 3. for some reason None values are returned as well 🤯, add_filter takes care of that
++            columns=EpisodeSchema,
++            schema_contract={
++                "tables": "evolve",
++                "columns": "discard_value",
++                "data_type": "discard_row",
++            },
++        ).add_filter(lambda i: i is not None)
+ 
+ 
+ @dlt.destination(batch_size=250, name="lancedb")
+@@ -135,13 +152,7 @@ def lancedb_destination(items: TDataItems, table: TTableSchema) -> None:
+     try:
+         tbl = db.open_table(table["name"])
+     except ValueError:
+-        tbl = db.create_table(table["name"], schema=EpisodeSchema)
+-
+-    # remove all fields that are not in the schema
+-    for item in items:
+-        keys_to_remove = [key for key in item.keys() if key not in EpisodeSchema.model_fields]
+-        for key in keys_to_remove:
+-            del item[key]
++        tbl = db.create_table(table["name"], schema=EpisodeSchemaVector)
+ 
+     tbl.add(items)
+ 
+diff --git a/docs/tools/prepare_examples_tests.py b/docs/tools/prepare_examples_tests.py
+index effa90a8b..7b4e8c5b4 100644
+--- a/docs/tools/prepare_examples_tests.py
++++ b/docs/tools/prepare_examples_tests.py
+@@ -11,9 +11,11 @@ EXAMPLES_DIR = "../examples"
+ 
+ # settings
+ SKIP_FOLDERS = ["archive", ".", "_", "local_cache"]
+-SKIP_EXAMPLES: List[str] = []
++# @pytest.mark.rfam
++SKIP_EXAMPLES: List[str] = ["backfill_in_chunks", "connector_x_arrow"]
+ SKIP_FORK_EXAMPLES: List[str] = ["custom_destination_lancedb"]
+ 
++
+ # the entry point for the script
+ MAIN_CLAUSE = 'if __name__ == "__main__":'
+ 
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/databricks.md b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+index 330d869e2..02b3e6f54 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/databricks.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+@@ -730,7 +730,36 @@ databricks_adapter(
+ ## Troubleshooting
+ Use the following steps to avoid conflicts with Databricks' built-in Delta Live Tables (DLT) module and enable dltHub integration.
+ 
+-### 1. Add an `init` script
++### Enable dlt on serverless (16.x)
++Live Tables (DLT) are not available on serverless but the import machinery that is patching DLT is still there in form of import hooks. You
++can temporarily disable this machinery to import `dlt` and use it afterwards. In a notebook cell (assuming that `dlt` is already installed):
++
++```sh
++%restart_python
++```
++
++```py
++import sys
++
++# dlt patching hook is the first one on the list
++metas = list(sys.meta_path)
++sys.meta_path = metas[1:]
++
++# remove RUNTIME - uncomment on dlt before 1.18.0
++# import os
++# del os.environ["RUNTIME"]
++
++import dlt
++sys.meta_path = metas  # restore post import hooks
++
++# use dlt
++info = dlt.run([1, 2, 3], destination=dlt.destinations.filesystem("_data"), table_name="digits")
++print(info)
++```
++
++### Enable dlt on a cluster
++
++#### 1. Add an `init` script
+ To ensure compatibility with the dltHub's dlt package in Databricks, add an `init` script that runs at cluster startup. This script installs the dlt package from dltHub, renames Databricks’ built-in DLT module to avoid naming conflicts, and updates internal references to allow continued use under the alias `dlt_dbricks`.
+ 
+ 1. In your Databricks workspace directory, create a new file named `init.sh` and add the following content:
+@@ -767,7 +796,7 @@ The following locations have been confirmed for the two latest LTS runtime versi
+ - 15.4 LTS: /databricks/python_shell/lib/dbruntime/DeltaLiveTablesHook.py
+ :::
+ 
+-### 2. Remove preloaded databricks modules in the notebook
++#### 2. Remove preloaded databricks modules in the notebook
+ After the cluster starts, Databricks may partially import its built-in Delta Live Tables (DLT) modules, which can interfere with the dlt package from dltHub.
+ 
+ To ensure a clean environment, add the following code at the top of your notebook:
+diff --git a/docs/website/docs/getting-started-snippets.py b/docs/website/docs/getting-started-snippets.py
+index eb00df998..c1b1c8508 100644
+--- a/docs/website/docs/getting-started-snippets.py
++++ b/docs/website/docs/getting-started-snippets.py
+@@ -1,4 +1,4 @@
+-import os
++import pytest
+ from tests.pipeline.utils import assert_load_info
+ 
+ 
+@@ -91,6 +91,7 @@ def api_snippet() -> None:
+     assert_load_info(load_info)
+ 
+ 
++@pytest.mark.rfam
+ def db_snippet() -> None:
+     # @@@DLT_SNIPPET_START db
+     import dlt
+diff --git a/docs/website/docs/intro-snippets.py b/docs/website/docs/intro-snippets.py
+index f270dcee6..f1a3bb8b3 100644
+--- a/docs/website/docs/intro-snippets.py
++++ b/docs/website/docs/intro-snippets.py
+@@ -1,3 +1,4 @@
++import pytest
+ from tests.pipeline.utils import assert_load_info
+ 
+ 
+@@ -50,6 +51,7 @@ def csv_snippet() -> None:
+     assert_load_info(load_info)
+ 
+ 
++@pytest.mark.rfam
+ def db_snippet() -> None:
+     # @@@DLT_SNIPPET_START db
+     import dlt
+diff --git a/pyproject.toml b/pyproject.toml
+index caf32c1ac..46df1d67b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -401,7 +401,7 @@ multi_line_output = 3
+ [tool.pytest.ini_options]
+ pythonpath = ["dlt", "docs/website/docs"]
+ norecursedirs = [".direnv", ".eggs", "build", "dist"]
+-addopts = "--showlocals --durations 10"
++addopts = "--showlocals --durations 10 -m 'not rfam'"
+ xfail_strict = true
+ log_cli_level = "INFO"
+ console_output_style = "count"
+@@ -410,5 +410,6 @@ python_functions = ["*_test", "test_*", "*_snippet"]
+ filterwarnings = ["ignore::DeprecationWarning"]
+ markers = [
+     "essential: marks all essential tests",
+-    "no_load: marks tests that do not load anything"
++    "no_load: marks tests that do not load anything",
++    "rfam: marks tests that use rfam db"
+ ]
+diff --git a/tests/common/configuration/test_sections.py b/tests/common/configuration/test_sections.py
+index c0321ce3f..491f97977 100644
+--- a/tests/common/configuration/test_sections.py
++++ b/tests/common/configuration/test_sections.py
+@@ -54,6 +54,12 @@ class EmbeddedWithIgnoredEmbeddedConfiguration(BaseConfiguration):
+     ignored_embedded: EmbeddedIgnoredWithSectionedConfiguration = None
+ 
+ 
++@configspec
++class SectionedNativeValueConfiguration(SectionedConfiguration):
++    def parse_native_representation(self, native_value: Any) -> None:
++        raise ValueError(native_value)
++
++
+ def test_sectioned_configuration(environment: Any, env_provider: ConfigProvider) -> None:
+     with pytest.raises(ConfigFieldMissingException) as exc_val:
+         resolve.resolve_configuration(SectionedConfiguration())
+@@ -83,6 +89,18 @@ def test_sectioned_configuration(environment: Any, env_provider: ConfigProvider)
+     assert C.password == "PASS"
+ 
+ 
++def test_sectioned_configuration_ignore_native_values(environment) -> None:
++    environment["DLT_TEST"] = "invalid()"
++    environment["DLT_TEST__PASSWORD"] = "PASS"
++    resolve.resolve_configuration(SectionedConfiguration())
++
++    # same for runtime
++    from dlt.common.configuration.specs import RuntimeConfiguration
++
++    environment["RUNTIME"] = "16.0LTS"
++    resolve.resolve_configuration(RuntimeConfiguration())
++
++
+ def test_explicit_sections(mock_provider: MockProvider) -> None:
+     mock_provider.value = "value"
+     # mock providers separates sections with | and key with -
+@@ -265,9 +283,9 @@ def test_section_with_pipeline_name(mock_provider: MockProvider) -> None:
+         # "PIPE", "DLT_TEST"
+         mock_provider.return_value_on = ()
+         mock_provider.reset_stats()
+-        # () will return "value" which cannot be parsed by the SectionedConfiguration
++        # () will return "value" which cannot be parsed by the SectionedNativeValueConfiguration
+         with pytest.raises(InvalidNativeValue):
+-            resolve.resolve_configuration(SectionedConfiguration())
++            resolve.resolve_configuration(SectionedNativeValueConfiguration())
+         mock_provider.return_value_on = ("DLT_TEST",)
+         mock_provider.reset_stats()
+         resolve.resolve_configuration(SectionedConfiguration())
+diff --git a/tests/load/pipeline/test_merge_disposition.py b/tests/load/pipeline/test_merge_disposition.py
+index 89ccd9ff3..a1b1ce9c9 100644
+--- a/tests/load/pipeline/test_merge_disposition.py
++++ b/tests/load/pipeline/test_merge_disposition.py
+@@ -19,7 +19,7 @@ from dlt.common.schema.exceptions import (
+ from dlt.common.schema.typing import TLoaderMergeStrategy, TTableFormat
+ from dlt.common.typing import StrAny
+ from dlt.common.utils import digest128
+-from dlt.common.destination import AnyDestination, DestinationCapabilitiesContext
++from dlt.common.destination import DestinationCapabilitiesContext
+ from dlt.common.destination.exceptions import DestinationCapabilitiesException
+ from dlt.common.libs.pyarrow import row_tuples_to_arrow
+ 
+@@ -71,6 +71,10 @@ def test_merge_on_keys_in_schema_nested_hints(
+     with open("tests/common/cases/schemas/eth/ethereum_schema_v11.yml", "r", encoding="utf-8") as f:
+         schema = dlt.Schema.from_dict(yaml.safe_load(f))
+ 
++    if destination_config.destination_type == "databricks":
++        # remove `partition` hint because it conflicts with `cluster` on databricks
++        schema.merge_hints({"partition": []}, replace=True)
++
+     # make block uncles unseen to trigger filtering loader in loader for nested tables
+     if has_table_seen_data(schema.tables["blocks__uncles"]):
+         del schema.tables["blocks__uncles"]["x-normalizer"]
+diff --git a/tests/load/sources/sql_database/test_sql_database_source_all_destinations.py b/tests/load/sources/sql_database/test_sql_database_source_all_destinations.py
+index 852f74797..6497e6196 100644
+--- a/tests/load/sources/sql_database/test_sql_database_source_all_destinations.py
++++ b/tests/load/sources/sql_database/test_sql_database_source_all_destinations.py
+@@ -191,13 +191,13 @@ def test_load_sql_table_incremental(
+     assert_row_counts(pipeline, postgres_db, tables)
+ 
+ 
+-@pytest.mark.skip(reason="Skipping this test temporarily")
+ @pytest.mark.parametrize(
+     "destination_config",
+     destinations_configs(default_sql_configs=True),
+     ids=lambda x: x.name,
+ )
+ @pytest.mark.parametrize("backend", ["sqlalchemy", "pandas", "pyarrow", "connectorx"])
++@pytest.mark.rfam
+ def test_load_mysql_data_load(
+     destination_config: DestinationTestConfiguration, backend: TableBackend
+ ) -> None:
+diff --git a/tests/sources/sql_database/test_sql_database_pipeline_template.py b/tests/sources/sql_database/test_sql_database_pipeline_template.py
+index 6b139515f..47a0c9df3 100644
+--- a/tests/sources/sql_database/test_sql_database_pipeline_template.py
++++ b/tests/sources/sql_database/test_sql_database_pipeline_template.py
+@@ -9,13 +9,13 @@ import pytest
+         "load_select_tables_from_database",
+         # "load_entire_database",
+         "load_standalone_table_resource",
+-        "select_columns",
+         "specify_columns_to_load",
+         "test_pandas_backend_verbatim_decimals",
+         "select_with_end_value_and_row_order",
+         "my_sql_via_pyarrow",
+     ),
+ )
++@pytest.mark.rfam
+ def test_all_examples(example_name: str) -> None:
+     from dlt._workspace._templates._core_source_templates import sql_database_pipeline
+ 
+diff --git a/tests/sources/test_pipeline_templates.py b/tests/sources/test_pipeline_templates.py
+index 6da7806e9..339f7c5bf 100644
+--- a/tests/sources/test_pipeline_templates.py
++++ b/tests/sources/test_pipeline_templates.py
+@@ -14,6 +14,7 @@ import importlib
+         ("fruitshop_pipeline", ("load_shop",)),
+     ],
+ )
++@pytest.mark.rfam
+ def test_debug_pipeline(template_name: str, examples: str) -> None:
+     demo_module = importlib.import_module(
+         f"dlt._workspace._templates._single_file_templates.{template_name}"
+
+
+===== COMMIT 7848c91f =====
+
+
+commit 7848c91f4
+Author: rudolfix
+Date: 2025-10-22
+
+    renames mcp pipeline tools (#3238)
+
+diff --git a/dlt/_workspace/mcp/tools/mcp_tools.py b/dlt/_workspace/mcp/tools/mcp_tools.py
+index bb2414e40..d34e5f28e 100644
+--- a/dlt/_workspace/mcp/tools/mcp_tools.py
++++ b/dlt/_workspace/mcp/tools/mcp_tools.py
+@@ -193,22 +193,22 @@ class PipelineMCPTools(BaseMCPTools):
+         pipeline_name = self.pipeline.pipeline_name
+         mcp_server.add_tool(
+             self.available_tables,
+-            name=f"available_tables_in_pipeline_{pipeline_name}",
++            name="available_tables",
+             description=f"All available tables in the pipeline {pipeline_name}",
+         )
+         mcp_server.add_tool(
+             self.table_head,
+-            name=f"table_head_in_pipeline_{pipeline_name}",
++            name="table_head",
+             description=f"Get the first 10 rows of the table in the pipeline {pipeline_name}",
+         )
+         mcp_server.add_tool(
+             self.table_schema,
+-            name=f"table_schema_in_pipeline_{pipeline_name}",
++            name="table_schema",
+             description=f"Get the schema of the table in the pipeline {pipeline_name}",
+         )
+         mcp_server.add_tool(
+             self.query_sql,
+-            name=f"query_sql_in_pipeline_{pipeline_name}",
++            name="query_sql",
+             description=(
+                 f"Executes sql statement on a given pipeline {pipeline_name} as returns the result "
+                 "as | delimited csv. Use this tool for simple analysis where the number of rows is "
+@@ -219,7 +219,7 @@ class PipelineMCPTools(BaseMCPTools):
+         )
+         mcp_server.add_tool(
+             self.bookmark_sql,
+-            name=f"bookmark_sql_in_pipeline_{pipeline_name}",
++            name="bookmark_sql",
+             description=(
+                 f"Executes sql statement on a pipeline {pipeline_name} and bookmarks it under "
+                 "given bookmark for further processing. Use this tool when you need to select "
+diff --git a/docs/website/docs/hub/features/mcp-server.md b/docs/website/docs/hub/features/mcp-server.md
+index d8dcb58e7..a599b4fa9 100644
+--- a/docs/website/docs/hub/features/mcp-server.md
++++ b/docs/website/docs/hub/features/mcp-server.md
+@@ -4,6 +4,106 @@ description: Install the dlt MCP with your preferred LLM-enabled IDE.
+ keywords: [mcp, llm, agents, ai]
+ ---
+ 
++# Workspace MCP Server - current status
++
++The server can do the following:
++- list pipelines in workspace
++- inspect table schema and data for dataset in particular pipeline
++- do sql queries
++
++It is the same server that is called **the open-source `dlt`** in the documentation below.
++
++Since all mcp clients work with `sse` transport, it is the default when running the server. Before we were struggling with
++launching `mcp` as a part of client process. There was no way to pass right Python virtual environment and dlt run context.
++There were also issues with `stdio` pollution from `print` statement (overall that was IMO a dead end, mcp is a server by nature.)
++
++To launch the server in workspace context:
++```sh
++dlt workspace mcp
++
++INFO:     Started server process [24925]
++INFO:     Waiting for application startup.
++INFO:     Application startup complete.
++INFO:     Uvicorn running on http://127.0.0.1:43654 (Press CTRL+C to quit)
++```
++Workspace mcp server has **43654** as default port and is configured without any path (ie `/sse`) so user can just copy the link above in the right
++client.
++
++To launch the server in pipeline context:
++```sh
++dlt pipeline fruitshop mcp
++
++Starting dlt MCP server
++INFO:     Started server process [28972]
++INFO:     Waiting for application startup.
++INFO:     Application startup complete.
++INFO:     Uvicorn running on http://127.0.0.1:43656 (Press CTRL+C to quit)
++
++```
++Pipeline mcp server has **43656** as default port. Pipeline is already attached when mcp server starts. Both pipeline and workspace mcps can work side by side.
++
++
++Example client configurations
++
++Cursor, Cline
++```json
++{
++  "mcpServers": {
++    "dlt-workspace": {
++      "url": "http://127.0.0.1:43654/"
++    },
++    "dlt-pipeline-mcp": {
++      "url": "http://127.0.0.1:43656/"
++    }
++  }
++}
++```
++
++Continue: for some reason it does see mcp configuration created in dev container. Maybe someone will make it work...
++```yaml
++name: dlt mcps
++version: 0.0.1
++schema: v1
++mcpServers:
++  - name: dlt-workspace
++    type: sse
++    url: "http://localhost:43654"
++```
++
++## Configuration
++Server can still be started with `stdio` transport and different port using the command line. The plan is to allow to configure
++mcp deeply via dlt configuration system.
++
++```toml
++[workspace.mcp]
++path="/sse"
++port=888
++```
++
++```toml
++[pipelines.fruitshop.mcp]
++transport="stdio"
++```
++
++## Interactions with Runtime
++This is a heads-up on how we host mcps on runtime. To be deleted.
++
++* deployed workspace dashboard has two routes `/app` to see the notebook and `/mcp` to connect to mcp server
++* workspace dashboard in single pipeline mode `/app/fruitshop` and `/mcp/fruitshop`
++* I'm also pondering exposing some kind of mcp attached to each marimo notebook
++
++
++# Project MCP server
++
++This is our "project" mcp (**integrates with `dltHub` features** below) and can be launched with:
++```sh
++dlt project mcp
++```
++It gets **43655** port and project context is obtained before launching the server.
++
++
++
++
+ # MCP Server
+ 
+ Currently, dltHub is [building two MCP servers](https://dlthub.com/blog/deep-dive-assistants-mcp-continue) that you can run locally and integrate with your preferred IDE. One server is for the open-source `dlt` library and the other integrates with `dltHub` features ([Learn more](ai.md)).
+diff --git a/tests/workspace/mcp/test_mcp_server.py b/tests/workspace/mcp/test_mcp_server.py
+index af3e7b4d2..1bc8a786b 100644
+--- a/tests/workspace/mcp/test_mcp_server.py
++++ b/tests/workspace/mcp/test_mcp_server.py
+@@ -18,11 +18,11 @@ def test_pipeline_mcp_server(pokemon_pipeline_context: RunContextBase) -> None:
+     tools = asyncio.run(mcp.list_tools())
+ 
+     tool_names_expected = [
+-        "available_tables_in_pipeline_rest_api_pokemon",
+-        "table_head_in_pipeline_rest_api_pokemon",
+-        "table_schema_in_pipeline_rest_api_pokemon",
+-        "query_sql_in_pipeline_rest_api_pokemon",
+-        "bookmark_sql_in_pipeline_rest_api_pokemon",
++        "available_tables",
++        "table_head",
++        "table_schema",
++        "query_sql",
++        "bookmark_sql",
+         "read_result_from_bookmark",
+         "recent_result",
+     ]
+
+
+===== COMMIT 986978d4 =====
+
+
+commit 986978d43
+Author: rudolfix
+Date: 2025-10-22
+
+    adds pokemon table count consts (#3232)
+
+diff --git a/tests/load/sources/rest_api/test_rest_api_source.py b/tests/load/sources/rest_api/test_rest_api_source.py
+index 66bc88ba4..302f054ac 100644
+--- a/tests/load/sources/rest_api/test_rest_api_source.py
++++ b/tests/load/sources/rest_api/test_rest_api_source.py
+@@ -10,6 +10,7 @@ from tests.load.utils import (
+     destinations_configs,
+     DestinationTestConfiguration,
+ )
++from tests.sources.rest_api.utils import POKEMON_EXPECTED_TABLE_COUNTS
+ 
+ 
+ def _make_pipeline(destination_name: str):
+@@ -54,10 +55,7 @@ def test_rest_api_source(destination_config: DestinationTestConfiguration) -> No
+     table_counts = load_table_counts(pipeline)
+ 
+     assert table_counts.keys() == {"pokemon_list", "berry", "location"}
+-
+-    assert table_counts["pokemon_list"] == 1302
+-    assert table_counts["berry"] == 64
+-    assert table_counts["location"] == 1070
++    assert table_counts.items() >= POKEMON_EXPECTED_TABLE_COUNTS.items()
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/sources/rest_api/test_rest_api_source.py b/tests/sources/rest_api/test_rest_api_source.py
+index 796738506..1eeeb5000 100644
+--- a/tests/sources/rest_api/test_rest_api_source.py
++++ b/tests/sources/rest_api/test_rest_api_source.py
+@@ -8,6 +8,7 @@ from dlt.sources.helpers.rest_client.paginators import SinglePagePaginator
+ from dlt.sources.rest_api import rest_api_source, rest_api
+ 
+ from tests.common.configuration.utils import environment, toml_providers
++from tests.sources.rest_api.utils import POKEMON_EXPECTED_TABLE_COUNTS
+ from tests.utils import ALL_DESTINATIONS
+ from tests.pipeline.utils import assert_load_info, load_table_counts, load_tables_to_dicts
+ 
+@@ -78,10 +79,7 @@ def test_rest_api_source(destination_name: str, invocation_type: str) -> None:
+     table_counts = load_table_counts(pipeline)
+ 
+     assert table_counts.keys() == {"pokemon_list", "berry", "location"}
+-
+-    assert table_counts["pokemon_list"] == 1302
+-    assert table_counts["berry"] == 64
+-    assert table_counts["location"] == 1070
++    assert table_counts.items() >= POKEMON_EXPECTED_TABLE_COUNTS.items()
+ 
+ 
+ @pytest.mark.parametrize("destination_name", ALL_DESTINATIONS)
+diff --git a/tests/sources/rest_api/utils.py b/tests/sources/rest_api/utils.py
+new file mode 100644
+index 000000000..77bfc0548
+--- /dev/null
++++ b/tests/sources/rest_api/utils.py
+@@ -0,0 +1,5 @@
++POKEMON_EXPECTED_TABLE_COUNTS = {
++    "pokemon_list": 1328,
++    "berry": 64,
++    "location": 1070,
++}
+
+
+===== COMMIT e5526068 =====
+
+
+commit e5526068d
+Author: Xiatong 夏童
+Date: 2025-10-22
+
+    fix: it should be destination (#3217)
+
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/databricks.md b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+index 5252b31b9..19eb1fded 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/databricks.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+@@ -134,11 +134,11 @@ client_secret = "XXX"
+ <TabItem value="env">
+ 
+ ```sh
+-export DESTINATIONS__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME="MY_DATABRICKS.azuredatabricks.net"
+-export DESTINATIONS__DATABRICKS__CREDENTIALS__HTTP_PATH="/sql/1.0/warehouses/12345"
+-export DESTINATIONS__DATABRICKS__CREDENTIALS__CATALOG="my_catalog"
+-export DESTINATIONS__DATABRICKS__CREDENTIALS__CLIENT_ID="XXX"
+-export DESTINATIONS__DATABRICKS__CREDENTIALS__CLIENT_SECRET="XXX"
++export DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME="MY_DATABRICKS.azuredatabricks.net"
++export DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH="/sql/1.0/warehouses/12345"
++export DESTINATION__DATABRICKS__CREDENTIALS__CATALOG="my_catalog"
++export DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID="XXX"
++export DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET="XXX"
+ ```
+   </TabItem>
+ 
+@@ -149,11 +149,11 @@ import os
+ 
+ # Do not set up the secrets directly in the code!
+ # What you can do is reassign env variables.
+-os.environ["DESTINATIONS__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "MY_DATABRICKS.azuredatabricks.net"
+-os.environ["DESTINATIONS__DATABRICKS__CREDENTIALS__HTTP_PATH"]="/sql/1.0/warehouses/12345"
+-os.environ["DESTINATIONS__DATABRICKS__CREDENTIALS__CATALOG"]="my_catalog"
+-os.environ["DESTINATIONS__DATABRICKS__CREDENTIALS__CLIENT_ID"]=os.environ.get("CLIENT_ID")
+-os.environ["DESTINATIONS__DATABRICKS__CREDENTIALS__CLIENT_SECRET"]=os.environ.get("CLIENT_SECRET")
++os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "MY_DATABRICKS.azuredatabricks.net"
++os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"]="/sql/1.0/warehouses/12345"
++os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"]="my_catalog"
++os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID"]=os.environ.get("CLIENT_ID")
++os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET"]=os.environ.get("CLIENT_SECRET")
+ ```
+ </TabItem>
+ </Tabs>
+@@ -190,10 +190,10 @@ access_token = "XXX"
+ <TabItem value="env">
+ 
+ ```sh
+-export DESTINATIONS__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME="MY_DATABRICKS.azuredatabricks.net"
+-export DESTINATIONS__DATABRICKS__CREDENTIALS__HTTP_PATH="/sql/1.0/warehouses/12345"
+-export DESTINATIONS__DATABRICKS__CREDENTIALS__CATALOG="my_catalog"
+-export DESTINATIONS__DATABRICKS__CREDENTIALS__ACCESS_TOKEN="XXX"
++export DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME="MY_DATABRICKS.azuredatabricks.net"
++export DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH="/sql/1.0/warehouses/12345"
++export DESTINATION__DATABRICKS__CREDENTIALS__CATALOG="my_catalog"
++export DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN="XXX"
+ ```
+   </TabItem>
+ 
+@@ -204,10 +204,10 @@ import os
+ 
+ # Do not set up the secrets directly in the code!
+ # What you can do is reassign env variables.
+-os.environ["DESTINATIONS__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "MY_DATABRICKS.azuredatabricks.net"
+-os.environ["DESTINATIONS__DATABRICKS__CREDENTIALS__HTTP_PATH"]="/sql/1.0/warehouses/12345"
+-os.environ["DESTINATIONS__DATABRICKS__CREDENTIALS__CATALOG"]="my_catalog"
+-os.environ["DESTINATIONS__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"]=os.environ.get("ACCESS_TOKEN")
++os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "MY_DATABRICKS.azuredatabricks.net"
++os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"]="/sql/1.0/warehouses/12345"
++os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"]="my_catalog"
++os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"]=os.environ.get("ACCESS_TOKEN")
+ ```
+ </TabItem>
+ </Tabs>
+@@ -392,9 +392,9 @@ aws_secret_access_key="XXX"
+ <TabItem value="env">
+ 
+ ```sh
+-export DESTINATIONS__FILESYSTEM__BUCKET_URL="s3://your-bucket-name"
+-export DESTINATIONS__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID="XXX"
+-export DESTINATIONS__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY="XXX"
++export DESTINATION__FILESYSTEM__BUCKET_URL="s3://your-bucket-name"
++export DESTINATION__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID="XXX"
++export DESTINATION__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY="XXX"
+ ```
+   </TabItem>
+ 
+@@ -405,9 +405,9 @@ import os
+ 
+ # Do not set up the secrets directly in the code!
+ # What you can do is reassign env variables.
+-os.environ["DESTINATIONS__FILESYSTEM__BUCKET_URL"] = "s3://your-bucket-name"
+-os.environ["DESTINATIONS__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID"] = os.environ.get("AWS_ACCESS_KEY_ID")
+-os.environ["DESTINATIONS__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY"] = os.environ.get("AWS_SECRET_ACCESS_KEY")
++os.environ["DESTINATION__FILESYSTEM__BUCKET_URL"] = "s3://your-bucket-name"
++os.environ["DESTINATION__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID"] = os.environ.get("AWS_ACCESS_KEY_ID")
++os.environ["DESTINATION__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY"] = os.environ.get("AWS_SECRET_ACCESS_KEY")
+ ```
+ </TabItem>
+ </Tabs>
+@@ -454,9 +454,9 @@ azure_storage_account_key="XXX"
+ <TabItem value="env">
+ 
+ ```sh
+-export DESTINATIONS__FILESYSTEM__BUCKET_URL="abfss://container_name@storage_account_name.dfs.core.windows.net/path"
+-export DESTINATIONS__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME="XXX"
+-export DESTINATIONS__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY="XXX"
++export DESTINATION__FILESYSTEM__BUCKET_URL="abfss://container_name@storage_account_name.dfs.core.windows.net/path"
++export DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME="XXX"
++export DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY="XXX"
+ ```
+   </TabItem>
+ 
+@@ -467,9 +467,9 @@ import os
+ 
+ # Do not set up the secrets directly in the code!
+ # What you can do is reassign env variables.
+-os.environ["DESTINATIONS__FILESYSTEM__BUCKET_URL"] = "abfss://container_name@storage_account_name.dfs.core.windows.net/path"
+-os.environ["DESTINATIONS__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME"] = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
+-os.environ["DESTINATIONS__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY"] = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
++os.environ["DESTINATION__FILESYSTEM__BUCKET_URL"] = "abfss://container_name@storage_account_name.dfs.core.windows.net/path"
++os.environ["DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME"] = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
++os.environ["DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY"] = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
+ ```
+ </TabItem>
+ </Tabs>
+
+
+===== COMMIT 3298b405 =====
+
+
+commit 3298b4059
+Author: anuunchin
+Date: 2025-10-20
+
+    Feat: workspace file selector, package builder (#3207)
+
+diff --git a/dlt/_workspace/_workspace_context.py b/dlt/_workspace/_workspace_context.py
+index 16153b3aa..265a05e3d 100644
+--- a/dlt/_workspace/_workspace_context.py
++++ b/dlt/_workspace/_workspace_context.py
+@@ -70,7 +70,7 @@ class WorkspaceRunContext(ProfilesRunContext):
+     def settings_dir(self) -> str:
+         """Returns a path to dlt settings directory. If not overridden it resides in current working directory
+ 
+-        The name of the setting folder is '.dlt'. The path is current working directory '.' but may be overridden by DLT_PROJECT_DIR env variable.
++        The name of the settings folder is '.dlt'. The path is current working directory '.' but may be overridden by DLT_PROJECT_DIR env variable.
+         """
+         return os.path.join(self.run_dir, DOT_DLT)
+ 
+diff --git a/dlt/_workspace/deployment/__init__.py b/dlt/_workspace/deployment/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/dlt/_workspace/deployment/file_selector.py b/dlt/_workspace/deployment/file_selector.py
+new file mode 100644
+index 000000000..7a40ca4b0
+--- /dev/null
++++ b/dlt/_workspace/deployment/file_selector.py
+@@ -0,0 +1,46 @@
++from typing import Iterator, Optional, List
++from pathlib import Path
++from pathspec import PathSpec
++from pathspec.util import iter_tree_files
++
++from dlt._workspace._workspace_context import WorkspaceRunContext
++
++
++class WorkspaceFileSelector:
++    """Iterates files in workspace respecting ignore patterns and excluding workspace internals.
++
++    Uses gitignore-style patterns from a configurable ignore file (default .gitignore). Additional
++    patterns can be provided as relative paths from workspace root. Settings directory is always excluded.
++    """
++
++    def __init__(
++        self,
++        context: WorkspaceRunContext,
++        additional_excludes: Optional[List[str]] = None,
++        ignore_file: str = ".gitignore",
++    ) -> None:
++        self.root_path: Path = Path(context.run_dir).resolve()
++        self.settings_dir: Path = Path(context.settings_dir).resolve()
++        self.ignore_file: str = ignore_file
++        self.spec: PathSpec = self._build_pathspec(additional_excludes or [])
++
++    def _build_pathspec(self, additional_excludes: List[str]) -> PathSpec:
++        """Build PathSpec from ignore file + defaults + additional excludes"""
++        patterns: List[str] = [f"{self.settings_dir.relative_to(self.root_path)}/"]
++
++        # Load ignore file if exists
++        ignore_path = self.root_path / self.ignore_file
++        if ignore_path.exists():
++            with ignore_path.open("r", encoding="utf-8") as f:
++                patterns.extend(f.read().splitlines())
++
++        # Add caller-provided excludes
++        patterns.extend(additional_excludes)
++
++        return PathSpec.from_lines("gitwildmatch", patterns)
++
++    def __iter__(self) -> Iterator[Path]:
++        """Yield paths of files eligible for deployment"""
++        for file_path in iter_tree_files(self.root_path):
++            if not self.spec.match_file(file_path):
++                yield Path(file_path)
+diff --git a/dlt/_workspace/deployment/manifest.py b/dlt/_workspace/deployment/manifest.py
+new file mode 100644
+index 000000000..f2f235097
+--- /dev/null
++++ b/dlt/_workspace/deployment/manifest.py
+@@ -0,0 +1,19 @@
++from typing import List
++from dlt.common.typing import TypedDict
++
++# current version of deployment engine
++DEPLOYMENT_ENGINE_VERSION = 1
++
++
++class TDeploymentFileItem(TypedDict, total=False):
++    """TypedDict representing a file in the deployment package"""
++
++    relative_path: str
++    size_in_bytes: int
++
++
++class TDeploymentManifest(TypedDict, total=False):
++    """TypedDict defining the deployment manifest structure"""
++
++    engine_version: int
++    files: List[TDeploymentFileItem]
+diff --git a/dlt/_workspace/deployment/package_builder.py b/dlt/_workspace/deployment/package_builder.py
+new file mode 100644
+index 000000000..e2c9d275c
+--- /dev/null
++++ b/dlt/_workspace/deployment/package_builder.py
+@@ -0,0 +1,76 @@
++from io import BytesIO
++from typing import Tuple, BinaryIO, List
++from pathlib import Path
++import tarfile
++import yaml
++
++from dlt.common.time import precise_time
++from dlt.common.utils import digest256_tar_stream
++
++from dlt._workspace.deployment.file_selector import WorkspaceFileSelector
++from dlt._workspace.deployment.manifest import (
++    TDeploymentFileItem,
++    TDeploymentManifest,
++    DEPLOYMENT_ENGINE_VERSION,
++)
++
++from dlt._workspace._workspace_context import WorkspaceRunContext
++
++
++DEFAULT_DEPLOYMENT_FILES_FOLDER = "files"
++DEFAULT_MANIFEST_FILE_NAME = "manifest.yaml"
++DEFAULT_DEPLOYMENT_PACKAGE_LAYOUT = "deployment-{timestamp}.tar.gz"
++
++
++class DeploymentPackageBuilder:
++    """Builds gzipped deployment package from file selectors"""
++
++    def __init__(self, context: WorkspaceRunContext):
++        self.run_context: WorkspaceRunContext = context
++
++    def write_package_to_stream(
++        self, file_selector: WorkspaceFileSelector, output_stream: BinaryIO
++    ) -> str:
++        """Write deployment package to output stream, return content hash"""
++        manifest_files: List[TDeploymentFileItem] = []
++
++        # Add files to the archive
++        with tarfile.open(fileobj=output_stream, mode="w|gz") as tar:
++            for file_path in file_selector:
++                full_path = self.run_context.run_dir / file_path
++                # Use POSIX paths for tar archives (cross-platform compatibility)
++                posix_path = file_path.as_posix()
++                tar.add(
++                    full_path,
++                    arcname=f"{DEFAULT_DEPLOYMENT_FILES_FOLDER}/{posix_path}",
++                    recursive=False,
++                )
++                manifest_files.append(
++                    {
++                        "relative_path": posix_path,
++                        "size_in_bytes": full_path.stat().st_size,
++                    }
++                )
++            # Create and add manifest with file metadata at the end
++            manifest: TDeploymentManifest = {
++                "engine_version": DEPLOYMENT_ENGINE_VERSION,
++                "files": manifest_files,
++            }
++            manifest_yaml = yaml.dump(
++                manifest, allow_unicode=True, default_flow_style=False, sort_keys=False
++            ).encode("utf-8")
++            manifest_info = tarfile.TarInfo(name=DEFAULT_MANIFEST_FILE_NAME)
++            manifest_info.size = len(manifest_yaml)
++            tar.addfile(manifest_info, BytesIO(manifest_yaml))
++
++        return digest256_tar_stream(output_stream)
++
++    def build_package(self, file_selector: WorkspaceFileSelector) -> Tuple[Path, str]:
++        """Create deployment package file, return (path, content_hash)"""
++        package_name = DEFAULT_DEPLOYMENT_PACKAGE_LAYOUT.format(timestamp=str(precise_time()))
++        package_path = Path(self.run_context.get_data_entity(package_name))
++
++        with open(package_path, "w+b") as f:
++            content_hash = self.write_package_to_stream(file_selector, f)
++
++        return package_path, content_hash
+diff --git a/dlt/common/utils.py b/dlt/common/utils.py
+index 339b07089..7a8cdc70f 100644
+--- a/dlt/common/utils.py
++++ b/dlt/common/utils.py
+@@ -1,4 +1,5 @@
+-from typing import TYPE_CHECKING, Any, Literal
++import re
++from typing import TYPE_CHECKING, Any, BinaryIO, Literal
+ import os
+ from pathlib import Path
+ import sys
+@@ -11,6 +12,7 @@ from os import environ
+ from types import ModuleType
+ import traceback
+ import zlib
++import tarfile
+ from importlib.metadata import version as pkg_version
+ from packaging.version import Version
+ 
+@@ -119,6 +121,45 @@ def digest256(v: str) -> str:
+     return base64.b64encode(digest).decode("ascii")
+ 
+ 
++def digest256_file_stream(stream: BinaryIO, chunk_size: int = 4096) -> str:
++    """Returns a base64 encoded sha3_256 hash of a binary stream"""
++    stream.seek(0)
++    hash_obj = hashlib.sha3_256()
++    while chunk := stream.read(chunk_size):
++        hash_obj.update(chunk)
++    digest = hash_obj.digest()
++    return base64.b64encode(digest).decode("ascii")
++
++
++def digest256_tar_stream(stream: BinaryIO, chunk_size: int = 8192) -> str:
++    """Returns a base64 encoded sha3_256 hash of tar archive contents (ignoring metadata)
++
++    Hashes only filenames and file contents, ignoring timestamps and other metadata.
++    This ensures identical file contents produce identical hashes regardless of when
++    the tar was created.
++
++    Note: This function operates entirely in-memory using tar.extractfile() which reads
++    from the archive stream. No files are written to disk, preventing leakage of sensitive
++    data that may be contained in the archive.
++    """
++    stream.seek(0)
++    hash_obj = hashlib.sha3_256()
++
++    with tarfile.open(fileobj=stream, mode="r:*") as tar:
++        members = sorted(tar.getmembers(), key=lambda m: m.name)
++
++        for member in members:
++            hash_obj.update(member.name.encode())
++            if member.isfile():
++                f = tar.extractfile(member)
++                if f:
++                    while chunk := f.read(chunk_size):
++                        hash_obj.update(chunk)
++
++    digest = hash_obj.digest()
++    return base64.b64encode(digest).decode("ascii")
++
++
+ def str2bool(v: str) -> bool:
+     if isinstance(v, bool):
+         return v
+diff --git a/pyproject.toml b/pyproject.toml
+index 0bff9bcd1..caf32c1ac 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -182,6 +182,7 @@ workspace = [
+     "pyarrow>=16.0.0",
+     "marimo>=0.14.5",
+     "mcp>=1.2.1 ; python_version >= '3.10'",
++    "pathspec>=0.11.2",
+ ]
+ dbml = [
+     "pydbml"
+diff --git a/tests/workspace/cases/workspaces/default/.ignorefile b/tests/workspace/cases/workspaces/default/.ignorefile
+new file mode 100644
+index 000000000..e9921afdc
+--- /dev/null
++++ b/tests/workspace/cases/workspaces/default/.ignorefile
+@@ -0,0 +1 @@
++/empty_file.py
+\ No newline at end of file
+diff --git a/tests/workspace/cases/workspaces/default/additional_exclude/empty_file.py b/tests/workspace/cases/workspaces/default/additional_exclude/empty_file.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/workspace/cases/workspaces/default/ducklake_pipeline.py b/tests/workspace/cases/workspaces/default/ducklake_pipeline.py
+new file mode 100644
+index 000000000..79b31f7cd
+--- /dev/null
++++ b/tests/workspace/cases/workspaces/default/ducklake_pipeline.py
+@@ -0,0 +1,3 @@
++import dlt
++
++pipeline = dlt.pipeline(pipeline_name="ducklake_pipeline")
+diff --git a/tests/workspace/cases/workspaces/default/empty_file.py b/tests/workspace/cases/workspaces/default/empty_file.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/workspace/deployment/test_file_selector.py b/tests/workspace/deployment/test_file_selector.py
+new file mode 100644
+index 000000000..3536031cc
+--- /dev/null
++++ b/tests/workspace/deployment/test_file_selector.py
+@@ -0,0 +1,31 @@
++import os
++import pytest
++
++from dlt._workspace.deployment.file_selector import WorkspaceFileSelector
++
++from tests.workspace.utils import isolated_workspace
++
++
++@pytest.mark.parametrize(
++    "with_additional_exclude",
++    [True, False],
++    ids=["with_additional_exclude", "without_additional_exclude"],
++)
++def test_file_selector_respects_gitignore(with_additional_exclude: bool) -> None:
++    """Test that .gitignore patterns are respected with and without additional excludes."""
++
++    additional_excludes = ["additional_exclude/"] if with_additional_exclude else None
++    expected_files = {
++        "additional_exclude/empty_file.py",
++        "ducklake_pipeline.py",
++        ".ignorefile",
++    }
++    if with_additional_exclude:
++        expected_files.remove("additional_exclude/empty_file.py")
++
++    with isolated_workspace("default") as ctx:
++        selector = WorkspaceFileSelector(
++            ctx, additional_excludes=additional_excludes, ignore_file=".ignorefile"
++        )
++        files = set([f.as_posix() for f in selector])
++        assert files == expected_files
+diff --git a/tests/workspace/deployment/test_package_builder.py b/tests/workspace/deployment/test_package_builder.py
+new file mode 100644
+index 000000000..519d6b459
+--- /dev/null
++++ b/tests/workspace/deployment/test_package_builder.py
+@@ -0,0 +1,83 @@
++import os
++import tarfile
++import yaml
++from io import BytesIO
++from pathlib import Path
++import time
++
++from dlt._workspace.deployment.package_builder import (
++    DeploymentPackageBuilder,
++    DEFAULT_DEPLOYMENT_FILES_FOLDER,
++    DEFAULT_MANIFEST_FILE_NAME,
++)
++from dlt._workspace.deployment.file_selector import WorkspaceFileSelector
++from dlt._workspace.deployment.manifest import DEPLOYMENT_ENGINE_VERSION
++
++from tests.workspace.utils import isolated_workspace
++
++
++def test_write_package_to_stream() -> None:
++    """Test building deployment package to a stream and verify structure."""
++
++    with isolated_workspace("default") as ctx:
++        builder = DeploymentPackageBuilder(ctx)
++        selector = WorkspaceFileSelector(ctx, ignore_file=".ignorefile")
++
++        stream = BytesIO()
++        content_hash = builder.write_package_to_stream(selector, stream)
++
++        assert content_hash
++        assert len(content_hash) == 44  # sha3_256 base64 string
++
++        expected_workspace_files = [
++            "additional_exclude/empty_file.py",
++            "ducklake_pipeline.py",
++            ".ignorefile",
++        ]
++
++        # Verify tar.gz structure
++        stream.seek(0)
++        with tarfile.open(fileobj=stream, mode="r:gz") as tar:
++            members = tar.getnames()
++
++            # Tar contains files under "files/" prefix + manifest
++            assert DEFAULT_MANIFEST_FILE_NAME in members
++            tar_files = [m for m in members if m.startswith(DEFAULT_DEPLOYMENT_FILES_FOLDER)]
++            assert set(tar_files) == {
++                f"{DEFAULT_DEPLOYMENT_FILES_FOLDER}/{f}" for f in expected_workspace_files
++            }
++
++            # Verify manifest structure
++            manifest_member = tar.extractfile(DEFAULT_MANIFEST_FILE_NAME)
++            manifest = yaml.safe_load(manifest_member)
++
++            assert manifest["engine_version"] == DEPLOYMENT_ENGINE_VERSION
++            assert all(
++                "relative_path" in file_item and "size_in_bytes" in file_item
++                for file_item in manifest["files"]
++            )
++
++            # Manifest has workspace-relative paths (no "files/" prefix)
++            manifest_paths = [f["relative_path"] for f in manifest["files"]]
++            assert set(manifest_paths) == set(expected_workspace_files)
++
++
++def test_build_package() -> None:
++    """Test that deployment packages are content-addressable with reproducible hashes."""
++
++    with isolated_workspace("default") as ctx:
++        builder = DeploymentPackageBuilder(ctx)
++        selector = WorkspaceFileSelector(ctx)
++
++        package_path, content_hash = builder.build_package(selector)
++        assert str(package_path).startswith(f"{ctx.data_dir}{os.sep}deployment-")
++        assert len(content_hash) == 44  # sha3_256 base64 string
++
++        # NOTE: Sleep ensures tarballs have different timestamps in their metadata, proving
++        # digest256_tar_stream produces identical hashes despite different creation times
++        time.sleep(0.2)
++
++        package_path_2, content_hash_2 = builder.build_package(selector)
++
++        assert package_path != package_path_2
++        assert content_hash == content_hash_2
+diff --git a/uv.lock b/uv.lock
+index 225de6d89..0cd9cc3b7 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2206,6 +2206,7 @@ workspace = [
+     { name = "ibis-framework", marker = "python_full_version >= '3.10'" },
+     { name = "marimo" },
+     { name = "mcp", marker = "python_full_version >= '3.10'" },
++    { name = "pathspec" },
+     { name = "pyarrow" },
+ ]
+ 
+@@ -2375,6 +2376,7 @@ requires-dist = [
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.6.7,!=3.9.11,!=3.9.12,!=3.9.13,!=3.9.14,!=3.10.1,<4" },
+     { name = "packaging", specifier = ">=21.1" },
+     { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.3.0" },
++    { name = "pathspec", marker = "extra == 'workspace'", specifier = ">=0.11.2" },
+     { name = "pathvalidate", specifier = ">=2.5.2" },
+     { name = "pendulum", specifier = ">=2.1.2" },
+     { name = "pendulum", marker = "python_full_version >= '3.14'", specifier = ">=3.0.0" },
+
+
+===== COMMIT f4c4752f =====
+
+
+commit f4c4752f3
+Author: Andrei Bondarenko
+Date: 2025-10-20
+
+    Update Databricks init scipt documentation (#3202)
+
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/databricks.md b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+index b2f8885e6..5252b31b9 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/databricks.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+@@ -757,6 +757,14 @@ pip install dlt
+ 
+ 4. Click Confirm to apply the change. The cluster will restart automatically.
+ 
++:::warning
++The location of `DeltaLiveTablesHook.py` might change when a new Databricks runtime version is released.
++
++The following locations have been confirmed for the two latest LTS runtime versions:
++- 16.4 LTS: /databricks/python_shell/lib/dbruntime/dlt/hook.py
++- 15.4 LTS: /databricks/python_shell/lib/dbruntime/DeltaLiveTablesHook.py
++:::
++
+ ### 2. Remove preloaded databricks modules in the notebook
+ After the cluster starts, Databricks may partially import its built-in Delta Live Tables (DLT) modules, which can interfere with the dlt package from dltHub.
+ 
+
+
+===== COMMIT e2ef7c1e =====
+
+
+commit e2ef7c1ec
+Author: Menna
+Date: 2025-10-20
+
+    feat/3103: Ensure consistency in HexBytes coercion  (#3200)
+
+diff --git a/dlt/common/json/__init__.py b/dlt/common/json/__init__.py
+index 2b849496f..1084738da 100644
+--- a/dlt/common/json/__init__.py
++++ b/dlt/common/json/__init__.py
+@@ -4,7 +4,6 @@ import dataclasses
+ from datetime import date, datetime, time  # noqa: I251
+ from typing import Any, Callable, List, Protocol, IO, Union, Dict
+ from uuid import UUID
+-from hexbytes import HexBytes
+ from enum import Enum
+ 
+ try:
+@@ -18,7 +17,7 @@ from dlt.common.pendulum import pendulum
+ from dlt.common.arithmetics import Decimal
+ from dlt.common.wei import Wei
+ from dlt.common.utils import map_nested_values_in_place
+-
++from dlt.common.libs.hexbytes import HexBytes
+ 
+ TPuaDecoders = List[Callable[[Any], Any]]
+ 
+diff --git a/dlt/common/libs/hexbytes.py b/dlt/common/libs/hexbytes.py
+new file mode 100644
+index 000000000..4eb5b9dd7
+--- /dev/null
++++ b/dlt/common/libs/hexbytes.py
+@@ -0,0 +1,88 @@
++from typing import (
++    TYPE_CHECKING,
++    Union,
++    cast,
++    overload,
++)
++
++if TYPE_CHECKING:
++    from typing import (
++        SupportsIndex,
++    )
++
++BytesLike = Union[bytearray, bytes, str, memoryview]
++
++HEX_PREFIX_LOWER = "0x"
++HEX_PREFIX_UPPER = "0X"
++
++
++class HexBytes(bytes):
++    """
++    HexBytes is a custom library that replaces the hexbytes library to ensure compatibility with the rest of the codebase.
++    It has these changes:
++        1. It always appends 0x prefix to the hex string.
++        2. The representation at console (__repr__) is 0x-prefixed
++    """
++
++    def __new__(cls, val: BytesLike) -> "HexBytes":
++        bytesval = HexBytes._to_bytes(val)
++        return cast(HexBytes, super().__new__(cls, bytesval))  # type: ignore  # https://github.com/python/typeshed/issues/2630  # noqa: E501
++
++    def hex(  # noqa: A003
++        self, sep: Union[str, bytes] = None, bytes_per_sep: "SupportsIndex" = 1
++    ) -> str:
++        """
++        Output hex-encoded bytes, with an "0x" prefix.
++        Everything following the "0x" is output exactly like :meth:`bytes.hex`.
++        """
++        return HEX_PREFIX_LOWER + (
++            super().hex() if sep is None else super().hex(sep, bytes_per_sep)
++        )
++
++    @overload
++    def __getitem__(self, key: "SupportsIndex") -> int:  # noqa: F811
++        ...
++
++    @overload  # noqa: F811
++    def __getitem__(self, key: slice) -> "HexBytes":  # noqa: F811
++        ...
++
++    def __getitem__(  # noqa: F811
++        self, key: Union["SupportsIndex", slice]
++    ) -> Union[int, "HexBytes"]:
++        result = super().__getitem__(key)
++        return cast(int, result) if isinstance(key, int) else self.__class__(cast(bytes, result))
++
++    def __repr__(self) -> str:
++        return f"HexBytes({self.hex()!r})"
++
++    @staticmethod
++    def _to_bytes(val: BytesLike) -> bytes:
++        """
++        Convert BytesLike input to bytes representation.
++
++        Args:
++            val: bytes, str (hex), bytearray, or memoryview
++
++        Returns:
++            bytes representation of the input
++        """
++        if isinstance(val, bytes):
++            return val
++        if isinstance(val, str):
++            return HexBytes.fromhex(val)
++        return bytes(val)
++
++    @classmethod
++    def fromhex(cls, hexstr: str) -> "HexBytes":
++        """
++        Create HexBytes from hex string, handling optional 0x prefix.
++
++        Args:
++            hexstr: Hex string with or without 0x/0X prefix
++
++        Returns:
++            HexBytes instance
++        """
++        cleaned_hex = hexstr.removeprefix(HEX_PREFIX_LOWER).removeprefix(HEX_PREFIX_UPPER)
++        return super(HexBytes, cls).__new__(cls, bytes.fromhex(cleaned_hex))
+diff --git a/dlt/common/schema/detections.py b/dlt/common/schema/detections.py
+index c9e0e05be..e894aed15 100644
+--- a/dlt/common/schema/detections.py
++++ b/dlt/common/schema/detections.py
+@@ -1,12 +1,12 @@
+ import datetime  # noqa: 251
+ from typing import Any, Optional, Type
+ 
+-from hexbytes import HexBytes
+ 
+ from dlt.common.pendulum import pendulum
+ from dlt.common.wei import Wei
+ from dlt.common.data_types import TDataType
+ from dlt.common.time import parse_iso_like_datetime
++from dlt.common.libs.hexbytes import HexBytes
+ 
+ 
+ _NOW_TS: float = pendulum.now().timestamp()
+diff --git a/pyproject.toml b/pyproject.toml
+index 87c4402ad..0bff9bcd1 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -35,7 +35,6 @@ dependencies = [
+     "simplejson>=3.17.5",
+     "PyYAML>=5.4.1",
+     "semver>=3.0.0",
+-    "hexbytes>=0.2.2",
+     "tzdata>=2022.1",
+     "tomlkit>=0.11.3",
+     "pathvalidate>=2.5.2",
+diff --git a/tests/cases.py b/tests/cases.py
+index 044bd1686..079345ed7 100644
+--- a/tests/cases.py
++++ b/tests/cases.py
+@@ -2,7 +2,6 @@ import datetime  # noqa: I251
+ import hashlib
+ from typing import Dict, List, Any, Sequence, Tuple, Literal, Union
+ import base64
+-from hexbytes import HexBytes
+ from copy import deepcopy
+ from string import ascii_lowercase
+ import random
+@@ -22,6 +21,7 @@ from dlt.common.time import (
+     ensure_pendulum_time,
+     ensure_pendulum_date,
+ )
++from dlt.common.libs.hexbytes import HexBytes
+ from dlt.common.schema import TColumnSchema, TTableSchemaColumns
+ 
+ from tests.utils import TPythonTableFormat, TestDataItemFormat, arrow_item_from_pandas
+diff --git a/tests/common/libs/test_hexbytes.py b/tests/common/libs/test_hexbytes.py
+new file mode 100644
+index 000000000..82d7cf6a1
+--- /dev/null
++++ b/tests/common/libs/test_hexbytes.py
+@@ -0,0 +1,74 @@
++import pytest
++
++from dlt.common.libs.hexbytes import HexBytes
++
++
++def test_hexbytes_from_bytes():
++    # Test creation from bytes
++    binary_string = HexBytes(b"binary string")
++    assert isinstance(binary_string, HexBytes)
++    assert isinstance(binary_string, bytes)
++    assert binary_string == b"binary string"
++    assert binary_string.hex() == "0x62696e61727920737472696e67"
++
++
++def test_hexbytes_from_hex_string():
++    # Test creation from hex string with and without 0x prefix
++    hex_with_prefix = "0x62696e61727920737472696e67"
++    hex_without_prefix = "62696e61727920737472696e67"
++
++    hex_bytes_with_prefix = HexBytes(hex_with_prefix)
++    hex_bytes_without_prefix = HexBytes(hex_without_prefix)
++
++    assert hex_bytes_with_prefix == hex_bytes_without_prefix
++    assert hex_bytes_with_prefix == b"binary string"
++    assert hex_bytes_with_prefix.hex() == "0x62696e61727920737472696e67"
++
++
++def test_hexbytes_indexing():
++    # Test indexing behavior
++    test_bytes = HexBytes(b"binary")
++
++    # Test single item access
++    first_byte = test_bytes[0]
++    last_byte = test_bytes[-1]
++    assert first_byte == ord("b")  # should return int
++    assert last_byte == ord("y")
++
++    # Test slicing
++    middle_slice = test_bytes[1:3]
++    assert isinstance(middle_slice, HexBytes)  # slices should return HexBytes
++    assert middle_slice == b"in"
++    assert test_bytes[:2] == b"bi"  # prefix slice
++    assert test_bytes[-2:] == b"ry"  # suffix slice
++
++
++def test_hexbytes_representation():
++    # Test string representation
++    test_bytes = HexBytes(b"test")
++    assert repr(test_bytes) == "HexBytes('0x74657374')"
++
++    # Test actual bytes content
++    assert bytes(test_bytes) == b"test"
++
++
++def test_hexbytes_comparison():
++    # Test equality comparisons
++    first_hex = HexBytes(b"test")
++    same_as_first = HexBytes(b"test")
++    different_hex = HexBytes(b"different")
++
++    assert first_hex == same_as_first
++    assert first_hex != different_hex
++    assert first_hex == b"test"  # Compare with bytes
++    assert first_hex != b"different"
++
++
++def test_hexbytes_hex_method():
++    # Test hex() method specifically
++    single_char = HexBytes(b"A")
++    assert single_char.hex() == "0x41"  # Should always include 0x prefix
++
++    # Test with empty bytes
++    empty_bytes = HexBytes(b"")
++    assert empty_bytes.hex() == "0x"
+diff --git a/tests/common/schema/test_coercion.py b/tests/common/schema/test_coercion.py
+index 6ce7c3849..fbe5c14f0 100644
+--- a/tests/common/schema/test_coercion.py
++++ b/tests/common/schema/test_coercion.py
+@@ -3,7 +3,7 @@ from copy import copy
+ from typing import Any, Type
+ import pytest
+ import datetime  # noqa: I251
+-from hexbytes import HexBytes
++from dlt.common.libs.hexbytes import HexBytes
+ from enum import Enum
+ 
+ from pendulum.tz import UTC
+@@ -32,10 +32,9 @@ def test_coerce_type_to_text() -> None:
+     # bytes to text (base64)
+     assert coerce_value("text", "binary", b"binary string") == "YmluYXJ5IHN0cmluZw=="
+     # HexBytes to text (hex with prefix)
+-    assert coerce_value("text", "binary", HexBytes(b"binary string")) in [
+-        "0x62696e61727920737472696e67",
+-        "62696e61727920737472696e67",
+-    ]
++    assert (
++        coerce_value("text", "binary", HexBytes(b"binary string")) == "0x62696e61727920737472696e67"
++    )
+ 
+     # Str enum value
+     class StrEnum(Enum):
+diff --git a/tests/common/schema/test_detections.py b/tests/common/schema/test_detections.py
+index 1dff8c2eb..89ac1a6ef 100644
+--- a/tests/common/schema/test_detections.py
++++ b/tests/common/schema/test_detections.py
+@@ -1,5 +1,4 @@
+-from hexbytes import HexBytes
+-
++from dlt.common.libs.hexbytes import HexBytes
+ from dlt.common import pendulum, Decimal, Wei
+ from dlt.common.schema.utils import autodetect_sc_type
+ from dlt.common.schema.detections import (
+diff --git a/tests/normalize/test_json_item_inference.py b/tests/normalize/test_json_item_inference.py
+index 459a5490b..04c5d63c1 100644
+--- a/tests/normalize/test_json_item_inference.py
++++ b/tests/normalize/test_json_item_inference.py
+@@ -3,8 +3,7 @@ from pendulum import UTC
+ import pytest
+ from copy import deepcopy
+ from typing import Any, Iterator, List, Sequence
+-from hexbytes import HexBytes
+-
++from dlt.common.libs.hexbytes import HexBytes
+ from dlt.common import Wei, Decimal, pendulum, json
+ from dlt.common.configuration.container import Container
+ from dlt.common.destination.capabilities import DestinationCapabilitiesContext
+diff --git a/tests/workspace/cli/test_init_command.py b/tests/workspace/cli/test_init_command.py
+index e8822f9be..5a048577b 100644
+--- a/tests/workspace/cli/test_init_command.py
++++ b/tests/workspace/cli/test_init_command.py
+@@ -5,12 +5,12 @@ import os
+ import contextlib
+ from subprocess import CalledProcessError
+ from typing import List, Tuple, Optional
+-from hexbytes import HexBytes
+ import pytest
+ from unittest import mock
+ import re
+ from packaging.requirements import Requirement
+ from typing import Dict
++from dlt.common.libs.hexbytes import HexBytes
+ 
+ # import that because O3 modules cannot be unloaded
+ import cryptography.hazmat.bindings._rust
+diff --git a/uv.lock b/uv.lock
+index b7cb0f4a2..225de6d89 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2048,7 +2048,6 @@ dependencies = [
+     { name = "fsspec" },
+     { name = "gitpython" },
+     { name = "giturlparse" },
+-    { name = "hexbytes" },
+     { name = "humanize" },
+     { name = "jsonpath-ng" },
+     { name = "orjson", version = "3.10.18", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14' and sys_platform != 'emscripten'" },
+@@ -2365,7 +2364,6 @@ requires-dist = [
+     { name = "google-cloud-bigquery", marker = "extra == 'gcp'", specifier = ">=2.26.0" },
+     { name = "grpcio", marker = "extra == 'bigquery'", specifier = ">=1.50.0" },
+     { name = "grpcio", marker = "extra == 'gcp'", specifier = ">=1.50.0" },
+-    { name = "hexbytes", specifier = ">=0.2.2" },
+     { name = "humanize", specifier = ">=4.4.0" },
+     { name = "ibis-framework", marker = "python_full_version >= '3.10' and extra == 'workspace'", specifier = ">=10.5.0" },
+     { name = "jsonpath-ng", specifier = ">=1.5.3" },
+@@ -3749,15 +3747,6 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/d0/9e/984486f2d0a0bd2b024bf4bc1c62688fcafa9e61991f041fb0e2def4a982/h2-4.2.0-py3-none-any.whl", hash = "sha256:479a53ad425bb29af087f3458a61d30780bc818e4ebcf01f0b536ba916462ed0", size = 60957, upload-time = "2025-02-01T11:02:26.481Z" },
+ ]
+ 
+-[[package]]
+-name = "hexbytes"
+-version = "0.3.1"
+-source = { registry = "https://pypi.org/simple" }
+-sdist = { url = "https://files.pythonhosted.org/packages/c1/94/fbfd526e8964652eec6a7b74ae18d1426e225ab602553858531ec6567d05/hexbytes-0.3.1.tar.gz", hash = "sha256:a3fe35c6831ee8fafd048c4c086b986075fc14fd46258fa24ecb8d65745f9a9d", size = 6188, upload-time = "2023-06-08T20:36:59.73Z" }
+-wheels = [
+-    { url = "https://files.pythonhosted.org/packages/0b/9e/fdfe374c28d448a58563e7e43f569f8cf8cf600db092efac2e8ac2f86782/hexbytes-0.3.1-py3-none-any.whl", hash = "sha256:383595ad75026cf00abd570f44b368c6cdac0c6becfae5c39ff88829877f8a59", size = 5944, upload-time = "2023-06-08T20:36:58.066Z" },
+-]
+-
+ [[package]]
+ name = "hpack"
+ version = "4.1.0"
+
+
+===== COMMIT 8a46409d =====
+
+
+commit 8a46409da
+Author: Thierry Jean
+Date: 2025-10-16
+
+    repo(pytest): migrate to `pyproject.toml` and reduce verbosity (#3205)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index a2fe45b4f..f5439ff80 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -402,3 +402,17 @@ profile = "black"
+ src_paths = ["dlt"]
+ multi_line_output = 3
+ 
++[tool.pytest.ini_options]
++pythonpath = ["dlt", "docs/website/docs"]
++norecursedirs = [".direnv", ".eggs", "build", "dist"]
++addopts = "--showlocals --durations 10"
++xfail_strict = true
++log_cli_level = "INFO"
++console_output_style = "count"
++python_files = ["test_*.py", "*_test.py", "*snippets.py", "*snippet.pytest"]
++python_functions = ["*_test", "test_*", "*_snippet"]
++filterwarnings = ["ignore::DeprecationWarning"]
++markers = [
++    "essential: marks all essential tests",
++    "no_load: marks tests that do not load anything"
++]
+diff --git a/pytest.ini b/pytest.ini
+deleted file mode 100644
+index 02c07174c..000000000
+--- a/pytest.ini
++++ /dev/null
+@@ -1,14 +0,0 @@
+-[pytest]
+-pythonpath= dlt docs/website/docs
+-norecursedirs= .direnv .eggs build dist
+-addopts= -v --showlocals --durations 10
+-xfail_strict= true
+-log_cli= 1
+-log_cli_level= INFO
+-python_files = test_*.py *_test.py *snippets.py *snippet.pytest
+-python_functions = *_test test_* *_snippet
+-filterwarnings= ignore::DeprecationWarning
+-markers =
+-    essential: marks all essential tests
+-    no_load: marks tests that do not load anything
+-    
+\ No newline at end of file
+
+
+===== COMMIT 8855732d =====
+
+
+commit 8855732d5
+Author: Violetta Mishechkina
+Date: 2025-10-16
+
+    Add redirect from dlt-plus pages to hub (#3195)
+
+diff --git a/docs/website/worker.ts b/docs/website/worker.ts
+index abb6fb569..608cfeec5 100644
+--- a/docs/website/worker.ts
++++ b/docs/website/worker.ts
+@@ -63,6 +63,13 @@ const REDIRECTS = [
+         from: "/docs/visualizations",
+         to: "/docs/general-usage/dataset-access/"
+     },
++
++    // dlt+ redirect
++    {
++        from: "/docs/hub",
++        to: "/docs/hub/intro"
++    },
++
+ ]
+ 
+ const ROUTE_404 = "/docs/404";
+@@ -72,19 +79,25 @@ const handler = {
+ 
+         const url = new URL(request.url);
+ 
++        // forward plus requests to hub
++        if (url.pathname.includes("/plus")) {
++            url.pathname = url.pathname.replace("/plus", "/hub");
++            return Response.redirect(url.toString(), 301);
++        }
++
+         // handle redirects
+         for (const redirect of REDIRECTS) {
+             if (url.pathname === redirect.from) {
+                 url.pathname = redirect.to;
+-                return Response.redirect(url.toString(), redirect.code || 301);
++                return Response.redirect(url.toString(), 301);
+             }
+-        }   
++        }
+ 
+         let res = await env.ASSETS.fetch(request);
+         if (res.status === 404) {
+             url.pathname = ROUTE_404;
+             return Response.redirect(url.toString(), 301);
+-        }    
++        }
+         return res; // unchanged response (transparent externally)
+     }
+   };
+
+
+===== COMMIT 036aab38 =====
+
+
+commit 036aab385
+Author: Marcin Rudolf
+Date: 2025-10-15
+
+    skips dlthub tests properly
+
+diff --git a/tests/hub/conftest.py b/tests/hub/conftest.py
+index 9e5bc222a..3d11432fa 100644
+--- a/tests/hub/conftest.py
++++ b/tests/hub/conftest.py
+@@ -1,11 +1,14 @@
+-from typing import Iterator
++from typing import Iterator, Any
+ import pytest
+ 
+-from dlthub.common.license import LicenseContext
+ 
+-from tests.hub.utils import issue_ephemeral_license
++@pytest.fixture(scope="session", autouse=True)
++def auto_issue_license() -> Iterator[Any]:
++    # skip tests if module not installed
++    pytest.importorskip("dlthub")
+ 
++    from dlthub.common.license import LicenseContext
++
++    from tests.hub.utils import issue_ephemeral_license
+ 
+-@pytest.fixture(scope="session", autouse=True)
+-def auto_issue_license() -> Iterator[LicenseContext]:
+     yield from issue_ephemeral_license()
+
+
+===== COMMIT 71ffcad3 =====
+
+
+commit 71ffcad39
+Author: rudolfix
+Date: 2025-10-14
+
+    removes cluster on create table test and allows only partition (#3191)
+
+diff --git a/tests/load/test_job_client.py b/tests/load/test_job_client.py
+index 5d8c9ed9f..05b7a8c22 100644
+--- a/tests/load/test_job_client.py
++++ b/tests/load/test_job_client.py
+@@ -252,7 +252,7 @@ def test_complete_load(naming: str, client: SqlJobClientBase) -> None:
+ 
+ @pytest.mark.parametrize(
+     "client",
+-    destinations_configs(default_sql_configs=True),
++    destinations_configs(default_sql_configs=True, exclude=["bigquery"]),
+     indirect=True,
+     ids=lambda x: x.name,
+ )
+@@ -267,6 +267,9 @@ def test_schema_update_create_table(client: SqlJobClientBase) -> None:
+     # this will be destkey
+     sender_id = item_normalizer._infer_column("sender_id", "982398490809324")
+     assert sender_id["cluster"] is True
++    # disable cluster on databricks: it does not support PARTITION and CLUSTER on a single table
++    has_cluster = client.config.destination_type != "databricks"
++    sender_id["cluster"] = has_cluster
+     # this will be not null
+     record_hash = item_normalizer._infer_column("_dlt_id", "m,i0392903jdlkasjdlk")
+     assert record_hash["unique"] is True
+@@ -276,8 +279,9 @@ def test_schema_update_create_table(client: SqlJobClientBase) -> None:
+     # check hints in schema update
+     table_update = schema_update[table_name]["columns"]
+     assert table_update["timestamp"]["sort"] is True
+-    assert table_update["sender_id"]["cluster"] is True
++    assert table_update["sender_id"]["cluster"] is has_cluster
+     assert table_update["_dlt_id"]["unique"] is True
++    assert table_update["_dlt_id"]["nullable"] is False
+     _, storage_columns = list(client.get_storage_tables([table_name]))[0]
+     assert len(storage_columns) > 0
+ 
+@@ -289,7 +293,9 @@ def test_schema_update_create_table(client: SqlJobClientBase) -> None:
+     ids=lambda x: x.name,
+ )
+ @pytest.mark.parametrize("dataset_name", (None, "_hidden_ds"))
+-def test_schema_update_create_table_bigquery(client: SqlJobClientBase, dataset_name: str) -> None:
++def test_schema_update_create_table_bigquery_hidden_dataset(
++    client: SqlJobClientBase, dataset_name: str
++) -> None:
+     # patch dataset name
+     if dataset_name:
+         # drop existing dataset
+
+
+===== COMMIT 5ca7c95f =====
+
+
+commit 5ca7c95f7
+Author: anuunchin
+Date: 2025-10-14
+
+    Minor docs fix (#3197)
+
+diff --git a/docs/website/docs/tutorial/load-data-from-an-api.md b/docs/website/docs/tutorial/load-data-from-an-api.md
+index 00ac6fd61..b01bfac62 100644
+--- a/docs/website/docs/tutorial/load-data-from-an-api.md
++++ b/docs/website/docs/tutorial/load-data-from-an-api.md
+@@ -78,7 +78,7 @@ You can use dlt [datasets](../general-usage/dataset-access/dataset) to easily qu
+ 
+ ```py
+ # get the dataset
+-dataset = pipeline.dataset("mydata")
++dataset = pipeline.dataset()
+ 
+ # get the user relation
+ table = dataset.users
+
+
+===== COMMIT b2ed341c =====
+
+
+commit b2ed341cf
+Author: anuunchin
+Date: 2025-10-10
+
+    QoL: accept destination name as shorthand form of destination  (#3122)
+
+diff --git a/dlt/common/configuration/exceptions.py b/dlt/common/configuration/exceptions.py
+index 863cb3a1c..f233abdb0 100644
+--- a/dlt/common/configuration/exceptions.py
++++ b/dlt/common/configuration/exceptions.py
+@@ -113,7 +113,7 @@ class ConfigFieldMissingException(KeyError, ConfigurationException):
+ 
+     def __str__(self) -> str:
+         msg = (
+-            f"Missing {len(self.fields)} field(s) in configuration`{self.spec_name}`:"
++            f"Missing {len(self.fields)} field(s) in configuration `{self.spec_name}`:"
+             f" {', '.join(f'`{f}`' for f in self.fields)}\n"
+         )
+         msg += self._build_config_error_message(
+diff --git a/dlt/common/destination/exceptions.py b/dlt/common/destination/exceptions.py
+index f71eb4b19..7a3e1ca94 100644
+--- a/dlt/common/destination/exceptions.py
++++ b/dlt/common/destination/exceptions.py
+@@ -1,4 +1,5 @@
+ from typing import Any, Iterable, List, Sequence
++import textwrap
+ 
+ from dlt.common.exceptions import DltException, TerminalException, TransientException
+ from dlt.common.reflection.exceptions import ReferenceImportError
+@@ -11,17 +12,58 @@ class DestinationException(DltException):
+ 
+ class UnknownDestinationModule(ReferenceImportError, DestinationException, KeyError):
+     def __init__(
+-        self, ref: str, qualified_refs: Sequence[str], traces: Sequence[ImportTrace]
++        self,
++        ref: str,
++        qualified_refs: Sequence[str],
++        traces: Sequence[ImportTrace],
++        destination_type: str = None,
++        named_dest_attempted: bool = False,
+     ) -> None:
+         self.ref = ref
+         self.qualified_refs = qualified_refs
++        self.destination_type = destination_type
++        self.named_dest_attempted = named_dest_attempted
+         super().__init__(traces=traces)
+ 
+     def __str__(self) -> str:
++        msg = ""
+         if "." in self.ref:
+-            msg = f"Destination module `{self.ref}` is not registered."
++            msg += f"Destination module `{self.ref}` is not registered."
+         else:
+-            msg = f"Destination `{self.ref}` is not one of the standard dlt destinations."
++            if self.named_dest_attempted:
++                msg += (
++                    f"Destination '{self.ref}' was first attempted to be resolved as a named"
++                    " destination with a configured type. "
++                )
++                if self.destination_type:
++                    msg += (
++                        f"However, the configured destination type '{self.destination_type}' is not"
++                        " valid. Set a valid destination type. "
++                    )
++                else:
++                    msg += (
++                        "However, no destination type was configured. "
++                        "If your destination is a named destination, "
++                        "set a valid destination type either as an environment variable:\n\n"
++                    )
++                    msg += textwrap.indent(
++                        f"DESTINATION__{self.ref.upper()}__DESTINATION_TYPE=duckdb\n", "  "
++                    )
++                    msg += "\nor in your configuration files:\n\n"
++                    msg += textwrap.indent(
++                        f'[destination.{self.ref}]\ndestination_type="duckdb"\n\n', "  "
++                    )
++
++                msg += (
++                    f"Since no{' valid' if self.destination_type else ''} destination type was"
++                    f" found, dlt also tried to resolve '{self.ref}' as a standard destination."
++                    " However, "
++                )
++
++            msg += (
++                f"{'d' if self.named_dest_attempted else 'D'}estination `{self.ref}` is not one of"
++                " the standard dlt destinations."
++            )
+ 
+         if len(self.qualified_refs) == 1 and self.qualified_refs[0] == self.ref:
+             pass
+diff --git a/dlt/common/destination/reference.py b/dlt/common/destination/reference.py
+index 5756031ab..525ab83e2 100644
+--- a/dlt/common/destination/reference.py
++++ b/dlt/common/destination/reference.py
+@@ -16,6 +16,7 @@ from typing import (
+ from typing_extensions import TypeAlias
+ import inspect
+ 
++import dlt
+ from dlt.common import logger
+ from dlt.common.configuration.specs.base_configuration import BaseConfiguration
+ from dlt.common.normalizers.naming import NamingConvention
+@@ -267,9 +268,36 @@ class Destination(ABC, Generic[TDestinationConfig, TDestinationClient]):
+                 )
+             return ref
+ 
+-        return DestinationReference.from_reference(
+-            ref, credentials, destination_name, environment, **kwargs
+-        )
++        # If destination name is provided or ref is a module ref
++        # don't attempt to resolve as named destination
++        if destination_name or "." in ref:
++            return DestinationReference.from_reference(
++                ref, credentials, destination_name, environment, **kwargs
++            )
++
++        # First, try to resolve as a named destination with configured type
++        destination_type: str = dlt.config.get(f"destination.{ref}.destination_type")
++        if destination_type:
++            try:
++                return DestinationReference.from_reference(
++                    ref=destination_type,
++                    destination_name=ref,
++                    credentials=credentials,
++                    environment=environment,
++                    **kwargs,
++                )
++            except Exception:
++                pass
++
++        # Then, try to resolve as a shorthand destination ref
++        try:
++            return DestinationReference.from_reference(
++                ref, credentials, destination_name, environment, **kwargs
++            )
++        except UnknownDestinationModule as e:
++            e.destination_type = destination_type
++            e.named_dest_attempted = True
++            raise e
+ 
+ 
+ class DestinationReference:
+@@ -278,17 +306,6 @@ class DestinationReference:
+     DESTINATIONS: ClassVar[Dict[str, Type[AnyDestination]]] = {}
+     """A registry of all the destination factories"""
+ 
+-    @staticmethod
+-    def normalize_type(destination_type: str) -> str:
+-        """Normalizes destination type string into a canonical form. Assumes that type names without dots correspond to built in destinations."""
+-        if "." not in destination_type:
+-            destination_type = "dlt.destinations." + destination_type
+-        # the next two lines shorten the dlt internal destination paths to dlt.destinations.<destination_type>
+-        pattern = r"\.destinations\.impl\.[a-zA-Z_][.a-zA-Z0-9_]*\."
+-        replacement = ".destinations."
+-        destination_type = re.sub(pattern, replacement, destination_type)
+-        return destination_type
+-
+     @classmethod
+     def register(cls, factory: Type[AnyDestination_CO], ref: str) -> None:
+         """Registers `factory` class under `ref`. `ref`"""
+@@ -299,28 +316,6 @@ class DestinationReference:
+             )
+         cls.DESTINATIONS[ref] = factory
+ 
+-    @staticmethod
+-    def to_fully_qualified_refs(ref: str) -> List[str]:
+-        """Converts ref into fully qualified form, return one or more alternatives for shorthand notations.
+-        Run context is injected if needed. Following formats are recognized
+-        - name
+-        NOTE: the last component of destination type serves as destination name if not explicitly specified
+-        """
+-        ref_split = ref.split(".")
+-        ref_parts = len(ref_split)
+-        if ref_parts < 2:
+-            # context name is needed
+-            refs = []
+-            for ref_prefix in get_plugin_modules():
+-                if ref_prefix:
+-                    ref_prefix = f"{ref_prefix}.{known_sections.DESTINATIONS}"
+-                else:
+-                    ref_prefix = f"{known_sections.DESTINATIONS}"
+-                refs.append(f"{ref_prefix}.{ref}")
+-            return refs
+-
+-        return []
+-
+     @classmethod
+     def find(
+         cls,
+@@ -411,3 +406,36 @@ class DestinationReference:
+         if environment:
+             kwargs["environment"] = environment
+         return factory(**kwargs)
++
++    @staticmethod
++    def normalize_type(destination_type: str) -> str:
++        """Normalizes destination type string into a canonical form. Assumes that type names without dots correspond to built in destinations."""
++        if "." not in destination_type:
++            destination_type = "dlt.destinations." + destination_type
++        # the next two lines shorten the dlt internal destination paths to dlt.destinations.<destination_type>
++        pattern = r"\.destinations\.impl\.[a-zA-Z_][.a-zA-Z0-9_]*\."
++        replacement = ".destinations."
++        destination_type = re.sub(pattern, replacement, destination_type)
++        return destination_type
++
++    @staticmethod
++    def to_fully_qualified_refs(ref: str) -> List[str]:
++        """Converts ref into fully qualified form, return one or more alternatives for shorthand notations.
++        Run context is injected if needed. Following formats are recognized
++        - name
++        NOTE: the last component of destination type serves as destination name if not explicitly specified
++        """
++        ref_split = ref.split(".")
++        ref_parts = len(ref_split)
++        if ref_parts < 2:
++            # context name is needed
++            refs = []
++            for ref_prefix in get_plugin_modules():
++                if ref_prefix:
++                    ref_prefix = f"{ref_prefix}.{known_sections.DESTINATIONS}"
++                else:
++                    ref_prefix = f"{known_sections.DESTINATIONS}"
++                refs.append(f"{ref_prefix}.{ref}")
++            return refs
++
++        return []
+diff --git a/dlt/common/runtime/run_context.py b/dlt/common/runtime/run_context.py
+index d0f6e1395..e65953815 100644
+--- a/dlt/common/runtime/run_context.py
++++ b/dlt/common/runtime/run_context.py
+@@ -1,4 +1,4 @@
+-from contextlib import contextmanager
++from contextlib import contextmanager, suppress
+ import os
+ import tempfile
+ import warnings
+@@ -204,7 +204,11 @@ def get_plugin_modules() -> List[str]:
+     ctx_module = active().module
+     run_module_name = ctx_module.__name__ if ctx_module else ""
+ 
+-    return [run_module_name] + [p for p in Container()[PluginContext].plugin_modules]
++    plugin_modules = Container()[PluginContext].plugin_modules.copy()
++    with suppress(ValueError):
++        plugin_modules.remove(run_module_name)
++    plugin_modules.insert(0, run_module_name)
++    return plugin_modules
+ 
+ 
+ def context_uri(name: str, run_dir: str, runtime_kwargs: Optional[Dict[str, Any]]) -> str:
+diff --git a/docs/website/docs/general-usage/destination.md b/docs/website/docs/general-usage/destination.md
+index 28bbef939..c04047413 100644
+--- a/docs/website/docs/general-usage/destination.md
++++ b/docs/website/docs/general-usage/destination.md
+@@ -18,6 +18,21 @@ We recommend that you declare the destination type when creating a pipeline inst
+ 
+ Above, we want to use the **filesystem** built-in destination. You can use shorthand types only for built-ins.
+ 
++* Use a **custom destination name** with a configured type
++<!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::custom_destination_name-->
++
++Above, we use a custom destination name and configure the destination type to **filesystem** using an environment variable.
++
++:::note
++When resolving non-module destination references (e.g., `"filesystem"` or `"my_destination"`, not `"dlt.destinations.filesystem"`), dlt first attempts to resolve the reference as a named destination with a valid destination type configured, then falls back to shorthand type resolution.
++
++This means that, in the previous example, if the destination type was not properly configured or was not a valid destination type, dlt would have attempted to resolve `"my_destination"` as a shorthand for a built-in type and would have eventually failed.
++
++As another example, the following:
++<!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::avoid_example-->
++will be resolved as a BigQuery destination that is named `"filesystem"`!
++:::
++
+ * Use full **destination factory type**
+ <!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::class_type-->
+ 
+@@ -30,32 +45,34 @@ Above, we import the destination factory for **filesystem** and pass it to the p
+ 
+ All examples above will create the same destination class with default parameters and pull required config and secret values from [configuration](credentials/index.md) - they are equivalent.
+ 
+-
+-### Pass explicit parameters and a name to a destination
++### Pass explicit parameters and a name to a destination factory
+ You can instantiate the **destination factory** yourself to configure it explicitly. When doing this, you work with destinations the same way you work with [sources](source.md)
+ <!--@@@DLT_SNIPPET ./snippets/destination-snippets.py::instance-->
+ 
+ Above, we import and instantiate the `filesystem` destination factory. We pass the explicit URL of the bucket and name the destination `production_az_bucket`.
+ 
+-If a destination is not named, its shorthand type (the Python factory name) serves as a destination name. Name your destination explicitly if you need several separate configurations of destinations of the same type (i.e., you wish to maintain credentials for development, staging, and production storage buckets in the same config file). The destination name is also stored in the [load info](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) and pipeline traces, so use them also when you need more descriptive names (other than, for example, `filesystem`).
++If a destination is not named, its shorthand type (the Python factory name) serves as the destination name. Name your destination explicitly if you need several separate configurations for destinations of the same type (i.e., when you wish to maintain credentials for development, staging, and production storage buckets in the same config file). The destination name is also stored in the [load info](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) and pipeline traces, so use explicit names when you need more descriptive identifiers (rather than generic names like `filesystem`).
+ 
+ 
+ ## Configure a destination
+ We recommend passing the credentials and other required parameters to configuration via TOML files, environment variables, or other [config providers](credentials/setup). This allows you, for example, to easily switch to production destinations after deployment.
+ 
+-We recommend using the [default config section layout](credentials/advanced#organize-configuration-and-secrets-with-sections) as below:
++Use the [default config section layout](credentials/advanced#organize-configuration-and-secrets-with-sections) as shown below:
+ <!--@@@DLT_SNIPPET ./snippets/destination-toml.toml::default_layout-->
+ 
+-or via environment variables:
++Alternatively, you can use environment variables:
+ ```sh
+ DESTINATION__FILESYSTEM__BUCKET_URL=az://dlt-azure-bucket
+ DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME=dltdata
+ DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY="storage key"
+ ```
+ 
+-For named destinations, you use their names in the config section
++When using named destination factories, use the destination name in the config section:
+ <!--@@@DLT_SNIPPET ./snippets/destination-toml.toml::name_layout-->
+ 
++For custom destination names passed to your pipeline (e.g., `destination="my_destination"`), dlt resolves the destination type from configuration. Add `destination_type` to specify which destination type to use:
++<!--@@@DLT_SNIPPET ./snippets/destination-toml.toml::custom_name_layout-->
++
+ 
+ Note that when you use the [`dlt init` command](../walkthroughs/add-a-verified-source.md) to create or add a data source, `dlt` creates a sample configuration for the selected destination.
+ 
+diff --git a/docs/website/docs/general-usage/pipeline.md b/docs/website/docs/general-usage/pipeline.md
+index f21f21485..e2895a474 100644
+--- a/docs/website/docs/general-usage/pipeline.md
++++ b/docs/website/docs/general-usage/pipeline.md
+@@ -31,7 +31,7 @@ You instantiate a pipeline by calling the `dlt.pipeline` function with the follo
+   events and to restore its state and data schemas on subsequent runs. If not provided, `dlt` will
+   create a pipeline name from the file name of the currently executing Python module.
+ - `destination`: a name of the [destination](../dlt-ecosystem/destinations) to which dlt
+-  will load the data. It may also be provided to the `run` method of the `pipeline`.
++  will load the data. It may also be provided to the `run` method of the `pipeline` and can be declared in [various ways](destination.md). 
+ - `dataset_name`: a name of the dataset to which the data will be loaded. A dataset is a logical
+   group of tables, i.e., `schema` in relational databases or a folder grouping many files. It may also be
+   provided later to the `run` or `load` methods of the pipeline. If not provided, then
+diff --git a/docs/website/docs/general-usage/snippets/destination-snippets.py b/docs/website/docs/general-usage/snippets/destination-snippets.py
+index c1c0f745c..2bccf1903 100644
+--- a/docs/website/docs/general-usage/snippets/destination-snippets.py
++++ b/docs/website/docs/general-usage/snippets/destination-snippets.py
+@@ -30,6 +30,30 @@ def destination_instantiation_snippet() -> None:
+ 
+     assert pipeline.destination.destination_name == "filesystem"
+ 
++    # @@@DLT_SNIPPET_START custom_destination_name
++    import os
++    import dlt
++
++    os.environ["DESTINATION__MY_DESTINATION__DESTINATION_TYPE"] = "filesystem"
++
++    pipeline = dlt.pipeline("pipeline", destination="my_destination")
++    # @@@DLT_SNIPPET_END custom_destination_name
++
++    assert pipeline.destination.destination_type == "dlt.destinations.filesystem"
++    assert pipeline.destination.destination_name == "my_destination"
++
++    # @@@DLT_SNIPPET_START avoid_example
++    import os
++    import dlt
++
++    os.environ["DESTINATION__FILESYSTEM__DESTINATION_TYPE"] = "bigquery"
++
++    pipeline = dlt.pipeline("pipeline", destination="filesystem")
++    # @@@DLT_SNIPPET_END avoid_example
++
++    assert pipeline.destination.destination_type == "dlt.destinations.bigquery"
++    assert pipeline.destination.destination_name == "filesystem"
++
+     # @@@DLT_SNIPPET_START instance
+     import dlt
+ 
+diff --git a/docs/website/docs/general-usage/snippets/destination-toml.toml b/docs/website/docs/general-usage/snippets/destination-toml.toml
+index f034494d1..99fe453f1 100644
+--- a/docs/website/docs/general-usage/snippets/destination-toml.toml
++++ b/docs/website/docs/general-usage/snippets/destination-toml.toml
+@@ -12,4 +12,13 @@ bucket_url="az://dlt-azure-bucket"
+ [destination.production_az_bucket.credentials]
+ azure_storage_account_name="dltdata"
+ azure_storage_account_key="storage key"
+-# @@@DLT_SNIPPET_END name_layout
+\ No newline at end of file
++# @@@DLT_SNIPPET_END name_layout
++
++# @@@DLT_SNIPPET_START custom_name_layout
++[destination.my_destination]
++destination_type="filesystem"
++bucket_url="az://dlt-azure-bucket"
++[destination.my_destination.credentials]
++azure_storage_account_name="dltdata"
++azure_storage_account_key="storage key"
++# @@@DLT_SNIPPET_END custom_name_layout
+\ No newline at end of file
+diff --git a/tests/.dlt/config.toml b/tests/.dlt/config.toml
+index aa06d98df..649e96988 100644
+--- a/tests/.dlt/config.toml
++++ b/tests/.dlt/config.toml
+@@ -12,4 +12,7 @@ bucket_url_r2="s3://dlt-ci-test-bucket"
+ # use "/" as root path
+ bucket_url_gdrive="gdrive://15eC3e5MNew2XAIefWNlG8VlEa0ISnnaG"
+ bucket_url_sftp="sftp://localhost/data"
+-memory="memory:///m"
+\ No newline at end of file
++memory="memory:///m"
++
++[destination.custom_name]
++destination_type = "duckdb"
+\ No newline at end of file
+diff --git a/tests/common/destination/test_reference.py b/tests/common/destination/test_reference.py
+index d6682a08c..44d9961b9 100644
+--- a/tests/common/destination/test_reference.py
++++ b/tests/common/destination/test_reference.py
+@@ -25,10 +25,9 @@ def test_import_unknown_destination() -> None:
+     assert unk_ex.value.qualified_refs == [
+         "meltdb",
+         "dlt.destinations.meltdb",
+-        "dlt.destinations.meltdb",
+     ]
+     traces = unk_ex.value.traces
+-    assert len(traces) == 2 and traces[0].reason == "AttrNotFound"
++    assert len(traces) == 1 and traces[0].reason == "AttrNotFound"
+ 
+     # custom module
+     with pytest.raises(UnknownDestinationModule) as unk_ex:
+@@ -308,6 +307,81 @@ def test_import_destination_config() -> None:
+         Destination.from_reference(ref=None, destination_name="balh")
+ 
+ 
++@pytest.mark.parametrize(
++    "destination_type",
++    ["duckdb", "wrong_type"],
++    ids=["destination_type_duckdb", "destination_type_invalid"],
++)
++def test_import_destination_type_config(
++    environment: Dict[str, str],
++    destination_type: str,
++) -> None:
++    """Test destination resolution behavior with both valid and invalid destination types.
++
++    This test covers the resolution strategy where dlt first tries to resolve
++    a destination as a named destination with configured type, and if that fails,
++    falls back to resolving it as a direct destination type reference.
++    """
++    environment["DESTINATION__MY_DESTINATION__DESTINATION_TYPE"] = destination_type
++
++    if destination_type == "wrong_type":
++        # Case 1: Fully qualified ref with dots
++        # Skips named destination resolution and only attempts direct type resolution
++        with pytest.raises(UnknownDestinationModule) as py_exc:
++            Destination.from_reference(ref=f"dlt.destinations.{destination_type}")
++        assert "`dlt.destinations.wrong_type` is not registered" in str(py_exc.value)
++        assert not py_exc.value.named_dest_attempted
++        assert not py_exc.value.destination_type
++
++        # Case 2: Explicit destination_name provided
++        # Same as Case 1
++        with pytest.raises(UnknownDestinationModule) as py_exc:
++            Destination.from_reference(ref=destination_type, destination_name="my_destination")
++        assert "`wrong_type` is not one of the standard dlt destinations" in str(py_exc.value)
++        assert not py_exc.value.named_dest_attempted
++        assert not py_exc.value.destination_type
++
++        # Case 3: Named destination with invalid configured type
++        # First tries named destination "my_destination" with configured type "wrong_type"
++        # Then tries "my_destination" as destination type
++        with pytest.raises(UnknownDestinationModule) as py_exc:
++            Destination.from_reference(ref="my_destination")
++        assert f"destination type '{destination_type}' is not valid" in str(py_exc.value)
++        assert "dlt also tried to resolve 'my_destination' as a standard destination" in str(
++            py_exc.value
++        )
++        assert py_exc.value.named_dest_attempted is True
++        assert py_exc.value.destination_type == "wrong_type"
++
++        # Case 4: Named destination with missing type configuration
++        # First tries named destination "my_destination" but no type configured (config error)
++        # Then tries "my_destination" as direct destination type
++        environment.clear()
++        with pytest.raises(UnknownDestinationModule) as py_exc:
++            Destination.from_reference(ref="my_destination")
++        assert "no destination type was configured" in str(py_exc.value)
++        assert "dlt also tried to resolve 'my_destination' as a standard destination" in str(
++            py_exc.value
++        )
++        assert py_exc.value.named_dest_attempted is True
++        assert not py_exc.value.destination_type
++
++    else:
++        dest = Destination.from_reference(ref="my_destination")
++        assert dest.destination_type == "dlt.destinations.duckdb"
++        assert dest.destination_name == "my_destination"
++
++        dest = Destination.from_reference(
++            ref=f"dlt.destinations.{destination_type}", destination_name="my_destination"
++        )
++        assert dest.destination_type == "dlt.destinations.duckdb"
++        assert dest.destination_name == "my_destination"
++
++        dest = Destination.from_reference(ref=f"dlt.destinations.{destination_type}")
++        assert dest.destination_type == "dlt.destinations.duckdb"
++        assert dest.destination_name == "duckdb"
++
++
+ def test_destination_config_explicit_credentials() -> None:
+     # set explicit credentials via reference
+     dest = Destination.from_reference(
+diff --git a/tests/common/runtime/test_run_context.py b/tests/common/runtime/test_run_context.py
+index ddfa3e2eb..58c4a4286 100644
+--- a/tests/common/runtime/test_run_context.py
++++ b/tests/common/runtime/test_run_context.py
+@@ -65,7 +65,7 @@ def test_run_context() -> None:
+ 
+     # check plugin modules
+     # NOTE: first `dlt` - is the root module of current context, second is always present
+-    assert get_plugin_modules() == ["dlt", "dlt"]
++    assert get_plugin_modules() == ["dlt"]
+ 
+ 
+ def test_context_without_module() -> None:
+diff --git a/tests/extract/test_decorators.py b/tests/extract/test_decorators.py
+index e4dbaab0b..841910b23 100644
+--- a/tests/extract/test_decorators.py
++++ b/tests/extract/test_decorators.py
+@@ -812,16 +812,13 @@ def test_source_reference() -> None:
+     with pytest.raises(UnknownSourceReference) as ref_ex:
+         SourceReference.from_reference("$ref")
+     assert ref_ex.value.ref == "$ref"
+-    # NOTE: 'dlt.sources.$ref.$ref' twice because top module of run context is dlt.
+     assert ref_ex.value.qualified_refs == [
+         "$ref",
+         "dlt.sources.$ref.$ref",
+-        "dlt.sources.$ref.$ref",
+         "tests.extract.cases.sources.$ref.$ref",
+     ]
+     # tried to auto import the following refs
+     assert [t.ref for t in ref_ex.value.traces] == [
+-        "dlt.sources.$ref.$ref",
+         "dlt.sources.$ref.$ref",
+         "tests.extract.cases.sources.$ref.$ref",
+     ]
+diff --git a/tests/load/pipeline/test_pipelines.py b/tests/load/pipeline/test_pipelines.py
+index e4758c10e..fbc4732f3 100644
+--- a/tests/load/pipeline/test_pipelines.py
++++ b/tests/load/pipeline/test_pipelines.py
+@@ -10,6 +10,7 @@ from dlt.common.exceptions import TerminalValueError
+ from dlt.common.pipeline import SupportsPipeline
+ from dlt.common.destination import Destination
+ from dlt.common.destination.client import WithStagingDataset
++from dlt.common.destination.exceptions import UnknownDestinationModule
+ from dlt.common.schema.schema import Schema
+ from dlt.common.schema.typing import VERSION_TABLE_NAME, REPLACE_STRATEGIES, TLoaderReplaceStrategy
+ from dlt.common.schema.utils import new_table
+@@ -1129,3 +1130,30 @@ def test_dest_column_hint_timezone(destination_config: DestinationTestConfigurat
+             actual = [r[0].strftime("%Y-%m-%dT%H:%M:%S.%f") for r in rows]
+             expected = output_map[destination]["tables"][t]["timestamp_values"]  # type: ignore
+             assert actual == expected
++
++
++def test_pipeline_with_destination_name():
++    # test configured destination name (tests/.dlt/config.toml)
++    pipeline = dlt.pipeline(destination="custom_name")
++    assert pipeline.destination.destination_type == "dlt.destinations.duckdb"
++    assert pipeline.destination.destination_name == "custom_name"
++
++    @dlt.resource
++    def test_data():
++        yield [{"id": 1, "name": "test"}]
++
++    info = pipeline.run(test_data())
++    assert_load_info(info)
++
++    # test unconfigured destination name
++    with pytest.raises(UnknownDestinationModule) as py_exc:
++        dlt.pipeline(destination="another_custom_name")
++    assert py_exc.value.named_dest_attempted is True
++    assert not py_exc.value.destination_type
++    assert "no destination type was configured" in str(py_exc.value)
++
++    # if destination contains dots, no fallbacks must happen
++    with pytest.raises(UnknownDestinationModule) as py_exc:
++        dlt.pipeline(destination="dlt.destinations.unknown")
++    assert not py_exc.value.named_dest_attempted
++    assert not py_exc.value.destination_type
+diff --git a/tests/plugins/test_plugin_discovery.py b/tests/plugins/test_plugin_discovery.py
+index 4ad02a18d..29410c2ff 100644
+--- a/tests/plugins/test_plugin_discovery.py
++++ b/tests/plugins/test_plugin_discovery.py
+@@ -72,7 +72,7 @@ def test_example_plugin() -> None:
+     plugin_context = Container()[PluginContext]
+     assert plugin_context.plugin_modules == [context.module.__name__, "dlt"]
+     # reference prefixes we probe when resolving
+-    assert run_context.get_plugin_modules() == ["dlt_example_plugin", "dlt_example_plugin", "dlt"]
++    assert run_context.get_plugin_modules() == ["dlt_example_plugin", "dlt"]
+     assert context.local_dir.startswith(context.data_dir)
+     assert context.local_dir.endswith("tmp")
+ 
+
+
+===== COMMIT 352b0534 =====
+
+
+commit 352b0534e
+Author: rudolfix
+Date: 2025-10-10
+
+    documents vault provider (#3160)
+

@@ -36,6 +36,8 @@ Apply the fifty-line test. If the functionality can be written clearly in about 
 
 Never add a dependency without being asked. Propose it and explain the tradeoff. Do not add it to the code.
 
+This section is about production code. Test tooling is a separate decision and is not covered by it.
+
 ## 4. Refactoring and Blast Radius
 
 Only refactor for a reason. Valid reasons are: the code must change and the current structure makes the change difficult; there is a bug and the confusing structure is what allowed it; or there is a measured performance problem. Invalid reasons are: the code looks ugly but works, you read about a new pattern, or the refactor is more interesting than the actual task.

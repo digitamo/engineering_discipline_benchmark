@@ -1,0 +1,2529 @@
+  - `external_volume`: The external volume name where Iceberg data is stored.
+  - `catalog`: The catalog name in which Iceberg tables are created. Defaults to `"SNOWFLAKE"`.
+  - `base_location`: A template string for the base path that Snowflake uses for storing the table data in external storage, supporting placeholders.
+  - `extra_placeholders`: Additional values that can be used in the `base_location` template.
+  - `catalog_sync`: The name of a [catalog integration](https://docs.snowflake.com/en/user-guide/tables-iceberg#catalog-integration) configured for [Snowflake Open Catalog](https://other-docs.snowflake.com/en/opencatalog/overview). If specified, Snowflake syncs Snowflake-managed Iceberg tables in the database with an external catalog in your Snowflake Open Catalog account.
+
+## Installation
+
+Install the `dlt` package with the `snowflake` extra:
+
+```sh
+pip install "dlt[hub,snowflake]"
+```
+
+Once the `snowflake` extra is installed, you can configure a pipeline to use `snowflake_plus` exactly the same way you would use the `snowflake` destination.
+
+## Setup
+
+1. [Configure your Snowflake credentials](../../dlt-ecosystem/destinations/snowflake.md#setup-guide)
+2. [Set up a database user and permissions](../../dlt-ecosystem/destinations/snowflake.md#set-up-the-database-user-and-permissions)
+3. [Configure an external volume in Snowflake](https://docs.snowflake.com/en/user-guide/tables-iceberg-configure-external-volume)
+4. Grant usage on the external volume to the role you are using to load data:
+
+```sql
+GRANT USAGE ON EXTERNAL VOLUME <external_volume_name> TO ROLE <role_name>;
+```
+
+5. If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-init@latest` (see the [installation guide](../getting-started/installation.md)). Then, from inside the workspace, add a Snowflake pipeline:
+
+```sh
+dlthub pipeline init sql_database snowflake
+```
+
+Add the configuration to your `config.toml` file. Set `external_volume` to the name of the external volume you created in step 3 and enable Iceberg table creation by setting `iceberg_mode`:
+
+```toml
+[destination.snowflake]
+external_volume = "<external_volume_name>"
+iceberg_mode = "all"
+```
+
+Use the `snowflake_plus` destination in your pipeline:
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name="my_snowflake_plus_pipeline",
+    destination="snowflake_plus",
+    dataset_name="my_dataset"
+)
+
+@dlt.resource
+def my_iceberg_table():
+    ...
+```
+
+## Configuration
+
+The `snowflake_plus` destination extends the standard Snowflake configuration with additional options:
+
+### `iceberg_mode`
+
+Controls which tables are created as Iceberg tables.
+
+- Possible values:
+  - `"all"`: All tables including dlt system tables are created as Iceberg tables
+  - `"data_tables"`: Only data tables (non-dlt system tables) are created as Iceberg tables
+  - `"none"`: No tables are created as Iceberg tables
+- Required: No
+- Default: `"none"`
+
+### `external_volume`
+
+The external volume to store Iceberg metadata.
+
+- Required: Yes
+- Default: None
+
+### `catalog`
+
+The catalog to use for Iceberg tables.
+
+- Required: No
+- Default: `"SNOWFLAKE"`. This will use [Snowflake as the catalog](https://docs.snowflake.com/en/user-guide/tables-iceberg#label-tables-iceberg-snowflake-as-catalog) for the Iceberg tables.
+
+### `base_location`
+
+Template string for the base location where Iceberg data is stored in the external volume. Supports placeholders like `{dataset_name}` and `{table_name}`.
+
+- Required: No
+- Default: `"{dataset_name}/{table_name}"`
+
+### `extra_placeholders`
+
+Dictionary of additional values that can be used in the `base_location` template. The values can be static strings or functions that accept the dataset name and table name as arguments and return a string.
+
+- Required: No
+- Default: None
+
+### `catalog_sync`
+
+The name of a [catalog integration](https://docs.snowflake.com/en/user-guide/tables-iceberg#catalog-integration) for syncing Iceberg tables to an external catalog in [Snowflake Open Catalog](https://other-docs.snowflake.com/en/opencatalog/overview).
+
+- Required: No
+- Default: None
+
+Configure these options in your `config.toml` file under the `[destination.snowflake]` section.
+
+## Base location templating
+
+The `base_location` parameter controls where Snowflake stores your Iceberg table data and metadata in the external volume. It's a template string that supports the following built-in placeholders:
+
+- `{dataset_name}`: The name of your dataset
+- `{table_name}`: The name of the table
+
+For more flexibility, you can also define custom placeholders using the `extra_placeholders` option.
+
+### Examples
+
+1. The default pattern `{dataset_name}/{table_name}` creates paths like `my_dataset/customers` in your external volume.
+
+2. Custom static path:
+
+   ```toml
+   [destination.snowflake]
+   base_location = "custom/static/path"
+   ```
+
+   This creates all tables in the same directory `custom/static/path`.
+
+3. Using custom placeholders:
+
+   ```toml
+   [destination.snowflake]
+   base_location = "{env}/{dataset_name}/{table_name}"
+   extra_placeholders = { env = "prod" }
+   ```
+
+   This creates paths like `prod/my_dataset/customers`.
+
+### How Snowflake uses the base location
+
+When you provide a `base_location`, Snowflake uses it to create the paths where data and metadata are stored in your external cloud storage. The actual directory structure Snowflake creates follows this pattern:
+
+```text
+STORAGE_BASE_URL/BASE_LOCATION.<randomId>/[data | metadata]/
+```
+
+Where `<randomId>` is a random Snowflake-generated 8-character string appended to create a unique directory.
+
+For more details on how Snowflake organizes Iceberg table files in external storage, see the [Snowflake documentation on data and metadata directories](https://docs.snowflake.com/en/user-guide/tables-iceberg-storage#data-and-metadata-directories).
+
+## Table format for individual tables
+
+You can specify table format (Iceberg/Native) for individual `dlt` resources. For example:
+
+  ```py
+  @dlt.resource(
+    table_format="native"
+  )
+  def my_resource():
+      ...
+
+  pipeline = dlt.pipeline("loads_native", destination="snowflake_plus")
+  ```
+
+  Will create a native (non-iceberg) **my_resource** table, also when you set the [iceberg_mode](#iceberg_mode) to **all** or **data_tables**.
+
+## Write dispositions
+
+All standard write dispositions (`append`, `replace`, and `merge`) are supported for both regular Snowflake tables and Iceberg tables.
+
+## Data types
+
+The Snowflake Plus destination supports all standard Snowflake destination data types, with additional type mappings for Iceberg tables:
+
+| dlt Type    | Iceberg Type  |
+| ----------- | ------------- |
+| `text`      | `string`      |
+| `bigint`    | `long`, `int` |
+| `double`    | `double`      |
+| `bool`      | `boolean`     |
+| `timestamp` | `timestamp`   |
+| `date`      | `date`        |
+| `time`      | `time`        |
+| `decimal`   | `decimal`     |
+| `binary`    | `binary`      |
+| `json`      | `string`      |
+
+## Syncing Snowflake-managed Iceberg tables to Snowflake Open Catalog
+
+To enable querying of Snowflake-managed Iceberg tables by third-party engines (for example, Apache Spark) via an external catalog (Snowflake Open Catalog), use the `catalog_sync` configuration option. This setting specifies a [catalog integration](https://docs.snowflake.com/en/user-guide/tables-iceberg#catalog-integration) that syncs Iceberg tables to the external catalog.
+
+### Open Catalog Setup
+
+1. Create an [external catalog in Snowflake Open Catalog](https://other-docs.snowflake.com/en/opencatalog/create-catalog).
+
+2. Create a catalog integration in Snowflake. Example:
+
+```sql
+  CREATE OR REPLACE CATALOG INTEGRATION my_open_catalog_int
+    CATALOG_SOURCE = POLARIS
+    TABLE_FORMAT = ICEBERG
+    REST_CONFIG = (
+      CATALOG_URI = 'https://<orgname>-<my-snowflake-open-catalog-account-name>.snowflakecomputing.com/polaris/api/catalog'
+      CATALOG_NAME = 'myOpenCatalogExternalCatalogName'
+    )
+    REST_AUTHENTICATION = (
+      TYPE = OAUTH
+      OAUTH_CLIENT_ID = 'myClientId'
+      OAUTH_CLIENT_SECRET = 'myClientSecret'
+      OAUTH_ALLOWED_SCOPES = ('PRINCIPAL_ROLE:ALL')
+    )
+    ENABLED = TRUE;
+```
+
+Refer to the [Snowflake documentation](https://docs.snowflake.com/en/user-guide/tables-iceberg-open-catalog-sync#step-4-create-a-catalog-integration-for-open-catalog) for detailed setup instructions.
+
+3. Configure the `catalog_sync` option in your `config.toml`:
+
+```toml
+[destination.snowflake]
+# ... other configuration
+catalog_sync = "my_open_catalog_int"
+```
+
+## Additional Resources
+
+For more information on basic Snowflake destination functionality, please refer to the [Snowflake destination documentation](../../dlt-ecosystem/destinations/snowflake.md).
+
+
+===== FILE: docs/website/docs/hub/license.md =====
+
+---
+title: License
+description: dltHub License governing the use of dltHub Software and toolkits
+keywords: [license, eula, dlthub license, terms]
+---
+# dltHub License
+
+Copyright 2026 ScaleVector, GmbH. All rights reserved.
+
+## Definitions
+
+"Agreement" means the agreement between ScaleVector, GmbH and its affiliates
+(collectively, "dltHub") and you governing the use of dltHub Services, including
+dltHub Platform, as those terms are defined in the applicable dltHub Terms of Use
+available at: [https://dlthub.com/terms](https://dlthub.com/terms).
+
+"dltHub Services" means dltHub Platform and any other products or services offered
+by dltHub, as defined in the Agreement.
+
+"Derivative Works" means any work that is based on, incorporates, or is derived
+from the Licensed Materials, including but not limited to code generated with the
+assistance of the Licensed Materials, modified copies, adaptations, and projects
+into which the Licensed Materials is installed or integrated.
+
+"Licensed Materials" means the source code, object code, data, and/or other works,
+including educational materials, to which this license applies.
+
+## Scope of Use
+
+You may view, use, copy, modify, publish, and distribute the Licensed Materials
+solely in connection with dltHub Services under a governing Agreement. Any use of
+the Licensed Materials outside of dltHub Services is not permitted under this
+license.
+
+Without limiting the foregoing, the following are examples of permitted use:
+
+1. Using toolkits and skills provided by dltHub to develop, build, test,
+   and deploy data pipelines on dltHub Platform.
+2. Copying and modifying toolkit code for use exclusively with dltHub Services and on
+   dltHub Services.
+3. Using the Licensed Materials to generate code intended for deployment on dltHub
+   Platform.
+
+The following are examples of uses that are NOT permitted under this license:
+
+1. Using toolkits and skills provided by dltHub to generate code or pipelines for
+   deployment on a third-party runtime platform or orchestration service that is not
+   part of dltHub Services.
+2. Modifying toolkits to replace, bypass, or substitute components that are part of
+   dltHub services in order to operate within a third-party development environment.
+3. Incorporating the Licensed Materials or Derivative Works into any product or
+   service that competes with the Licensed Materials, or any other dltHub Services.
+4. Providing the Licensed Materials to third parties as part of a hosted or managed
+   service that replicates the functionality of dltHub Services.
+
+Use beyond the scope of this license requires a separate license agreement
+negotiated with dltHub on a case-by-case basis.
+
+## Redistribution
+
+Redistribution of the Licensed Materials, with or without modification, is
+permitted provided that this license notice is included in all copies or substantial
+portions of the Licensed Materials. All recipients are bound by the same scope of
+use restrictions set forth in this license.
+
+## Intellectual Property
+
+dltHub retains all right, title, and interest in and to the Licensed Materials as
+originally published.
+
+dltHub waives all intellectual property claims over Derivative Works, provided that:
+
+1. The use of the Licensed Materials complies with the scope of use set forth in
+   this license, and
+2. This license notice is retained in all copies or substantial portions of the
+   Licensed Materials contained within the Derivative Works.
+
+This waiver extends to the Licensed Materials itself as incorporated into Derivative
+Works—you are free to use, modify, and distribute it within your Derivative Works
+without further restriction, subject only to the scope of use and redistribution
+terms above.
+
+## Disclaimer and Limitation of Liability
+
+THE LICENSED MATERIALS ARE PROVIDED "AS IS" WITH ALL FAULTS. DLTHUB AND ITS
+LICENSORS DISCLAIM ALL WARRANTIES, WHETHER EXPRESS, IMPLIED, STATUTORY, OR
+OTHERWISE, INCLUDING WITHOUT LIMITATION THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, AND NONINFRINGEMENT. DLTHUB AND ITS LICENSORS'
+TOTAL AGGREGATE LIABILITY RELATING TO OR ARISING OUT OF YOUR USE OF OR DLTHUB'S
+PROVISIONING OF THE LICENSED MATERIALS SHALL BE LIMITED TO ONE THOUSAND DOLLARS
+($1,000). IN NO EVENT SHALL DLTHUB OR ITS LICENSORS BE LIABLE FOR ANY LOST PROFITS,
+LOSS OF REVENUE, LOST BUSINESS, COSTS OF COVER OR ANY INCIDENTAL, SPECIAL,
+EXEMPLARY OR PUNITIVE DAMAGES OF ANY KIND OR NATURE IN CONNECTION WITH THIS LICENSE
+OR THE LICENSED MATERIALS.
+
+
+===== FILE: docs/website/docs/hub/notifications/email.md =====
+
+---
+title: Send email notifications
+description: Subscribe to dltHub workspace failure and success alerts, or send custom emails from your pipeline code with SMTP.
+keywords: [email, alerts, notifications, failure alerts, run alerts, hub, dltHub, smtp]
+---
+# Send email notifications
+
+dltHub provides native email alerting managed directly from the Web UI, with no pipeline code changes required. You can also send custom emails directly from your pipeline code using SMTP.
+
+---
+
+## dltHub platform alerts
+
+:::tip Recommended
+Configuring alerts in the dltHub Web UI is the preferred way to monitor your workloads. It requires no code or secrets in your repository and captures platform-level failures (such as container crashes, timeouts, memory limits, and dependency issues) that occur outside your pipeline code.
+:::
+
+With platform alerts, dltHub sends transactional email notifications when pipeline runs fail or complete successfully.
+
+![dltHub workspace email alert configuration](https://storage.googleapis.com/dlt-blog-images/dlthub-screenshot-email-alert-config.png)
+
+### How to configure
+
+1. Open the dltHub Web UI and navigate to your workspace.
+
+2. In the left navigation, go to **Settings > Alerts** (`/w/<workspace_id>/settings/alerts`).
+
+3. Under **Alerts Configuration**, locate the trigger you want to configure:
+
+  - **Job run failures**: Fires whenever a job or pipeline run transitions to failed status.
+  - **Job run successes**: Fires whenever a job or pipeline run transitions to completed status.
+
+4. Toggle the alert switch **On**.
+
+5. Under **Email Recipients**, select who should receive the email:
+
+  - **Workspace owners only**: Default for failure alerts. Delivers to users with the Workspace Owner or Org Owner role.
+  - **All workspace members**: Sends notifications to all human members belonging to the workspace.
+  - **( ) No email recipients**: Disables email delivery for this trigger (useful when routing notifications exclusively to Slack).
+
+6. Under **Scope**, choose which jobs to monitor:
+
+  - **All jobs**: Delivers alerts for any job run in the workspace.
+  - **Specific pipelines**: Filters alerts to a selected list of pipelines.
+
+7. Click **Save** in the bottom changes bar to apply your configuration.
+
+### What the email includes
+
+Platform alert emails are pre-formatted and sent via high-deliverability infrastructure. Each email includes:
+
+- The name of the pipeline and workspace.
+- The failure reason and error excerpt (for failure alerts).
+- The exact UTC timestamp of the run.
+- A direct link to open the run details and logs in the dltHub Web UI.
+
+---
+
+## Custom email notification on pipeline failure (in-code alternative)
+
+:::note When to use custom in-code emails
+Platform alerts above notify you when a **job run** fails, whatever the cause. The custom notification below covers **pipeline failures** only: it runs inside your job, so it cannot report a job that fails before your code runs or is killed mid-run by the container runtime.
+
+Use this custom approach only if you need custom email templates, attachments, or need to send alerts to external recipients outside your dltHub workspace.
+:::
+
+If you need a different channel, recipient list, or message body than the platform alerts provide, send the email from the job itself. The pattern below uses Python's standard `smtplib` with Gmail SMTP, but the same shape works for any SMTP server (Outlook, Workspace SMTP relay, or transactional providers like Resend, SendGrid, Mailgun).
+
+### Prerequisites
+
+Generate a Gmail **App Password**, a 16-character credential that lets SMTP authenticate without your real password:
+
+1. Make sure **2-Step Verification** is enabled on the Google Account.
+2. Open [https://myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
+3. Create a new password and name it, e.g. "dltHub pipeline".
+4. Copy the 16 characters. Google displays them with spaces (`abcd efgh ijkl mnop`); the spaces are decorative, so strip them.
+
+App Passwords don't affect normal sign-in: your password, 2FA, and existing sessions are unchanged. You can revoke the App Password from the same page without touching the account.
+
+If you're on a **Google Workspace** domain, an administrator may have disabled App Passwords org-wide. In that case use a transactional provider (Resend, SendGrid, Mailgun). The wiring is the same; just point `smtplib` at their SMTP server and use their API key as the password.
+
+### Store credentials in your prod profile
+
+Add to `.dlt/prod.secrets.toml`:
+
+```toml
+[notifications.email]
+host = "smtp.gmail.com"
+port = 587
+sender = "you@example.com"
+recipient = "you@example.com"
+password = "abcdefghijklmnop"     # 16 chars, no spaces, no angle brackets
+```
+
+`sender` must be the **same Google Account** the App Password was generated on.
+
+:::tip Allowlist outbound IPs
+If your SMTP server requires IP allowlisting, enable [static egress IPs](../pipeline-operations/job-configuration.md#static-egress-ips) so the job's outbound traffic uses a known set of source IPs.
+:::
+
+### Wire it into your pipeline
+
+```python
+import smtplib
+import time
+from datetime import datetime, timezone
+from email.message import EmailMessage
+
+import dlt
+from dlt.hub import run
+
+
+def send_email(subject: str, body: str) -> None:
+    host = dlt.secrets["notifications.email.host"]
+    port = int(dlt.secrets["notifications.email.port"])
+    sender = dlt.secrets["notifications.email.sender"]
+    recipient = dlt.secrets["notifications.email.recipient"]
+    password = dlt.secrets["notifications.email.password"]
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.set_content(body)
+
+    with smtplib.SMTP(host, port) as s:
+        s.starttls()
+        s.login(sender, password)
+        s.send_message(msg)
+
+
+@run.pipeline("my_pipeline")
+def my_job():
+    pipeline = dlt.pipeline(
+        pipeline_name="my_pipeline",
+        destination="warehouse",
+        dataset_name="my_dataset",
+    )
+
+    started = time.time()
+    try:
+        load_info = pipeline.run(my_source())
+        send_email(
+            f"[dltHub] {pipeline.pipeline_name} succeeded",
+            "\n".join([
+                f"Pipeline:  {pipeline.pipeline_name}",
+                f"Status:    SUCCESS",
+                f"Finished:  {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S UTC}",
+                f"Duration:  {time.time() - started:.1f}s",
+                f"Load ID:   {load_info.loads_ids[-1]}",
+            ]),
+        )
+    except Exception as e:
+        try:
+            send_email(
+                f"[dltHub] {pipeline.pipeline_name} FAILED",
+                f"Pipeline:  {pipeline.pipeline_name}\nError:     {type(e).__name__}: {e}",
+            )
+        except Exception as mail_err:
+            print(f"Failed to send failure email: {mail_err}")
+        raise
+```
+
+Wrap the failure-path `send_email` in its own try/except: a broken alerting channel shouldn't mask the underlying pipeline error.
+
+### Deploy and trigger
+
+```sh
+uv run dlthub deploy                            # syncs code + SMTP credentials
+uv run dlthub run my_job                        # triggers the job, email lands on completion
+```
+
+
+===== FILE: docs/website/docs/hub/notifications/slack.md =====
+
+---
+title: Send Slack notifications
+description: Connect Slack incoming webhooks to receive dltHub workspace run failure and success alerts, or send custom messages from your pipeline code.
+keywords: [slack, incoming webhooks, alerts, notifications, failure alerts, run alerts, hub, dltHub]
+---
+# Send Slack notifications
+
+dltHub supports native Slack notifications for pipeline status changes, configured directly in the Web UI using Slack incoming webhooks. You can also send custom Slack messages programmatically from within your pipeline code.
+
+---
+
+## dltHub platform alerts
+
+:::tip Recommended
+Configuring Slack alerts in the dltHub Web UI is the preferred way to monitor pipeline runs. It requires no code changes or secrets in your repository, catches container and runtime failures that happen before user code executes, formats messages with interactive Slack Block Kit buttons, and allows routing alerts to different channels across your team.
+:::
+
+With platform alerts, dltHub dispatches rich notifications to your Slack channels whenever a pipeline run fails or succeeds.
+
+![dltHub workspace Slack alert configuration](https://storage.googleapis.com/dlt-blog-images/dlthub-screenshot-slack-alert-config.png)
+
+### Step 1: Create an incoming webhook in Slack
+
+1. Open the [Slack Incoming Webhooks guide](https://api.slack.com/messaging/webhooks).
+2. Create a Slack app (or select an existing one in your workspace).
+3. Enable **Incoming Webhooks** and click **Add New Webhook to Workspace**.
+4. Select the destination Slack channel (e.g. `#data-alerts` or `#pipeline-monitoring`) and authorize the webhook.
+5. Copy the generated Webhook URL (`https://hooks.slack.com/services/T.../B.../...`).
+
+### Step 2: Connect the Slack channel in dltHub
+
+1. Open the dltHub Web UI and navigate to your workspace.
+2. In the left navigation, go to **Settings > Alerts** (`/w/<workspace_id>/settings/alerts`).
+3. In the **Slack Channel Setup** card, click **+ Add channel**.
+4. Enter a friendly **Channel** name (e.g. `#data-alerts`).
+5. Paste the **Webhook URL** copied from Slack.
+6. Click **Save** in the bottom changes bar to store the channel.
+
+### Step 3: Route alerts to your Slack channels and test
+
+1. In the **Alerts Configuration** section on the same page, locate the trigger:
+
+  - **Job run failures**: Fires whenever a pipeline or job run fails.
+  - **Job run successes**: Fires whenever a pipeline or job run finishes successfully.
+
+2. Toggle the alert switch **On**.
+
+3. Click the **Slack Channels** dropdown to open the **Post to** popover:
+
+  - Check the channel(s) that should receive this alert. You can select multiple channels.
+  - Click the **Test** button next to any channel to dispatch a test notification immediately and verify delivery for that alert type.
+
+4. Under **Scope**, choose which jobs to monitor:
+
+  - **All jobs**: Delivers alerts for any job run in the workspace.
+  - **Specific pipelines**: Filters alerts to a selected list of pipelines.
+
+5. (Optional) Under **Email Recipients**, select **( ) No email recipients** if you want alerts routed exclusively to Slack.
+
+6. Click **Save** in the bottom changes bar.
+
+### What the Slack notification includes
+
+dltHub formats alerts using Slack Block Kit:
+
+- **Status header**: Indicates the pipeline name, environment, and outcome (e.g. `dltHub • Job Run Failed: my_pipeline (prod)`).
+- **Color-coded attachment**: Red for failures, green for completions.
+- **Run metadata**: Workspace name, exact reported timestamp, and trigger source.
+- **Failure reason**: Truncated error message and stack excerpt (for failure alerts).
+- **Interactive action buttons**:
+  - **View Run Details**: Deep links directly to the run page and execution logs in dltHub.
+  - **View Pipeline**: Links to the pipeline overview page.
+
+---
+
+## Custom Slack notifications from code (in-code alternative)
+
+:::note When to use custom in-code notifications
+dltHub platform alerts above manage channel webhooks and pipeline run notifications across your workspace with zero code changes.
+
+Use the in-code pattern below only if you need custom notification logic from within Python (for instance, notifying Slack on dlt schema changes or custom load metrics).
+:::
+
+dlt ships a helper, `send_slack_message`, that posts to a Slack [incoming webhook](https://api.slack.com/messaging/webhooks). Combined with `pipeline.runtime_config.slack_incoming_hook`, it gives you a way to alert a channel directly from your Python script.
+
+### Store the webhook in your prod profile
+
+Add to `.dlt/prod.secrets.toml`:
+
+```toml
+[runtime]
+slack_incoming_hook = "https://hooks.slack.com/services/T…/B…/…"
+```
+
+dlt picks this up automatically and exposes it at runtime as `pipeline.runtime_config.slack_incoming_hook`. To also get notifications from local runs, mirror the same `[runtime]` block into `.dlt/dev.secrets.toml`.
+
+### Wire it into your pipeline
+
+```python
+import time
+from datetime import datetime, timezone
+
+import dlt
+from dlt.common.runtime.slack import send_slack_message
+from dlt.hub import run
+
+
+@run.pipeline("my_pipeline")
+def my_job():
+    pipeline = dlt.pipeline(
+        pipeline_name="my_pipeline",
+        destination="warehouse",
+        dataset_name="my_dataset",
+    )
+
+    hook = pipeline.runtime_config.slack_incoming_hook
+    started = time.time()
+    try:
+        load_info = pipeline.run(my_source())
+        if hook:
+            send_slack_message(
+                hook,
+                "\n".join([
+                    f":white_check_mark: *`{pipeline.pipeline_name}` succeeded*",
+                    f"*Finished:* {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S UTC}",
+                    f"*Duration:* {time.time() - started:.1f}s",
+                    f"*Load ID:* `{load_info.loads_ids[-1]}`",
+                ]),
+            )
+    except Exception as e:
+        if hook:
+            send_slack_message(
+                hook,
+                f":x: *`{pipeline.pipeline_name}` failed*: `{type(e).__name__}: {e}`",
+            )
+        raise
+```
+
+The `if hook:` check skips the Slack call when no webhook is configured. The same script works in any profile, whether you've set up notifications or not.
+
+:::tip Notify on schema changes
+You can also notify Slack whenever a load surfaces new tables or columns. The dlt chess pipeline shows this pattern by inspecting `schema_update` on each load package and posting a message when new tables or columns appear.
+:::
+
+### Deploy and trigger
+
+```sh
+uv run dlthub deploy                            # syncs code + prod secret
+uv run dlthub run my_job                        # triggers the job, posts to Slack on completion
+```
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/environment-variables.md =====
+
+---
+title: Environment variables
+description: Set workspace-scoped and profile-scoped environment variables for dltHub platform runs from the web app or the CLI
+keywords: [environment variables, workspace variables, secrets, profiles, CLI, hub, dltHub]
+---
+# Environment variables
+
+Workspace **owners** define environment variables on a dltHub workspace. A shared workspace set applies to every run. Optional per-[profile](profiles.md) values apply when that profile is in use (for example `prod` or `access`). When a job starts, the dltHub platform merges those variables into the run’s process environment (`os.environ`).
+
+Variables are managed on the platform — in the **web app** or with the **CLI** — rather than in the deployable `.dlt` config tree. They are not isolated from it, though: at run time they take priority over it, as described in [What runs receive](#what-runs-receive). [Workspace owners](../platform-capabilities/users-and-roles.md#workspace-roles) can list and change them.
+
+## Scopes and precedence
+
+| Scope         | Meaning                                                |
+| ------------- | ------------------------------------------------------ |
+| **Workspace** | Shared variables applied to every run in the workspace |
+| **Profile**   | Variables applied when the run uses that profile       |
+
+When the same name exists in both scopes, the **profile value** is used.
+
+On the dltHub platform, [batch jobs](overview.md#batch-vs-interactive) use the `prod` profile and [interactive jobs](overview.md#batch-vs-interactive) use the `access` profile. Profile-scoped variables for those names apply on top of the workspace-wide set. See [Profiles](profiles.md) and [Workspace setup](workspace-setup.md#understanding-workspace-profiles).
+
+## Plain and secret variables
+
+| Kind       | Behavior                                                                                                                                                       |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Plain**  | Values are readable when you list variables. An empty value is allowed.                                                                                        |
+| **Secret** | Values are write-only. After save, the UI keeps them hidden and the CLI lists them masked. Secrets require a non-empty value. Update a secret by replacing it. |
+
+## Manage variables in the web app
+
+1. Open the workspace, go to **Settings**, and open **Environment Variables**.
+2. Add or edit variables. Choose the **workspace** scope or a specific **profile**.
+3. Optionally **import a `.env` file** by copying its content, to stage many entries at once.
+4. Review the pending changes, then **Save**. Staged edits apply only after that explicit save.
+
+:::caution
+Secret values are visible only while you enter them. After save they are write-only — replace a secret to change its value.
+:::
+
+## Manage variables with the CLI
+
+From a connected workspace (see [Workspace setup](workspace-setup.md)), owners use `dlthub variable`:
+
+```sh
+# List every scope (secret values are masked)
+dlthub variable list
+
+# List one scope
+dlthub variable list --workspace
+dlthub variable list --profile prod
+
+# Set a plain workspace-wide variable (value from stdin, or pass --value)
+echo "INFO" | dlthub variable set LOG_LEVEL --plain --workspace
+
+# Set a secret for the prod profile (stdin / prompt keeps the value out of shell history)
+dlthub variable set SENTRY_DSN --secret --profile prod
+
+# Remove a variable (-y accepts the confirmation prompt)
+dlthub variable delete LOG_LEVEL --workspace -y
+
+# Succeed even if the variable is not there
+dlthub variable delete LOG_LEVEL --workspace --allow-missing -y
+```
+
+On `set`, choose both a kind (`--plain` or `--secret`) and a scope (`--workspace` or `--profile`).
+
+On `delete`, the two flags are orthogonal: `-y` accepts the confirmation prompt, while `--allow-missing` decides whether an absent variable is an error or a success. Scripts that must be repeatable usually want both.
+
+Full command reference: [CLI reference](../command-line-interface.md).
+
+## What runs receive
+
+At run start, the dltHub platform injects the workspace-wide variables and the variables for that run’s profile into the process environment, with profile values overriding workspace-wide values for the same name.
+
+Because they land in the process environment, `dlt` reads them through its [environment variables provider](../../general-usage/credentials/setup.md#environment-variables), which has the highest priority of all config providers. A variable named in the `SECTION__KEY` form therefore overrides the same key in the deployed `secrets.toml` or `config.toml` — a workspace variable `DESTINATION__POSTGRES__CREDENTIALS` wins over the value committed in `prod.secrets.toml`. See [Credentials setup](../../general-usage/credentials/setup.md) for the full provider order.
+
+## See also
+
+- [Credentials setup](../../general-usage/credentials/setup.md) — dlt config providers (TOML, environment, vaults)
+- [Secrets management](secrets-management.md) — dltHub-managed secrets and external vaults for cloud runs
+- [Profiles](profiles.md) — `dev`, `prod`, `access`, and custom profiles
+- [Settings](../platform-capabilities/settings.md) — workspace settings entry point
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/job-configuration.md =====
+
+---
+title: Job configuration
+description: Per-job options on the dltHub platform — execution timeouts, dependency groups, instance size, and TOML configuration sections
+keywords: [dlthub platform, job configuration, timeout, dependency groups, instance, size, require.instance, static egress, execute, require, expose, section]
+---
+# Job configuration
+
+This page documents the per-job options that aren't about *when* a job runs (those live in [Triggers and scheduling](triggers.md)) but about *how* it runs — execution limits, runner resources, the Python environment it gets, and the configuration values it reads at runtime.
+
+All options below are arguments to the `@run.pipeline`, `@run.job`, `@run.interactive`, and `@run.agent` decorators.
+
+## Execution constraints
+
+`execute={"timeout": "6h"}` overrides the default 120-minute job timeout. Use the dict form to also customize the grace period — the window for the job to finish in-flight work before the dltHub platform hard-kills the process:
+
+```py notype
+@run.pipeline(
+    my_pipeline,
+    execute={"timeout": {"timeout": 7200, "grace_period": 60}},
+)
+def long_load():
+    ...
+```
+
+Accepted timeout formats: a duration string (`"6h"`, `"30m"`) or an integer number of seconds.
+
+## Dependency groups
+
+Install extra packages only for the jobs that need them. Declare a group in `pyproject.toml`:
+
+```toml
+[dependency-groups]
+ibis = ["ibis-framework[duckdb]"]
+```
+
+Then opt into it in the decorator:
+
+```py notype
+@run.pipeline(my_pipeline, require={"dependency_groups": ["ibis"]})
+def transform(run_context: TJobRunContext):
+    ...
+```
+
+The dltHub platform composes the execution environment from the workspace's base dependencies plus the job's declared groups.
+
+## Instance size
+
+:::warning
+This feature is in public preview
+:::
+
+Pick how much CPU and memory the job’s runner gets. Pass it under `require.instance`:
+
+```py notype
+@run.pipeline(
+    my_pipeline,
+    require={"instance": {"size": "medium"}},
+)
+def heavy_sync():
+    ...
+```
+
+| `size`   | vCPU | Memory | Disk   | Multiplier |
+| -------- | ---- | ------ | ------ | ---------- |
+| `small`  | 2    | 4 GiB  | 500 GB | 1×         |
+| `medium` | 4    | 8 GiB  | 500 GB | 2×         |
+| `large`  | 8    | 16 GiB | 500 GB | 4×         |
+| `xlarge` | 16   | 32 GiB | 500 GB | 8×         |
+
+If you omit `instance`, jobs default to `small`. Larger sizes use a higher `multiplier` against your organization's run time budget. For example, a one-hour `large` run consumes four hours of budget.
+
+Pipeline-level tuning (chunking, parallelism, memory settings) often lowers the size you need, see [Optimizing dlt](../../reference/performance.md).
+
+## Static egress IPs
+
+Use this when you must whitelist outbound IP addresses so external systems can grant your jobs access to private resources. Opt in per job so outbound requests use your workspace's static egress IPs:
+
+```py notype
+@run.pipeline(my_pipeline, require={"static_egress_ips": True})
+def sync_from_vendor():
+    ...
+```
+
+Which static egress IPs your jobs use depends on your organization's region and data residency settings. See [Regions and data residency](../platform-capabilities/regions.md) for how regional data planes relate to your organization.
+
+The static egress IPs for the **EU region** are:
+
+- 63.181.217.92
+- 18.156.57.4
+- 63.183.227.2
+- 63.182.151.74
+
+The static egress IPs for the **US region** are:
+
+- 34.205.113.62
+- 44.221.24.144
+- 34.193.87.36
+- 98.80.106.70
+- 54.81.217.233
+
+## Inputs and outputs
+
+The parameters of a job with a default or `dlt.config.value` are its inputs, and a TypedDict return type is its output. `dlthub deploy` writes both into the deployment manifest as JSON Schemas. Describe a parameter or a field with `run.Doc`. Mark a parameter or a field that holds the id of a workspace entity with `run.Entity`:
+
+```py notype
+from typing import Annotated, TypedDict
+
+class Report(TypedDict):
+    """Rows the report counted."""
+    pipeline: Annotated[str, run.Entity("pipeline")]
+    rows: int
+
+@run.job
+def rerun_report(
+    run_id: Annotated[str, run.Entity("job-runs"), run.Doc("Run to report on")] = dlt.config.value,
+) -> Report:
+    ...
+```
+
+- Entity types are `job-runs`, `job`, `workspace`, `pipeline`, and `dataset`. Another type fails `dlthub deploy`.
+- The [job result](deployments.md#job-results) of a run lists the entities from its entity-typed inputs, overwritten by output fields of the same name.
+- The first entity-typed input becomes `expose.object_input` in the manifest. The Web UI reads it to link the job to entities.
+
+See [Entity-typed inputs and outputs](../agents/agent-definitions.md#entity-typed-inputs-and-outputs) for how agent jobs use them.
+
+## Job configuration via TOML
+
+Jobs read configuration through dlt's standard config system. The default section is the containing module name:
+
+```toml
+# applies to every job defined in usgs_pipeline.py
+[jobs.usgs_pipeline]
+epoch = "2026-04-05T00:00:00+00:00"
+
+# overrides for one specific job
+[jobs.usgs_pipeline.usgs_daily]
+epoch = "2026-04-10T00:00:00+00:00"
+```
+
+For inline jobs in `__deployment__.py`, pass `section="my_job"` to the decorator to give it a clean section name. Profile-aware overrides live in `dev.config.toml`, `prod.config.toml`, etc. — see [Workspace setup](workspace-setup.md#setting-up-configuration-files).
+
+## Display metadata
+
+`expose={...}` controls how the job appears in the dashboard and to selectors:
+
+```py notype
+@run.pipeline(
+    "github_pipeline",
+    expose={
+        "tags": ["ingest"],
+        "display_name": "GitHub commits ingest",
+    },
+)
+def load_commits():
+    ...
+```
+
+| Key            | Purpose                                                                                |
+| -------------- | -------------------------------------------------------------------------------------- |
+| `tags`         | List of labels for grouping in the dashboard and matching CLI selectors (`tag:ingest`) |
+| `display_name` | Human-readable label shown in the dashboard                                            |
+| `manual`       | Whether the runner adds the `manual:` trigger. `True` by default                       |
+
+See [Tags and bulk triggering](triggers.md#tags-and-bulk-triggering) for how tags drive `dlthub job trigger` selectors.
+
+## Next steps
+
+- [Triggers and scheduling](triggers.md) — schedule and chain jobs
+- [Deployments](deployments.md) — push these decorators to the dltHub platform
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/monitoring.md =====
+
+---
+title: Monitoring and debugging
+description: Monitor pipeline health, view logs, and diagnose failures on the dltHub platform
+keywords: [monitoring, observability, logs, debug, run status, metrics, dlthub platform]
+---
+# Monitoring and debugging
+
+Use the dltHub CLI and the Web UI at [app.dlthub.com](https://app.dlthub.com) to monitor pipeline health, inspect logs, and diagnose failures.
+
+## Check workspace status
+
+Retrieve a workspace summary from the CLI:
+
+```sh
+dlthub workspace info
+```
+
+The command returns the workspace name, job count, latest run status, and the latest deployment and configuration versions. See [`dlthub workspace info`](../command-line-interface.md#dlthub-workspace-info).
+
+## Inspect jobs
+
+```sh
+dlthub job list                    # all jobs
+dlthub job list "tag:ingest"       # jobs matching selector
+dlthub job list batch              # only batch jobs
+dlthub job info <name>             # details for one job
+dlthub job show <name>             # open the job page in the dashboard
+```
+
+## Inspect runs
+
+List, inspect, and open runs from the CLI:
+
+```sh
+# list runs (optionally filter by job name or selector)
+dlthub job runs list [name_or_selector] [--running]
+
+# exit status, timing, and metadata of a run (defaults to latest)
+dlthub job runs info <name> [run#]
+
+# open the run page in the web dashboard
+dlthub job runs show <name> [run#]
+```
+
+## View logs
+
+### From the CLI
+
+Display logs for the latest run of a job:
+
+```sh
+dlthub job logs my_pipeline.py
+```
+
+Display logs for a specific run number:
+
+```sh
+dlthub job logs my_pipeline.py 3
+```
+
+To stream logs in real time while a run is in progress, pass `--follow`, or supply it directly to [`dlthub run`](../command-line-interface.md#dlthub-run).
+
+For all options, see [`dlthub job logs`](../command-line-interface.md#dlthub-job-logs) and [`dlthub job runs logs`](../command-line-interface.md#dlthub-job-runs-logs).
+
+### From the Web UI
+
+Select any run on the Jobs page to open its **run detail page**, which provides:
+
+- **Status bar** — status badge, trigger type, profile, start and end timestamps, and elapsed time (live-updating while the run is in progress)
+- **Pipeline runs table** — every dlt pipeline executed during the job, with row counts and status
+- **Log viewer** — real-time streaming logs (refreshed each second while the run is active) or static logs once a run has completed
+
+## Understand run states
+
+| Status        | Meaning                                       |
+| ------------- | --------------------------------------------- |
+| **Pending**   | Run is queued, waiting to start               |
+| **Starting**  | Run is being initialized                      |
+| **Running**   | Actively executing                            |
+| **Completed** | Finished without errors                       |
+| **Failed**    | Encountered an error — check logs for details |
+| **Cancelled** | Manually stopped via CLI or Web UI            |
+
+## Diagnose a failed run
+
+From the CLI:
+
+1. `dlthub job runs info <name> [run#]` — check exit status and timing
+2. `dlthub job logs <name> [run#]` — read the error output
+
+From the Web UI:
+
+1. **Inspect the logs** — the log viewer on the run detail page contains the full execution output, including stack traces.
+2. **Review the pipeline runs** — the pipeline-runs table on the run detail page lists each dlt pipeline executed during the job and its outcome. Open an individual pipeline run for detailed load information (tables loaded, row counts, bytes, duration).
+3. **Consult the dashboard** — the Dashboard and Pipelines pages surface success-rate trends that help identify recurring issues.
+4. **Verify the deployment** — the Deployment & Config page indicates the currently deployed code version. Sync the latest changes with [`dlthub deploy`](../command-line-interface.md#dlthub-deploy).
+
+Common causes of failures:
+
+- **Missing dependencies** in `pyproject.toml` — all packages must be declared, not just locally installed (run `dlthub local run <job>` first to catch this)
+- **Secrets not configured for the `prod` profile** — the platform uses `prod` for batch jobs; check `.dlt/prod.secrets.toml`
+- **Script missing `if __name__ == "__main__":`** — the job does nothing without it
+- **`dev_mode=True` left in** — drops and recreates the dataset on every run, destroying production data
+- **Wrong destination credentials** — the `prod` profile may point to a different destination than `dev`
+- **Job timeout** — default is 120 minutes; override with `execute={"timeout": "6h"}` (see [Execution constraints](job-configuration.md#execution-constraints))
+
+## Cancel an active run
+
+Cancel the latest active run of a job:
+
+```sh
+dlthub job runs cancel my_pipeline.py
+```
+
+Cancel a specific run number:
+
+```sh
+dlthub job runs cancel my_pipeline.py 5
+```
+
+Cancel active runs across multiple matching jobs (for example everything tagged `ingest`):
+
+```sh
+dlthub job cancel "tag:ingest"
+
+# preview without cancelling
+dlthub job cancel "tag:ingest" --dry-run
+```
+
+See [`dlthub job runs cancel`](../command-line-interface.md#dlthub-job-runs-cancel) and [`dlthub job cancel`](../command-line-interface.md#dlthub-job-cancel). Cancellation is also available from the run detail page and the Jobs page context menu.
+
+## Monitor pipeline metrics
+
+The Web UI at [app.dlthub.com](https://app.dlthub.com) provides built-in dashboards and visualizations of pipeline telemetry, removing the need for an external observability stack. The Pipelines page surfaces aggregated metrics per pipeline:
+
+- **Success rate** — percentage of successful runs over time
+- **Rows loaded** — total data volume trends
+- **Duration** — performance trends for identifying regressions
+- **Charts** — time-series visualizations with toggleable views (Runs, Rows, Bytes, Duration)
+
+The Dashboard page provides a workspace-wide overview, summarizing job status and recent run activity.
+
+## Pipeline dashboard in the platform UI
+
+The same [pipeline and dataset troubleshooting dashboard](../ingestion/dashboard.md) you run locally is available directly in the dltHub platform Web UI under the **Notebooks** section. Open it from there to inspect schemas, query loaded data, and review run traces for pipelines deployed on the platform — no local setup required.
+
+## Known limitations
+
+Batch jobs have a configurable **maximum runtime**. Jobs exceeding this limit are automatically cancelled. See [Platform limits](overview.md#platform-limits) for details.
+
+## Troubleshooting
+
+### No 'access' profile detected
+
+Your interactive notebooks will use the `prod` (or default) configuration. Create `access.config.toml` and `access.secrets.toml` with read-only credentials.
+
+### No 'prod' profile detected
+
+Batch jobs will use the default configuration. Create `prod.config.toml` and `prod.secrets.toml` with read/write credentials.
+
+### Job not using latest code
+
+The CLI does not yet detect whether local code differs from remote. Run `dlthub workspace deployment sync` (or any `run` / `serve` / `deploy`) to ensure your latest code is deployed.
+
+### Logs not appearing
+
+Logs typically lag a few seconds during execution and are guaranteed complete after the run finishes. Wait for the run to complete, or stream them in real time:
+
+```sh
+dlthub job logs my_pipeline.py --follow
+```
+
+## See also
+
+- [dltHub platform overview](overview.md)
+- [Profiles](./profiles.md)
+- [CLI reference](../command-line-interface.md)
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/overview.md =====
+
+---
+title: Overview
+description: Deploy and run dlt pipelines, transformations and notebooks in the cloud with the dltHub platform
+keywords: [dlthub platform, deployment, cloud, scheduling, notebooks, dashboard, jobs, triggers, manifest]
+---
+# dltHub platform
+
+The dltHub platform is a managed cloud platform for running your [`dlt` pipelines](../../general-usage/pipeline.md), [transformations](../transformations/index.md), and [notebooks](../../general-usage/dataset-access/marimo.md). It mirrors your local [dltHub Workspace](../getting-started/installation.md#what-is-a-dlthub-workspace) into the cloud (called a **workspace deployment**), so your familiar dlt pipelines, [datasets](../data-discovery/datasets.md), notebooks, and dashboards run remotely with the same code that runs on your machine.
+
+For a high-level summary of platform capabilities, see [Pipeline operations](../getting-started/introduction.md#pipeline-operations) in the introduction.
+
+## Where to start
+
+| If you want to...                                                                                                                                            | Go to                                             |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------- |
+| Convert a Python project into a dltHub workspace and set up credentials                                                                                      | [Workspace setup](workspace-setup.md)             |
+| Push code to the cloud — ad-hoc runs or full manifest deploys                                                                                                | [Deployments](deployments.md)                     |
+| Schedule with cron/intervals, chain follow-ups, backfill with scheduler-driven intervals, gate on freshness, cascade refreshes, tag jobs for bulk operations | [Triggers and scheduling](triggers.md)            |
+| Configure timeouts, dependencies, timezone, and per-job TOML sections                                                                                        | [Job configuration](job-configuration.md)         |
+| Set workspace or profile environment variables for cloud runs                                                                                                | [Environment variables](environment-variables.md) |
+| Stream logs in real time, inspect run states, view metric dashboards, diagnose failures, cancel runs                                                         | [Monitoring and debugging](monitoring.md)         |
+| Pick a deployment region                                                                                                                                     | [Regions](../platform-capabilities/regions.md)    |
+
+## Key concepts
+
+### Jobs vs runs
+
+- A **Job** is a script registered in your workspace. It defines what code to run and optionally a schedule.
+- A **Run** is a single execution of a job. Each run has its own logs, status, and metadata. See [run states](monitoring.md#understand-run-states).
+
+### Batch vs interactive
+
+- **Batch jobs** run with the [`prod` profile](./profiles.md) and are meant for scheduled [data loading](../../general-usage/pipeline.md).
+- **Interactive jobs** run with the [`access` profile](./profiles.md) and are meant for [notebooks](../../general-usage/dataset-access/marimo.md), [dashboards](../ingestion/dashboard.md), and Streamlit apps.
+
+### Interactive application types
+
+| Type           | Description                                                                                                            |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Notebooks      | [Marimo notebooks](../../general-usage/dataset-access/marimo.md) for the pipeline dashboard, exploration, and analysis |
+| Streamlit apps | Interactive [Streamlit dashboards](../ingestion/dashboard.md)                                                          |
+| MCP servers    | Model Context Protocol servers that provide tool and data access for AI assistants and agents                          |
+
+Each interactive application is exposed via a unique public URL tied to its run.
+
+### Profiles
+
+[Profiles](./profiles.md) let you keep different configurations for different environments:
+
+- Local development can use [DuckDB](../../dlt-ecosystem/destinations/duckdb.md) with no credentials needed
+- Production runs use [MotherDuck](../../dlt-ecosystem/destinations/motherduck.md) (or [any cloud destination](../../dlt-ecosystem/destinations/index.md)) with full read/write access
+- Interactive sessions use read-only credentials for safety
+
+See [profiles in dltHub](./profiles.md) for details, and [Workspace setup](workspace-setup.md#understanding-workspace-profiles) for the relevant profile table.
+
+### Deployments and configurations
+
+- **Deployment** — your code files (`.py` scripts, notebooks)
+- **Configuration** — your `.dlt/*.toml` files ([settings and secrets](../../general-usage/credentials/index.md))
+
+Both are versioned separately, so you can update code without changing secrets and vice versa.
+
+## Command line fundamentals
+
+The `dlthub` CLI is split into two scopes:
+
+- **local** — `dlthub local ...` operates on the **local workspace** (files in `.dlt/`, your machine's pipeline working dirs, local profiles).
+- **remote** — `dlthub ...` (unqualified) operates on the **connected dltHub workspace** (the cloud deployment, configurations, jobs, runs).
+
+Most actions and entities exist in both scopes: running a job, serving an interactive app, inspecting workspace state, listing pipelines. Use the local scope to validate jobs before pushing them to the cloud.
+
+Verbs have consistent meaning regardless of the scope or the entity they operate on:
+
+| Verb      | Meaning                                                                                              |
+| --------- | ---------------------------------------------------------------------------------------------------- |
+| `info`    | Print structured information about the entity (workspace, job, run, deployment, configuration)       |
+| `list`    | Enumerate entities                                                                                   |
+| `run`     | Execute a batch job or pipeline                                                                      |
+| `serve`   | Start an interactive job (notebook, dashboard, MCP server, REST app)                                 |
+| `show`    | Open the GUI / human-readable interface (web dashboard remotely, marimo view locally) for the entity |
+| `clean`   | Remove local artefacts (e.g. wipe pipeline working dirs and locally loaded data)                     |
+| `sync`    | Push local changes to the cloud counterpart                                                          |
+| `cancel`  | Cancel an in-flight job or run                                                                       |
+| `connect` | Bind a local entity to a remote one                                                                  |
+| `deploy`  | Push the deployment manifest to the cloud                                                            |
+
+The local/remote split makes most pages of this guide read in pairs:
+
+| Local                                       | Remote                                |
+| ------------------------------------------- | ------------------------------------- |
+| `dlthub local run [<selector_or_job>]`      | `dlthub run [<selector_or_job>]`      |
+| `dlthub local serve [<selector_or_job>]`    | `dlthub serve [<selector_or_job>]`    |
+| `dlthub local pipeline run <pipeline_name>` | `dlthub pipeline run <pipeline_name>` |
+| `dlthub local info`                         | `dlthub workspace info`               |
+| `dlthub local show`                         | `dlthub show`                         |
+
+Run the local form first to catch missing dependencies, misconfigured destinations, or broken decorators without burning a remote slot.
+
+## Web UI
+
+Visit [app.dlthub.com](https://app.dlthub.com) to access the web dashboard. It provides workspace overview, jobs and runs management, run details with execution logs, deployment & config inspection, pipeline dashboards, and workspace settings.
+
+For monitoring runs, streaming logs, and diagnosing failures, see [Monitoring and debugging](monitoring.md).
+
+### Public links for interactive jobs
+
+Notebooks and dashboards can be shared via public links. Manage them either from the dashboard — open the job's context menu (or its detail page) and click **Manage Public Link** to toggle the link — or from the CLI:
+
+```sh
+# Generate a public link
+dlthub job publish fruitshop_notebook.py
+
+# Revoke an active link
+dlthub job unpublish fruitshop_notebook.py
+```
+
+Anyone with an active link can view the running notebook or dashboard — useful for sharing dashboards with stakeholders without dltHub platform access.
+
+## CLI reference
+
+For detailed CLI documentation, see [CLI](../command-line-interface.md).
+
+### Common commands
+
+| Command                                                                      | Description                                                               |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `dlthub login`                                                               | Authenticate with GitHub OAuth (interactive workspace selection)          |
+| `dlthub logout`                                                              | Clear local credentials                                                   |
+| `dlthub workspace list`                                                      | List all accessible workspaces                                            |
+| `dlthub workspace connect [name_or_id]`                                      | Connect project to a workspace (interactive picker if no arg)             |
+| `dlthub local info`                                                          | Show local workspace info                                                 |
+| `dlthub show`                                                                | Open the dltHub dashboard                                                 |
+| `dlthub local run <script_or_job>`                                           | Run a batch job on the local machine (recommended before deploying)       |
+| `dlthub local serve <script_or_job>`                                         | Serve an interactive app on the local machine                             |
+| `dlthub run [<script_or_selector>] [-f] [--refresh]`                         | Deploy and run a batch script or named job                                |
+| `dlthub serve [<script_or_selector>] [-f]`                                   | Deploy and serve an interactive application                               |
+| `dlthub deploy [--dry-run] [--show-manifest]`                                | Deploy jobs from `__deployment__.py`                                      |
+| `dlthub job trigger <selectors...> [--refresh] [--dry-run] [--profile NAME]` | Trigger runs for matching jobs (for example `tag:backfill`, `schedule:*`) |
+| `dlthub pipeline run <pipeline_name> [-f] [--refresh]`                       | Run a job by pipeline name                                                |
+| `dlthub job cancel <selector_or_name>...`                                    | Cancel active runs for matching jobs                                      |
+| `dlthub job runs cancel <selector_or_name> [run_number]`                     | Cancel a specific run (defaults to latest)                                |
+| `dlthub job logs <selector_or_name> [run_number] [-f]`                       | View or stream logs for a run                                             |
+| `dlthub job publish <script_path>`                                           | Generate a public link for an interactive notebook/app                    |
+| `dlthub job unpublish <script_path>`                                         | Revoke a public link                                                      |
+
+## Platform limits
+
+- **Platform limits**: non-interactive jobs default to 2 hours maximum execution time (override with `execute={"timeout": "6h"}` in the decorator — see [Job configuration](job-configuration.md#execution-constraints))
+- **Interactive timeout**: interactive jobs (notebooks, dashboards, MCP servers) are capped at 15 minutes of execution time and are not extended
+- **UI operations**: new jobs must currently be created via the CLI; once a job exists, subsequent runs can be triggered from the Web UI (and schedules can be changed there too)
+- **Pagination**: list views are paginated; the page size can be adjusted in the Web UI
+- **Log latency**: logs typically lag a few seconds during execution and are guaranteed complete after the run finishes (completed or failed state)
+- **One workspace per repo**: a single GitHub repository can only be connected to one remote workspace at a time; reconnecting deactivates jobs deployed under the previous binding — see [Workspace setup](workspace-setup.md#2-log-in-to-the-dlthub-platform)
+- **No drift detection**: the CLI does not yet detect whether local code differs from remote. Run `dlthub workspace deployment sync` (or any `run` / `serve` / `deploy`) to ensure your latest code is deployed
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/playground-workspace.md =====
+
+---
+title: The Playground workspace
+description: What the Playground workspace is, when to use it, and when to create a dedicated workspace instead.
+keywords: [playground, workspace, onboarding, dlthub platform, profiles]
+---
+# The Playground workspace
+
+## What is the Playground workspace?
+
+The **Playground workspace** is a regular dltHub [workspace](../getting-started/installation.md#what-is-a-dlthub-workspace) that the platform creates for you automatically when you create your account, so you always have somewhere to try dltHub without setting one up yourself. It is personal (single-member) and, unlike other workspaces, cannot be renamed or deleted.
+
+When you run `uvx dlthub-start`, it connects your local project to this workspace and provides a sample pipeline that loads to the [Playground destination](../ingestion/playground.md), so data lands on dltHub-managed storage with no warehouse, bucket, or credentials to configure. See [Deploy your first pipeline](../getting-started/onboarding.md) for the full flow.
+
+## When to use it
+
+Use the Playground workspace to get started with dltHub:
+
+* Complete [onboarding](../getting-started/onboarding.md) and the guided tour (`uvx dlthub-start`).
+* Learn how dltHub works: deployments, cloud runs, and the dashboard.
+* Run examples, paired with the [Playground destination](../ingestion/playground.md) so you can load and explore data without any setup.
+
+## When to create a new workspace
+
+Create a dedicated workspace instead of using the Playground when any of these apply:
+
+| Situation                 | Why a new workspace                                                                                                                                                   |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Real projects**         | Create a dedicated workspace with a name that fits the project. Unlike the Playground, you can rename or delete it, so it is easier to organize and clean up.         |
+| **Team or collaboration** | Workspaces have [roles](../platform-capabilities/users-and-roles.md) (Owner, Viewer) providing proper access control for organizations, not your personal Playground. |
+| **Environment isolation** | To isolate a pipeline's environment (dependencies, credentials, or configuration), you can give it its own workspace.                                                 |
+
+You can create a workspace in the platform UI at [app.dlthub.com](https://app.dlthub.com), or from the CLI:
+
+```sh
+uv run dlthub login
+uv run dlthub workspace connect "<name>" --create
+```
+
+Any organization **Member** can create workspaces; **Owners** additionally manage organization settings.
+
+## Next steps
+
+* [Workspace setup](workspace-setup.md): configure destinations, config, and secrets.
+* [Profiles](profiles.md): target different destinations from the same code.
+* [Deployments](deployments.md): declare jobs and run them on the platform.
+* [Users and roles](../platform-capabilities/users-and-roles.md): invite teammates and manage access.
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/profiles.md =====
+
+---
+title: Profiles
+description: Manage environment-specific configurations and secrets in dltHub Workspace
+keywords: [dltHub, profiles, workspace, configuration, secrets, environments]
+---
+# Profiles
+
+Profiles in `dlt` define **environment-specific configurations and secrets**.
+They allow you to manage separate settings for development, testing, and production using the same codebase.
+
+Each profile provides isolated configuration, credentials, and working directories for dlt pipelines, datasets, transformations, notebooks, and agents. You don't need to write any additional code to benefit from profiles.
+
+Profiles are defined and managed through [**TOML files**](../../general-usage/credentials) located in the `.dlt` directory.
+They are compatible with the `secrets.toml` and `config.toml` files you may already know from OSS dlt.
+
+The [dltHub platform](https://app.dlthub.com) automatically uses certain profiles to deploy and run pipelines, notebooks, and agents.
+
+## Enable the workspace and profiles
+
+Before you start, make sure you have followed the [installation instructions](../getting-started/installation.md) and enabled [additional Workspace features](../getting-started/installation.md#enable-workspace-mode) (which also include Profiles).
+
+**dltHub Workspace** is a unified environment for developing, running, and maintaining data pipelines—from local development to production.
+
+[More about dlt Workspace →](../getting-started/installation.md#what-is-a-dlthub-workspace)
+
+[Scaffold](../ingestion/init.md) a workspace with `uvx dlthub-init@latest`, then add a pipeline to it from inside the workspace:
+
+```sh
+dlthub pipeline init pokemon_api duckdb
+```
+
+Once initialized, the workspace exposes the extended CLI surface, including profile-aware commands:
+
+```sh
+dlthub profile
+dlthub local
+```
+
+## Define profiles
+
+Once your workspace is scaffolded, you'll have two familiar `toml` files in `.dlt`: `secrets.toml` and `config.toml`. They work exactly the same way as in OSS `dlt`. You can run your OSS dlt code without modifications.
+
+**Anything you place in those files is visible to all profiles**. For example, if you place
+`log_level="INFO"` in `config.toml`, it applies to all profiles. Only when you want certain settings to vary across profiles (for example, `INFO` level for development, `WARNING` for production) do you need to create profile-specific `toml` files.
+
+**dltHub Workspace** predefines several profiles. `dev` and `tests` are local-only and never uploaded; `prod`, `access`, and any custom profile referenced in a job decorator are synchronized to the cloud configuration on every `dlthub deploy`.
+
+| Profile      | Scope           | Description                                                                                                                                                                           |
+| ------------ | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`dev`**    | Local only      | Default profile for local development.                                                                                                                                                |
+| **`tests`**  | Local only      | Profile for automated test runs and CI/CD.                                                                                                                                            |
+| **`prod`**   | Synced to cloud | Production profile, [used by the dltHub platform to run batch pipelines](./workspace-setup.md#understanding-workspace-profiles).                                                      |
+| **`access`** | Synced to cloud | Read-only production profile [for interactive notebooks on the dltHub platform](./workspace-setup.md#understanding-workspace-profiles), and for agent jobs, which take it by default. |
+
+:::note
+The `dev` profile is active by default when you create a workspace. The others become active when pinned locally or automatically selected by the dltHub platform (`prod` for batch jobs, `access` for interactive jobs). An [agent job](../agents/index.md) is the exception among batch jobs: on the dltHub platform it takes `access` unless it declares another profile. Pin `require={"profile": "access"}` on every agent job to state it in the code.
+:::
+
+View available profiles:
+
+```sh
+dlthub profile list
+```
+
+## Switching profiles
+
+To change environments locally, **pin the desired profile**.
+This makes it the default for subsequent `dlthub local …` commands:
+
+```sh
+dlthub local profile use prod
+```
+
+You can verify your current profile:
+
+```sh
+dlthub profile info
+```
+
+To unpin:
+
+```sh
+rm .dlt/profile-name
+```
+
+:::tip
+You can pin a profile with any name, not just those from the predefined list. This allows you to create as many profiles as you need.
+You can also pin a profile that doesn't yet have profile-specific TOML files and add those files later.
+
+```sh
+dlthub -v local info
+```
+
+This command lists all expected file locations from which `dlt` reads profile settings.
+:::
+
+Once pinned, you can run your pipeline as usual through the local runner:
+
+```sh
+dlthub local pipeline run pokemon_api_pipeline
+```
+
+The workspace automatically uses the active profile's configuration, secrets, and data locations to run the pipeline.
+
+:::tip
+Profiles isolate not only configuration but also pipeline runs. Each profile has a separate working directory (`.dlt/state/<profile>/`) and
+local data directory (`.dlt/data/<profile>/`). This makes it easy to:
+
+1. Clean up your workspace and start over (`dlthub local clean`)
+2. Switch to the `tests` profile when running `pytest` (for example, using a fixture) so you can develop on the `dev` profile interactively while running tests in parallel in isolation
+:::
+
+### Switching profiles in code
+
+You can interact with the workspace run context, switch profiles, and inspect workspace configuration using code:
+
+```py
+import dlt
+
+workspace = dlt.current.workspace()
+
+workspace.switch_profile("test")
+```
+
+## Example: Switch destinations using profiles
+
+Let's walk through a setup that switches between **local DuckDB** (`dev`) and **MotherDuck** (`prod`).
+
+### Step 1. Configure the development profile
+
+In `.dlt/dev.secrets.toml` (to fully separate profiles), define your local destination:
+
+```toml
+[destination.warehouse]
+destination_type = "duckdb"
+```
+
+Then, in your pipeline script, use `destination="warehouse"`:
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name='pokemon_api_pipeline',
+    destination='warehouse',
+    dataset_name='pokemon_api_data',
+)
+```
+
+Run it locally:
+
+```sh
+dlthub local pipeline run pokemon_api_pipeline
+```
+
+Data will be stored in `.dlt/data/dev/warehouse.duckdb`.
+Pipeline state will be stored in `.dlt/state/dev/`.
+
+### Step 2. Configure the production profile
+
+Create `.dlt/prod.secrets.toml`:
+
+```toml
+[destination.warehouse]
+destination_type = "motherduck"
+credentials = "md:///dlt_data?motherduck_token=...."
+```
+
+Pin and activate the profile:
+
+```sh
+dlthub local profile use prod
+```
+
+#### Test the connection (optional)
+
+Before running your pipeline in production, you can verify that the credentials and dataset configuration work correctly:
+
+```sh
+dlthub --debug local pipeline sync pokemon_api_pipeline --destination warehouse --dataset-name pokemon_api_data
+```
+
+:::warning
+`sync` drops the local pipeline working directory and restores it from the destination. Only run this on a fresh local state for the `prod` profile (the case here, since you just switched profiles).
+:::
+
+This command connects to your destination, validates credentials, and bootstraps a local copy of pipeline state from the destination. If your credentials are invalid or the configuration is wrong, `dlt` will raise a detailed exception with a full stack trace—helping you debug before deployment.
+
+If the connection succeeds but the dataset doesn't yet exist in **MotherDuck**, you'll see a message like:
+
+```text
+ERROR: Pipeline pokemon_api_pipeline was not found in dataset pokemon_api_data in warehouse
+```
+
+This simply means the target dataset hasn't been created yet—no action is required.
+Now run your pipeline script to load data into MotherDuck:
+
+#### Run the pipeline with the `prod` profile
+
+```sh
+dlthub local pipeline run pokemon_api_pipeline
+```
+
+Data will be stored in MotherDuck.
+Pipeline state will be stored in `.dlt/state/prod/`.
+
+Once the pipeline completes, open the **Workspace Dashboard** with:
+
+```sh
+dlthub local show
+```
+
+You'll see your pipeline connected to the remote MotherDuck dataset and ready for further exploration.
+
+#### Schedule the pipeline to run on the dltHub platform
+
+Now you're ready to deploy your Workspace to the dltHub platform and [schedule your pipeline to run](deployments.md).
+Note that the dltHub platform will automatically use the `prod` profile you just created.
+
+## Inspecting and managing profiles
+
+### List profiles
+
+```sh
+dlthub profile list
+```
+
+### Show the current profile
+
+```sh
+dlthub profile info
+```
+
+### Clean the workspace (useful in dev)
+
+```sh
+dlthub local clean
+```
+
+## Best practices
+
+* Use **`dev`** for local testing and experimentation.
+* Use **`prod`** for production jobs on the dltHub platform.
+* Keep secrets in separate `<profile>.secrets.toml` files—never in code.
+* Use **named destinations** (like `warehouse`) to simplify switching.
+* Commit `config.toml`, but exclude all `.secrets.toml` files.
+* For process environment that should not live in the repo, set [workspace environment variables](environment-variables.md); profile-scoped values override the shared workspace set for that profile’s runs.
+
+## Next steps
+
+* [Configure the workspace](../getting-started/installation.md#what-is-a-dlthub-workspace)
+* [Deploy your pipeline](deployments.md)
+* [Monitor and debug pipelines](../../general-usage/pipeline#monitor-the-loading-progress)
+* [Environment variables](environment-variables.md)
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/secrets-management.md =====
+
+---
+title: Secrets management
+description: How dltHub handles your secrets, and how to manage them safely in production with vaults and access controls.
+keywords: [secrets, secrets management, vault, encryption, google secret manager, credentials, hub, dltHub]
+---
+# Secrets management
+
+Pipelines deployed to dltHub need access to credentials (warehouse passwords, API keys, tokens) at run time. This page explains how dltHub handles those secrets for you, and the options you have for managing them yourself in production.
+
+There are two broad approaches:
+
+- **Let dltHub manage your secrets.** Put them in your workspace config and deploy. dltHub encrypts and stores them for you. This is the default and needs no extra setup.
+- **Bring your own vault.** Keep secrets in an external secret manager (e.g. Google Secret Manager) and have dlt fetch them at run time. Recommended for production.
+
+## How dltHub handles your secrets
+
+Your secrets never live in plaintext on the platform. When you deploy, your configuration is transmitted over an encrypted channel and stored **encrypted at rest** in a secure, isolated store. That store can be reached by **only a single vault service identity, running inside a private network (VPC)**, so nothing else can touch it. At run time, your pipeline runner is granted **short-lived access** to only the secrets that run needs.
+
+dltHub workspaces use **profiles** to separate environments. Deployed pipelines run under the `prod` profile, so put production secrets in `.dlt/prod.secrets.toml` and development secrets in `.dlt/dev.secrets.toml`. See [profiles](profiles.md) for how `dev`, `prod`, and `access` profiles work and when each is used.
+
+For stronger isolation, especially in production, keep the secret values in your own vault instead.
+
+## Use your own vault: Google Secret Manager
+
+The most robust pattern for production is to keep your actual secret values in an external vault and let dlt fetch them at run time, so your `secrets.toml` holds only the small set of credentials needed to *reach* the vault, never the secrets themselves. dlt supports **Google Secret Manager** today; other vaults (AWS Secrets Manager, Azure Key Vault) are straightforward to add and welcome as contributions.
+
+### 1. Add the dependency
+
+dlt's Google Secret Manager provider requires `google-api-python-client`. Add it to your project dependencies so the deployed runner installs it too. Installing it only into your local environment will make the deployed run fail.
+
+In `pyproject.toml`:
+
+```toml
+dependencies = [
+    "dlt[hub]>=1.17.0",
+    "google-api-python-client",
+]
+```
+
+Then refresh your lockfile (`uv lock`) before deploying.
+
+### 2. Create a Google service account and store your secrets
+
+These steps are the same for OSS dlt and dltHub. See [Configure Google Secret Provider](../../general-usage/credentials/vaults.md#configure-google-secret-provider) in the OSS docs for:
+
+- Creating a GCP service account with `roles/secretmanager.secretAccessor` and downloading its JSON key.
+- Adding secrets to Google Secret Manager, including `dlt_secrets_toml` to store your `secrets.toml` as a single secret.
+- The [naming convention](../../general-usage/credentials/vaults.md#naming-convention-for-google-secrets) for individual secrets.
+
+### 3. Point dlt at the vault from your workspace
+
+In `.dlt/secrets.toml`, enable the provider and add **only** the service-account credentials from the JSON key file you created. The actual secrets (your warehouse token, etc.) stay in the vault:
+
+```toml
+[providers]
+enable_google_secrets = true
+
+[providers.google_secrets]
+only_secrets = false
+list_secrets = false
+
+[providers.google_secrets.credentials]
+project_id = "<project_id>"
+client_email = "<...>@<project_id>.iam.gserviceaccount.com"
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+```
+
+You can also configure this with environment variables. See [Activate Google Secret Provider](../../general-usage/credentials/vaults.md#activate-google-secret-provider) for the equivalent setup.
+
+### 4. Deploy and run
+
+```sh
+uv run dlthub deploy
+uv run dlthub run my_job
+```
+
+`dlthub deploy` syncs your code and the vault bootstrap config; the runner then fetches the actual secrets from Google Secret Manager at run time. The secret values themselves are never stored in your deployed config.
+
+## Harden access with static egress IPs
+
+If your vault, or the warehouse it holds credentials for, supports IP allowlisting, restrict it so it only accepts traffic from your dltHub runners. Opt in per job by adding `require={"static_egress_ips": True}` to the job's `@run.pipeline` decorator:
+
+```py notype
+@run.pipeline(my_pipeline, require={"static_egress_ips": True})
+def my_job():
+    ...
+```
+
+Then allowlist your region's dltHub egress IP set on the resource. See [Static egress IPs](job-configuration.md#static-egress-ips) for the current IP lists by region.
+
+## On the roadmap
+
+A built-in dltHub vault is on the roadmap, so you'll be able to manage secrets natively without wiring up an external provider.
+
+## See also
+
+- [Adding credentials](../../walkthroughs/add_credentials.md): general guide to dlt credentials.
+- [Vaults](../../general-usage/credentials/vaults.md): OSS reference for vault providers.
+- [Profiles](profiles.md): how `dev`, `prod`, and `access` profiles separate environments.
+- [Environment variables](environment-variables.md): workspace- and profile-scoped process environment for platform runs.
+- [Static egress IPs](job-configuration.md#static-egress-ips): pin job outbound traffic to known IPs for vault and destination allowlisting.
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/triggers.md =====
+
+---
+title: Triggers and scheduling
+description: Schedule jobs on the dltHub platform with cron, intervals, follow-up chains, freshness constraints, and refresh cascades
+keywords: [dlthub platform, triggers, scheduling, cron, interval, backfill, follow-up, freshness, refresh, tags]
+---
+# Triggers and scheduling
+
+A **trigger** declares when a job runs. Triggers are attached to a decorated job via the `trigger=` argument and are the source of truth for scheduling on the dltHub platform — there is no separate CLI for adding or removing schedules. Change the decorator, redeploy.
+
+```py
+from dlt.hub import run
+from dlt.hub.run import trigger
+
+@run.pipeline("github_pipeline", trigger=trigger.every("5m"))
+def load_commits():
+    ...
+```
+
+This page covers all the trigger types and the related scheduling features.
+
+## Basic triggers
+
+| Trigger                                | Meaning                                                                                                  |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `trigger.every("5m")`                  | Recurring interval (`"5m"`, `"6h"`, seconds as float)                                                    |
+| `trigger.schedule("0 * * * *")`        | Cron expression                                                                                          |
+| `trigger.once("2026-12-31T23:59:59Z")` | One-shot at a timestamp                                                                                  |
+| `"*/5 * * * *"`                        | Bare cron string — auto-detected                                                                         |
+| `upstream_job.success`                 | Follow-up — fires when an upstream job completes successfully                                            |
+| `upstream_job.fail`                    | Follow-up — fires when an upstream job fails                                                             |
+| `upstream_job.completed`               | Follow-up — fires on success or failure                                                                  |
+| `"job.fail:tag:ingest"`                | Follow-up on every job matching a selector, used by [agent jobs](../agents/index.md#triggers-for-agents) |
+| no `trigger=` at all                   | The job runs only when started by hand, and its runs carry a `manual:` trigger                           |
+
+A selector after `job.fail:` or `job.success:` takes the same forms `dlthub job trigger` takes: `tag:<tag>`, `batch:`, `*`, or a job ref. A job ref names one job: `jobs.<section>.<job>`, where the section is the module the job is declared in or the `section=` argument on its decorator. So `job.success:jobs.github_pipeline.load_commits` fires when the `load_commits` job in `github_pipeline.py` succeeds, and `job.fail:jobs.github_pipeline.*` fires on a failure of any job in that module. `dlthub job list` prints the job refs of a deployment. See [Job configuration via TOML](job-configuration.md#job-configuration-via-toml).
+
+The runner adds the `manual:` trigger itself, so passing `trigger.manual()` raises `InvalidTrigger: manual: triggers are added automatically`. Set `expose={"manual": False}` to keep the runner from adding it.
+
+## Multiple triggers
+
+A job can have any number of triggers. Pass a list and inspect `run_context["trigger"]` to discover which one fired:
+
+```py notype
+from dlt.hub.run import TJobRunContext
+
+@run.job(
+    trigger=[
+        trigger.schedule("0 * * * *"),
+        upstream_ingest.success,
+    ],
+)
+def transform(run_context: TJobRunContext):
+    if run_context["trigger"] == "schedule":
+        ...
+    elif run_context["trigger"] == "followup":
+        ...
+```
+
+`TJobRunContext` is a dict injected by the launcher with: `run_id`, `trigger`, `refresh`, and the scheduler-supplied `interval_start` / `interval_end` (see [Scheduler-driven intervals](#scheduler-driven-intervals) below).
+
+A list of triggers means "any of these": the job runs whenever one of them fires, and each one starts its own run. With `trigger=[job_a.success, job_b.success, job_c.success]`, the job runs once after each upstream job succeeds, so up to three times.
+
+### Wait for several upstream jobs
+
+To run a job once, after all of its upstream jobs have finished, combine a [follow-up trigger](#follow-up-triggers) and a [freshness check](#freshness-checks) for each upstream job:
+
+```py notype
+@run.job(
+    trigger=[job_a.success, job_b.success, job_c.success],
+    freshness=[job_a.is_fresh, job_b.is_fresh, job_c.is_fresh],
+)
+def job_d(run_context: TJobRunContext):
+    ...
+```
+
+Each upstream success tries to start `job_d`, but the freshness check skips the run while any upstream job's latest run is still running or failed. `job_d` runs once, right after the last upstream job finishes.
+
+To run the job at a fixed time instead, keep the freshness check and give it a schedule:
+
+```py notype
+@run.job(
+    trigger=trigger.schedule("0 8 * * *"),
+    freshness=[job_a.is_fresh, job_b.is_fresh, job_c.is_fresh],
+)
+def job_d(run_context: TJobRunContext):
+    ...
+```
+
+At each scheduled time, `job_d` runs only if the latest run of every upstream job completed. Otherwise that run is skipped, and `job_d` tries again at its next scheduled time.
+
+## Follow-up triggers
+
+Every decorated job exposes `.success`, `.fail`, and `.completed` trigger properties. Use them to chain jobs into a dependency graph.
+
+```py notype
+from dlt.hub.run import TJobRunContext
+
+@run.pipeline("transform_pipeline", trigger=ingest_job.success)
+def transform(run_context: TJobRunContext):
+    ...
+```
+
+Follow-up triggers fire as soon as the upstream completes — no polling, no scheduler delay.
+
+## Scheduler-driven intervals
+
+For incremental pipelines, declare the overall time range with `interval=` and let the dltHub platform hand each run a `[interval_start, interval_end]` window:
+
+```py notype
+@run.pipeline(
+    my_pipeline,
+    interval={"start": "2026-01-01T00:00:00Z"},
+    trigger=trigger.schedule("*/3 * * * *"),
+)
+def daily_ingest(run_context: TJobRunContext):
+    start = run_context["interval_start"]
+    end = run_context["interval_end"]
+    # pass start/end into your source so it is a pure function of inputs
+    ...
+```
+
+Behaviour:
+
+- Each run gets the interval that just elapsed
+- Missed runs are backfilled automatically — windows extend back continuously
+- On refresh, the dltHub platform resets the interval pointer to `interval.start`
+- Source code stays stateless — no cursor persistence, no state lookups
+
+### Schedule/cron and every intervals
+
+A `schedule` trigger is defined with a cron expression and produces intervals that start and end at absolute points in time — the cron ticks. The scheduler starts a job when an interval **closes**, handing it the window that just elapsed. Take a daily schedule firing at 3am, `trigger.schedule("0 3 * * *")`: the run started on May 26th at 3:00 receives the interval from May 25th 3:00 to May 26th 3:00. The same rule applies to a newly deployed job — it does not run on deployment but starts for the first time when the current interval elapses: deploy the 3am job at noon on May 25th and the first run happens on May 26th at 3:00, covering the May 25th–26th window.
+
+When such a job is started manually (e.g., `dlthub job trigger` or `dlthub run`), it receives the *current* interval: from the end of the last completed interval up to the most recent elapsed cron tick. In most cases these coincide — the scheduled run already covered everything up to the last tick, and the window currently in progress belongs to the next tick — so the interval is **empty** (`interval_start == interval_end`). An empty interval means there is no new window to process, and incremental jobs should treat it as a no-op. The exception is a missed or failed scheduled tick: a manual run then backfills the uncovered gap. To force already-loaded windows to be reprocessed, use a [refresh](#refresh-cascade) instead.
+
+An `every` trigger generates relative intervals of a fixed period, starting from now rather than at absolute tick times. A newly deployed job runs for the first time once the period has elapsed: deploy `trigger.every("1h")` at 14:20 and the first run starts at 15:20 with the interval 14:20 to 15:20. When run manually, the interval spans from the previous run start to now — so unlike cron jobs, manual runs of `every` jobs always receive a non-empty interval.
+
+## Freshness checks
+
+`freshness=[upstream.is_fresh]` blocks a job until the upstream's most recent interval has fully completed:
+
+```py notype
+@run.pipeline(
+    "report_pipeline",
+    trigger=trigger.schedule("0 * * * *"),
+    freshness=[ingest_job.is_fresh],
+)
+def build_report(run_context: TJobRunContext):
+    ...
+```
+
+Unlike a trigger, the job still runs on its own schedule — it just skips while upstream is mid-load. Use for transforms that must not observe partial data.
+
+:::note
+Invalidation and replacement of a single interval is not yet supported. Once done you'll be able to do:
+
+* **Parallel backfills** — splitting a historical range into many intervals processed concurrently.
+* **Partial refresh** — invalidating specific intervals so only the affected windows are reloaded.
+* **Interval-based freshness** — today freshness is a single watermark: a downstream job is gated only on the upstream's most recent completed interval. With interval-based freshness, every upstream interval that arrives (including late or replayed ones) would mark the matching downstream window stale, so the downstream job is re-run exactly for the affected windows instead of relying on a full refresh cascade.
+:::
+
+## Refresh cascade
+
+A backfill job with `refresh_propagation="always"` originates a refresh signal that propagates through all downstream jobs in the dependency graph. Downstream jobs receive `run_context["refresh"] = True` and react accordingly (for example `pipeline.refresh = "drop_sources"`).
+
+Refresh policies:
+
+| Policy     | Behaviour                                                        |
+| ---------- | ---------------------------------------------------------------- |
+| `"always"` | Originate a refresh signal on every run                          |
+| `"auto"`   | Pass through any refresh signal received from upstream (default) |
+| `"block"`  | Stop refresh propagation here                                    |
+
+```py
+from dlt.hub import run
+
+@run.job(expose={"tags": ["backfill"]}, refresh_propagation="always")
+def backfill():
+    """Cascade a refresh; does not load data."""
+```
+
+Then trigger it from the CLI:
+
+```sh
+dlthub job trigger "tag:backfill"
+dlthub run backfill --refresh    # explicit refresh on a single job
+```
+
+Note that the refresh signal will not drop your data automatically, you should use one of the [refresh](../../general-usage/pipeline.md#refresh-pipeline-data-and-state) options available.
+
+```py notype
+@run.pipeline(
+    "report_pipeline",
+    trigger=trigger.schedule("0 * * * *"),
+    freshness=[ingest_job.is_fresh],
+)
+def build_report(run_context: TJobRunContext):
+    ...
+    report_pipeline.run(
+        data_source(),
+        refresh="drop_data" if run_context["refresh"] else None
+    )
+```
+
+Above we tell `dlt` to truncate all tables belonging to resources in `data_source()` if the refresh signal got passed in the `refresh` flag.
+
+## Tags and bulk triggering
+
+Tags are labels on jobs (set via `expose={"tags": [...]}`). They are used to:
+
+1. Group related jobs in the dashboard
+2. Run bulk operations from the CLI via **selectors**
+
+```sh
+# trigger every job tagged "ingest"
+dlthub job trigger "tag:ingest"
+
+# trigger every job that has a schedule
+dlthub job trigger "schedule:*"
+
+# preview without running
+dlthub job trigger "tag:ingest" --dry-run
+```
+
+## Timezone
+
+Cron expressions default to UTC. To interpret them in a specific IANA timezone, declare it on the job:
+
+```py notype
+@run.pipeline(
+    my_pipeline,
+    trigger=trigger.schedule("0 9 * * *"),    # 9am
+    require={"timezone": "Europe/Berlin"},    # ...in Berlin time
+)
+def morning_load():
+    ...
+```
+
+Intervals in `run_context` remain UTC datetimes, but they align to tick boundaries in the declared timezone.
+
+`require={"timezone": ...}` holds for the whole run, whether or not the trigger generates an
+interval. This timezone is also the [context timezone](../../general-usage/schema.md#context-timezone)
+for the run, so `dlt` reads a naive timestamp in it and takes the day of a `date` column in it.
+When a job declares no timezone, `dlt` uses UTC.
+
+## Next steps
+
+- [Job configuration](job-configuration.md) — execution timeouts, dependency groups, TOML config sections
+- [Deployments](deployments.md) — `dlthub deploy` and the deployment manifest
+- [Monitoring and debugging](monitoring.md) — watch what triggers fire and diagnose failures
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/what-is-a-workspace.md =====
+
+---
+title: What is a workspace
+description: A dltHub workspace bundles pipelines, configuration, and AI toolkit into a single deployable unit that runs locally and in the cloud.
+keywords: [workspace, dlthub, workspace mode, dlt project, profiles, deployment]
+---
+# What is a workspace?
+
+A workspace is a Python project layout that bundles your dlt pipelines, transformations, configuration, and AI toolkit setup into a single deployable unit. The same folder runs on your local machine, in CI, and — when you deploy — on the managed dltHub platform, so what you build locally is what runs in production.
+
+A workspace is where you:
+
+- Connect a local repo to a remote workspace on dltHub (`dlthub workspace connect`)
+- Configure [destinations](../../dlt-ecosystem/destinations/index.md), config, and secrets (often via [profiles](profiles.md) like `dev`, `prod`, `access`)
+- Create and manage pipelines, [deployments](deployments.md), jobs/runs, logs, and notebooks
+- Control access via [workspace roles](../platform-capabilities/users-and-roles.md) (owner, developer, viewer)
+
+When you create an account, dltHub automatically creates a personal [Playground workspace](playground-workspace.md) so you can try things without any setup.
+
+Every workspace contains:
+
+- **`.dlt/.workspace`** — a marker file that activates the `dlthub` CLI, [profile support](profiles.md), and the managed-platform commands. Without this file you're using plain OSS `dlt`.
+- **`.dlt/config.toml`** and **`.dlt/secrets.toml`** — settings and credentials, with optional per-profile overrides (`dev`, `prod`, `tests`, `access`).
+- **`pyproject.toml`** (or `requirements.txt`) — workspace-level dependencies like `dlt[hub]`, `duckdb`, `marimo`.
+- **Pipeline files** and an optional **`__deployment__.py`** manifest — the code you run, and the description of how it's deployed.
+- **AI toolkit configuration** — skills, rules, and MCP wiring for Claude Code, Cursor, or Codex (added when you opt in during scaffolding).
+
+## Creating a workspace
+
+```sh
+uv run dlthub login
+uv run dlthub workspace connect "<name>" --create
+```
+
+When you [deploy](deployments.md), all files from your local project directory are mirrored to the remote workspace on the dltHub platform. To exclude files you don't want deployed (temp directories, data/state directories, local IDE files), list them in `.gitignore`. Files not excluded can cause deployments to fail with:
+
+```text
+Upload failed (HTTP 413): {"status_code":413,"detail":"Request Entity Too Large"}
+```
+
+## Next steps
+
+* [Workspace setup](workspace-setup.md): convert a Python project into a workspace and configure credentials.
+* [The Playground workspace](playground-workspace.md): the auto-created workspace for trying dltHub.
+* [Profiles](profiles.md): target different destinations from the same code.
+
+
+===== FILE: docs/website/docs/hub/pipeline-operations/workspace-setup.md =====
+
+---
+title: Workspace setup
+description: Convert a Python project into a dltHub platform workspace and configure credentials for dev, prod, and access profiles
+keywords: [dlthub platform, workspace, setup, login, profiles, credentials, configuration]
+---
+# Workspace setup
+
+A workspace ready for the dltHub platform is a regular Python project with a few additions. You can easily convert any existing dlt project into a dltHub workspace.
+
+Starting from scratch instead? Use `uvx dlthub-start@latest`, which scaffolds a workspace and runs a first pipeline for you — see [Deploy your first pipeline](../getting-started/onboarding.md).
+
+## 1. Enable dltHub platform features
+
+Initialize the workspace:
+
+```sh
+uvx dlthub-init@latest
+```
+
+`uvx dlthub-init@latest` scaffolds a ready-to-run workspace—the `.dlt/.workspace` marker that turns on workspace mode, local config and secrets, a managed `pyproject.toml`, and the dltHub AI skills your coding agent uses—then installs dependencies with `uv sync`.
+
+The `.dlt/.workspace` marker activates [profile support](./profiles.md) and enables the `dlthub` CLI command (including `dlthub profile` and `dlthub local`). Run `uvx dlthub-init@latest --help` for options like `--no-sync`. If you'd rather flip the toggle by hand, see [Enable workspace mode](../getting-started/installation.md#enable-workspace-mode).
+
+## 2. Log in to the dltHub platform
+
+```sh
+dlthub login
+```
+
+This opens a GitHub OAuth device flow and authenticates the current user. Then bind this repo to a remote workspace:
+
+```sh
+dlthub workspace connect [<name_or_id>] [--org-id <id>]
+```
+
+With no argument, an interactive picker is shown, grouped by organization. The chosen `workspace_id` (and `organization_id`, on the first connect) is persisted to `.dlt/config.toml`. To list workspaces you have access to, use `dlthub workspace list`.
+
+:::note
+The first time you run `dlthub deploy`, `dlthub run`, or `dlthub serve`, the CLI walks you through GitHub OAuth and then prompts you to pick (or create) a remote workspace — so you can skip this step entirely.
+
+`organization_id` is write-once. To switch organizations later, remove the line from `.dlt/config.toml` by hand and run `dlthub workspace connect` again.
+:::
+
+:::caution
+A single GitHub repository can be connected to only one remote workspace at a time. You connect with `dlthub workspace connect`. If you point the same repo at a different remote workspace, jobs deployed under the previous binding are deactivated — run history is preserved but their triggers no longer fire.
+
+Connecting multiple local repositories to the same remote workspace is not yet supported.
+:::
+
+## 3. Add pipelines
+
+```sh
+dlthub pipeline init <source> <destination>
+```
+
+This reuses the same machinery as `dlt init`, so verified sources and templates work as you'd expect. See [Initialize a pipeline](../ingestion/init.md) for templates, verified sources, and the agentic setup.
+
+## Credentials and configs
+
+### Understanding workspace profiles
+
+The dltHub platform uses **profiles** to manage different configurations for different environments. **Some profiles stay local; others are synchronized with the backend.** Local-only profiles live in your repo and are never uploaded. Synced profiles are pushed to the dltHub platform on every deploy so the cloud runtime can use the same configuration when it executes your jobs.
+
+The built-in profiles are:
+
+| Profile  | Scope               | Purpose                                                                                                       | Credentials                                  |
+| -------- | ------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `dev`    | Local only          | Local development (default when running on your machine)                                                      | Local DuckDB / test credentials              |
+| `tests`  | Local only          | Automated tests                                                                                               | Test credentials                             |
+| `prod`   | Synced with backend | Production batch jobs running on the dltHub platform                                                          | Read/write access to your destination        |
+| `access` | Synced with backend | Interactive notebooks and dashboards on the dltHub platform, and [agent jobs](../agents/index.md) that pin it | Read-only access (for safe data exploration) |
+
+Any custom profile you reference in a job decorator (e.g. `require={"profile": "analytics"}`) is also synced to the cloud configuration.
+
+When you run a script locally, dlt uses `dev`. When the dltHub platform executes a **batch job**, it uses `prod`. When the dltHub platform serves an **interactive job** (notebook, dashboard, MCP), it uses `access`. If `access` is not configured, interactive jobs fall back to `prod`. An **agent job** is a batch job and takes `prod` too, so declare `require={"profile": "access"}` on it to keep the production credentials out of its environment.
+
+See [profiles in dltHub](./profiles.md) for the full reference.
+
+### Setting up configuration files
+
+Configuration files live in the `.dlt/` directory:
+
+```text
+.dlt/
+├── .workspace              # Marker file enabling profiles + the `dlthub` CLI
+├── config.toml             # Workspace-wide config (all profiles)
+├── secrets.toml            # Workspace-wide secrets (gitignored)
+├── dev.config.toml         # Dev profile config
+├── prod.config.toml        # Production profile config
+├── prod.secrets.toml       # Production secrets (gitignored)
+├── access.config.toml      # Access profile config
+└── access.secrets.toml     # Access secrets (gitignored)
+```
+
+Settings in profile-scoped files override workspace-scoped files. Below is an example using **named destinations** so the same `destination="warehouse"` resolves to DuckDB locally and MotherDuck in production. You can swap MotherDuck for any cloud destination — see for example [BigQuery](../../dlt-ecosystem/destinations/bigquery.md), [Snowflake](../../dlt-ecosystem/destinations/snowflake.md), or [filesystem/S3](../../dlt-ecosystem/destinations/filesystem.md).
+
+**`config.toml`** (defaults shared by all profiles):
+
+```toml
+[runtime]
+log_level = "WARNING"
+dlthub_telemetry = true
+
+# Set automatically by `dlthub workspace connect`
+workspace_id = "your-workspace-id"
+organization_id = "your-organization-id"
+```
+
+`api_base_url` defaults to `https://api.dlthub.com` and only needs to be set when targeting a self-hosted control plane. For non-interactive auth (CI, scripts), set `api_key` in `secrets.toml` under `[runtime]` instead of relying on the OAuth flow.
+
+**`dev.config.toml`** (local DuckDB):
+
+```toml
+[destination.warehouse]
+destination_type = "duckdb"
+```
+
+**`prod.config.toml`** (production destination):
+
+```toml
+[destination.warehouse]
+destination_type = "motherduck"
+```
+
+**`prod.secrets.toml`** (read/write credentials for batch jobs):
+
+```toml
+[destination.warehouse.credentials]
+database = "your_database"
+password = "your-motherduck-service-token"
+```
+
+**`access.config.toml`** + **`access.secrets.toml`** (read-only credentials for interactive jobs):
+
+```toml
+[destination.warehouse]
+destination_type = "motherduck"
+```
+
+```toml
+[destination.warehouse.credentials]
+database = "your_database"
+password = "your-motherduck-read-only-token"
+```
+
+:::warning Security
+Files matching `*.secrets.toml` and `secrets.toml` are gitignored by default. Never commit secrets to version control. The dltHub platform stores your secrets securely when you sync your configuration.
+:::
+
+## Next steps
+
+- [Deployments](deployments.md) — quick deploys and the full deployment workflow
+- [Triggers and scheduling](triggers.md) — schedule jobs, chain follow-ups, and backfill with intervals
+- [Monitoring and debugging](monitoring.md) — watch runs, stream logs, diagnose failures
+
+
+===== FILE: docs/website/docs/hub/platform-capabilities/regions.md =====
+
+---
+title: Regions and data residency
+description: How the dltHub platform splits the control plane from regional data planes, and what that means for where your code, configuration, and workload data are stored.
+keywords: [region, data residency, control plane, data plane, EU, US, dltHub platform]
+---
+# Regions and data residency
+
+The dltHub platform is architected as a control plane paired with one or more regional data planes. Each organization is assigned to a data region (currently US or Europe), which determines where your code, configuration, secrets, and workload data are processed and stored.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client -->|1. authenticate| CP[Control plane US]
+    CP -->|2. scoped token| Client
+    Client -->|3. deploy, run, fetch logs| DP_US[Data plane US]
+    Client -->|3. deploy, run, fetch logs| DP_EU[Data plane Europe]
+```
+
+- The control plane is hosted in the US and is shared across all organizations.
+- A data plane operates in the selected supported region. Every organization is bound to exactly one data plane.
+
+### What the control plane handles
+
+The control plane is responsible for:
+
+- User and organization management
+- Authorization and permissions
+- Orchestration metadata — what jobs exist, when they should run, and the status of past runs
+
+The control plane does not store:
+
+- Uploaded user code
+- Deployment payloads
+- Workspace configuration values
+- Workspace secrets
+
+These reside exclusively in the organization's data plane.
+
+### What a data plane handles
+
+A regional data plane:
+
+- Executes batch and interactive jobs
+- Stores deployment artifacts (code and configuration) for organizations in that region
+- Holds workspace secrets used by jobs at runtime
+- Persists workload outputs and metadata generated by your jobs
+
+## How regional isolation is enforced
+
+The dltHub platform uses scoped tokens to ensure that user data only ever touches the organization's selected region:
+
+1. The client (CLI or dashboard) authenticates against the control plane.
+2. The control plane issues a scoped token tied to the target organization and its region.
+3. The client uses that token to communicate directly with the regional data plane for all operations involving user data — deployments, runs, secrets, and logs.
+
+As a result, code, deployment configuration, and secrets are transmitted to and stored only within the organization's selected region. The control plane never relays them.
+
+## Choosing a region
+
+You select a region when creating an organization, either during `dlthub login` or via the dashboard.
+
+:::caution
+An organization's region is permanent and cannot be changed after creation. To run workloads in a different region, create a new organization in the target region and redeploy with `dlthub deploy`.
+:::
+
+## Current limitations
+
+### Log routing
+
+Workload execution remains in the selected data plane. However, workload output streams — `stdout` and `stderr` — currently transit through the US region en route to the dashboard and the `dlthub job logs` command. This applies to all regions, including EU workspaces.
+
+For this reason, avoid emitting sensitive data in logs while running on dltHub:
+
+- Secrets and credentials
+- Personally identifiable information (PII)
+- Regulated data fields (personal health information (PHI), financial identifiers, etc.)
+- Secrets
+
+Unhandled exceptions may also leak sensitive context through stack traces, depending on your application and the libraries it uses. Catch and sanitize exceptions in code paths that handle sensitive values.
+
+We are developing a self-contained logging path that will keep log transit fully within the selected region. This page will be updated once that change is released.
+
+## See also
+
+- [dltHub platform overview](../pipeline-operations/overview.md)
+- [Profiles in dltHub](../pipeline-operations/profiles.md)
+
+
+===== FILE: docs/website/docs/hub/platform-capabilities/settings.md =====
+
+---
+title: Settings
+description: Configure workspaces, organizations, and personal account settings, including members, usage, and API keys, on the dltHub platform.
+keywords: [settings, workspace settings, organization settings, api keys, members, usage, dltHub platform]
+---
+# Settings
+
+The Settings page is where you configure your workspace, manage your organization, and manage personal account settings. Settings are organized into three levels: **workspace**, **organization**, and **user**.
+
+## Workspace settings
+
+Workspace settings are scoped to a single workspace. Workspace [Owners](users-and-roles.md#workspace-roles) can edit them. Other roles see the same fields as read-only.
+
+- **Name and description.** Edit the workspace name and description, then save with **Update Workspace**.
+- **Connection info.** Connection details that external tools and integrations use to talk to the workspace.
+- **Environment variables.** Define plain and secret process environment variables for the whole workspace or for a specific profile. See [Environment variables](../pipeline-operations/environment-variables.md).
+- **Alerts.** Subscribe to workspace alerts and get an email when a job run fails. See [dltHub Platform alerts](../notifications/email.md#dlthub-platform-alerts).
+- **Usage chart.** A monthly bar chart showing workspace consumption for the previous six months.
+
+### Members
+
+The Members section lists the users who have access to the workspace and their assigned [workspace role](users-and-roles.md#workspace-roles).
+
+Workspace owners can:
+
+- Add a member from the organization and assign them a workspace role.
+- Change an existing member's role.
+- Remove a member from the workspace. Removal revokes workspace access immediately, but the user remains in the organization.
+
+:::note
+Users invited directly to a workspace hold a regular workspace role here, but at the organization level they're tracked as [Collaborators](users-and-roles.md#organization-roles) rather than full organization members. Their organization membership only exists through their workspace access, so removing them from their last workspace in the organization also removes them from the organization.
+:::
+
+#### Default access
+
+Besides adding members individually, workspace owners can set a **Default Access** level for the workspace. It controls what access organization members get without being explicitly invited:
+
+- **Restricted.** Only invited people have access to the workspace.
+- **Viewer.** All organization members receive the [Viewer role](users-and-roles.md#workspace-roles) in this workspace.
+- **Developer.** All organization members receive the Developer role in this workspace.
+
+:::note
+Default access applies to organization members only. It doesn't extend to collaborators, who can only access the workspaces they were explicitly added to.
+:::
+
+See [Users and roles](users-and-roles.md) for the full permission model.
+
+### Workspace API keys
+
+:::warning
+This feature is in public preview
+:::
+
+Workspace API keys are long-lived tokens that authenticate non-interactive clients on behalf of a workspace rather than a personal user account. Use them for automation that should keep working independently of any individual user's account or workspace membership.
+
+Key properties:
+
+- **Scope.** Tied to a single workspace. The key grants access to that workspace only.
+- **Role.** Each key is created with a [workspace role](users-and-roles.md#workspace-roles), Developer (the default) or Viewer, fixed for the key's lifetime. A Developer key can deploy and run data-writing jobs. A Viewer key is read-only.
+- **Prefix.** Workspace API keys are prefixed with `dlt_sa_`.
+- **Expiration.** Every key expires after 90 days by default and 365 days at most. An expired key stops authenticating.
+- **Revocation.** Keys can be deleted at any time. A deleted key stops authenticating immediately.
+
+:::caution
+The plaintext value is displayed only once, at creation. It can't be retrieved later. If you lose it, delete the key and create a new one.
+:::
+
+#### Use a workspace key
+
+Clients authenticate with a workspace key the same way as with a [user API key](#api-keys). Because the key is valid for a single workspace, the workspace id should be pinned as well. Set `api_key` in `.dlt/secrets.toml` and `workspace_id` in `.dlt/config.toml`, both under `[runtime]`:
+
+```toml
+# .dlt/secrets.toml
+[runtime]
+api_key = "dlt_sa_..."
+```
+
+```toml
+# .dlt/config.toml
+[runtime]
+workspace_id = "your-workspace-id"
+```
+
+Both values can also be set as environment variables: `RUNTIME__API_KEY` and `RUNTIME__WORKSPACE_ID`. See [Workspace setup](../pipeline-operations/workspace-setup.md) for the full runtime configuration.
+
+:::note
+API key mode is non-interactive, the same as with a [user key](#use-a-user-key): `dlthub login` refuses to run while a key is configured, and the CLI never opens the workspace picker. Setting `workspace_id` explicitly is optional. Running `dlthub workspace connect` once pins the key's workspace. Because the key is bound to a single workspace, `dlthub workspace connect` can't target any other workspace, and `dlthub workspace connect --create` isn't available.
+:::
+
+## Organization settings
+
+Organization settings are accessed through the organization-level navigation and apply to every workspace in the organization. Only [organization Owners](users-and-roles.md#organization-roles) can edit them.
+
+- **Name and description.** Edit the organization name and description.
+- **Usage.** Aggregate usage metrics across all workspaces in the organization.
+- **Members.** Invite users to the organization and assign them an Owner or Member [organization role](users-and-roles.md#organization-roles).
+
+:::note
+Users invited directly to a single workspace don't need organization membership. They appear in the member list with the Collaborator role.
+:::
+
+## User settings
+
+User settings are personal to your account and are accessed from the user menu in the sidebar.
+
+### API keys
+
+API keys are personal, long-lived tokens that authenticate non-interactive clients on your behalf. For automation that shouldn't be tied to an individual account, use [workspace API keys](#workspace-api-keys) instead.
+
+Key properties:
+
+- **Scope.** Tied to your user account. A key inherits your organization and workspace permissions.
+- **Prefix.** User API keys are prefixed with `dlt_u_`.
+- **Expiration.** Every key expires after 90 days by default and 365 days at most. An expired key stops authenticating.
+- **Revocation.** Keys can be deleted at any time. A deleted key stops authenticating immediately.
+
+:::caution
+The plaintext value is displayed only once, at creation. It can't be retrieved later. If you lose it, delete the key and create a new one.
+:::
+
+#### Use a user key
+
+A client authenticates by supplying the plaintext value as the `RUNTIME__API_KEY` setting. It's resolved like any other dlt runtime setting, so you can provide it two ways:
+
+Environment variable, recommended for CI and headless runs:
+
+```sh
+export RUNTIME__API_KEY="dlt_u_..."
+```
+
+Or in `secrets.toml` under the `[runtime]` section:
+
+```toml
+[runtime]
+api_key = "dlt_u_..."
+```
+
+When an API key is set, the CLI uses it for every request and skips the interactive OAuth flow. In fact, `dlthub login` refuses to run while a key is configured, and `dlthub logout` leaves the key in place. To switch back to interactive login, remove the key from your configuration. See [Workspace setup](../pipeline-operations/workspace-setup.md) for the full runtime configuration.
+
+:::note
+Because API key mode is non-interactive, the CLI never opens the workspace picker. Target a workspace explicitly by setting `RUNTIME__WORKSPACE_ID` alongside the key, or by running `dlthub workspace connect <name>` once to pin it.
+:::
+
+## See also
+
+- [Users and roles](users-and-roles.md)
+- [Environment variables](../pipeline-operations/environment-variables.md)
+- [Regions and data residency](regions.md)
+- [Send email notifications](../notifications/email.md)
+- [dltHub platform overview](../pipeline-operations/overview.md)
+
+
+===== FILE: docs/website/docs/hub/platform-capabilities/users-and-roles.md =====
+
+---
+title: Users and roles
+description: How users, organizations, and workspaces relate on the dltHub platform, how to invite people, and what each role can do.
+keywords: [users, roles, permissions, organization, workspace, access control, RBAC, invite, members, dltHub platform]
+---
+# Users and roles
+
+The dltHub platform uses a two-level access model. Every user belongs to an **organization**, and within that organization users are granted access to one or more **workspaces**. A user's effective permissions are determined by the combination of their organization role and their per-workspace role.
+
+## Authentication
+
+Users authenticate against the dltHub platform in the following ways:
+
+- **GitHub OAuth.** Interactive sign-in for both the Web UI ([app.dlthub.com](https://app.dlthub.com)) and the CLI (`dlthub login`). The same identity is used everywhere. Your CLI session inherits the workspaces and roles granted to your GitHub account.
+- **Google OAuth.** Interactive sign-in to the Web UI ([app.dlthub.com](https://app.dlthub.com)) with a Google Account. As with GitHub OAuth, the same identity is used across the Web UI and CLI.
+- **Email signup.** Register for the Web UI ([app.dlthub.com](https://app.dlthub.com)) with an email address and password when you don't want to use a third-party identity provider.
+- **API keys.** Long-lived tokens for non-interactive clients. [User API keys](settings.md#api-keys), prefixed `dlt_u_`, act on your behalf and inherit your organization and workspace permissions. [Workspace API keys](settings.md#workspace-api-keys), prefixed `dlt_sa_`, are scoped to a single workspace, hold a fixed workspace role (Developer or Viewer), and work independently of any user account.
+
+## Inviting people to your organization and workspaces
+
+:::info Public preview
+This feature is available as a preliminary public preview to all dltHub customers.
+:::
+
+You can invite teammates by email into a whole organization or into a specific workspace, and control what each person can do with [roles](#roles).
+
+### Inviting someone
+
+1. Open the **Settings** page for the organization or workspace you want to add someone to.
+2. In the members section, find the pending-invites area and enter the person's **email address**.
+3. Pick the **role** they should have (see [Roles](#roles) below).
+4. Send the invite. The invitee receives an email with a link to the platform, and the invite appears in the pending-invites list until it's accepted. Invites expire after 14 days.
+
+You can invite people who don't have an account yet. They'll be added automatically when they sign up and sign in with that email.
+
+### Accepting an invite
+
+The invitee receives an email announcing the invite with a link to the platform. When they follow the link and **sign in** with the email the invite was sent to, they're automatically added to the organization or workspace with the role you chose. Brand-new users skip the "create your own organization" step and land directly in the team that invited them. Invites expire 14 days after they're sent.
+
+### Revoking an invite
+
+If you invited the wrong person or no longer want them to join, open the pending-invites list and **revoke** the invite. A revoked invite won't be accepted on sign-in. You can always send a new invite later.
+
+## Roles
+
+Roles decide what a member can see and do. Organizations and workspaces have separate roles.
+
+### Organization roles
+
+Organization membership is a prerequisite for any workspace access: a user must be added to the organization before they can be granted a role in any workspace.
+
+| Role           | Can do                                                                                     |
+| -------------- | ------------------------------------------------------------------------------------------ |
+| `owner`        | Full control: manage members and invites, change roles, and manage workspaces.             |
+| `member`       | Standard access: work within the organization and the workspaces they belong to.           |
+| `collaborator` | Limited access: typically someone invited to a single workspace rather than the whole org. |
+
+### Workspace roles
+
+A workspace role is assigned per workspace and controls what a user can do inside that workspace. A user can hold different workspace roles in different workspaces.
+
+| Role        | Can do                                                                                                                                                                                              |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `owner`     | Full control: manage members, invites, settings, and content in the workspace.                                                                                                                      |
+| `developer` | Write access: create and edit scripts, deployments, and configurations, deploy the workspace, and launch or cancel jobs on any profile. Can't manage members or change workspace settings.          |
+| `viewer`    | Read-only access: jobs, runs, logs, pipelines, deployments, and notebooks. Viewers can also launch jobs on the [access profile](../pipeline-operations/profiles.md), such as interactive notebooks. |
+
+### How invites and roles combine
+
+- Inviting someone to a **workspace** also adds them to the parent **organization** as a `collaborator`, so they can reach that workspace. If they are later removed from their last workspace in that organization, they're removed from the organization too.
+- If someone has more than one pending invite for the same organization or workspace, they get the **most permissive** role. Accepting an invite never lowers a role they already have.
+
+## Permission scope
+
+Role-based restrictions apply to both the dashboard and the API, so a viewer can't bypass restrictions by using the CLI. The table below summarizes what each workspace role can do.
+
+| Action                                                                              | Owner | Developer | Viewer |
+| ----------------------------------------------------------------------------------- | :---: | :-------: | :----: |
+| View jobs, runs, logs, pipelines, deployments, and notebooks                        | Yes   | Yes       | Yes    |
+| Launch jobs on the `access` profile (notebooks and read-only interactive workloads) | Yes   | Yes       | Yes    |
+| Launch jobs on the `prod` profile                                                   | Yes   | Yes       | No     |
+| Create or edit scripts, configurations, and deployments                             | Yes   | Yes       | No     |
+| Deploy the workspace (`dlthub deploy`)                                              | Yes   | Yes       | No     |
+| Cancel runs                                                                         | Yes   | Yes       | No     |
+| Publish or revoke public links for interactive applications                         | Yes   | Yes       | No     |
+| Change workspace settings                                                           | Yes   | No        | No     |
+| Manage environment variables                                                        | Yes   | No        | No     |
+| Manage members and invites                                                          | Yes   | No        | No     |
+| Manage workspace API keys                                                           | Yes   | No        | No     |
+
+For details on which profiles are used for which workloads, see [Profiles in dltHub](../pipeline-operations/profiles.md).
+
+## Managing members
+
+In the members section of an organization's or workspace's settings, you can:
+
+- **Change a member's role** with the inline role dropdown. The new permissions take effect immediately.
+- **Remove a member.** Removing a user from a workspace revokes their access to that workspace immediately.
+
+A few rules keep things safe:
+
+- You can't change **your own** role from the members table.
+- An organization or workspace can have **multiple owners**, but the **last owner can't be removed or demoted**. Promote someone else to owner first.
+
+## Multiple members per role
+
+Every role can be held by any number of people. There are no single-holder roles. In particular, organizations and workspaces can have more than one **owner**, so responsibility isn't tied to a single person. Any owner can invite people, manage members, and change roles. The only limit is that the **last owner can't be removed or demoted**. Promote someone else to owner first.
+
+## See also
+
+- [Regions and data residency](regions.md)
+- [Profiles in dltHub](../pipeline-operations/profiles.md)
+- [dltHub platform overview](../pipeline-operations/overview.md)
+
+
+===== FILE: docs/website/docs/hub/release-notes/2026-08-24.md =====
+
+---
+title: "Release highlights: August 24, 2026"
+description: dltHub release highlights for August 24, 2026, covering guided pipeline setup, consolidated settings, and the interactive schema graph.
+keywords: [dlthub, release notes, release highlights, platform, workspace, pipeline setup, settings, schema graph]
+---
+# Release highlights: August 24, 2026
+
+Released August 24, 2026. This release makes setting up a pipeline a guided flow, moves every settings surface into one place, and adds an interactive schema graph for exploring what a pipeline loaded.
+
+## Guided pipeline setup
+
+A new **Add a pipeline** page takes you from scaffolding a source locally to a deployed, scheduled pipeline in five guided steps. It's now the empty state for a workspace, so a new workspace opens straight into it.
+
+![The Add a Pipeline page in dltHub, with the five-step rail down the left and the first step, Create your pipeline locally, expanded to show source type, source name, endpoints, and a copy-ready agent prompt.](https://storage.googleapis.com/dlt-blog-images/dlthub-release-0-26-add-pipeline-stepper.png)
+
+Each step that a coding agent can do for you carries an agent-prompt panel that generates a copy-ready prompt for Claude, Codex, or Cursor. Steps that handle credentials stay manual, so secrets never leave your machine. The final step includes a trigger picker that turns the schedule you choose into the exact [trigger](../pipeline-operations/triggers.md) expression.
+
+![An agent-prompt panel on the Add a pipeline page, with a generated prompt and a control for choosing between Claude, Codex, and Cursor.](https://storage.googleapis.com/dlt-blog-images/dlthub-release-0-26-add-pipeline-agent-prompt.png)
+
+## All settings in one place
+
+Centralized settings is now the only settings surface. Every entry point opens it, and clicking **Settings** lands you on the workspace General section.
+
+[Environment variables](../pipeline-operations/environment-variables.md) now live there too. Workspace and organization owners can read and edit workspace variables and secrets without leaving settings. Everyone else sees a note explaining that the section is owner-only.
+
+![The Environment variables section inside dltHub centralized settings, listing workspace variables and secrets with edit controls.](https://storage.googleapis.com/dlt-blog-images/dlthub-release-0-26-settings-env-variables.png)
+
+The organization workspaces table now shows who owns each workspace and how many people are in it, with the member count linking straight to that workspace's members. [Playground workspaces](../pipeline-operations/playground-workspace.md) carry a badge and show "Just you".
+
+See [Settings](../platform-capabilities/settings.md) for the full reference.
+
+## An interactive schema graph
+
+Dataset and [pipeline run](../pipeline-operations/monitoring.md) pages gained an interactive schema graph. Table cards show columns, keys, per-table traffic, and load status, laid out in dependency columns with relationship edges anchored on the exact foreign-key columns. A table that failed to load gets a red border, with the error in its tooltip.
+

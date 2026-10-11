@@ -1,0 +1,2802 @@
+diff --git a/dlt/common/data_writers/writers.py b/dlt/common/data_writers/writers.py
+index 76d9b423f..73679d63b 100644
+--- a/dlt/common/data_writers/writers.py
++++ b/dlt/common/data_writers/writers.py
+@@ -518,7 +518,9 @@ class ArrowToParquetWriter(ParquetDataWriter):
+         # pyarrow writer starts a row group for each item it writes (even with 0 rows)
+         # it also converts batches into tables internally. by creating a single table
+         # we allow the user rudimentary control over row group size via max buffered items
+-        table = concat_batches_and_tables_in_order(items)
++        table = concat_batches_and_tables_in_order(
++            items, promote_options=self.parquet_format.arrow_concat_promote_options
++        )
+         # release batch references - concat is zero-copy so table shares the
+         # underlying buffers via Arrow refcounting. clearing the input list
+         # drops the Python-level RecordBatch/Table references so only the
+diff --git a/dlt/common/destination/configuration.py b/dlt/common/destination/configuration.py
+index 80fa7b685..2deccb4aa 100644
+--- a/dlt/common/destination/configuration.py
++++ b/dlt/common/destination/configuration.py
+@@ -37,6 +37,10 @@ class ParquetFormatConfiguration(BaseConfiguration):
+     """When False, constant columns (like _dlt_load_id) will use regular arrays instead of
+     dictionary-encoded arrays. Set to False for destinations using ADBC drivers that don't
+     support dictionary types (e.g., MSSQL)."""
++    arrow_concat_promote_options: Literal["none", "default", "permissive"] = "none"
++    """PyArrow concat_tables promote_options for Arrow table concatenation. "none" (default)
++    requires identical schemas and enables zero-copy concat. "default" promotes within type
++    families (e.g. int32 to int64). "permissive" promotes across families (e.g. int64 to double)."""
+ 
+     def max_timestamp_precision(self) -> int:
+         if (self.flavor or "").lower() == "spark":
+diff --git a/dlt/common/libs/pyarrow.py b/dlt/common/libs/pyarrow.py
+index 85652ad08..0f91cd420 100644
+--- a/dlt/common/libs/pyarrow.py
++++ b/dlt/common/libs/pyarrow.py
+@@ -910,10 +910,15 @@ def cast_arrow_schema_types(
+ 
+ 
+ def concat_batches_and_tables_in_order(
+-    tables_or_batches: Iterable[Union[pyarrow.Table, pyarrow.RecordBatch]]
++    tables_or_batches: Iterable[Union[pyarrow.Table, pyarrow.RecordBatch]],
++    promote_options: str = "none",
+ ) -> pyarrow.Table:
+-    """Concatenate iterable of tables and batches into a single table, preserving row order. Zero copy is used during
+-    concatenation so schemas must be identical.
++    """Concatenate iterable of tables and batches into a single table, preserving row order.
++
++    Args:
++        promote_options: PyArrow concat_tables promote_options. "none" (default) requires identical
++            schemas and enables zero-copy concat. "default" promotes within type families (e.g.
++            int32→int64). "permissive" promotes across families (e.g. int64→double).
+     """
+     batches = []
+     tables = []
+@@ -929,8 +934,8 @@ def concat_batches_and_tables_in_order(
+             raise ValueError(f"Unsupported type: `{type(item)}`")
+     if batches:
+         tables.append(pyarrow.Table.from_batches(batches))
+-    # "none" option ensures 0 copy concat
+-    return pyarrow.concat_tables(tables, promote_options="none")
++    # "none" ensures 0 copy concat; "default"/"permissive" allow type promotion
++    return pyarrow.concat_tables(tables, promote_options=promote_options)
+ 
+ 
+ def transpose_rows_to_columns(
+diff --git a/docs/website/docs/dlt-ecosystem/file-formats/parquet.md b/docs/website/docs/dlt-ecosystem/file-formats/parquet.md
+index cff46da8e..156f48fb8 100644
+--- a/docs/website/docs/dlt-ecosystem/file-formats/parquet.md
++++ b/docs/website/docs/dlt-ecosystem/file-formats/parquet.md
+@@ -49,6 +49,7 @@ Under the hood, `dlt` uses the [pyarrow parquet writer](https://arrow.apache.org
+ - `allow_truncated_timestamps` - will raise if precision is lost on truncated timestamps.
+ - `write_page_index`: Boolean specifying whether a [page index](https://github.com/apache/parquet-format/blob/master/PageIndex.md) is written. Defaults to `False`.
+ - `use_content_defined_chunking`: Boolean specifying whether [Content-Defined Chunking](https://github.com/apache/arrow/pull/45360) is used. Defaults to `False`. Requires `pyarrow>=21.0.0`, ignored otherwise.
++- `arrow_concat_promote_options`: Controls type promotion when concatenating multiple Arrow tables/DataFrames. Accepts `"none"` (default), `"default"`, or `"permissive"`. See [Handling schema mismatches](../verified-sources/arrow-pandas.md#handling-schema-mismatches-across-batches) for details.
+ 
+ :::tip
+ The default parquet version used by `dlt` is 2.4. It coerces timestamps to microseconds and truncates nanoseconds silently. Such a setting
+@@ -75,6 +76,7 @@ DATA_WRITER__FLAVOR
+ DATA_WRITER__VERSION
+ DATA_WRITER__DATA_PAGE_SIZE
+ DATA_WRITER__TIMESTAMP_TIMEZONE
++DATA_WRITER__ARROW_CONCAT_PROMOTE_OPTIONS
+ ```
+ 
+ :::tip
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md b/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md
+index be7fbdc52..f0719c0b4 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/arrow-pandas.md
+@@ -1,7 +1,7 @@
+ ---
+ title: Arrow Table / Pandas
+ description: dlt source for Arrow tables and Pandas dataframes
+-keywords: [arrow, pandas, parquet, source]
++keywords: [arrow, pandas, parquet, source, schema mismatch]
+ ---
+ import Header from './_source-info-header.md';
+ 
+@@ -77,6 +77,31 @@ The output file format is chosen automatically based on the destination's capabi
+ * synapse
+ 
+ 
++## Handling schema mismatches across batches
++
++When a resource yields multiple Arrow tables or DataFrames, `dlt` concatenates them before writing to disk. By default, all batches must have **identical schemas** — any type difference (e.g., `int64` vs `float64`) raises an `ArrowInvalid` error. This is common when reading multiple source files where pandas infers slightly different types per file.
++
++The `arrow_concat_promote_options` setting controls how type differences are resolved:
++
++| Value | Behavior |
++|-------|----------|
++| `"none"` (default) | Requires identical schemas. Zero-copy concatenation. |
++| `"default"` | Fills missing columns with nulls. Promotes `null`-typed columns to concrete types. Rejects cross-family type differences. |
++| `"permissive"` | Full type promotion (e.g., `int64` → `float64`). Fills missing columns with nulls. |
++
++```toml
++[sources.data_writer]
++arrow_concat_promote_options = "permissive"
++```
++
++```sh
++DATA_WRITER__ARROW_CONCAT_PROMOTE_OPTIONS=permissive
++```
++
++:::note
++Setting this to anything other than `"none"` disables zero-copy concatenation, which may increase memory usage for large batches. This maps directly to the `promote_options` parameter of [`pyarrow.concat_tables`](https://arrow.apache.org/docs/python/generated/pyarrow.concat_tables.html).
++:::
++
+ ## Add `_dlt_load_id` and `_dlt_id` to your tables
+ 
+ `dlt` does not add any data lineage columns by default when loading Arrow tables. This is to give the best performance and avoid unnecessary data copying.
+diff --git a/tests/common/data_writers/utils.py b/tests/common/data_writers/utils.py
+index 842038532..c8a33ecef 100644
+--- a/tests/common/data_writers/utils.py
++++ b/tests/common/data_writers/utils.py
+@@ -4,6 +4,7 @@ from typing import Type, Optional
+ from dlt.common.data_writers.buffered import BufferedDataWriter
+ from dlt.common.data_writers.writers import TWriter, ALL_WRITERS
+ from dlt.common.destination import DestinationCapabilitiesContext
++from dlt.common.destination.configuration import ParquetFormatConfiguration
+ 
+ from tests.utils import get_test_storage_root
+ 
+diff --git a/tests/libs/test_parquet_writer.py b/tests/libs/test_parquet_writer.py
+index 42d9051ab..b5595098a 100644
+--- a/tests/libs/test_parquet_writer.py
++++ b/tests/libs/test_parquet_writer.py
+@@ -10,6 +10,7 @@ from dlt.common import pendulum, Decimal, json
+ from dlt.common.configuration import inject_section
+ from dlt.common.data_writers.writers import ArrowToParquetWriter, ParquetDataWriter
+ from dlt.common.destination import DestinationCapabilitiesContext
++from dlt.common.destination.configuration import ParquetFormatConfiguration
+ from dlt.common.schema.utils import new_column
+ from dlt.common.configuration.specs.config_section_context import ConfigSectionContext
+ 
+@@ -388,6 +389,92 @@ def test_arrow_parquet_row_group_size() -> None:
+         assert reader.metadata.row_group(1).num_rows == 0
+ 
+ 
++def _caps_with_promote(promote_options: str) -> DestinationCapabilitiesContext:
++    caps = DestinationCapabilitiesContext.generic_capabilities()
++    caps.parquet_format = ParquetFormatConfiguration(arrow_concat_promote_options=promote_options)  # type: ignore[arg-type]
++    return caps
++
++
++@pytest.mark.parametrize("promote_options", ["none", "default"])
++def test_arrow_concat_promote_options_rejects_mismatched_types(promote_options: str) -> None:
++    """promote_options="none" and "default" both reject int64/float64 schema mismatch."""
++    c1 = {"col1": new_column("col1", "bigint")}
++    table_int = pa.Table.from_pydict({"col1": pa.array([1, 2], type=pa.int64())})
++    table_float = pa.Table.from_pydict({"col1": pa.array([3.0, 4.0], type=pa.float64())})
++
++    with pytest.raises((pa.lib.ArrowInvalid, pa.lib.ArrowTypeError)):
++        with get_writer(
++            ArrowToParquetWriter,
++            buffer_max_items=10,
++            caps=_caps_with_promote(promote_options),
++        ) as writer:
++            writer.write_data_item(table_int, columns=c1)
++            writer.write_data_item(table_float, columns=c1)
++
++
++def test_arrow_concat_promote_options_permissive() -> None:
++    """promote_options="permissive" promotes int64 to double on cross-family mismatch."""
++    c1 = {"col1": new_column("col1", "bigint")}
++    table_int = pa.Table.from_pydict({"col1": pa.array([1, 2], type=pa.int64())})
++    table_float = pa.Table.from_pydict({"col1": pa.array([3.0, 4.0], type=pa.float64())})
++
++    with get_writer(
++        ArrowToParquetWriter,
++        buffer_max_items=10,
++        caps=_caps_with_promote("permissive"),
++    ) as writer:
++        writer.write_data_item(table_int, columns=c1)
++        writer.write_data_item(table_float, columns=c1)
++
++    with pa.parquet.ParquetFile(writer.closed_files[0].file_path) as reader:
++        table = reader.read()
++        assert table.schema.field("col1").type == pa.float64()
++        assert table.column("col1").to_pylist() == [1.0, 2.0, 3.0, 4.0]
++
++
++@pytest.mark.parametrize("promote_options", ["default", "permissive"])
++def test_arrow_concat_promote_options_null_column(promote_options: str) -> None:
++    """Both "default" and "permissive" promote null + string to string."""
++    cols = {"col1": new_column("col1", "text")}
++    table_str = pa.Table.from_pydict({"col1": pa.array(["a", "b"], type=pa.string())})
++    table_null = pa.Table.from_pydict({"col1": pa.array([None, None], type=pa.null())})
++
++    with get_writer(
++        ArrowToParquetWriter,
++        buffer_max_items=10,
++        caps=_caps_with_promote(promote_options),
++    ) as writer:
++        writer.write_data_item(table_str, columns=cols)
++        writer.write_data_item(table_null, columns=cols)
++
++    with pa.parquet.ParquetFile(writer.closed_files[0].file_path) as reader:
++        table = reader.read()
++        assert table.schema.field("col1").type == pa.string()
++        assert table.column("col1").to_pylist() == ["a", "b", None, None]
++
++
++def test_arrow_concat_promote_options_permissive_missing_column() -> None:
++    """promote_options="permissive" fills missing columns with null."""
++    c1 = {"col1": new_column("col1", "bigint")}
++    table_two_cols = pa.Table.from_pydict(
++        {"col1": pa.array([1], type=pa.int64()), "col2": pa.array(["x"], type=pa.string())}
++    )
++    table_one_col = pa.Table.from_pydict({"col1": pa.array([2], type=pa.int64())})
++
++    with get_writer(
++        ArrowToParquetWriter,
++        buffer_max_items=10,
++        caps=_caps_with_promote("permissive"),
++    ) as writer:
++        writer.write_data_item(table_two_cols, columns=c1)
++        writer.write_data_item(table_one_col, columns=c1)
++
++    with pa.parquet.ParquetFile(writer.closed_files[0].file_path) as reader:
++        table = reader.read()
++        assert table.column("col1").to_pylist() == [1, 2]
++        assert table.column("col2").to_pylist() == ["x", None]
++
++
+ def test_empty_tables_get_flushed() -> None:
+     c1 = {"col1": new_column("col1", "bigint")}
+     single_elem_table = pa.Table.from_pylist([{"col1": 1}])
+
+
+===== COMMIT 5ff1651d =====
+
+
+commit 5ff1651dc
+Author: Travior
+Date: 2026-03-12
+
+    switch lancedb example from spotify to podcastindex (#3736)
+
+diff --git a/docs/examples/custom_destination_lancedb/.dlt/config.toml b/docs/examples/custom_destination_lancedb/.dlt/config.toml
+index 4fd35e115..51b642bdd 100644
+--- a/docs/examples/custom_destination_lancedb/.dlt/config.toml
++++ b/docs/examples/custom_destination_lancedb/.dlt/config.toml
+@@ -1,2 +1,2 @@
+ [lancedb]
+-db_path = "spotify.db"
+\ No newline at end of file
++db_path = "podcast.db"
+\ No newline at end of file
+diff --git a/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml b/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml
+index 9c86df320..8711116be 100644
+--- a/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml
++++ b/docs/examples/custom_destination_lancedb/.dlt/example.secrets.toml
+@@ -1,7 +1,7 @@
+-[spotify]
+-client_id = ""
+-client_secret = ""
++[sources.podcastindex]
++api_key = ""
++api_secret = ""
+ 
+-# provide the openai api key here
++# provide the OpenAI API key here
+ [destination.lancedb.credentials]
+ embedding_model_provider_api_key = ""
+\ No newline at end of file
+diff --git a/docs/examples/custom_destination_lancedb/.gitignore b/docs/examples/custom_destination_lancedb/.gitignore
+index c73564481..2b143ae4d 100644
+--- a/docs/examples/custom_destination_lancedb/.gitignore
++++ b/docs/examples/custom_destination_lancedb/.gitignore
+@@ -1 +1 @@
+-spotify.db
+\ No newline at end of file
++podcast.db
+\ No newline at end of file
+diff --git a/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py b/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
+index c33630f37..d41f3db88 100644
+--- a/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
++++ b/docs/examples/custom_destination_lancedb/custom_destination_lancedb.py
+@@ -8,10 +8,10 @@ keywords: [destination, credentials, example, lancedb, custom destination, vecto
+ This example showcases a Python script that demonstrates the integration of LanceDB, an open-source vector database,
+ as a custom destination within the dlt ecosystem.
+ The script illustrates the implementation of a custom destination as well as the population of the LanceDB vector
+-store with data from various sources.
++store with podcast episode data from Podcast Index.
+ This highlights the seamless interoperability between dlt and LanceDB.
+ 
+-You can get a Spotify client ID and secret from https://developer.spotify.com/.
++You can get a Podcast Index API key and secret from https://api.podcastindex.org/developer_home.
+ 
+ We'll learn how to:
+ - Use the [custom destination](../dlt-ecosystem/destinations/destination.md)
+@@ -19,12 +19,13 @@ We'll learn how to:
+ - Use Pydantic for unified dlt and lancedb schema validation
+ """
+ 
+-__source_name__ = "spotify"
++__source_name__ = "podcastindex"
+ 
+-import datetime  # noqa: I251
+ from dataclasses import dataclass, fields
++import hashlib
+ import os
+ from pathlib import Path
++import time
+ from typing import Any
+ 
+ import lancedb
+@@ -32,11 +33,10 @@ from lancedb.embeddings import get_registry
+ from lancedb.pydantic import LanceModel, Vector
+ 
+ import dlt
++from dlt.common.configuration import configspec
+ from dlt.common.schema import TTableSchema
+ from dlt.common.typing import TDataItems, TSecretStrValue
+-from dlt.sources.helpers import requests
+-from dlt.common.configuration import configspec
+-from dlt.sources.helpers.rest_client import RESTClient, AuthConfigBase
++from dlt.sources.helpers.rest_client import AuthConfigBase, RESTClient
+ 
+ # access secrets to get openai key
+ openai_api_key: str = dlt.secrets.get(
+@@ -62,14 +62,12 @@ os.environ["OPENAI_API_KEY"] = openai_api_key
+ class EpisodeSchema(LanceModel):
+     """Used for dlt and lance schema validation"""
+ 
+-    id: str  # noqa: A003
+-    name: str
++    id: int  # noqa: A003
++    title: str
+     description: str = func.SourceField()
+-    release_date: datetime.date
+-    audio_preview_url: str
+-    duration_ms: int
+-    href: str
+-    uri: str
++    datePublished: int
++    link: str
++    duration: int
+     # there is more data but we are not using it ...
+ 
+ 
+@@ -81,67 +79,61 @@ class EpisodeSchemaVector(EpisodeSchema):
+ 
+ @dataclass(frozen=True)
+ class Shows:
+-    monday_morning_data_chat: str = "3Km3lBNzJpc1nOTJUtbtMh"
+-    superdatascience_podcast: str = "1n8P7ZSgfVLVJ3GegxPat1"
+-    lex_fridman: str = "2MAi0BvDc6GTFvKFPXnkCL"
++    latent_space: str = "6058902"
++    superdatascience_podcast: str = "4299005"
++    lex_fridman: str = "745287"
+ 
+ 
+ @configspec
+-class SpotifyAuth(AuthConfigBase):
+-    client_id: str = None
+-    client_secret: TSecretStrValue = None
++class PodcastIndexAuth(AuthConfigBase):
++    api_key: str = None
++    api_secret: TSecretStrValue = None
+ 
+     def __call__(self, request) -> Any:
+-        if not hasattr(self, "access_token"):
+-            self.access_token = self._get_access_token()
+-        request.headers["Authorization"] = f"Bearer {self.access_token}"
++        epoch_time = int(time.time())
++        signature = hashlib.sha1(
++            f"{self.api_key}{self.api_secret}{str(epoch_time)}".encode()
++        ).hexdigest()
++        headers = {
++            "X-Auth-Date": str(epoch_time),
++            "X-Auth-Key": self.api_key,
++            "Authorization": signature,
++            "User-Agent": "DltPipeline/1.0",
++        }
++        request.headers.update(headers)
+         return request
+ 
+-    def _get_access_token(self) -> Any:
+-        auth_url = "https://accounts.spotify.com/api/token"
+-        auth_response = requests.post(
+-            auth_url,
+-            {
+-                "grant_type": "client_credentials",
+-                "client_id": self.client_id,
+-                "client_secret": self.client_secret,
+-            },
+-        )
+-        return auth_response.json()["access_token"]
+-
+ 
+ @dlt.source
+-def spotify_shows(
+-    client_id: str = dlt.secrets.value,
+-    client_secret: str = dlt.secrets.value,
++def podcast_episodes(
++    api_key: str = dlt.secrets.value,
++    api_secret: str = dlt.secrets.value,
+ ):
+-    spotify_base_api_url = "https://api.spotify.com/v1"
++    podcast_index_base_api_url = "https://api.podcastindex.org/api/1.0"
+     client = RESTClient(
+-        base_url=spotify_base_api_url,
+-        auth=SpotifyAuth(client_id=client_id, client_secret=client_secret),
++        base_url=podcast_index_base_api_url,
++        auth=PodcastIndexAuth(api_key=api_key, api_secret=api_secret),
+     )
+ 
+     for show in fields(Shows):
+         show_name = show.name
+         show_id = show.default
+-        url = f"/shows/{show_id}/episodes"
++        url = f"/episodes/byfeedid?id={show_id}"
+         yield dlt.resource(
+-            client.paginate(url, params={"limit": 50}),
++            client.get(url, params={"limit": 50}).json()["items"] or [],
+             name=show_name,
+             primary_key="id",
+-            parallelized=True,
+             max_table_nesting=0,
+-            # reuse lance model to filter out all non-matching items and extra columns from spotify api
++            # reuse lance model to filter out all non-matching items and extra columns from the Podcast Index API
+             # 1. unknown columns are removed ("columns": "discard_value")
+-            # 2. non validating items (ie. without id or url) are removed ("data_type": "discard_row")
+-            # 3. for some reason None values are returned as well 🤯, add_filter takes care of that
++            # 2. non-validating items (for example missing `id` or `link`) are removed ("data_type": "discard_row")
+             columns=EpisodeSchema,
+             schema_contract={
+                 "tables": "evolve",
+                 "columns": "discard_value",
+                 "data_type": "discard_row",
+             },
+-        ).add_filter(lambda i: i is not None)
++        ).add_filter(lambda i: i["description"] != "")
+ 
+ 
+ @dlt.destination(batch_size=250, name="lancedb")
+@@ -169,13 +161,13 @@ if __name__ == "__main__":
+             pass
+ 
+     pipeline = dlt.pipeline(
+-        pipeline_name="spotify",
++        pipeline_name="podcastindex",
+         destination=lancedb_destination,
+-        dataset_name="spotify_podcast_data",
++        dataset_name="podcastindex_data",
+         progress="log",
+     )
+ 
+-    load_info = pipeline.run(spotify_shows())
++    load_info = pipeline.run(podcast_episodes())
+     print(load_info)
+ 
+     row_counts = pipeline.last_trace.last_normalize_info
+
+
+===== COMMIT 92f885ce =====
+
+
+commit 92f885cee
+Author: rudolfix
+Date: 2026-03-12
+
+    (chore) adds cli docs check to docs ci workflow (#3739)
+
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 69808c87c..bd3278d54 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -49,10 +49,6 @@ jobs:
+           export PATH=$PATH:"/c/Program Files/usr/bin" # needed for Windows
+           make lint
+ 
+-      - name: Check that cli docs are up to date
+-        run: make check-cli-docs
+-        if: ${{ matrix.python-version == '3.11' }}
+-
+       - name: Check filesizes
+         uses: ppremk/lfs-warning@v3.2
+         with:
+diff --git a/.github/workflows/test_docs.yml b/.github/workflows/test_docs.yml
+index 4f7d73d29..46ffacaf4 100644
+--- a/.github/workflows/test_docs.yml
++++ b/.github/workflows/test_docs.yml
+@@ -79,6 +79,12 @@ jobs:
+         run:  docker compose -f "tests/load/weaviate/docker-compose.yml" up -d
+ 
+ 
++      - name: Install root project for CLI docs check
++        run: uv sync --extra cli
++
++      - name: Check that CLI docs are up to date
++        run: make check-cli-docs
++
+       - name: Install dependencies
+         run: cd docs && make dev
+ 
+diff --git a/dlt/_workspace/cli/commands.py b/dlt/_workspace/cli/commands.py
+index 4d01248c7..6cad6a1b5 100644
+--- a/dlt/_workspace/cli/commands.py
++++ b/dlt/_workspace/cli/commands.py
+@@ -69,7 +69,7 @@ version if run again with an existing `source` name. You will be warned if files
+             ),
+         )
+         parser.add_argument(
+-            "destination", nargs="?", help="Name of a destination ie. bigquery or redshift"
++            "destination", nargs="?", help="Name of a destination i.e. bigquery or redshift"
+         )
+         parser.add_argument(
+             "--location",
+
+
+===== COMMIT 988996c0 =====
+
+
+commit 988996c0a
+Author: Elisabeth Reitmayr
+Date: 2026-03-11
+
+    Docs/ai workbench license (#3729)
+
+diff --git a/README.md b/README.md
+index befac0305..810507ef2 100644
+--- a/README.md
++++ b/README.md
+@@ -96,9 +96,7 @@ You can find examples for various use cases in the [examples](docs/examples) fol
+ * `minor` new features, sometimes automatic migrations
+ * `patch` bug fixes
+ 
+-We suggest that you allow only `patch` level updates automatically:
+-* Using the [Compatible Release Specifier](https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release). For example **dlt~=1.0** allows only versions **>=1.0** and less than **<1.1**
+-* Poetry [caret requirements](https://python-poetry.org/docs/dependency-specification/). For example **^1.0** allows only versions **>=1.0** to **<1.0**
++We suggest that you allow only `patch` level updates automatically using the [Compatible Release Specifier](https://packaging.python.org/en/latest/specifications/version-specifiers/#compatible-release). For example **dlt~=1.23.0** allows only versions **>=1.23.0** and less than **<1.24.0**
+ 
+ Please also see our [release notes](https://github.com/dlt-hub/dlt/releases) for notable changes between versions.
+ 
+diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+index 0b704a0e5..b14434f45 100644
+--- a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
++++ b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+@@ -6,6 +6,10 @@ keywords: [cursor, claude, codex, llm, restapi, ai, workbench, toolkit]
+ 
+ # REST API Source with dltHub AI Workbench
+ 
++:::info
++The dltHub AI Workbench is a part of the dltHub platform. View the license [here](https://github.com/dlt-hub/dlthub-ai-workbench/blob/master/LICENSE). Sign up [here](https://dlthub.com/solutions/for-small-data-teams) for early access to dltHub.
++:::
++
+ ## Overview
+ 
+ Build a custom REST API connector for any of the 8k+ available sources — often in a single session. Instead of generating ad-hoc code, the AI assistant follows a defined sequence of steps from start to finish to help you build production-grade pipelines following the dltHub best practices. 
+@@ -291,7 +295,7 @@ Once your pipeline is validated, you can continue to the next phase of the data
+ - **`data-exploration`** — query loaded data and create marimo notebooks, charts, and dashboards
+ - **`dlthub-runtime`** — deploy, schedule, and monitor your pipeline in production 
+ 
+-[Sign up for dltHub Early Access](https://info.dlthub.com/waiting-list)
++[Sign up for dltHub Early Access](https://dlthub.com/solutions/for-small-data-teams)
+ 
+ ```sh
+ uv run dlt ai toolkit data-exploration install
+diff --git a/docs/website/docs/hub/EULA.md b/docs/website/docs/hub/EULA.md
+index 9930adf1a..fc709519f 100644
+--- a/docs/website/docs/hub/EULA.md
++++ b/docs/website/docs/hub/EULA.md
+@@ -184,4 +184,8 @@ If it turns out that a section of this EULA isn’t enforceable, then that secti
+ 
+ You and we agree that no joint venture, partnership, employment, or agency relationship exists between us.
+ 
+-The EULA, along with any Specific Terms, make up the entire agreement between us in relation to its subject matter and supersede all prior agreements, representations, and understandings.
+\ No newline at end of file
++The EULA, along with any Specific Terms, make up the entire agreement between us in relation to its subject matter and supersede all prior agreements, representations, and understandings.
++
++# EULA for dltHub AI Workbench
++
++The dltHub AI Workbench has a separate license which can be accessed [here](https://github.com/dlt-hub/dlthub-ai-workbench/blob/master/LICENSE).
+\ No newline at end of file
+
+
+===== COMMIT 3809b453 =====
+
+
+commit 3809b4533
+Author: UD
+Date: 2026-03-06
+
+    feat(ducklake): add `override_data_path` option to ATTACH statement (#3709)
+
+diff --git a/dlt/destinations/impl/ducklake/configuration.py b/dlt/destinations/impl/ducklake/configuration.py
+index 46034cb94..5fe33ed6e 100644
+--- a/dlt/destinations/impl/ducklake/configuration.py
++++ b/dlt/destinations/impl/ducklake/configuration.py
+@@ -128,6 +128,7 @@ class DuckLakeClientConfiguration(WithLocalFiles, DestinationClientDwhWithStagin
+     )
+     credentials: DuckLakeCredentials = None
+     create_indexes: bool = False  # does nothing but required
++    override_data_path: bool = False
+ 
+     def fingerprint(self) -> str:
+         """Use fingerprint of underlying storage. This is precise to bucket level"""
+diff --git a/dlt/destinations/impl/ducklake/ducklake.py b/dlt/destinations/impl/ducklake/ducklake.py
+index 1ab2f995c..d90cf70d1 100644
+--- a/dlt/destinations/impl/ducklake/ducklake.py
++++ b/dlt/destinations/impl/ducklake/ducklake.py
+@@ -160,6 +160,7 @@ class DuckLakeClient(DuckDbClient):
+             staging_dataset_name=config.normalize_staging_dataset_name(schema),
+             credentials=config.credentials,
+             capabilities=capabilities,
++            override_data_path=config.override_data_path,
+         )
+ 
+     def initialize_storage(self, truncate_tables: Iterable[str] = None) -> None:
+diff --git a/dlt/destinations/impl/ducklake/sql_client.py b/dlt/destinations/impl/ducklake/sql_client.py
+index ad944382c..44400acc6 100644
+--- a/dlt/destinations/impl/ducklake/sql_client.py
++++ b/dlt/destinations/impl/ducklake/sql_client.py
+@@ -26,10 +26,12 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+         staging_dataset_name: str,
+         credentials: DuckLakeCredentials,
+         capabilities: DestinationCapabilitiesContext,
++        override_data_path: bool = False,
+     ) -> None:
+         super().__init__(dataset_name, staging_dataset_name, credentials, capabilities)
+         self.credentials: DuckLakeCredentials = credentials
+         self._attach_statement: str = None
++        self.override_data_path = override_data_path
+ 
+     def create_dataset(self) -> None:
+         if self.has_dataset():
+@@ -122,6 +124,7 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+         ducklake_name: str,
+         catalog: ConnectionStringCredentials,
+         storage_url: str,
++        override_data_path: bool = False,
+     ) -> str:
+         attach_params = ""
+         if isinstance(catalog, DuckDbCredentials):
+@@ -147,7 +150,8 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+         else:
+             raise NotImplementedError(str(catalog))
+         attach_statement += f" AS {ducklake_name}"
+-        attach_statement += f" (DATA_PATH '{storage_url}'{attach_params})"
++        override_param = ", OVERRIDE_DATA_PATH true" if override_data_path else ""
++        attach_statement += f" (DATA_PATH '{storage_url}'{attach_params}{override_param})"
+         return attach_statement
+ 
+     @property
+@@ -160,4 +164,5 @@ class DuckLakeSqlClient(DuckDbSqlClient):
+                 ducklake_name=self.credentials.ducklake_name,
+                 catalog=self.credentials.catalog,
+                 storage_url=self.credentials.storage_url,
++                override_data_path=self.override_data_path,
+             )
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/ducklake.md b/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
+index 56ce1c090..60879dd40 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/ducklake.md
+@@ -126,6 +126,34 @@ You can set additional connection options, pragmas and extensions - `ducklake` c
+ ducklake_max_retry_count=100
+ ```
+ 
++### Override data path
++DuckLake stores file paths in the catalog relative to a base `DATA_PATH` that is set at creation time. When `override_data_path` is set to `True`, the `DATA_PATH` provided in the current connection replaces the stored one for both reads and writes. The stored value in the catalog is not modified.
++
++Typical use cases:
++- Populating a ducklake locally and then uploading the catalog and data files to remote storage together
++- Accessing the same catalog from different environments where the storage is at a different path (e.g., data replicated to another bucket)
++
++```toml
++[destination.ducklake]
++override_data_path=true
++```
++
++Or via environment variable `DESTINATION__DUCKLAKE__OVERRIDE_DATA_PATH=true`, or in code:
++```py
++import dlt
++from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
++
++destination = dlt.destinations.ducklake(
++    credentials=DuckLakeCredentials(
++        catalog="sqlite:///catalog.sqlite",
++        storage="s3://new-bucket/data",
++    ),
++    override_data_path=True,
++)
++```
++
++See the [DuckLake docs on connecting](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details on `OVERRIDE_DATA_PATH`.
++
+ ### Configure in code
+ You can create ducklake destination instance and configure it in code. In most cases you will just set additional options while still using the configuration:
+ ```py
+@@ -237,5 +265,4 @@ This destination fully supports [dlt state sync](../../general-usage/state#synci
+ * open table interface for table maintenance like we have for iceberg and delta.
+ * better partitioning support.
+ * Motherduck as catalog if possible.
+-* support additional `ATTACH` options like `OVERRIDE_DATA_PATH`
+ * implement callbacks that will be called on creation of :memory: database and `ATTACH` command so those can be fully customized.
+diff --git a/tests/load/ducklake/test_ducklake_client.py b/tests/load/ducklake/test_ducklake_client.py
+index e753cba6b..21f1f7583 100644
+--- a/tests/load/ducklake/test_ducklake_client.py
++++ b/tests/load/ducklake/test_ducklake_client.py
+@@ -266,6 +266,39 @@ def test_attach_statement_doesnt_use_postgresql() -> None:
+     assert "postgresql" not in expected_attach_statement
+ 
+ 
++def test_ducklake_attach_statement_with_override_data_path() -> None:
++    expected_attach_statement = (
++        "ATTACH IF NOT EXISTS 'ducklake:postgres:postgres://loader:loader@localhost:5432/dlt_data'"
++        " AS foo (DATA_PATH '/path/to/storage', METADATA_SCHEMA 'foo',"
++        " OVERRIDE_DATA_PATH true)"
++    )
++    attach_statement = DuckLakeSqlClient.build_attach_statement(
++        catalog=ConnectionStringCredentials("postgres://loader:loader@localhost:5432/dlt_data"),
++        ducklake_name="foo",
++        storage_url="/path/to/storage",
++        override_data_path=True,
++    )
++    assert expected_attach_statement == attach_statement
++
++
++def test_ducklake_override_data_path_config() -> None:
++    configuration = resolve_configuration(
++        DuckLakeClientConfiguration(override_data_path=True)._bind_dataset_name(dataset_name="foo")
++    )
++    assert configuration.override_data_path is True
++
++    from dlt.destinations.impl.ducklake.configuration import _get_ducklake_capabilities
++
++    sql_client = DuckLakeSqlClient(
++        dataset_name="foo",
++        staging_dataset_name="foo_staging",
++        credentials=configuration.credentials,
++        capabilities=_get_ducklake_capabilities(),
++        override_data_path=configuration.override_data_path,
++    )
++    assert "OVERRIDE_DATA_PATH true" in sql_client.attach_statement
++
++
+ def test_ducklake_conn_pool_always_open() -> None:
+     # connection pool is embedded in configuration, configuration is a singleton during loading
+     # phase which the pool needs. See DuckDbConnectionPool
+
+
+===== COMMIT ca639756 =====
+
+
+commit ca639756a
+Author: aditypan
+Date: 2026-03-06
+
+    Fetch Databricks Compute Credentials (#3667)
+
+diff --git a/dlt/destinations/impl/databricks/configuration.py b/dlt/destinations/impl/databricks/configuration.py
+index d901d8287..d87f4efb7 100644
+--- a/dlt/destinations/impl/databricks/configuration.py
++++ b/dlt/destinations/impl/databricks/configuration.py
+@@ -1,5 +1,6 @@
+ import dataclasses
+ from typing import ClassVar, Final, Optional, Any, Dict, List, List, Dict, cast, Callable
++from urllib.parse import urlparse
+ 
+ from dlt.common import logger
+ from dlt.common.typing import TSecretStrValue
+@@ -37,30 +38,32 @@ class DatabricksCredentials(CredentialsConfiguration):
+     ]
+ 
+     def on_resolved(self) -> None:
+-        if not ((self.client_id and self.client_secret) or self.access_token):
+-            try:
+-                # attempt context authentication
+-                from databricks.sdk import WorkspaceClient
+-
+-                w = WorkspaceClient()
+-                self.access_token = (
+-                    w.dbutils.notebook.entry_point.getDbutils()
+-                    .notebook()
+-                    .getContext()
+-                    .apiToken()
+-                    .getOrElse(None)
+-                )
+-            except Exception:
+-                self.access_token = None
++        try:
++            from databricks.sdk import WorkspaceClient
+ 
+-            try:
+-                from databricks.sdk import WorkspaceClient
++            w = WorkspaceClient()
++        except Exception:
++            w = None
+ 
+-                w = WorkspaceClient()
+-                self.access_token = w.config.authenticate
+-                logger.info(f"Will attempt to use default auth of type {w.config.auth_type}")
+-            except Exception:
+-                pass
++        if not ((self.client_id and self.client_secret) or self.access_token):
++            if w is not None:
++                try:
++                    # attempt context authentication via notebook token
++                    self.access_token = (
++                        w.dbutils.notebook.entry_point.getDbutils()
++                        .notebook()
++                        .getContext()
++                        .apiToken()
++                        .getOrElse(None)
++                    )
++                except Exception:
++                    self.access_token = None
++
++                try:
++                    self.access_token = w.config.authenticate
++                    logger.info(f"Will attempt to use default auth of type {w.config.auth_type}")
++                except Exception:
++                    pass
+ 
+             if not self.access_token:
+                 raise ConfigurationValueError(
+@@ -70,24 +73,52 @@ class DatabricksCredentials(CredentialsConfiguration):
+                 )
+ 
+         if not self.server_hostname or not self.http_path:
+-            try:
+-                # attempt to fetch warehouse details
+-                from databricks.sdk import WorkspaceClient
+-
+-                w = WorkspaceClient()
+-                # warehouse ID may be present in an env variable
+-                if w.config.warehouse_id:
+-                    warehouse = w.warehouses.get(w.config.warehouse_id)
+-                else:
+-                    # for some reason list of warehouses has different type than a single one 🤯
+-                    warehouse = list(w.warehouses.list())[0]
+-                logger.info(
+-                    f"Will attempt to use warehouse {warehouse.id} to get sql connection params"
+-                )
+-                self.server_hostname = self.server_hostname or warehouse.odbc_params.hostname
+-                self.http_path = self.http_path or warehouse.odbc_params.path
+-            except Exception:
+-                pass
++            if w is not None:
++                # try to get server_hostname from workspace URL
++                if not self.server_hostname:
++                    try:
++                        workspace_url = w.config.host
++                        if workspace_url:
++                            self.server_hostname = urlparse(workspace_url).hostname
++                            logger.info(
++                                f"Using server_hostname from workspace: {self.server_hostname}"
++                            )
++                    except Exception:
++                        pass
++
++                # try to get http_path from notebook cluster context
++                if not self.http_path:
++                    try:
++                        notebook_context = (
++                            w.dbutils.notebook.entry_point.getDbutils().notebook().getContext()
++                        )
++                        cluster_id = notebook_context.clusterId().get()
++                        workspace_id = notebook_context.workspaceId().get()
++                        if cluster_id and workspace_id:
++                            self.http_path = f"/sql/protocolv1/o/{workspace_id}/{cluster_id}"
++                            logger.info(f"Using http_path from cluster context: {self.http_path}")
++                    except Exception:
++                        pass
++
++                # fallback: try to fetch warehouse details
++                if not self.server_hostname or not self.http_path:
++                    try:
++                        if w.config.warehouse_id:
++                            warehouse = w.warehouses.get(w.config.warehouse_id)
++                        else:
++                            # for some reason list of warehouses has different type
++                            # than a single one
++                            warehouse = list(w.warehouses.list())[0]
++                        logger.info(
++                            "Will attempt to use warehouse"
++                            f" {warehouse.id} to get sql connection params"
++                        )
++                        self.server_hostname = (
++                            self.server_hostname or warehouse.odbc_params.hostname
++                        )
++                        self.http_path = self.http_path or warehouse.odbc_params.path
++                    except Exception:
++                        pass
+ 
+         for param in ("catalog", "server_hostname", "http_path"):
+             if not getattr(self, param):
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/databricks.md b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+index 02b3e6f54..7545e75c3 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/databricks.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/databricks.md
+@@ -255,8 +255,10 @@ See [Staging support](#staging-support) for authentication options when `dlt` co
+ If none of auth methods above is configured, `dlt` attempts to get authorization from the Databricks workspace context. The context may
+ come, for example, from a Notebook (runtime) or via standard set of env variables that Databricks Python sdk recognizes (ie. **DATABRICKS_TOKEN** or **DATABRICKS_HOST**)
+ 
+-`dlt` is able to set `server_hostname` and `http_path` from available warehouses. We use default warehouse id (**DATABRICKS_WAREHOUSE_ID**)
+-if set (via env variable), or a first one on warehouse's list.
++When `server_hostname` or `http_path` are not provided, `dlt` attempts to derive them automatically:
++
++1. **Notebook cluster context** (tried first): when running inside a Databricks Notebook, `dlt` reads `server_hostname` from the workspace URL and constructs `http_path` from the workspace ID and cluster ID of the compute attached to the notebook. This allows dlt to use the notebook's own cluster without requiring a SQL warehouse.
++2. **SQL warehouse discovery** (fallback): if the cluster context is not available (e.g., running outside a notebook, or on a Shared Access Mode cluster), `dlt` looks for an available SQL warehouse. We use default warehouse id (**DATABRICKS_WAREHOUSE_ID**) if set (via env variable), or the first one on the warehouse's list.
+ 
+ ## Write disposition
+ All write dispositions are supported.
+diff --git a/tests/load/databricks/test_databricks_configuration.py b/tests/load/databricks/test_databricks_configuration.py
+index 7ebd52d1c..1ec84c14e 100644
+--- a/tests/load/databricks/test_databricks_configuration.py
++++ b/tests/load/databricks/test_databricks_configuration.py
+@@ -99,44 +99,266 @@ def test_databricks_abfss_converter() -> None:
+     )
+ 
+ 
+-def test_databricks_auth_invalid() -> None:
+-    with pytest.raises(ConfigurationValueError, match="Authentication failed:*"):
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID"] = ""
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET"] = ""
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = ""
++def _setup_sdk_auth(mock_ws):
++    """Enable SDK default authentication on the mock WorkspaceClient."""
++    mock_ws.config.authenticate = lambda: {"Authorization": "Bearer token"}
++    mock_ws.config.auth_type = "pat"
++
++
++def _setup_notebook_context(
++    mock_ws,
++    mocker,
++    cluster_id="0123-456789-abcdefgh",
++    workspace_id="1234567890123456",
++    api_token="nb-token",
++):
++    """Set up the dbutils notebook context chain on the mock WorkspaceClient."""
++    mock_cluster_id = mocker.MagicMock()
++    mock_cluster_id.get.return_value = cluster_id
++    mock_workspace_id = mocker.MagicMock()
++    mock_workspace_id.get.return_value = workspace_id
++
++    mock_context = mocker.MagicMock()
++    mock_context.clusterId.return_value = mock_cluster_id
++    mock_context.workspaceId.return_value = mock_workspace_id
++
++    mock_option = mocker.MagicMock()
++    mock_option.getOrElse.return_value = api_token
++    mock_context.apiToken.return_value = mock_option
++
++    mock_notebook = mocker.MagicMock()
++    mock_notebook.getContext.return_value = mock_context
++    mock_dbutils = mocker.MagicMock()
++    mock_dbutils.notebook.return_value = mock_notebook
++    mock_entry_point = mocker.MagicMock()
++    mock_entry_point.getDbutils.return_value = mock_dbutils
++    mock_ws.dbutils.notebook.entry_point = mock_entry_point
++
++
++def _setup_warehouse(
++    mock_ws,
++    mocker,
++    warehouse_id="wh-1",
++    hostname="warehouse.databricks.com",
++    path="/sql/1.0/warehouses/wh-1",
++):
++    """Set up warehouse mock. Uses get() if warehouse_id is set on config, list() otherwise."""
++    mock_warehouse = mocker.MagicMock()
++    mock_warehouse.id = warehouse_id
++    mock_warehouse.odbc_params.hostname = hostname
++    mock_warehouse.odbc_params.path = path
++    if mock_ws.config.warehouse_id:
++        mock_ws.warehouses.get.return_value = mock_warehouse
++    else:
++        mock_ws.warehouses.list.return_value = iter([mock_warehouse])
++
++
++@pytest.fixture
++def mock_databricks_env(mocker):
++    """Clears Databricks-related env vars and provides a mock WorkspaceClient.
++
++    Returns a mock WorkspaceClient instance. By default, notebook context and
++    warehouse discovery are disabled (raise exceptions). Tests can override
++    specific attributes on the returned mock as needed.
++    """
++    # clear only DESTINATION__DATABRICKS__ prefixed env vars to avoid
++    # interfering with other destination tests
++    for key in list(os.environ.keys()):
++        if key.startswith("DESTINATION__DATABRICKS__") or key.startswith("DATABRICKS_"):
++            del os.environ[key]
++
++    mock_ws = mocker.MagicMock()
++    mock_ws.dbutils.notebook.entry_point.getDbutils.side_effect = Exception("No notebook context")
++    mock_ws.config.authenticate = None
++    mock_ws.config.warehouse_id = None
++    mock_ws.config.host = None
++    mock_ws.warehouses.list.return_value = iter([])
++    mocker.patch("databricks.sdk.WorkspaceClient", return_value=mock_ws)
++    return mock_ws
++
++
++def test_databricks_auth_invalid(mock_databricks_env) -> None:
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_ID"] = ""
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CLIENT_SECRET"] = ""
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = ""
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = "test_catalog"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "test.databricks.com"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = "/sql/1.0/test"
++
++    with pytest.raises(ConfigurationValueError, match="Authentication failed:.*"):
+         bricks = databricks()
+         bricks.configuration(None, accept_partial=True)
+ 
+ 
+-def test_databricks_missing_config_catalog() -> None:
++def test_databricks_missing_config_catalog(mock_databricks_env) -> None:
++    mock_databricks_env.warehouses.list.side_effect = Exception("No warehouses")
++
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = "test_token"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "test.databricks.com"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = "/sql/1.0/test"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = ""
++
+     with pytest.raises(
+         ConfigurationValueError, match="Configuration error: Missing required parameter `catalog`"
+     ):
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = ""
+         bricks = databricks()
+         bricks.configuration(None, accept_partial=True)
+ 
+ 
+-def test_databricks_missing_config_http_path() -> None:
++def test_databricks_missing_config_http_path(mock_databricks_env) -> None:
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = "test_token"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = "test.databricks.com"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = "test_catalog"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = ""
++
+     with pytest.raises(
+         ConfigurationValueError,
+         match="Configuration error: Missing required parameter `http_path`",
+     ):
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = ""
+         bricks = databricks()
+         bricks.configuration(None, accept_partial=True)
+ 
+ 
+-def test_databricks_missing_config_server_hostname() -> None:
++def test_databricks_missing_config_server_hostname(mock_databricks_env) -> None:
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__ACCESS_TOKEN"] = "test_token"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__CATALOG"] = "test_catalog"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__HTTP_PATH"] = "/sql/1.0/test"
++    os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = ""
++
+     with pytest.raises(
+         ConfigurationValueError,
+         match="Configuration error: Missing required parameter `server_hostname`",
+     ):
+-        os.environ["DESTINATION__DATABRICKS__CREDENTIALS__SERVER_HOSTNAME"] = ""
+         bricks = databricks()
+         bricks.configuration(None, accept_partial=True)
+ 
+ 
++def test_shared_cluster_authentication(mock_databricks_env) -> None:
++    """Test that default SDK authentication is used when no explicit credentials
++    are provided and notebook context is unavailable."""
++
++    def mock_authenticator():
++        return {"Authorization": "Bearer mock-token"}
++
++    mock_databricks_env.config.authenticate = mock_authenticator
++    mock_databricks_env.config.auth_type = "azure-cli"
++
++    creds = DatabricksCredentials(
++        catalog="test_catalog",
++        server_hostname="test.databricks.com",
++        http_path="/sql/1.0/test",
++    )
++    creds.on_resolved()
++
++    assert callable(creds.access_token)
++    assert creds.access_token == mock_authenticator
++
++    params = creds.to_connector_params()
++    assert "credentials_provider" in params
++    assert callable(params["credentials_provider"])
++
++
++def test_cluster_context_connection_params(mock_databricks_env, mocker) -> None:
++    """Test that server_hostname and http_path are derived from the notebook
++    cluster context when not explicitly provided."""
++    mock_ws = mock_databricks_env
++    mock_ws.config.host = "https://adb-1234567890123456.12.azuredatabricks.net"
++    _setup_sdk_auth(mock_ws)
++    _setup_notebook_context(mock_ws, mocker)
++
++    creds = DatabricksCredentials(catalog="test_catalog")
++    creds.on_resolved()
++
++    assert creds.server_hostname == "adb-1234567890123456.12.azuredatabricks.net"
++    assert creds.http_path == "/sql/protocolv1/o/1234567890123456/0123-456789-abcdefgh"
++
++
++def test_warehouse_provides_both_params(mock_databricks_env, mocker) -> None:
++    """No workspace URL, no cluster context — both server_hostname and http_path
++    come from the first warehouse on the list."""
++    _setup_sdk_auth(mock_databricks_env)
++    _setup_warehouse(mock_databricks_env, mocker)
++
++    creds = DatabricksCredentials(catalog="test_catalog")
++    creds.on_resolved()
++
++    assert creds.server_hostname == "warehouse.databricks.com"
++    assert creds.http_path == "/sql/1.0/warehouses/wh-1"
++
++
++def test_hostname_from_workspace_http_path_from_warehouse(mock_databricks_env, mocker) -> None:
++    """Workspace URL resolves server_hostname before warehouse fallback, so
++    warehouse only fills in http_path."""
++    mock_databricks_env.config.host = "https://adb-123.azuredatabricks.net"
++    _setup_sdk_auth(mock_databricks_env)
++    _setup_warehouse(mock_databricks_env, mocker)
++
++    creds = DatabricksCredentials(catalog="test_catalog")
++    creds.on_resolved()
++
++    assert creds.server_hostname == "adb-123.azuredatabricks.net"
++    assert creds.http_path == "/sql/1.0/warehouses/wh-1"
++
++
++def test_warehouse_id_selects_specific_warehouse(mock_databricks_env, mocker) -> None:
++    """When DATABRICKS_WAREHOUSE_ID is set, warehouses.get() is used instead
++    of warehouses.list()."""
++    _setup_sdk_auth(mock_databricks_env)
++    mock_databricks_env.config.warehouse_id = "specific-wh"
++    _setup_warehouse(
++        mock_databricks_env,
++        mocker,
++        warehouse_id="specific-wh",
++        path="/sql/1.0/warehouses/specific-wh",
++    )
++
++    creds = DatabricksCredentials(catalog="test_catalog")
++    creds.on_resolved()
++
++    mock_databricks_env.warehouses.get.assert_called_once_with("specific-wh")
++    assert creds.server_hostname == "warehouse.databricks.com"
++    assert creds.http_path == "/sql/1.0/warehouses/specific-wh"
++
++
++def test_explicit_params_skip_auto_resolution(mock_databricks_env) -> None:
++    """Test that explicitly provided server_hostname and http_path are not
++    overwritten by auto-resolution."""
++    mock_databricks_env.config.host = "https://should-not-overwrite.databricks.net"
++    _setup_sdk_auth(mock_databricks_env)
++
++    creds = DatabricksCredentials(
++        catalog="test_catalog",
++        server_hostname="explicit.databricks.com",
++        http_path="/sql/1.0/explicit",
++    )
++    creds.on_resolved()
++
++    assert creds.server_hostname == "explicit.databricks.com"
++    assert creds.http_path == "/sql/1.0/explicit"
++
++
++def test_notebook_token_overwritten_by_sdk_auth(mock_databricks_env, mocker) -> None:
++    """Test that w.config.authenticate always takes precedence over notebook
++    token — matches devel behavior where the second try block overwrites."""
++
++    def sdk_authenticator():
++        return {"Authorization": "Bearer sdk-token"}
++
++    mock_databricks_env.config.authenticate = sdk_authenticator
++    mock_databricks_env.config.auth_type = "azure-cli"
++    _setup_notebook_context(mock_databricks_env, mocker)
++
++    creds = DatabricksCredentials(
++        catalog="test_catalog",
++        server_hostname="test.databricks.com",
++        http_path="/sql/1.0/test",
++    )
++    creds.on_resolved()
++
++    # sdk authenticator overwrites notebook token (devel parity)
++    assert creds.access_token is sdk_authenticator
++
++
+ @pytest.mark.parametrize("auth_type", ("pat", "oauth2"))
+ def test_default_credentials(auth_type: str) -> None:
+     # create minimal default env
+
+
+===== COMMIT b3990a91 =====
+
+
+commit b3990a910
+Author: AyushPatel101
+Date: 2026-03-06
+
+    fix: set start_out_of_range flag when row equals start_value with range_start="open" (#3708)
+
+diff --git a/dlt/extract/incremental/transform.py b/dlt/extract/incremental/transform.py
+index 5a7b46cf8..634897bcb 100644
+--- a/dlt/extract/incremental/transform.py
++++ b/dlt/extract/incremental/transform.py
+@@ -328,7 +328,7 @@ class JsonIncremental(IncrementalTransform):
+ 
+             if self.range_start == "open" and processed_row_value == self.start_value:
+                 # We only want greater than start_value
+-                return None, False, False
++                return None, True, False
+ 
+             # skip the record that is not a start_value or new_value: that record was already processed
+             if self.start_value is None:
+diff --git a/tests/extract/test_incremental.py b/tests/extract/test_incremental.py
+index 9be3d27d3..2f21de5a6 100644
+--- a/tests/extract/test_incremental.py
++++ b/tests/extract/test_incremental.py
+@@ -2301,6 +2301,29 @@ def test_out_of_range_flags(item_type: TestDataItemFormat) -> None:
+     pipeline.extract(ascending_single_item())
+ 
+ 
++@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
++def test_start_out_of_range_open_equals_start_value(item_type: TestDataItemFormat) -> None:
++    """start_out_of_range is set when row equals start_value with range_start='open'"""
++
++    @dlt.resource
++    def descending(
++        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
++            "updated_at", initial_value=10, row_order="desc", range_start="open"
++        )
++    ) -> Any:
++        # descending from 12 down to 8, with value 10 == start_value
++        for i in [12, 11, 10, 9, 8]:
++            yield data_to_item_format(item_type, [{"updated_at": i}])
++            # 10 equals start_value and range_start="open" so it's out of range
++            if i <= 10:
++                assert updated_at.start_out_of_range is True
++
++    # early stopping should close the generator when row_order="desc"
++    data = list(descending)
++    # only 12 and 11 are > 10 (open range excludes 10)
++    assert data_item_length(data) == 2
++
++
+ @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+ def test_async_row_order_out_of_range(item_type: TestDataItemFormat) -> None:
+     @dlt.resource
+
+
+===== COMMIT 3201e053 =====
+
+
+commit 3201e053d
+Author: Denis Krivenko
+Date: 2026-03-05
+
+    fix: docstring typo in BigQuery factory (#3705)
+
+diff --git a/dlt/destinations/impl/bigquery/factory.py b/dlt/destinations/impl/bigquery/factory.py
+index 3d3781823..d0ed90da1 100644
+--- a/dlt/destinations/impl/bigquery/factory.py
++++ b/dlt/destinations/impl/bigquery/factory.py
+@@ -179,7 +179,7 @@ class bigquery(Destination[BigQueryClientConfiguration, "BigQueryClient"]):
+         environment: str = None,
+         **kwargs: Any,
+     ) -> None:
+-        """Configure the MsSql destination to use in a pipeline.
++        """Configure the BigQuery destination to use in a pipeline.
+ 
+         All arguments provided here supersede other configuration sources such as environment variables and dlt config files.
+ 
+
+
+===== COMMIT bcf8b93a =====
+
+
+commit bcf8b93a5
+Author: Travior
+Date: 2026-03-05
+
+    fix(lance): allow `dataset_name=None` when instantiating dataset (#3710)
+
+diff --git a/dlt/destinations/impl/lancedb/sql_client.py b/dlt/destinations/impl/lancedb/sql_client.py
+index 423792620..3dc173878 100644
+--- a/dlt/destinations/impl/lancedb/sql_client.py
++++ b/dlt/destinations/impl/lancedb/sql_client.py
+@@ -124,9 +124,19 @@ class LanceDBSQLClient(DuckDbSqlClient):
+ 
+     def create_view(self, table_name: str) -> None:
+         lance_table_uri = get_lance_table_uri(self.lancedb_client, table_name)
++
++        # lancedb allows omitting the dataset_name, calling `make_qualified_table_name` will
++        # prepend the dataset_name even if it is None
++        if self.dataset_name:
++            view_name = self.make_qualified_table_name(table_name)
++        else:
++            view_name = self.capabilities.escape_identifier(
++                self.capabilities.casefold_identifier(table_name)
++            )
++
+         create_view_sql = _prepare_create_view_statement(
+             lance_table_uri=lance_table_uri,
+-            view_name=self.make_qualified_table_name(table_name),
++            view_name=view_name,
+         )
+         try:
+             self.open_connection().execute(create_view_sql)
+diff --git a/tests/load/lancedb/test_pipeline.py b/tests/load/lancedb/test_pipeline.py
+index fc855c109..c738f735d 100644
+--- a/tests/load/lancedb/test_pipeline.py
++++ b/tests/load/lancedb/test_pipeline.py
+@@ -561,6 +561,10 @@ def test_empty_dataset_allowed() -> None:
+     assert client.sentinel_table == "dltSentinelTable"  # type: ignore
+     assert_table(pipe, "content", expected_items_count=3)
+ 
++    dataset = pipe.dataset()
++    rows = dataset.content.select("value").fetchall()
++    assert len(rows) == 3
++
+ 
+ def test_lancedb_remove_nested_orphaned_records_with_chunks() -> None:
+     @dlt.resource(
+
+
+===== COMMIT 68c9b7f3 =====
+
+
+commit 68c9b7f30
+Author: rudolfix
+Date: 2026-03-04
+
+    (feat) adds iceberg table properties (#3699)
+
+diff --git a/dlt/common/libs/deltalake.py b/dlt/common/libs/deltalake.py
+index decc968d1..5d50923ea 100644
+--- a/dlt/common/libs/deltalake.py
++++ b/dlt/common/libs/deltalake.py
+@@ -11,8 +11,9 @@ from dlt.common.libs.utils import load_open_tables
+ from dlt.common.schema.typing import TWriteDisposition, TTableSchema
+ from dlt.common.schema.utils import get_first_column_name_with_prop, get_columns_names_with_prop
+ from dlt.common.exceptions import MissingDependencyException, ValueErrorWithKnownValues
+-from dlt.common.storages import FilesystemConfiguration
++from dlt.common.typing import DictStrAny
+ from dlt.common.utils import assert_min_pkg_version
++from dlt.common.configuration.specs import CredentialsConfiguration
+ from dlt.common.configuration.specs.mixins import WithObjectStoreRsCredentials
+ 
+ try:
+@@ -172,14 +173,17 @@ def get_delta_tables(
+     )
+ 
+ 
+-def deltalake_storage_options(config: FilesystemConfiguration) -> Dict[str, str]:
++def deltalake_storage_options(
++    credentials: Optional[CredentialsConfiguration] = None,
++    storage_options: Optional[DictStrAny] = None,
++) -> Dict[str, str]:
+     """Returns dict that can be passed as `storage_options` in `deltalake` library."""
+     creds = {}
+     extra_options = {}
+-    if isinstance(config.credentials, WithObjectStoreRsCredentials):
+-        creds = config.credentials.to_object_store_rs_credentials()
+-    if config.deltalake_storage_options is not None:
+-        extra_options = config.deltalake_storage_options
++    if isinstance(credentials, WithObjectStoreRsCredentials):
++        creds = credentials.to_object_store_rs_credentials()
++    if storage_options is not None:
++        extra_options = storage_options
+     shared_keys = creds.keys() & extra_options.keys()
+     if len(shared_keys) > 0:
+         logger.warning(
+diff --git a/dlt/common/libs/pyiceberg.py b/dlt/common/libs/pyiceberg.py
+index e978f164b..5c61d2ff5 100644
+--- a/dlt/common/libs/pyiceberg.py
++++ b/dlt/common/libs/pyiceberg.py
+@@ -23,8 +23,6 @@ from dlt.common.configuration.specs import BaseConfiguration, CredentialsConfigu
+ from dlt.common.configuration.specs.mixins import WithPyicebergConfig
+ from dlt.common.configuration.inject import with_config
+ 
+-from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
+-
+ 
+ try:
+     import pyiceberg
+@@ -389,7 +387,8 @@ def get_catalog(
+ 
+ def evolve_table(
+     catalog: IcebergCatalog,
+-    client: FilesystemClient,
++    fs_client: AbstractFileSystem,
++    config: FilesystemConfiguration,
+     table_id: str,
+     table_location: str,
+     schema: Optional[pa.Schema] = None,
+@@ -399,11 +398,9 @@ def evolve_table(
+     except NoSuchTableError:
+         # add table to catalog
+         metadata_path = f"{table_location.rstrip('/')}/metadata"
+-        if client.fs_client.exists(metadata_path):
++        if fs_client.exists(metadata_path):
+             # found metadata; register existing table
+-            table = register_table(
+-                table_id, metadata_path, catalog, client.fs_client, client.config
+-            )
++            table = register_table(table_id, metadata_path, catalog, fs_client, config)
+         else:
+             raise
+ 
+@@ -422,6 +419,7 @@ def create_table(
+     schema: Union[pa.Schema, "pyiceberg.schema.Schema"],
+     partition_columns: Optional[List[str]] = None,
+     partition_spec: Optional[IcebergPartitionSpec] = UNPARTITIONED_PARTITION_SPEC,
++    properties: Optional[Dict[str, str]] = None,
+ ) -> None:
+     if isinstance(schema, pa.Schema):
+         schema = ensure_iceberg_compatible_arrow_schema(schema)
+@@ -434,6 +432,7 @@ def create_table(
+             table_id,
+             schema=schema,
+             location=table_location,
++            properties=properties or {},
+         ) as txn:
+             # add partitioning
+             with txn.update_spec() as update_spec:
+@@ -445,6 +444,7 @@ def create_table(
+             schema=schema,
+             location=table_location,
+             partition_spec=partition_spec,
++            properties=properties or {},
+         )
+ 
+ 
+diff --git a/dlt/common/storages/configuration.py b/dlt/common/storages/configuration.py
+index 004140871..f6950873c 100644
+--- a/dlt/common/storages/configuration.py
++++ b/dlt/common/storages/configuration.py
+@@ -214,9 +214,6 @@ class FilesystemConfiguration(BaseConfiguration):
+     """Additional arguments passed to underlying fsspec native client ie. dict(verify="public.crt) for botocore"""
+     config_kwargs: Optional[DictStrAny] = None
+     """Additional arguments as Config in botocore"""
+-    deltalake_storage_options: Optional[DictStrAny] = None
+-    deltalake_configuration: Optional[DictStrOptionalStr] = None
+-    deltalake_streamed_exec: bool = True
+ 
+     @property
+     def protocol(self) -> str:
+diff --git a/dlt/destinations/impl/filesystem/configuration.py b/dlt/destinations/impl/filesystem/configuration.py
+index 73a63261d..8bd4a69f6 100644
+--- a/dlt/destinations/impl/filesystem/configuration.py
++++ b/dlt/destinations/impl/filesystem/configuration.py
+@@ -1,7 +1,9 @@
+ import dataclasses
+ 
+ import os
+-from typing import Final, Optional, Type
++from typing import Dict, Final, Optional, Type
++
++from dlt.common.typing import DictStrAny, DictStrOptionalStr
+ 
+ from dlt.common import logger
+ from dlt.common.configuration import configspec, resolve_type
+@@ -27,6 +29,16 @@ class FilesystemDestinationClientConfiguration(FilesystemConfigurationWithLocalF
+     """Maximum number of pipeline state files to keep; 0 or negative value disables cleanup."""
+     always_refresh_views: bool = False
+     """Always refresh table scanner views by setting the newest table metadata or globbing table files"""
++    deltalake_storage_options: Optional[DictStrAny] = None
++    """Additional storage options passed to `deltalake` library, overriding credentials-derived values."""
++    deltalake_configuration: Optional[DictStrOptionalStr] = None
++    """Delta table configuration passed to `write_deltalake` and `create_deltalake` calls."""
++    deltalake_streamed_exec: bool = True
++    """When true, delta merge operations use streamed execution to reduce memory usage."""
++    iceberg_table_properties: Optional[Dict[str, str]] = None
++    """Default Iceberg table properties applied to all tables; per-table adapter properties take precedence."""
++    iceberg_namespace_properties: Optional[Dict[str, str]] = None
++    """Properties passed to the Iceberg catalog when creating the namespace."""
+ 
+     @resolve_type("credentials")
+     def resolve_credentials_type(self) -> Type[CredentialsConfiguration]:
+diff --git a/dlt/destinations/impl/filesystem/filesystem.py b/dlt/destinations/impl/filesystem/filesystem.py
+index 08c16a733..493958b5c 100644
+--- a/dlt/destinations/impl/filesystem/filesystem.py
++++ b/dlt/destinations/impl/filesystem/filesystem.py
+@@ -215,7 +215,10 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
+             f" buffer: {pa.total_allocated_bytes()}]"
+         )
+         source_ds = self.arrow_dataset
+-        storage_options = deltalake_storage_options(self._job_client.config)
++        storage_options = deltalake_storage_options(
++            self._job_client.config.credentials,
++            self._job_client.config.deltalake_storage_options,
++        )
+         try:
+             delta_table: DeltaTable = self._job_client.load_open_table(
+                 "delta", self.load_table_name
+@@ -269,10 +272,21 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
+                 schema=self.arrow_dataset.schema,
+             )
+         except DestinationUndefinedEntity:
++            from dlt.destinations.impl.filesystem.iceberg_adapter import TABLE_PROPERTIES_HINT
++
+             location = self._job_client.get_open_table_location("iceberg", self.load_table_name)
+             table_id = f"{self._job_client.dataset_name}.{self.load_table_name}"
+ 
+             spec_list = self._get_partition_spec_list()
++            # merge config-level defaults with per-table adapter overrides
++            config_properties = self._job_client.config.iceberg_table_properties
++            adapter_properties: Optional[Dict[str, str]] = self._load_table.get(
++                TABLE_PROPERTIES_HINT
++            )  # type: ignore[assignment]
++            if config_properties or adapter_properties:
++                properties = {**(config_properties or {}), **(adapter_properties or {})}
++            else:
++                properties = None
+ 
+             if spec_list:
+                 partition_spec, iceberg_schema = build_iceberg_partition_spec(
+@@ -284,6 +298,7 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
+                     table_location=location,
+                     schema=iceberg_schema,
+                     partition_spec=partition_spec,
++                    properties=properties,
+                 )
+             else:
+                 create_table(
+@@ -291,6 +306,7 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
+                     table_id,
+                     table_location=location,
+                     schema=self.arrow_dataset.schema,
++                    properties=properties,
+                 )
+             # run again with created table
+             self.run()
+@@ -1259,7 +1275,8 @@ class FilesystemClient(
+             try:
+                 return evolve_table(
+                     catalog=catalog,
+-                    client=self,
++                    fs_client=self.fs_client,
++                    config=self.config,
+                     table_id=table_id,
+                     table_location=table_location,
+                     **kwargs,
+@@ -1269,7 +1286,9 @@ class FilesystemClient(
+         elif table_format == "delta":
+             from dlt.common.libs.deltalake import deltalake_storage_options, DeltaTable
+ 
+-            storage_options = deltalake_storage_options(self.config)
++            storage_options = deltalake_storage_options(
++                self.config.credentials, self.config.deltalake_storage_options
++            )
+ 
+             if not DeltaTable.is_deltatable(table_location, storage_options):
+                 raise DestinationUndefinedEntity(table_name)
+@@ -1307,7 +1326,10 @@ class FilesystemClient(
+ 
+         # Create namespace
+         try:
+-            catalog.create_namespace(self.dataset_name)
++            catalog.create_namespace(
++                self.dataset_name,
++                properties=self.config.iceberg_namespace_properties or {},
++            )
+             logger.info(f"Created Iceberg namespace: {self.dataset_name}")
+         except NamespaceAlreadyExistsError as e:
+             logger.debug(f"Namespace {self.dataset_name} already exists or error: {e}")
+diff --git a/dlt/destinations/impl/filesystem/iceberg_adapter.py b/dlt/destinations/impl/filesystem/iceberg_adapter.py
+index dade49e43..285720931 100644
+--- a/dlt/destinations/impl/filesystem/iceberg_adapter.py
++++ b/dlt/destinations/impl/filesystem/iceberg_adapter.py
+@@ -6,6 +6,7 @@ from dlt.destinations.utils import get_resource_for_adapter
+ from dlt.extract import DltResource
+ 
+ PARTITION_HINT = "x-iceberg-partition"
++TABLE_PROPERTIES_HINT = "x-iceberg-table-properties"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -149,31 +150,40 @@ class iceberg_partition:
+ def iceberg_adapter(
+     data: Any,
+     partition: Union[str, PartitionSpec, Sequence[Union[str, PartitionSpec]]] = None,
++    table_properties: Optional[Dict[str, str]] = None,
+ ) -> DltResource:
+     """Prepares data or a DltResource for loading into Apache Iceberg table.
+ 
+-    Takes raw data or an existing DltResource and configures it for Iceberg,
+-    primarily by defining partitioning strategies via the DltResource's hints.
++    Takes raw data or an existing DltResource and configures it for Iceberg
++    by defining partitioning strategies and/or table properties via the
++    DltResource's hints.
+ 
+     Args:
+         data: The data to be transformed. This can be raw data (e.g., list of dicts)
+             or an instance of `DltResource`. If raw data is provided, it will be
+             encapsulated into a `DltResource` instance.
+         partition: Defines how the Iceberg table should be partitioned.
+-            Must be provided. It accepts:
++            It accepts:
+             - A single column name (string): Defaults to an identity transform.
+             - A `PartitionSpec` object: Allows for detailed partition configuration,
+               including transformation types (year, month, day, hour, bucket, truncate).
+               Use the `iceberg_partition` helper class to create these specs.
+             - A sequence of the above: To define multiple partition columns.
++        table_properties: A dictionary of Iceberg table properties to set on the
++            table at creation time. Keys and values must be strings. These correspond
++            to Iceberg table properties such as ``write.format.default`` or
++            ``write.target-file-size-bytes``. Properties are only applied when the
++            table is first created.
+ 
+     Returns:
+-        A `DltResource` instance configured with Iceberg-specific partitioning hints,
++        A `DltResource` instance configured with Iceberg-specific hints,
+         ready for loading.
+ 
+     Raises:
+-        ValueError: If `partition` is not specified or if an invalid
+-            partition transform is requested within a `PartitionSpec`.
++        ValueError: If neither `partition` nor `table_properties` is specified,
++            or if an invalid partition transform is requested within a
++            `PartitionSpec`, or if `table_properties` is not a dict with string
++            keys and values.
+ 
+     Examples:
+         >>> data = [{"id": 1, "event_time": "2023-03-15T10:00:00Z", "category": "A"}]
+@@ -182,20 +192,9 @@ def iceberg_adapter(
+         ...     partition=[
+         ...         "category",  # Identity partition on category
+         ...         iceberg_partition.year("event_time"),
+-        ...     ]
++        ...     ],
++        ...     table_properties={"write.format.default": "parquet"},
+         ... )
+-        >>> # The resource's hints now contain the Iceberg partition specs:
+-        >>> # resource.compute_table_schema().get('x-iceberg-partition')
+-        >>> # [
+-        >>> #     {'transform': 'identity', 'source_column': 'event_time'},
+-        >>> #     {'transform': 'year', 'source_column': 'event_time'},
+-        >>> # ]
+-        >>> #
+-        >>> # Or in case of using an existing DltResource
+-        >>> @dlt.resource
+-        ... def my_data():
+-        ...     yield [{"value": "abc"}]
+-        >>> iceberg_adapter(my_data, partition="value")
+     """
+     resource = get_resource_for_adapter(data)
+     additional_table_hints: Dict[str, Any] = {}
+@@ -209,15 +208,28 @@ def iceberg_adapter(
+             if isinstance(item, PartitionSpec):
+                 specs.append(item)
+             else:
+-                # Item is the column name, use identity transform
++                # item is the column name, use identity transform
+                 specs.append(iceberg_partition.identity(item))
+ 
+         additional_table_hints[PARTITION_HINT] = [spec.to_dict() for spec in specs]
+ 
++    if table_properties is not None:
++        if not isinstance(table_properties, dict):
++            raise ValueError("`table_properties` must be a dictionary.")
++        for key, value in table_properties.items():
++            if not isinstance(key, str):
++                raise ValueError("Table property keys must be strings.")
++            if not isinstance(value, str):
++                raise ValueError(
++                    f"Table property values must be strings. Got {type(value).__name__}"
++                    f" for key '{key}'."
++                )
++        additional_table_hints[TABLE_PROPERTIES_HINT] = table_properties
++
+     if additional_table_hints:
+         resource.apply_hints(additional_table_hints=additional_table_hints)
+     else:
+-        raise ValueError("A value for `partition` must be specified.")
++        raise ValueError("At least one of `partition` or `table_properties` must be specified.")
+ 
+     return resource
+ 
+diff --git a/docs/uv.lock b/docs/uv.lock
+index bf3e03fa8..985062737 100644
+--- a/docs/uv.lock
++++ b/docs/uv.lock
+@@ -1718,6 +1718,7 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/7d/ed/6bfa4109fcb23a58819600392564fea69cdc6551ffd5e69ccf1d52a40cbc/greenlet-3.2.4-cp310-cp310-macosx_11_0_universal2.whl", hash = "sha256:8c68325b0d0acf8d91dde4e6f930967dd52a5302cd4062932a6b2e7c2969f47c", size = 271061, upload-time = "2025-08-07T13:17:15.373Z" },
+     { url = "https://files.pythonhosted.org/packages/2a/fc/102ec1a2fc015b3a7652abab7acf3541d58c04d3d17a8d3d6a44adae1eb1/greenlet-3.2.4-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:94385f101946790ae13da500603491f04a76b6e4c059dab271b3ce2e283b2590", size = 629475, upload-time = "2025-08-07T13:42:54.009Z" },
+     { url = "https://files.pythonhosted.org/packages/c5/26/80383131d55a4ac0fb08d71660fd77e7660b9db6bdb4e8884f46d9f2cc04/greenlet-3.2.4-cp310-cp310-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:f10fd42b5ee276335863712fa3da6608e93f70629c631bf77145021600abc23c", size = 640802, upload-time = "2025-08-07T13:45:25.52Z" },
++    { url = "https://files.pythonhosted.org/packages/9f/7c/e7833dbcd8f376f3326bd728c845d31dcde4c84268d3921afcae77d90d08/greenlet-3.2.4-cp310-cp310-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:c8c9e331e58180d0d83c5b7999255721b725913ff6bc6cf39fa2a45841a4fd4b", size = 636703, upload-time = "2025-08-07T13:53:12.622Z" },
+     { url = "https://files.pythonhosted.org/packages/e9/49/547b93b7c0428ede7b3f309bc965986874759f7d89e4e04aeddbc9699acb/greenlet-3.2.4-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:58b97143c9cc7b86fc458f215bd0932f1757ce649e05b640fea2e79b54cedb31", size = 635417, upload-time = "2025-08-07T13:18:25.189Z" },
+     { url = "https://files.pythonhosted.org/packages/7f/91/ae2eb6b7979e2f9b035a9f612cf70f1bf54aad4e1d125129bef1eae96f19/greenlet-3.2.4-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c2ca18a03a8cfb5b25bc1cbe20f3d9a4c80d8c3b13ba3df49ac3961af0b1018d", size = 584358, upload-time = "2025-08-07T13:18:23.708Z" },
+     { url = "https://files.pythonhosted.org/packages/f7/85/433de0c9c0252b22b16d413c9407e6cb3b41df7389afc366ca204dbc1393/greenlet-3.2.4-cp310-cp310-musllinux_1_1_aarch64.whl", hash = "sha256:9fe0a28a7b952a21e2c062cd5756d34354117796c6d9215a87f55e38d15402c5", size = 1113550, upload-time = "2025-08-07T13:42:37.467Z" },
+@@ -1728,6 +1729,7 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/a4/de/f28ced0a67749cac23fecb02b694f6473f47686dff6afaa211d186e2ef9c/greenlet-3.2.4-cp311-cp311-macosx_11_0_universal2.whl", hash = "sha256:96378df1de302bc38e99c3a9aa311967b7dc80ced1dcc6f171e99842987882a2", size = 272305, upload-time = "2025-08-07T13:15:41.288Z" },
+     { url = "https://files.pythonhosted.org/packages/09/16/2c3792cba130000bf2a31c5272999113f4764fd9d874fb257ff588ac779a/greenlet-3.2.4-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:1ee8fae0519a337f2329cb78bd7a8e128ec0f881073d43f023c7b8d4831d5246", size = 632472, upload-time = "2025-08-07T13:42:55.044Z" },
+     { url = "https://files.pythonhosted.org/packages/ae/8f/95d48d7e3d433e6dae5b1682e4292242a53f22df82e6d3dda81b1701a960/greenlet-3.2.4-cp311-cp311-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:94abf90142c2a18151632371140b3dba4dee031633fe614cb592dbb6c9e17bc3", size = 644646, upload-time = "2025-08-07T13:45:26.523Z" },
++    { url = "https://files.pythonhosted.org/packages/d5/5e/405965351aef8c76b8ef7ad370e5da58d57ef6068df197548b015464001a/greenlet-3.2.4-cp311-cp311-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:4d1378601b85e2e5171b99be8d2dc85f594c79967599328f95c1dc1a40f1c633", size = 640519, upload-time = "2025-08-07T13:53:13.928Z" },
+     { url = "https://files.pythonhosted.org/packages/25/5d/382753b52006ce0218297ec1b628e048c4e64b155379331f25a7316eb749/greenlet-3.2.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0db5594dce18db94f7d1650d7489909b57afde4c580806b8d9203b6e79cdc079", size = 639707, upload-time = "2025-08-07T13:18:27.146Z" },
+     { url = "https://files.pythonhosted.org/packages/1f/8e/abdd3f14d735b2929290a018ecf133c901be4874b858dd1c604b9319f064/greenlet-3.2.4-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2523e5246274f54fdadbce8494458a2ebdcdbc7b802318466ac5606d3cded1f8", size = 587684, upload-time = "2025-08-07T13:18:25.164Z" },
+     { url = "https://files.pythonhosted.org/packages/5d/65/deb2a69c3e5996439b0176f6651e0052542bb6c8f8ec2e3fba97c9768805/greenlet-3.2.4-cp311-cp311-musllinux_1_1_aarch64.whl", hash = "sha256:1987de92fec508535687fb807a5cea1560f6196285a4cde35c100b8cd632cc52", size = 1116647, upload-time = "2025-08-07T13:42:38.655Z" },
+@@ -1738,6 +1740,7 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/44/69/9b804adb5fd0671f367781560eb5eb586c4d495277c93bde4307b9e28068/greenlet-3.2.4-cp312-cp312-macosx_11_0_universal2.whl", hash = "sha256:3b67ca49f54cede0186854a008109d6ee71f66bd57bb36abd6d0a0267b540cdd", size = 274079, upload-time = "2025-08-07T13:15:45.033Z" },
+     { url = "https://files.pythonhosted.org/packages/46/e9/d2a80c99f19a153eff70bc451ab78615583b8dac0754cfb942223d2c1a0d/greenlet-3.2.4-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ddf9164e7a5b08e9d22511526865780a576f19ddd00d62f8a665949327fde8bb", size = 640997, upload-time = "2025-08-07T13:42:56.234Z" },
+     { url = "https://files.pythonhosted.org/packages/3b/16/035dcfcc48715ccd345f3a93183267167cdd162ad123cd93067d86f27ce4/greenlet-3.2.4-cp312-cp312-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:f28588772bb5fb869a8eb331374ec06f24a83a9c25bfa1f38b6993afe9c1e968", size = 655185, upload-time = "2025-08-07T13:45:27.624Z" },
++    { url = "https://files.pythonhosted.org/packages/31/da/0386695eef69ffae1ad726881571dfe28b41970173947e7c558d9998de0f/greenlet-3.2.4-cp312-cp312-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:5c9320971821a7cb77cfab8d956fa8e39cd07ca44b6070db358ceb7f8797c8c9", size = 649926, upload-time = "2025-08-07T13:53:15.251Z" },
+     { url = "https://files.pythonhosted.org/packages/68/88/69bf19fd4dc19981928ceacbc5fd4bb6bc2215d53199e367832e98d1d8fe/greenlet-3.2.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:c60a6d84229b271d44b70fb6e5fa23781abb5d742af7b808ae3f6efd7c9c60f6", size = 651839, upload-time = "2025-08-07T13:18:30.281Z" },
+     { url = "https://files.pythonhosted.org/packages/19/0d/6660d55f7373b2ff8152401a83e02084956da23ae58cddbfb0b330978fe9/greenlet-3.2.4-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3b3812d8d0c9579967815af437d96623f45c0f2ae5f04e366de62a12d83a8fb0", size = 607586, upload-time = "2025-08-07T13:18:28.544Z" },
+     { url = "https://files.pythonhosted.org/packages/8e/1a/c953fdedd22d81ee4629afbb38d2f9d71e37d23caace44775a3a969147d4/greenlet-3.2.4-cp312-cp312-musllinux_1_1_aarch64.whl", hash = "sha256:abbf57b5a870d30c4675928c37278493044d7c14378350b3aa5d484fa65575f0", size = 1123281, upload-time = "2025-08-07T13:42:39.858Z" },
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/iceberg.md b/docs/website/docs/dlt-ecosystem/destinations/iceberg.md
+index 2ec04a016..adf1cfd39 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/iceberg.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/iceberg.md
+@@ -250,6 +250,73 @@ def multi_partition_data():
+ ```
+ 
+ 
++## Table properties
++
++You can set [Iceberg table properties](https://iceberg.apache.org/docs/latest/configuration/) at two levels. Properties are applied when the table is first created and are not updated on subsequent loads.
++
++### Destination-level defaults
++Set default properties for all Iceberg tables via configuration:
++
++```toml
++[destination.filesystem]
++iceberg_table_properties = '{"write.format.default": "parquet", "write.target-file-size-bytes": "536870912"}'
++```
++
++### Per-table properties with `iceberg_adapter`
++Use `iceberg_adapter` to set or override properties on individual resources:
++
++```py
++import dlt
++from dlt.destinations.adapters import iceberg_adapter
++
++@dlt.resource(table_format="iceberg")
++def my_data():
++    yield [{"id": 1, "value": "a"}]
++
++iceberg_adapter(
++    my_data,
++    table_properties={
++        "write.format.default": "parquet",
++        "write.target-file-size-bytes": "536870912",
++    },
++)
++
++pipeline = dlt.pipeline("iceberg_props", destination="filesystem")
++pipeline.run(my_data)
++```
++
++You can combine table properties with partitioning:
++
++```py
++from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
++
++iceberg_adapter(
++    my_data,
++    partition=[iceberg_partition.month("created_at")],
++    table_properties={"write.format.default": "parquet"},
++)
++```
++
++### Merge behavior
++When both destination-level and per-table properties are set, they are merged. Per-table adapter properties take precedence over destination-level defaults on any conflicting keys.
++
++:::note
++Table properties are only applied at table creation time. If the table already exists, the properties are ignored.
++:::
++
++## Namespace properties
++
++You can set properties on the Iceberg namespace (schema) via configuration. These are passed to the catalog when the namespace is first created.
++
++```toml
++[destination.filesystem]
++iceberg_namespace_properties = '{"owner": "data-team", "description": "Production tables"}'
++```
++
++:::note
++Namespace properties are only applied at namespace creation time. If the namespace already exists, the properties are ignored.
++:::
++
+ ## Table access helper functions
+ You can use the `get_iceberg_tables` helper function to access native table objects. These are `pyiceberg` [Table](https://py.iceberg.apache.org/reference/pyiceberg/table/#pyiceberg.table.Table) objects.
+ 
+diff --git a/tests/libs/test_deltalake.py b/tests/libs/test_deltalake.py
+index 6cabdd746..ddff90099 100644
+--- a/tests/libs/test_deltalake.py
++++ b/tests/libs/test_deltalake.py
+@@ -43,26 +43,20 @@ def filesystem_client() -> Iterator[Tuple[FilesystemClient, str]]:
+ 
+ 
+ def test_deltalake_storage_options() -> None:
+-    config = FilesystemDestinationClientConfiguration()
++    # no credentials, no storage options
++    assert deltalake_storage_options() == dict()
+ 
+-    # no credentials, no deltalake_storage_options
+-    config.bucket_url = "_storage://foo"
+-    assert deltalake_storage_options(config) == dict()
++    # no credentials, yes storage options
++    assert deltalake_storage_options(storage_options={"foo": "bar"}) == {"foo": "bar"}
+ 
+-    # no credentials, yes deltalake_storage_options
+-    config.deltalake_storage_options = {"foo": "bar"}
+-    assert deltalake_storage_options(config) == {"foo": "bar"}
+-
+-    # yes credentials, yes deltalake_storage_options: no shared keys
++    # yes credentials, yes storage options: no shared keys
+     creds = AwsCredentials(
+         aws_access_key_id="dummy_key_id",
+         aws_secret_access_key="dummy_acces_key",
+         aws_session_token="dummy_session_token",
+         region_name="dummy_region_name",
+     )
+-    config.credentials = creds
+-    config.bucket_url = "s3://foo"
+-    assert deltalake_storage_options(config).keys() == {
++    assert deltalake_storage_options(creds, {"foo": "bar"}).keys() == {
+         "aws_access_key_id",
+         "aws_secret_access_key",
+         "aws_session_token",
+@@ -70,15 +64,15 @@ def test_deltalake_storage_options() -> None:
+         "foo",
+     }
+ 
+-    # yes credentials, yes deltalake_storage_options: yes shared keys
+-    config.deltalake_storage_options = {"aws_access_key_id": "i_will_overwrite"}
+-    assert deltalake_storage_options(config).keys() == {
++    # yes credentials, yes storage options: yes shared keys
++    opts = deltalake_storage_options(creds, {"aws_access_key_id": "i_will_overwrite"})
++    assert opts.keys() == {
+         "aws_access_key_id",
+         "aws_secret_access_key",
+         "aws_session_token",
+         "region",
+     }
+-    assert deltalake_storage_options(config)["aws_access_key_id"] == "i_will_overwrite"
++    assert opts["aws_access_key_id"] == "i_will_overwrite"
+ 
+ 
+ @pytest.mark.parametrize("arrow_data_type", (pa.Table, pa.RecordBatchReader))
+@@ -97,7 +91,9 @@ def test_write_delta_table(
+ 
+     client, remote_dir = filesystem_client
+     client = cast(FilesystemClient, client)
+-    storage_options = deltalake_storage_options(client.config)
++    storage_options = deltalake_storage_options(
++        client.config.credentials, client.config.deltalake_storage_options
++    )
+ 
+     arrow_table = arrow_table_all_data_types(
+         "arrow-table",
+diff --git a/tests/load/filesystem/test_filesystem_common.py b/tests/load/filesystem/test_filesystem_common.py
+index 9a2b67344..0d40c7ed6 100644
+--- a/tests/load/filesystem/test_filesystem_common.py
++++ b/tests/load/filesystem/test_filesystem_common.py
+@@ -58,9 +58,6 @@ def test_filesystem_configuration() -> None:
+         "client_kwargs": None,
+         "config_kwargs": None,
+         "kwargs": None,
+-        "deltalake_storage_options": None,
+-        "deltalake_configuration": None,
+-        "deltalake_streamed_exec": True,
+     }
+ 
+ 
+@@ -230,7 +227,7 @@ def test_filesystem_instance_from_s3_endpoint(environment: Dict[str, str]) -> No
+ 
+ 
+ def test_filesystem_configuration_with_additional_arguments() -> None:
+-    config = FilesystemConfiguration(
++    config = FilesystemDestinationClientConfiguration(
+         bucket_url="az://root",
+         kwargs={"use_ssl": True},
+         client_kwargs={"verify": "public.crt"},
+@@ -240,21 +237,18 @@ def test_filesystem_configuration_with_additional_arguments() -> None:
+             "delta.enableChangeDataFeed": "true",
+         },
+         deltalake_streamed_exec=False,
++        iceberg_table_properties={"write.format.default": "parquet"},
++        iceberg_namespace_properties={"owner": "data-team"},
+     )
+-    assert dict(config) == {
+-        "read_only": False,
+-        "bucket_url": "az://root",
+-        "credentials": None,
+-        "kwargs": {"use_ssl": True},
+-        "client_kwargs": {"verify": "public.crt"},
+-        "config_kwargs": None,
+-        "deltalake_storage_options": {"AWS_S3_LOCKING_PROVIDER": "dynamodb"},
+-        "deltalake_configuration": {
+-            "delta.minWriterVersion": "7",
+-            "delta.enableChangeDataFeed": "true",
+-        },
+-        "deltalake_streamed_exec": False,
++    config_dict = dict(config)
++    assert config_dict["deltalake_storage_options"] == {"AWS_S3_LOCKING_PROVIDER": "dynamodb"}
++    assert config_dict["deltalake_configuration"] == {
++        "delta.minWriterVersion": "7",
++        "delta.enableChangeDataFeed": "true",
+     }
++    assert config_dict["deltalake_streamed_exec"] is False
++    assert config_dict["iceberg_table_properties"] == {"write.format.default": "parquet"}
++    assert config_dict["iceberg_namespace_properties"] == {"owner": "data-team"}
+ 
+ 
+ @pytest.mark.skipif("s3" not in ALL_FILESYSTEM_DRIVERS, reason="s3 destination not configured")
+diff --git a/tests/load/filesystem/test_iceberg_adapter.py b/tests/load/filesystem/test_iceberg_adapter.py
+index 07d9ecb8e..634352731 100644
+--- a/tests/load/filesystem/test_iceberg_adapter.py
++++ b/tests/load/filesystem/test_iceberg_adapter.py
+@@ -5,6 +5,7 @@ import pyarrow as pa
+ from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+ from dlt.destinations.impl.filesystem.iceberg_adapter import (
+     PARTITION_HINT,
++    TABLE_PROPERTIES_HINT,
+     PartitionSpec,
+     parse_partition_hints,
+     create_identity_specs,
+@@ -134,13 +135,66 @@ def test_iceberg_adapter_custom_partition_field_name() -> None:
+     ]
+ 
+ 
+-def test_iceberg_adapter_no_partition_raises() -> None:
++def test_iceberg_adapter_no_args_raises() -> None:
+     @dlt.resource
+     def my_data():
+         yield [{"id": 1}]
+ 
+-    with pytest.raises(ValueError, match="A value for `partition` must be specified"):
+-        iceberg_adapter(my_data, partition=None)
++    with pytest.raises(
++        ValueError, match="At least one of `partition` or `table_properties` must be specified"
++    ):
++        iceberg_adapter(my_data)
++
++
++def test_iceberg_adapter_table_properties() -> None:
++    @dlt.resource
++    def my_data():
++        yield [{"id": 1, "region": "US"}]
++
++    resource = iceberg_adapter(
++        my_data,
++        partition="region",
++        table_properties={"write.format.default": "parquet"},
++    )
++
++    table_schema = resource.compute_table_schema()
++    assert table_schema.get(PARTITION_HINT) == [
++        {"transform": "identity", "source_column": "region"}
++    ]
++    assert table_schema.get(TABLE_PROPERTIES_HINT) == {"write.format.default": "parquet"}
++
++
++def test_iceberg_adapter_table_properties_only() -> None:
++    @dlt.resource
++    def my_data():
++        yield [{"id": 1}]
++
++    resource = iceberg_adapter(
++        my_data,
++        table_properties={"write.target-file-size-bytes": "536870912"},
++    )
++
++    table_schema = resource.compute_table_schema()
++    assert table_schema.get(PARTITION_HINT) is None
++    assert table_schema.get(TABLE_PROPERTIES_HINT) == {"write.target-file-size-bytes": "536870912"}
++
++
++@pytest.mark.parametrize(
++    "bad_properties,match",
++    [
++        ("not_a_dict", "`table_properties` must be a dictionary"),
++        ({1: "val"}, "Table property keys must be strings"),
++        ({"key": 123}, "Table property values must be strings"),
++    ],
++    ids=["not_dict", "non_string_key", "non_string_value"],
++)
++def test_iceberg_adapter_invalid_table_properties(bad_properties, match) -> None:
++    @dlt.resource
++    def my_data():
++        yield [{"id": 1}]
++
++    with pytest.raises(ValueError, match=match):
++        iceberg_adapter(my_data, table_properties=bad_properties)
+ 
+ 
+ def test_iceberg_adapter_with_raw_data() -> None:
+diff --git a/tests/load/pipeline/test_open_table_pipeline.py b/tests/load/pipeline/test_open_table_pipeline.py
+index 460258913..47635abfa 100644
+--- a/tests/load/pipeline/test_open_table_pipeline.py
++++ b/tests/load/pipeline/test_open_table_pipeline.py
+@@ -1153,6 +1153,98 @@ def test_iceberg_adapter_partitioning(
+     assert isinstance(it.spec().fields[0].transform, TruncateTransform)
+ 
+ 
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(
++        table_format_local_configs=True,
++        with_table_format="iceberg",
++    ),
++    ids=lambda x: x.name,
++)
++def test_iceberg_table_properties(
++    destination_config: DestinationTestConfiguration,
++) -> None:
++    """Config-level defaults, adapter-only, and merge (adapter wins) in one pipeline run."""
++    from dlt.common.libs.pyiceberg import get_iceberg_tables
++    from dlt.destinations.adapters import iceberg_adapter
++
++    # config sets defaults for all tables
++    os.environ["DESTINATION__FILESYSTEM__ICEBERG_TABLE_PROPERTIES"] = (
++        '{"write.format.default": "avro", "write.target-file-size-bytes": "536870912"}'
++    )
++
++    try:
++        pipeline = destination_config.setup_pipeline("fs_pipe", dev_mode=True)
++
++        @dlt.resource(table_format="iceberg")
++        def config_only():
++            yield [{"id": 1, "value": "a"}]
++
++        @dlt.resource(table_format="iceberg")
++        def adapter_override():
++            yield [{"id": 1, "value": "b"}]
++
++        info = pipeline.run(
++            [
++                config_only,
++                iceberg_adapter(
++                    adapter_override,
++                    table_properties={"write.format.default": "parquet"},
++                ),
++            ]
++        )
++        assert_load_info(info)
++
++        tables = get_iceberg_tables(pipeline, "config_only", "adapter_override")
++
++        # config-only: both config properties applied
++        assert tables["config_only"].properties["write.format.default"] == "avro"
++        assert tables["config_only"].properties["write.target-file-size-bytes"] == "536870912"
++
++        # adapter override: adapter wins on conflict, config default kept
++        assert tables["adapter_override"].properties["write.format.default"] == "parquet"
++        assert tables["adapter_override"].properties["write.target-file-size-bytes"] == "536870912"
++    finally:
++        del os.environ["DESTINATION__FILESYSTEM__ICEBERG_TABLE_PROPERTIES"]
++
++
++@pytest.mark.parametrize(
++    "destination_config",
++    destinations_configs(
++        table_format_local_configs=True,
++        with_table_format="iceberg",
++    ),
++    ids=lambda x: x.name,
++)
++def test_iceberg_namespace_properties(
++    destination_config: DestinationTestConfiguration,
++) -> None:
++    """Namespace properties from config are applied when creating the Iceberg namespace."""
++    os.environ["DESTINATION__FILESYSTEM__ICEBERG_NAMESPACE_PROPERTIES"] = (
++        '{"owner": "data-team", "description": "test namespace"}'
++    )
++
++    try:
++        pipeline = destination_config.setup_pipeline("fs_pipe_ns", dev_mode=True)
++
++        @dlt.resource(table_format="iceberg")
++        def ns_data():
++            yield [{"id": 1, "value": "a"}]
++
++        info = pipeline.run(ns_data)
++        assert_load_info(info)
++
++        from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
++
++        client: FilesystemClient = pipeline.destination_client()  # type: ignore[assignment]
++        catalog = client.get_open_table_catalog("iceberg")
++        ns_props = catalog.load_namespace_properties(client.dataset_name)
++        assert ns_props["owner"] == "data-team"
++        assert ns_props["description"] == "test namespace"
++    finally:
++        del os.environ["DESTINATION__FILESYSTEM__ICEBERG_NAMESPACE_PROPERTIES"]
++
++
+ @pytest.mark.parametrize(
+     "destination_config",
+     destinations_configs(
+
+
+===== COMMIT ab9e68db =====
+
+
+commit ab9e68db3
+Author: Jorrit Sandbrink
+Date: 2026-03-04
+
+    fix: respect custom Hugging Face endpoint for dataset card operations (#3696)
+
+diff --git a/dlt/destinations/impl/filesystem/configuration.py b/dlt/destinations/impl/filesystem/configuration.py
+index 4fd2619bd..73a63261d 100644
+--- a/dlt/destinations/impl/filesystem/configuration.py
++++ b/dlt/destinations/impl/filesystem/configuration.py
+@@ -44,7 +44,7 @@ class FilesystemDestinationClientConfiguration(FilesystemConfigurationWithLocalF
+ 
+ @configspec
+ class HfFilesystemDestinationClientConfiguration(FilesystemDestinationClientConfiguration):
+-    credentials: HfCredentials
++    credentials: HfCredentials = None
+     hf_dataset_card: bool = True
+     """Create and update dataset card (README.md) with subset metadata for the Hugging Face dataset viewer."""
+ 
+diff --git a/dlt/destinations/impl/filesystem/filesystem.py b/dlt/destinations/impl/filesystem/filesystem.py
+index 35bc31710..08c16a733 100644
+--- a/dlt/destinations/impl/filesystem/filesystem.py
++++ b/dlt/destinations/impl/filesystem/filesystem.py
+@@ -1466,16 +1466,42 @@ class HfFilesystemClient(FilesystemClient):
+                 f" skipping: {type(ex).__name__}: {ex}"
+             )
+ 
++    @contextmanager
++    def _hf_endpoint_env(self) -> Iterator[None]:
++        """Temporarily sets HF_ENDPOINT env var as specified in credentials.
++
++        Useful for methods that do not allow passing endpoint as argument.
++
++        Behavior in all four cases:
++        1. no endpoint in credentials, HF_ENDPOINT not set: no-op
++        2. no endpoint in credentials, HF_ENDPOINT set: no-op
++        3. endpoint in credentials, HF_ENDPOINT not set: sets HF_ENDPOINT to credentials endpoint temporarily
++        4. endpoint in credentials, HF_ENDPOINT set: overrides HF_ENDPOINT with credentials endpoint temporarily
++        """
++        if endpoint := self.config.credentials.hf_endpoint:
++            old = os.environ.get("HF_ENDPOINT")
++            os.environ["HF_ENDPOINT"] = endpoint
++            try:
++                yield
++            finally:
++                if old is None:
++                    del os.environ["HF_ENDPOINT"]
++                else:
++                    os.environ["HF_ENDPOINT"] = old
++        else:
++            yield
++
+     def init_dataset_card(self) -> None:
+         from huggingface_hub import DatasetCard
+ 
+-        # TODO: make dataset card content configurable
+-        DatasetCard(content="").push_to_hub(
+-            repo_id=self.repo_id,
+-            token=self.config.credentials.hf_token,
+-            repo_type="dataset",
+-            commit_message="Initialize dataset card",
+-        )
++        with self._hf_endpoint_env():
++            # TODO: make dataset card content configurable
++            DatasetCard(content="").push_to_hub(
++                repo_id=self.repo_id,
++                token=self.config.credentials.hf_token,
++                repo_type="dataset",
++                commit_message="Initialize dataset card",
++            )
+ 
+     @staticmethod
+     def create_dataset_card_metadata_config(
+@@ -1501,13 +1527,14 @@ class HfFilesystemClient(FilesystemClient):
+         from huggingface_hub import metadata_update
+ 
+         table_names = list(self.schema.data_table_names(seen_data_only=True))
+-        metadata_update(
+-            repo_id=self.repo_id,
+-            metadata=self.create_dataset_card_metadata(),
+-            repo_type="dataset",
+-            overwrite=True,
+-            token=self.config.credentials.hf_token,
+-            commit_message=(
+-                f"Load {load_id}: update dataset card metadata for {', '.join(table_names)}"
+-            ),
+-        )
++        with self._hf_endpoint_env():
++            metadata_update(
++                repo_id=self.repo_id,
++                metadata=self.create_dataset_card_metadata(),
++                repo_type="dataset",
++                overwrite=True,
++                token=self.config.credentials.hf_token,
++                commit_message=(
++                    f"Load {load_id}: update dataset card metadata for {', '.join(table_names)}"
++                ),
++            )
+diff --git a/docs/uv.lock b/docs/uv.lock
+index 71ad9070d..bf3e03fa8 100644
+--- a/docs/uv.lock
++++ b/docs/uv.lock
+@@ -834,7 +834,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.22.1"
++version = "1.22.2"
+ source = { editable = "../" }
+ dependencies = [
+     { name = "click" },
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/huggingface.md b/docs/website/docs/dlt-ecosystem/destinations/huggingface.md
+index 6a763a2e3..c9871a1a7 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/huggingface.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/huggingface.md
+@@ -59,15 +59,14 @@ Authentication is attempted in that order of priority: `hf_token` config → `HF
+ 
+ ### Private Hub endpoint
+ 
+-By default, `https://huggingface.co` is used as the API endpoint. To use a [Private Hub](https://huggingface.co/docs/hub/enterprise-hub) or a self-hosted endpoint, set the `HF_ENDPOINT` [environment variable](#hugging-face-environment-variables):
++By default, `https://huggingface.co` is used as the API endpoint. To use a [Private Hub](https://huggingface.co/docs/hub/enterprise-hub) or a self-hosted endpoint, set `hf_endpoint`:
+ 
+-```sh
+-export HF_ENDPOINT="https://your-private-hub.example.com"
++```toml
++[destination.filesystem.credentials]
++hf_endpoint = "https://your-private-hub.example.com"    # replace with your Hugging Face endpoint
+ ```
+ 
+-:::note
+-dlt also supports `hf_endpoint` in the configuration, but this only configures the filesystem and API clients — not the [dataset card](#dataset-card) operations. Use `HF_ENDPOINT` to ensure all operations target the correct endpoint.
+-:::
++Alternatively, you can set the `HF_ENDPOINT` [environment variable](#hugging-face-environment-variables). When both are set, the `hf_endpoint` config takes precedence over the `HF_ENDPOINT` env var.
+ 
+ ### Full example configuration
+ 
+@@ -225,5 +224,5 @@ If you see authentication errors, verify that:
+ 
+ 1. Your token has **write** access to the target namespace.
+ 2. The token is correctly set in `hf_token`, `HF_TOKEN`, or via `huggingface-cli login`.
+-3. If using a Private Hub, `HF_ENDPOINT` is set to the correct URL.
++3. If using a Private Hub, `hf_endpoint` (or `HF_ENDPOINT`) is set to the correct URL.
+ 4. Dataset `dataset_name` exists.
+diff --git a/tests/load/filesystem/test_filesystem_client.py b/tests/load/filesystem/test_filesystem_client.py
+index aa4491593..9ff9a008b 100644
+--- a/tests/load/filesystem/test_filesystem_client.py
++++ b/tests/load/filesystem/test_filesystem_client.py
+@@ -5,6 +5,7 @@ import json
+ import orjson
+ from unittest import mock
+ from pathlib import Path
++from unittest.mock import patch
+ from urllib.parse import urlparse
+ 
+ import pytest
+@@ -20,11 +21,14 @@ from dlt.common.known_env import DLT_LOCAL_DIR
+ from dlt.common.schema.schema import Schema
+ from dlt.common.storages.configuration import FilesystemConfiguration
+ from dlt.common.time import ensure_pendulum_datetime_utc
+-from dlt.common.utils import digest128, uniq_id
++from dlt.common.utils import custom_environ, digest128, uniq_id
+ from dlt.common.storages import FileStorage, ParsedLoadJobFileName
+ from dlt.common.storages.exceptions import UnsupportedStorageVersionException
+ 
+ from dlt.destinations import filesystem
++from dlt.destinations.impl.filesystem.configuration import (
++    HfFilesystemDestinationClientConfiguration,
++)
+ from dlt.destinations.impl.filesystem.filesystem import (
+     FilesystemClient,
+     FilesystemDestinationClientConfiguration,
+@@ -59,9 +63,14 @@ NORMALIZED_FILES = [
+ 
+ 
+ def _client_factory(fs: filesystem) -> FilesystemClient:
++    config_class = (
++        HfFilesystemDestinationClientConfiguration
++        if fs.is_hf
++        else FilesystemDestinationClientConfiguration
++    )
+     client = fs.client(
+         Schema("test"),
+-        initial_config=FilesystemDestinationClientConfiguration()._bind_dataset_name("test"),
++        initial_config=config_class()._bind_dataset_name("test"),
+     )
+     return client
+ 
+@@ -488,3 +497,61 @@ def test_verify_schema_table_format(with_gdrive_buckets_env: str) -> None:
+             client.verify_schema(["delta_table"])
+     else:
+         client.verify_schema(["delta_table"])
++
++
++def test_hf_endpoint_env(default_buckets_env: str) -> None:
++    if not default_buckets_env.startswith("hf://"):
++        pytest.skip("only runs on hf:// protocol")
++
++    from dlt.destinations.impl.filesystem.filesystem import HfFilesystemClient
++
++    filesystem_ = filesystem(default_buckets_env)
++    client = _client_factory(filesystem_)
++    assert isinstance(client, HfFilesystemClient)
++
++    CREDS_ENDPOINT = "https://credentials-endpoint.com"
++    ENV_VAR_ENDPOINT = "https://env-var-endpoint.com"
++
++    # sanity check
++    assert client.config.credentials.hf_endpoint is None
++    assert os.environ.get("HF_ENDPOINT") is None
++
++    # case 1: no endpoint in credentials, HF_ENDPOINT not set
++    with client._hf_endpoint_env():
++        assert os.environ.get("HF_ENDPOINT") is None
++
++    # case 2: no endpoint in credentials, HF_ENDPOINT set
++    with custom_environ({"HF_ENDPOINT": ENV_VAR_ENDPOINT}):
++        with client._hf_endpoint_env():
++            assert os.environ.get("HF_ENDPOINT") == ENV_VAR_ENDPOINT  # env var endpoint retained
++        assert os.environ.get("HF_ENDPOINT") == ENV_VAR_ENDPOINT
++
++    # now set endpoint in credentials
++    client.config.credentials.hf_endpoint = CREDS_ENDPOINT
++    assert os.environ.get("HF_ENDPOINT") is None
++
++    # case 3: endpoint in credentials, HF_ENDPOINT not set
++    with client._hf_endpoint_env():
++        assert os.environ.get("HF_ENDPOINT") == CREDS_ENDPOINT  # creds endpoint set in env
++    assert os.environ.get("HF_ENDPOINT") is None  # env var endpoint restored
++
++    # case 4: endpoint in credentials, HF_ENDPOINT set
++    with custom_environ({"HF_ENDPOINT": ENV_VAR_ENDPOINT}):
++        with client._hf_endpoint_env():
++            assert (
++                os.environ.get("HF_ENDPOINT") == CREDS_ENDPOINT
++            )  # creds endpoint takes precedence
++        assert os.environ.get("HF_ENDPOINT") == ENV_VAR_ENDPOINT  # env var endpoint restored
++
++    # now test that Hugging Face methods without endpoint argument are wrapped with `_hf_endpoint_env`
++
++    assert client.config.credentials.hf_endpoint == CREDS_ENDPOINT  # sanity check
++
++    def assert_hf_endpoint_set(*args, **kwargs):
++        assert os.environ["HF_ENDPOINT"] == CREDS_ENDPOINT
++
++    with patch("huggingface_hub.DatasetCard.push_to_hub", side_effect=assert_hf_endpoint_set):
++        client.init_dataset_card()
++
++    with patch("huggingface_hub.metadata_update", side_effect=assert_hf_endpoint_set):
++        client.update_dataset_card_metadata(load_id="test")
+
+
+===== COMMIT ff3f4f41 =====
+
+
+commit ff3f4f417
+Author: rudolfix
+Date: 2026-03-04
+
+    (fix) fixes various threading issues that may cause locking (#3698)
+
+diff --git a/dlt/extract/concurrency.py b/dlt/extract/concurrency.py
+index b56cbb56e..c69bc3405 100644
+--- a/dlt/extract/concurrency.py
++++ b/dlt/extract/concurrency.py
+@@ -8,6 +8,7 @@ import contextvars
+ from threading import Thread
+ from typing import Awaitable, Dict, Optional
+ 
++from dlt.common import logger
+ from dlt.common.exceptions import PipelineException
+ from dlt.common.configuration.container import Container
+ from dlt.common.runners.pool_runner import TimeoutThreadPoolExecutor
+@@ -229,10 +230,22 @@ class FuturesPool:
+                 self._async_pool.shutdown_asyncgens(), self._ensure_async_pool()
+             )
+ 
+-            wait_for_futures([future])
++            _, not_done = wait_for_futures([future], timeout=60)
++            if not_done:
++                logger.warning(
++                    "Closing extract async pool: shutdown_asyncgens did not complete"
++                    " within 60s, abandoning remaining async generators"
++                )
+             self._async_pool.call_soon_threadsafe(stop_background_loop, self._async_pool)
+ 
+-            self._async_pool_thread.join()
++            self._async_pool_thread.join(timeout=10)
++            if self._async_pool_thread.is_alive():
++                logger.warning(
++                    "Closing extract async pool: event loop thread did not stop"
++                    " within 10s, abandoning"
++                )
++            else:
++                self._async_pool.close()
+             self._async_pool = None
+             self._async_pool_thread = None
+ 
+diff --git a/tests/common/configuration/test_container.py b/tests/common/configuration/test_container.py
+index 92393e9af..556705df6 100644
+--- a/tests/common/configuration/test_container.py
++++ b/tests/common/configuration/test_container.py
+@@ -150,6 +150,7 @@ def test_raise_on_no_default_value(container: Container) -> None:
+ def test_container_injectable_context(
+     container: Container, spec: Type[InjectableTestContext]
+ ) -> None:
++    """injectable_context sets context on enter and removes on exit."""
+     with container.injectable_context(InjectableTestContext()) as current_config:
+         assert current_config.current_value is None
+         current_config.current_value = "TEST"
+@@ -163,6 +164,7 @@ def test_container_injectable_context(
+ def test_container_injectable_context_restore(
+     container: Container, spec: Type[InjectableTestContext]
+ ) -> None:
++    """Nested injectable_context restores previous context on exit."""
+     # this will create InjectableTestConfiguration
+     original = container[spec]
+     original.current_value = "ORIGINAL"
+@@ -182,6 +184,7 @@ def test_container_injectable_context_restore(
+ def test_container_injectable_context_mangled(
+     container: Container, spec: Type[InjectableTestContext]
+ ) -> None:
++    """Overwriting context during injectable_context raises ContainerInjectableContextMangled."""
+     original = container[spec]
+     original.current_value = "ORIGINAL"
+ 
+@@ -197,25 +200,26 @@ def test_container_injectable_context_mangled(
+ 
+ @pytest.mark.parametrize("spec", (InjectableTestContext, GlobalTestContext))
+ def test_container_thread_affinity(container: Container, spec: Type[InjectableTestContext]) -> None:
+-    event = threading.Semaphore(0)
++    """Regular threads get isolated contexts; GlobalTestContext shares one instance."""
++    barrier = threading.Barrier(2, timeout=5)
+     thread_item: InjectableTestContext = None
+ 
+     def _thread() -> None:
+-        container[spec] = spec(current_value="THREAD")
+-        event.release()
+-        event.acquire()
+         nonlocal thread_item
++        container[spec] = spec(current_value="THREAD")
++        barrier.wait()  # sync 1: thread context is set
++        barrier.wait()  # sync 2: main has modified value
+         thread_item = container[spec]
+-        event.release()
+ 
+-    threading.Thread(target=_thread, daemon=True).start()
+-    event.acquire()
+-    # it may be or separate copy (InjectableTestContext) or single copy (GlobalTestContext)
++    t = threading.Thread(target=_thread, daemon=True)
++    t.start()
++    barrier.wait()  # sync 1: wait for thread to set context
+     main_item = container[spec]
+     main_item.current_value = "MAIN"
+-    event.release()
++    barrier.wait()  # sync 2: let thread proceed
++    t.join(timeout=5)
++    assert not t.is_alive()
+     main_item = container[spec]
+-    event.release()
+     if spec is GlobalTestContext:
+         # just one context is kept globally
+         assert main_item is thread_item
+@@ -229,27 +233,28 @@ def test_container_thread_affinity(container: Container, spec: Type[InjectableTe
+ 
+ @pytest.mark.parametrize("spec", (InjectableTestContext, GlobalTestContext))
+ def test_container_pool_affinity(container: Container, spec: Type[InjectableTestContext]) -> None:
+-    event = threading.Semaphore(0)
++    """Threads named with pool prefix inherit the parent thread's context."""
++    barrier = threading.Barrier(2, timeout=5)
+     thread_item: InjectableTestContext = None
+ 
+     def _thread() -> None:
+-        container[spec] = spec(current_value="THREAD")
+-        event.release()
+-        event.acquire()
+         nonlocal thread_item
++        container[spec] = spec(current_value="THREAD")
++        barrier.wait()  # sync 1: thread context is set
++        barrier.wait()  # sync 2: main has modified value
+         thread_item = container[spec]
+-        event.release()
+ 
+-    threading.Thread(target=_thread, daemon=True, name=Container.thread_pool_prefix()).start()
+-    event.acquire()
+-    # it may be or separate copy (InjectableTestContext) or single copy (GlobalTestContext)
++    t = threading.Thread(target=_thread, daemon=True, name=Container.thread_pool_prefix())
++    t.start()
++    barrier.wait()  # sync 1: wait for thread to set context
+     main_item = container[spec]
+     main_item.current_value = "MAIN"
+-    event.release()
++    barrier.wait()  # sync 2: let thread proceed
++    t.join(timeout=5)
++    assert not t.is_alive()
+     main_item = container[spec]
+-    event.release()
+ 
+-    # just one context is kept globally - Container user pool thread name to get the starting thread id
++    # just one context is kept globally - Container uses pool thread name to get the starting thread id
+     # and uses it to retrieve context
+     assert main_item is thread_item
+     # MAIN was set after thread
+@@ -257,6 +262,8 @@ def test_container_pool_affinity(container: Container, spec: Type[InjectableTest
+ 
+ 
+ def test_thread_pool_affinity(container: Container) -> None:
++    """ThreadPoolExecutor with dlt pool prefix shares parent context; without prefix does not."""
++
+     def _context() -> InjectableTestContext:
+         return container[InjectableTestContext]
+ 
+@@ -278,6 +285,7 @@ def test_thread_pool_affinity(container: Container) -> None:
+ 
+ @pytest.mark.parametrize("spec", (InjectableTestContext, GlobalTestContext))
+ def test_container_provider(container: Container, spec: Type[InjectableTestContext]) -> None:
++    """ContextProvider resolves injectable contexts from container, rejects sections."""
+     provider = ContextProvider()
+     # default value will be created
+     v, k = provider.get_value("n/a", spec, None)
+@@ -308,6 +316,7 @@ def test_container_provider(container: Container, spec: Type[InjectableTestConte
+ 
+ 
+ def test_container_provider_embedded_inject(container: Container, environment: Any) -> None:
++    """Container provider takes precedence over environ for embedded injectable fields."""
+     environment["INJECTED"] = "unparsable"
+     with container.injectable_context(InjectableTestContext(current_value="Embed")) as injected:
+         # must have top precedence - over the environ provider. environ provider is returning a value that will cannot be parsed
+@@ -321,6 +330,7 @@ def test_container_provider_embedded_inject(container: Container, environment: A
+ def test_container_provider_embedded_no_default(
+     container: Container, spec: Type[InjectableTestContext]
+ ) -> None:
++    """Embedded no-default context requires active injection or Optional field."""
+     with container.injectable_context(NoDefaultInjectableContext()):
+         resolve_configuration(EmbeddedWithNoDefaultInjectableContext())
+     # default cannot be created so fails
+@@ -421,8 +431,10 @@ def test_get_worker_contexts_thread_local(container: Container) -> None:
+     t_b.start()
+ 
+     t_b.join(timeout=5)
++    assert not t_b.is_alive()
+     event1.acquire()  # wait for thread_a to finish
+     t_a.join(timeout=5)
++    assert not t_a.is_alive()
+ 
+     # each thread should get its own context
+     assert ThreadLocalWorkerContext in results["thread_a"]
+@@ -489,7 +501,9 @@ def test_get_worker_contexts_two_pools_different_contexts(container: Container)
+     t_a.start()
+     t_b.start()
+     t_a.join(timeout=5)
++    assert not t_a.is_alive()
+     t_b.join(timeout=5)
++    assert not t_b.is_alive()
+ 
+     # each pool should have gotten its parent thread's context
+     assert ThreadLocalWorkerContext in results["pool_a"]
+@@ -551,6 +565,7 @@ def test_injectable_context_lock_controls_concurrent_write(
+     finally:
+         write_completed.wait(timeout=5)
+         t.join(timeout=5)
++        assert not t.is_alive()
+ 
+ 
+ def test_injectable_context_lock_no_deadlock_on_new_thread(container: Container) -> None:
+@@ -568,6 +583,7 @@ def test_injectable_context_lock_no_deadlock_on_new_thread(container: Container)
+         t.start()
+         assert thread_done.wait(timeout=5), "thread must not deadlock"
+         t.join(timeout=5)
++        assert not t.is_alive()
+ 
+ 
+ def test_concurrent_default_creation(container: Container) -> None:
+@@ -585,6 +601,7 @@ def test_concurrent_default_creation(container: Container) -> None:
+         t.start()
+     for t in threads:
+         t.join(timeout=5)
++        assert not t.is_alive()
+ 
+     assert all(r is not None for r in results)
+     # double-checked locking must produce exactly one instance
+@@ -608,4 +625,5 @@ def test_injectable_context_setitem_exception_releases_lock(container: Container
+     t.start()
+     assert acquired.wait(timeout=5), "lock must be released after setitem exception"
+     t.join(timeout=5)
++    assert not t.is_alive()
+     assert container[GlobalTestContext].current_value == "AFTER_FAIL"
+diff --git a/tests/common/configuration/test_inject.py b/tests/common/configuration/test_inject.py
+index 815d1c9ec..883112ac1 100644
+--- a/tests/common/configuration/test_inject.py
++++ b/tests/common/configuration/test_inject.py
+@@ -466,8 +466,8 @@ def test_lock_context(lock, same_pool) -> None:
+             thread_ids = ["dlt-pool-5-1", "dlt-pool-20-2"]
+ 
+         # simulate threads in the same pool
+-        thread1 = threading.Thread(target=test_sections, name=thread_ids[0])
+-        thread2 = threading.Thread(target=test_sections, name=thread_ids[1])
++        thread1 = threading.Thread(target=test_sections, name=thread_ids[0], daemon=True)
++        thread2 = threading.Thread(target=test_sections, name=thread_ids[1], daemon=True)
+ 
+         thread1.start()
+         thread2.start()
+diff --git a/tests/common/runners/test_runners.py b/tests/common/runners/test_runners.py
+index 663fd0cb8..5b07f0f07 100644
+--- a/tests/common/runners/test_runners.py
++++ b/tests/common/runners/test_runners.py
+@@ -149,10 +149,13 @@ def default_args() -> Iterator[None]:
+     signals._received_signal = 0
+     global _counter
+     _counter = 0
++    saved = Container._INSTANCE
++    Container._INSTANCE = None
+     try:
+         yield
+     finally:
+         signals._received_signal = 0
++        Container._INSTANCE = saved
+ 
+ 
+ # test runner functions
+
+
+===== COMMIT dd69e9ae =====
+
+
+commit dd69e9aec
+Author: Anuun Chinbat
+Date: 2026-03-04
+
+    always set pipeline dataset when restoring state (#3700)
+
+diff --git a/dlt/pipeline/pipeline.py b/dlt/pipeline/pipeline.py
+index c46e28d31..5be999643 100644
+--- a/dlt/pipeline/pipeline.py
++++ b/dlt/pipeline/pipeline.py
+@@ -824,6 +824,15 @@ class Pipeline(SupportsPipeline):
+                                 "destination state contains state for pipeline with name"
+                                 f" {remote_state['pipeline_name']}",
+                             )
++                        # warn if remote state has a different dataset_name
++                        if state["dataset_name"] != remote_state["dataset_name"]:
++                            logger.warning(
++                                f"Pipeline {self.pipeline_name} got restored from destination"
++                                " but the remote state contains a different dataset_name"
++                                f" '{remote_state['dataset_name']}'. The current dataset_name"
++                                f" '{self.dataset_name}' will be used and the pipeline state"
++                                " will be updated accordingly."
++                            )
+                         # if state was modified force get all schemas
+                         restored_schemas = self._get_schemas_from_destination(
+                             remote_state["schema_names"], always_download=True
+@@ -847,6 +856,8 @@ class Pipeline(SupportsPipeline):
+                     # use remote state as state
+                     remote_state["_local"] = state["_local"]
+                     state = remote_state
++                    # preserve the user's dataset_name over the remote state value
++                    state["dataset_name"] = self.dataset_name
+                     # set the pipeline props from merged state
+                     self._state_to_props(state)
+                     # add that the state is already extracted
+diff --git a/tests/pipeline/test_pipeline.py b/tests/pipeline/test_pipeline.py
+index 022a0d5c9..1e081cf1f 100644
+--- a/tests/pipeline/test_pipeline.py
++++ b/tests/pipeline/test_pipeline.py
+@@ -1539,6 +1539,71 @@ def test_restore_state_on_dummy() -> None:
+     assert p.state["_state_version"] == 0
+ 
+ 
++def test_restore_state_on_destination_dataset_name_change(caplog: Any) -> None:
++    """The dataset_name set by the user is authoritative. When the pipeline restores state
++    from a destination dataset that was copied from another, the remote state contains
++    the old dataset_name. The pipeline must use the user's dataset_name
++    and update the state accordingly"""
++
++    @dlt.resource(write_disposition="merge", primary_key="id")
++    def items(data):
++        yield data
++
++    pipeline_name = "pipe_" + uniq_id()
++
++    # initial run to original_dataset
++    pipeline = dlt.pipeline(pipeline_name, destination="duckdb", dataset_name="original_dataset")
++
++    load_info = pipeline.run(items([{"id": 1, "name": "Bob"}]))
++    assert_load_info(load_info)
++    assert pipeline.dataset_name == "original_dataset"
++    assert pipeline.state["dataset_name"] == "original_dataset"
++
++    # copy all tables from original_dataset to new_dataset
++    # (simulates the user copying a dataset)
++    with pipeline.sql_client() as client:
++        client.execute_sql("CREATE SCHEMA IF NOT EXISTS new_dataset")
++        tables = client.execute_sql(
++            "SELECT table_name FROM information_schema.tables "
++            "WHERE table_schema = 'original_dataset'"
++        )
++        for (table_name,) in tables:
++            client.execute_sql(
++                f"CREATE TABLE new_dataset.{table_name} AS SELECT * FROM"
++                f" original_dataset.{table_name}"
++            )
++
++    # wipe local state
++    # (simulates ephemeral envs)
++    pipeline._wipe_working_folder()
++
++    # pipeline pointing at new_dataset
++    pipeline = dlt.pipeline(pipeline_name, destination="duckdb", dataset_name="new_dataset")
++
++    # state restored from new_dataset must not revert dataset_name to original_dataset
++    dlt_logger = logging.getLogger("dlt")
++    dlt_logger.propagate = True
++    try:
++        with caplog.at_level(logging.WARNING, logger="dlt"):
++            load_info = pipeline.run(items([{"id": 1, "name": "Bob"}, {"id": 2, "name": "Alice"}]))
++    finally:
++        dlt_logger.propagate = False
++    assert_load_info(load_info)
++    assert pipeline.dataset_name == "new_dataset"
++    assert pipeline.state["dataset_name"] == "new_dataset"
++
++    # warning was emitted about dataset_name mismatch
++    warning_message = caplog.records[0].message
++    assert "the remote state contains a different dataset_name" in warning_message
++
++    # verify data landed in new_dataset, not original_dataset
++    with pipeline.sql_client() as client:
++        original_rows = client.execute_sql("SELECT id, name FROM original_dataset.items")
++        new_rows = client.execute_sql("SELECT id, name FROM new_dataset.items")
++        assert original_rows == [(1, "Bob")]
++        assert set(new_rows) == {(1, "Bob"), (2, "Alice")}
++
++
+ def test_first_run_flag() -> None:
+     pipeline_name = "pipe_" + uniq_id()
+     p = dlt.pipeline(pipeline_name=pipeline_name, destination=DUMMY_COMPLETE)
+
+
+===== COMMIT c645c8b8 =====
+
+
+commit c645c8b8d
+Author: aditypan
+Date: 2026-03-03
+
+    Add missing parameters in Paginator Configs (#3658)
+
+diff --git a/dlt/sources/rest_api/typing.py b/dlt/sources/rest_api/typing.py
+index e2f8318da..c35e6b795 100644
+--- a/dlt/sources/rest_api/typing.py
++++ b/dlt/sources/rest_api/typing.py
+@@ -68,6 +68,8 @@ class PageNumberPaginatorConfig(PaginatorTypeConfig, total=False):
+     total_path: Optional[jsonpath.TJsonPath]
+     maximum_page: Optional[int]
+     stop_after_empty_page: Optional[bool]
++    has_more_path: Optional[jsonpath.TJsonPath]
++    page_body_path: Optional[str]
+ 
+ 
+ class OffsetPaginatorConfig(PaginatorTypeConfig, total=False):
+@@ -82,6 +84,7 @@ class OffsetPaginatorConfig(PaginatorTypeConfig, total=False):
+     total_path: Optional[jsonpath.TJsonPath]
+     maximum_offset: Optional[int]
+     stop_after_empty_page: Optional[bool]
++    has_more_path: Optional[jsonpath.TJsonPath]
+ 
+ 
+ class HeaderLinkPaginatorConfig(PaginatorTypeConfig, total=False):
+@@ -105,6 +108,8 @@ class JSONResponseCursorPaginatorConfig(PaginatorTypeConfig, total=False):
+     cursor_path: Optional[jsonpath.TJsonPath]
+     cursor_param: Optional[str]
+     cursor_body_path: Optional[jsonpath.TJsonPath]
++    stop_after_empty_page: Optional[bool]
++    has_more_path: Optional[jsonpath.TJsonPath]
+ 
+ 
+ class HeaderCursorPaginatorConfig(PaginatorTypeConfig, total=False):
+
+
+===== COMMIT ba71c8f2 =====
+
+
+commit ba71c8f24
+Author: rudolfix
+Date: 2026-03-01
+
+    fix: replace commonprefix with commonpath in FileStorage.is_path_in_storage (CWE-22) (#3678)
+

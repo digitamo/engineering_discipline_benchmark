@@ -1,0 +1,3694 @@
+---
+title: Export Arize Phoenix Telemetry
+description: Export traces, spans, and evaluations from Arize Phoenix to your data lake
+keywords: [arize, phoenix, opentelemetry, traces, spans, evaluations, observability, llm, export]
+---
+# Export Arize Phoenix Telemetry
+
+[Arize Phoenix](https://phoenix.arize.com/) is an open-source observability platform for AI and LLM
+applications. It captures traces, spans, and evaluations (e.g. relevance scores, hallucination checks)
+that are sent via the OpenTelemetry (OTel) protocol.
+
+To enable analytics, reporting, and offline evaluation, this telemetry needs to be exported to a
+data lakehouse or warehouse. Arize Phoenix persists data in a relational database — either **PostgreSQL**
+(recommended for production) or **SQLite** (the default for single-node deployments).
+
+The `dlt` library's built-in `sql_database()` source makes extraction straightforward:
+
+* Connect directly to Phoenix's Postgres or SQLite backend with a connection string.
+* Use `resolve_foreign_keys=True` so dlt automatically links child tables (e.g. spans → traces).
+* Load to **DuckDB** for zero-config local analytics, or swap to any other dlt destination.
+
+## Credentials
+
+### PostgreSQL
+
+Add the following block to `.dlt/secrets.toml`, filling in the values from your deployment:
+
+```toml
+# .dlt/secrets.toml
+[sources.sql_database.credentials]
+drivername = "postgresql"
+host = "localhost"
+port = 5432
+database = "phoenix"
+username = "phoenix"
+password = "phoenix"
+```
+
+You also need the psycopg2 driver installed:
+
+```bash
+pip install psycopg2-binary
+```
+
+Where to find these values:
+
+- **Docker Compose**: look for the `db` service in your `docker-compose.yml`. The credentials are
+  set via `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` environment variables. The host
+  is the service name (or `localhost` if the port is published to the host).
+- **Helm chart**: check `values.yaml` under `postgresql.auth` or the `PHOENIX_SQL_DATABASE_URL`
+  environment variable on the Phoenix deployment.
+
+### SQLite
+
+Add the following block to `.dlt/secrets.toml`, pointing `database` at the `.db` file on disk:
+
+```toml
+# .dlt/secrets.toml
+[sources.sql_database.credentials]
+drivername = "sqlite"
+database = "/path/to/phoenix.db"
+```
+
+Where to find the file:
+
+- **Docker Compose**: the SQLite file lives at `/phoenix/storage/phoenix.db` inside the container.
+  Volume-mount it to a host path so the pipeline can read it directly:
+
+  ```yaml
+  volumes:
+    - ./data/phoenix.db:/phoenix/storage/phoenix.db
+  ```
+
+  Then set `database` to the host-side path (e.g. `./data/phoenix.db`).
+- **No volume mount**: copy the file out first with
+  `docker cp <container>:/phoenix/storage/phoenix.db ./phoenix.db`, then point `database` at the
+  copied file.
+
+NOTE. You need the `dlt[sql-database]` extra installed:
+
+```bash
+pip install "dlt[sql-database]"
+```
+
+## Data model
+
+dlt automatically discovers every table in the Phoenix database and infers their relationships from
+foreign keys — no schema configuration required. The exact set of tables you get depends on which
+Phoenix features you have used: tables are only created in the database once the corresponding
+feature is exercised. For example, the `datasets` and `dataset_examples` tables do not exist until
+you create a dataset through the Phoenix web UI.
+
+The tables most relevant for AI observability are:
+
+- **`projects`** — top-level containers; each project groups a set of traces.
+- **`traces`** — a trace is a complete request or workflow, identified by a `trace_id`.
+- **`spans`** — the core table. Every OTEL span belongs to a trace. Spans carry timing, status,
+  LLM token counts, input/output values, and arbitrary OpenInference attributes.
+- **`span_annotations`** — evaluations attached to individual spans (e.g. relevance score,
+  hallucination label), produced by human raters or automated LLM judges.
+- **`trace_annotations`** — same as `span_annotations` but scoped to a full trace.
+- **`datasets`** — curated collections of examples, created via the Phoenix web UI or SDK.
+- **`dataset_examples`** — the individual rows inside a dataset, each linked back to a source span.
+- **`dataset_versions`** — snapshot history of a dataset, enabling reproducible evaluations.
+- **`experiments`** — prompt playground runs executed against a dataset version.
+- **`experiment_runs`** — individual outputs produced by an experiment for each dataset example.
+
+Some tables are internal to Phoenix (e.g. migration tracking, internal job queues).
+You can explicitly select a subset of tables to load via the parameter `sql_database(..., table_names=...)`.
+
+```mermaid
+erDiagram
+    alembic_version{
+    text version_num PK
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    users{
+    bigint id PK
+    bigint user_role_id
+    text username
+    text email
+    text profile_picture_url
+    binary password_hash
+    binary password_salt
+    bool reset_password
+    text oauth2_client_id
+    text oauth2_user_id
+    timestamp created_at
+    timestamp updated_at
+    text auth_method
+    text ldap_unique_id
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    user_roles{
+    bigint id PK
+    text name
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    projects{
+    bigint id PK
+    text name
+    text description
+    text gradient_start_color
+    text gradient_end_color
+    timestamp created_at
+    timestamp updated_at
+    bigint trace_retention_policy_id
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    project_trace_retention_policies{
+    bigint id PK
+    text name
+    text cron_expression
+    json rule
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    generative_models{
+    bigint id PK
+    text name
+    text provider
+    text name_pattern
+    bool is_built_in
+    timestamp start_time
+    timestamp created_at
+    timestamp updated_at
+    timestamp deleted_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    token_prices{
+    bigint id PK
+    bigint model_id
+    text token_type
+    bool is_prompt
+    double base_rate
+    json customization
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    evaluators{
+    bigint id PK
+    text name
+    text description
+    json metadata
+    text kind
+    bigint user_id
+    timestamp created_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    builtin_evaluators{
+    bigint id PK
+    text kind
+    text key
+    json input_schema
+    json output_configs
+    timestamp synced_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    dataset_examples{
+    bigint id PK
+    bigint dataset_id
+    bigint span_rowid
+    timestamp created_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    datasets{
+    bigint id PK
+    text name
+    text description
+    json metadata
+    timestamp created_at
+    timestamp updated_at
+    bigint user_id
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    spans{
+    bigint id PK
+    bigint trace_rowid
+    text span_id
+    text parent_id
+    text name
+    text span_kind
+    timestamp start_time
+    timestamp end_time
+    json attributes
+    json events
+    text status_code
+    text status_message
+    bigint cumulative_error_count
+    bigint cumulative_llm_token_count_prompt
+    bigint cumulative_llm_token_count_completion
+    bigint llm_token_count_prompt
+    bigint llm_token_count_completion
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    traces{
+    bigint id PK
+    bigint project_rowid
+    text trace_id
+    timestamp start_time
+    timestamp end_time
+    bigint project_session_rowid
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    project_sessions{
+    bigint id PK
+    text session_id
+    bigint project_id
+    timestamp start_time
+    timestamp end_time
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    dataset_example_revisions{
+    bigint id PK
+    bigint dataset_example_id
+    bigint dataset_version_id
+    json input
+    json output
+    json metadata
+    text revision_kind
+    timestamp created_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    dataset_versions{
+    bigint id PK
+    bigint dataset_id
+    text description
+    json metadata
+    timestamp created_at
+    bigint user_id
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    span_annotations{
+    bigint id PK
+    bigint span_rowid
+    text name
+    text label
+    double score
+    text explanation
+    json metadata
+    text annotator_kind
+    timestamp created_at
+    timestamp updated_at
+    bigint user_id
+    text identifier
+    text source
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    project_annotation_configs{
+    bigint id PK
+    bigint project_id
+    bigint annotation_config_id
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    annotation_configs{
+    bigint id PK
+    text name
+    json config
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    span_costs{
+    bigint id PK
+    bigint span_rowid
+    bigint trace_rowid
+    bigint model_id
+    timestamp span_start_time
+    double total_cost
+    double total_tokens
+    double prompt_cost
+    double prompt_tokens
+    double completion_cost
+    double completion_tokens
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    span_cost_details{
+    bigint id PK
+    bigint span_cost_id
+    text token_type
+    bool is_prompt
+    double cost
+    double tokens
+    double cost_per_token
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    users ||--|{ user_roles : ""
+    projects ||--|{ project_trace_retention_policies : ""
+    token_prices ||--|{ generative_models : ""
+    evaluators ||--|{ users : ""
+    builtin_evaluators ||--|{ evaluators : ""
+    dataset_examples ||--|{ datasets : ""
+    dataset_examples ||--|{ spans : ""
+    datasets ||--|{ users : ""
+    spans ||--|{ traces : ""
+    traces ||--|{ projects : ""
+    traces ||--|{ project_sessions : ""
+    project_sessions ||--|{ projects : ""
+    dataset_example_revisions ||--|{ dataset_versions : ""
+    dataset_example_revisions ||--|{ dataset_examples : ""
+    dataset_versions ||--|{ datasets : ""
+    dataset_versions ||--|{ users : ""
+    span_annotations ||--|{ users : ""
+    span_annotations ||--|{ spans : ""
+    project_annotation_configs ||--|{ projects : ""
+    project_annotation_configs ||--|{ annotation_configs : ""
+    span_costs ||--|{ traces : ""
+    span_costs ||--|{ spans : ""
+    span_costs ||--|{ generative_models : ""
+    span_cost_details ||--|{ span_costs : ""
+```
+
+### Full source code
+
+```py noexecute
+import dlt
+from dlt.sources.sql_database import sql_database
+
+
+@dlt.source
+def arize_phoenix_source(credentials=dlt.secrets.value):
+    """Returns all Arize Phoenix tables as a dlt source.
+
+    Reads directly from Phoenix's relational backend (PostgreSQL or SQLite) using
+    dlt's built-in `sql_database` source. Foreign key relationships are resolved
+    automatically so destination tables reference each other correctly.
+
+    The primary tables of interest are:
+
+    - **spans**: Every OTEL span recorded by Phoenix — the core unit of telemetry.
+      Each row represents one span with timing, attributes, status, and token counts.
+    - **traces**: Groups of related spans sharing the same `trace_id`.
+    - **projects**: Phoenix projects that spans are assigned to.
+    - **span_annotations**: Human or model-generated evaluations attached to spans
+      (e.g. relevance score, hallucination label).
+    - **trace_annotations**: Evaluations at the trace level.
+    - **datasets / dataset_examples**: Curated examples used in prompt playgrounds
+      or regression test suites.
+
+    Args:
+        credentials: SQLAlchemy-compatible connection string or credential dict,
+            loaded from `secrets.toml`. Supports both PostgreSQL and SQLite URIs.
+
+    Returns:
+        A list of dlt resources — one per Phoenix database table.
+    """
+    return sql_database(
+        credentials=credentials,
+        resolve_foreign_keys=True,
+    )
+
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(
+        pipeline_name="arize_phoenix",
+        # can be configure to any dlt destination
+        destination="duckdb",
+    )
+    load_info = pipeline.run(arize_phoenix_source())
+    print(load_info)
+```
+
+
+===== FILE: docs/website/docs/examples/backfill_in_chunks.md =====
+
+---
+title: Backfilling in chunks
+description: Learn how to backfill in chunks of defined size
+keywords: [incremental loading, backfilling, chunks,example]
+---
+# Backfilling in chunks
+
+In this example, you'll find a Python script that will load from a sql_database source in chunks of defined size. This is useful for backfilling in multiple pipeline runs as
+opposed to backfilling in one very large pipeline run which may fail due to memory issues on ephemeral storage or just take a very long time to complete without seeing any
+progress in the destination.
+
+We'll learn how to:
+
+- Connect to a mysql database with the sql_database source
+- Select one table to load and apply incremental loading hints as well as the primary key
+- Set the chunk size and limit the number of chunks to load in one pipeline run
+- Create a pipeline and backfill the table in the defined chunks
+- Use the datasets accessor to inspect and assert the load progress
+
+## Full source code
+
+```py noexecute
+import pandas as pd
+
+import dlt
+from dlt.sources.sql_database import sql_database
+
+
+if __name__ == "__main__":
+    # NOTE: this is a live table in the rfam database, so the number of final rows may change
+    TOTAL_TABLE_ROWS = 4178
+    RFAM_CONNECTION_STRING = (
+        "mysql+pymysql://rfamro@mysql-rfam-public.ebi.ac.uk:4497/Rfam"
+    )
+
+    # create sql database source that only loads the family table in chunks of 1000 rows
+    source = sql_database(
+        RFAM_CONNECTION_STRING, table_names=["family"], chunk_size=1000
+    )
+
+    # we apply some hints to the table, we know the rfam_id is unique and that we can order
+    # and load incrementally on the created datetime column
+    source.family.apply_hints(
+        primary_key="rfam_id",
+        incremental=dlt.sources.incremental(
+            cursor_path="created", initial_value=None, row_order="asc"
+        ),
+    )
+
+    # with limit we can limit the number of chunks to load, with a chunk size of 1000 and a limit of 1
+    # we will load 1000 rows per pipeline run
+    source.add_limit(1)
+
+    # create pipeline
+    pipeline = dlt.pipeline(
+        pipeline_name="rfam",
+        destination="duckdb",
+        dataset_name="rfam_data",
+        dev_mode=True,
+    )
+
+    def _assert_unique_row_count(df: pd.DataFrame, num_rows: int) -> None:
+        """Assert that a dataframe has the correct number of unique rows"""
+        # NOTE: this check is dependent on reading the full table back from the destination into memory,
+        # so it is only useful for testing before you do a large backfill.
+        assert len(df) == num_rows
+        assert len(set(df.rfam_id.tolist())) == num_rows
+
+    # after the first run, the family table in the destination should contain the first 1000 rows
+    pipeline.run(source)
+    _assert_unique_row_count(pipeline.dataset().family.df(), 1000)
+
+    # after the second run, the family table in the destination should contain 1999 rows
+    # there is some overlap on the incremental to prevent skipping rows
+    pipeline.run(source)
+    _assert_unique_row_count(pipeline.dataset().family.df(), 1999)
+
+    # ...
+    pipeline.run(source)
+    _assert_unique_row_count(pipeline.dataset().family.df(), 2998)
+
+    # ...
+    pipeline.run(source)
+    _assert_unique_row_count(pipeline.dataset().family.df(), 3997)
+
+    # the final run will load all the rows until the end of the table
+    pipeline.run(source)
+    _assert_unique_row_count(pipeline.dataset().family.df(), TOTAL_TABLE_ROWS)
+
+    # NOTE: in a production environment you will likely:
+    # * be using much larger chunk sizes and limits
+    # * run the pipeline in a loop to load all the rows
+    # * and programmatically check if the table is fully loaded and abort the loop if this is the case.
+```
+
+
+===== FILE: docs/website/docs/examples/chess_production.md =====
+
+---
+title: Run chess pipeline in production
+description: Learn how run chess pipeline in production
+keywords: [incremental loading, example]
+---
+# Run chess pipeline in production
+
+In this example, you'll find a Python script that interacts with the Chess API to extract players and game data.
+
+We'll learn how to:
+
+- Inspecting packages after they have been loaded.
+- Loading back load information, schema updates, and traces.
+- Triggering notifications in case of schema evolution.
+- Using context managers to independently retry pipeline stages.
+- Run basic tests utilizing `sql_client` and `normalize_info`.
+
+## Full source code
+
+```py noexecute notype
+import threading
+from typing import Any, Iterator
+
+from tenacity import (
+    Retrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+import requests
+
+import dlt
+from dlt.common import sleep, logger
+from dlt.common.typing import StrAny, TDataItems
+from dlt.sources.helpers.requests import client
+from dlt.pipeline.helpers import retry_load
+from dlt.common.runtime.slack import send_slack_message
+
+
+@dlt.source
+def chess(
+    chess_url: str = dlt.config.value,
+    title: str = "GM",
+    max_players: int = 2,
+    year: int = 2022,
+    month: int = 10,
+) -> Any:
+    def _get_data_with_retry(path: str) -> StrAny:
+        r = client.get(f"{chess_url}{path}")
+        return r.json()  # type: ignore
+
+    @dlt.resource(write_disposition="replace")
+    def players() -> Iterator[TDataItems]:
+        # return players one by one, you could also return a list
+        # that would be faster but we want to pass players item by item to the transformer
+        yield from _get_data_with_retry(f"titled/{title}")["players"][:max_players]
+
+    # this resource takes data from players and returns profiles
+    # it uses `paralellized` flag to enable parallel run in thread pool.
+    @dlt.transformer(data_from=players, write_disposition="replace", parallelized=True)
+    def players_profiles(username: Any) -> TDataItems:
+        print(
+            f"getting {username} profile via thread {threading.current_thread().name}"
+        )
+        sleep(1)  # add some latency to show parallel runs
+        return _get_data_with_retry(f"player/{username}")
+
+    # this resource takes data from players and returns games for the last month
+    # if not specified otherwise
+    @dlt.transformer(data_from=players, write_disposition="append")
+    def players_games(username: Any) -> Iterator[TDataItems]:
+        # https://api.chess.com/pub/player/{username}/games/{YYYY}/{MM}
+        path = f"player/{username}/games/{year:04d}/{month:02d}"
+        try:
+            yield _get_data_with_retry(path)["games"]
+        except requests.HTTPError as exc:
+            # we allow players to not have games for some months
+            if not exc.response.status_code == 404:
+                raise exc
+
+    return players(), players_profiles, players_games
+
+
+MAX_PLAYERS = 5
+
+
+def load_data_with_retry(pipeline, data):
+    try:
+        for attempt in Retrying(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=1.5, min=4, max=10),
+            retry=retry_if_exception(retry_load(())),
+            reraise=True,
+        ):
+            with attempt:
+                logger.info(
+                    f"Running the pipeline, attempt={attempt.retry_state.attempt_number}"
+                )
+                load_info = pipeline.run(data)
+                logger.info(str(load_info))
+
+                # send notification
+                send_slack_message(
+                    pipeline.runtime_config.slack_incoming_hook,
+                    "Data was successfully loaded!",
+                )
+    except Exception:
+        # we get here after all the failed retries
+        # send notification
+        send_slack_message(
+            pipeline.runtime_config.slack_incoming_hook, "Something went wrong!"
+        )
+        raise
+
+    # we get here after a successful attempt
+    # see when load was started
+    logger.info(f"Pipeline was started: {load_info.started_at}")
+    # print the information on the first load package and all jobs inside
+    logger.info(f"First load package info: {load_info.load_packages[0]}")
+    # print the information on the first completed job in first load package
+    logger.info(
+        f"First completed job info: {load_info.load_packages[0].jobs['completed_jobs'][0]}"
+    )
+
+    # check for schema updates:
+    schema_updates = [p.schema_update for p in load_info.load_packages]
+    # send notifications if there are schema updates
+    if schema_updates:
+        # send notification
+        send_slack_message(
+            pipeline.runtime_config.slack_incoming_hook, "Schema was updated!"
+        )
+
+    # To run simple tests with `sql_client`, such as checking table counts and
+    # warning if there is no data, you can use the `execute_query` method
+    with pipeline.sql_client() as client:
+        with client.execute_query("SELECT COUNT(*) FROM players") as cursor:
+            count = cursor.fetchone()[0]
+            if count == 0:
+                logger.info("Warning: No data in players table")
+            else:
+                logger.info(f"Players table contains {count} rows")
+    assert count == MAX_PLAYERS
+
+    # To run simple tests with `normalize_info`, such as checking table counts and
+    # warning if there is no data, you can use the `row_counts` attribute.
+    normalize_info = pipeline.last_trace.last_normalize_info
+    count = normalize_info.row_counts.get("players", 0)
+    if count == 0:
+        logger.info("Warning: No data in players table")
+    else:
+        logger.info(f"Players table contains {count} rows")
+    assert count == MAX_PLAYERS
+
+    # we reuse the pipeline instance below and load to the same dataset as data
+    logger.info("Saving the load info in the destination")
+    pipeline.run([load_info], table_name="_load_info")
+    assert "_load_info" in pipeline.last_trace.last_normalize_info.row_counts
+    # save trace to destination, sensitive data will be removed
+    logger.info("Saving the trace in the destination")
+    pipeline.run([pipeline.last_trace], table_name="_trace")
+    assert "_trace" in pipeline.last_trace.last_normalize_info.row_counts
+
+    # print all the new tables/columns in
+    for package in load_info.load_packages:
+        for table_name, table in package.schema_update.items():
+            logger.info(f"Table {table_name}: {table.get('description')}")
+            for column_name, column in table["columns"].items():
+                logger.info(f"\tcolumn {column_name}: {column['data_type']}")
+
+    # save the new tables and column schemas to the destination:
+    table_updates = [p.asdict()["tables"] for p in load_info.load_packages]
+    pipeline.run(table_updates, table_name="_new_tables")
+    assert "_new_tables" in pipeline.last_trace.last_normalize_info.row_counts
+
+    return load_info
+
+
+if __name__ == "__main__":
+    # create dlt pipeline
+    pipeline = dlt.pipeline(
+        pipeline_name="chess_pipeline",
+        destination="duckdb",
+        dataset_name="chess_data",
+    )
+    # get data for a few famous players
+    data = chess(max_players=MAX_PLAYERS)
+    load_data_with_retry(pipeline, data)
+```
+
+
+===== FILE: docs/website/docs/examples/connector_x_arrow.md =====
+
+---
+title: Load mysql table with ConnectorX & Arrow
+description: Load data from sql queries fast with connector x and arrow tables
+keywords: [connector x, pyarrow, zero copy]
+---
+# Load mysql table with ConnectorX & Arrow
+
+The example script below takes genome data from public **mysql** instance and then loads it into **duckdb**. Mind that your destination
+must support loading of parquet files as this is the format that `dlt` uses to save arrow tables. [Connector X](https://github.com/sfu-db/connector-x) allows to
+get data from several popular databases and creates in memory Arrow table which `dlt` then saves to load package and loads to the destination.
+:::tip
+You can yield several tables if your data is large and you need to partition your load.
+:::
+
+We'll learn:
+
+- How to get arrow tables from [connector X](https://github.com/sfu-db/connector-x) and yield them.
+- That merge and incremental loads work with arrow tables.
+- How to enable [incremental loading](../general-usage/incremental-loading) for efficient data extraction.
+- How to use build in ConnectionString credentials.
+
+## Full source code
+
+```py noexecute notype
+import connectorx as cx
+
+import dlt
+from dlt.sources.credentials import ConnectionStringCredentials
+
+
+def read_sql_x(
+    conn_str: ConnectionStringCredentials = dlt.secrets.value,
+    query: str = dlt.config.value,
+):
+    yield cx.read_sql(
+        conn_str.to_native_representation(),
+        query,
+        return_type="arrow",
+        protocol="binary",
+    )
+
+
+def genome_resource():
+    # create genome resource with merge on `upid` primary key
+    genome = dlt.resource(
+        name="genome",
+        write_disposition="merge",
+        primary_key="upid",
+    )(read_sql_x)(
+        "mysql://rfamro@mysql-rfam-public.ebi.ac.uk:4497/Rfam",  # type: ignore[arg-type]
+        "SELECT * FROM genome ORDER BY created LIMIT 1000",
+    )
+    # add incremental on created at
+    genome.apply_hints(incremental=dlt.sources.incremental("created"))
+    return genome
+
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(destination="duckdb")
+    genome = genome_resource()
+
+    pipeline.run(genome)
+
+    # check that stuff was loaded
+    normalize_info = pipeline.last_trace.last_normalize_info
+    assert normalize_info is not None
+    
+    row_counts = dict(normalize_info.row_counts)
+    assert row_counts["genome"] == 1000
+```
+
+
+===== FILE: docs/website/docs/examples/custom_config_provider.md =====
+
+---
+title: Use custom yaml file for config and secrets
+description: We show how to keep configuration in yaml file with switchable profiles and simple templates
+keywords: [config, yaml config, profiles]
+---
+# Use custom yaml file for config and secrets
+
+This example shows how to replace secrets/config toml files with a yaml file that contains several profiles (prod and dev) and jinja-like
+placeholders that are replaced with corresponding env variables.
+`dlt` resolves configuration by querying so called config providers (to ie. query env variables or content of a toml file).
+Here we will instantiate a provider with a custom loader and register it to be queried. At the end we demonstrate (using mock github source)
+that `dlt` uses it along other (standard) providers to resolve configuration.
+
+In this example you will learn to:
+
+* Implement custom configuration loader that parses yaml file, manipulates it and then returns final Python dict
+* Instantiate custom provider (CustomLoaderDocProvider) from the loader
+* Register provider instance to be queried
+
+## Full source code
+
+```py execute
+import os
+import re
+import dlt
+import yaml
+import functools
+
+from dlt.common.configuration.providers import CustomLoaderDocProvider
+from dlt.common.utils import map_nested_values_in_place
+
+
+# config for all resources found in this file will be grouped in this source level config section
+__source_name__ = "github_api"
+
+
+def eval_placeholder(value):
+    """Replaces jinja placeholders {{ PLACEHOLDER }} with environment variables"""
+    if isinstance(value, str):
+
+        def replacer(match):
+            return os.environ[match.group(1)]
+
+        return re.sub(r"\{\{\s*(\w+)\s*\}\}", replacer, value)
+    return value
+
+
+def loader(profile_name: str):
+    """Loads yaml file from profiles.yaml in current working folder, selects profile, replaces
+    placeholders with env variables and returns Python dict with final config
+    """
+    path = os.path.abspath("profiles.yaml")
+    with open(path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    # get the requested environment
+    config = config.get(profile_name, None)
+    if config is None:
+        raise RuntimeError(
+            f"Profile with name {profile_name} not found in {os.path.abspath(path)}"
+        )
+    # evaluate all placeholders
+    # NOTE: this method only works with placeholders wrapped as strings in yaml. use jinja lib for real templating
+    return map_nested_values_in_place(eval_placeholder, config)
+
+
+@dlt.resource
+def github(url: str = dlt.config.value, api_key=dlt.secrets.value):
+    # just return the injected config and secret
+    yield url, api_key
+
+
+# mock env variables to fill placeholders in profiles.yaml
+os.environ["GITHUB_API_KEY"] = "secret_key"  # mock expected var
+
+# set the active profile explicitly (normally this comes from config.toml or an env var)
+dlt.config["dlt_config_profile_name"] = "prod"
+
+# dlt standard providers work at this point (we have the profile name in config)
+profile_name = dlt.config["dlt_config_profile_name"]
+
+# instantiate custom provider using `prod` profile
+# NOTE: all placeholders (ie. GITHUB_API_KEY) will be evaluated in next line!
+provider = CustomLoaderDocProvider("profiles", functools.partial(loader, profile_name))
+# register provider, it will be added as the last one in chain
+dlt.config.register_provider(provider)
+
+# your pipeline will now be able to use your yaml provider
+# p = Pipeline(...)
+# p.run(...)
+
+# show the final config
+# print(provider.to_yaml())
+# or if you like toml
+# print(provider.to_toml())
+
+# the registered provider now resolves config and secrets for the github_api source
+assert dlt.config["sources.github_api.github.url"] == "https://github.com/api"
+assert dlt.secrets["sources.github_api.github.api_key"] == "secret_key"
+```
+
+
+===== FILE: docs/website/docs/examples/custom_destination_bigquery.md =====
+
+---
+title: Custom destination with BigQuery
+description: Learn how use the custom destination to load to bigquery and use credentials
+keywords: [destination, credentials, example, bigquery, custom destination]
+---
+# Custom destination with BigQuery
+
+In this example, you'll find a Python script that demonstrates how to load to BigQuery with the custom destination.
+
+We'll learn how to:
+
+- Use [built-in credentials.](../general-usage/credentials/complex_types#gcp-credentials)
+- Use the [custom destination.](../dlt-ecosystem/destinations/destination.md)
+- Use pyarrow tables to create nested column types on BigQuery.
+- Use BigQuery `autodetect=True` for schema inference from parquet files.
+
+## Full source code
+
+```py noexecute
+import dlt
+import pandas as pd
+import pyarrow as pa
+from google.cloud import bigquery
+
+from dlt.common.configuration.specs import GcpServiceAccountCredentials
+
+# constants
+OWID_DISASTERS_URL = (
+    "https://raw.githubusercontent.com/owid/owid-datasets/master/datasets/"
+    "Natural%20disasters%20from%201900%20to%202019%20-%20EMDAT%20(2020)/"
+    "Natural%20disasters%20from%201900%20to%202019%20-%20EMDAT%20(2020).csv"
+)
+# this table needs to be manually created in your gc account
+# format: "your-project.your_dataset.your_table"
+BIGQUERY_TABLE_ID = "chat-analytics-rasa-ci.ci_streaming_insert.natural-disasters"
+
+
+# dlt sources
+@dlt.resource(name="natural_disasters")
+def resource(url: str):
+    # load pyarrow table with pandas
+    table = pa.Table.from_pandas(pd.read_csv(url))
+    # we add a list type column to demonstrate bigquery lists
+    table = table.append_column(
+        "tags",
+        pa.array(
+            [["disasters", "earthquakes", "floods", "tsunamis"]] * len(table),
+            pa.list_(pa.string()),
+        ),
+    )
+    # we add a struct type column to demonstrate bigquery structs
+    table = table.append_column(
+        "meta",
+        pa.array(
+            [{"loaded_by": "dlt"}] * len(table),
+            pa.struct([("loaded_by", pa.string())]),
+        ),
+    )
+    yield table
+
+
+# dlt bigquery custom destination
+# we can use the dlt provided credentials class
+# to retrieve the gcp credentials from the secrets
+@dlt.destination(
+    name="bigquery",
+    loader_file_format="parquet",
+    batch_size=0,
+    naming_convention="snake_case",
+)
+def bigquery_insert(
+    items,
+    table=BIGQUERY_TABLE_ID,
+    credentials: GcpServiceAccountCredentials = dlt.secrets.value,
+) -> None:
+    client = bigquery.Client(
+        credentials.project_id, credentials.to_native_credentials(), location="US"
+    )
+    job_config = bigquery.LoadJobConfig(
+        autodetect=True,
+        source_format=bigquery.SourceFormat.PARQUET,
+        schema_update_options=bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
+    )
+    # since we have set the batch_size to 0, we get a filepath and can load the file directly
+    with open(items, "rb") as f:
+        load_job = client.load_table_from_file(f, table, job_config=job_config)
+    load_job.result()  # Waits for the job to complete.
+
+
+if __name__ == "__main__":
+    # run the pipeline and print load results
+    pipeline = dlt.pipeline(
+        pipeline_name="csv_to_bigquery_insert",
+        destination=bigquery_insert,
+        dataset_name="mydata",
+        dev_mode=True,
+    )
+    load_info = pipeline.run(resource(url=OWID_DISASTERS_URL))
+
+    print(load_info)
+```
+
+
+===== FILE: docs/website/docs/examples/custom_destination_lancedb.md =====
+
+---
+title: Custom destination with LanceDB
+description: Learn how use the custom destination to load to LanceDB.
+keywords: [destination, credentials, example, lancedb, custom destination, vectorstore, AI, LLM]
+---
+# Custom destination with LanceDB
+
+This example showcases a Python script that demonstrates the integration of LanceDB, an open-source vector database,
+as a custom destination within the dlt ecosystem.
+The script illustrates the implementation of a custom destination as well as the population of the LanceDB vector
+store with podcast episode data from Podcast Index.
+This highlights the seamless interoperability between dlt and LanceDB.
+
+You can get a Podcast Index API key and secret from [https://api.podcastindex.org/developer_home](https://api.podcastindex.org/developer_home).
+
+We'll learn how to:
+
+- Use the [custom destination](../dlt-ecosystem/destinations/destination.md)
+- Delegate the embeddings to LanceDB using OpenAI Embeddings
+- Use Pydantic for unified dlt and lancedb schema validation
+
+## Full source code
+
+```py noexecute notype
+__source_name__ = "podcastindex"
+
+from dataclasses import dataclass, fields
+import hashlib
+import os
+from pathlib import Path
+import time
+from typing import Any
+
+import lancedb
+from lancedb.embeddings import get_registry
+from lancedb.pydantic import LanceModel, Vector
+
+import dlt
+from dlt.common.configuration import configspec
+from dlt.common.schema import TTableSchema
+from dlt.common.typing import TDataItems, TSecretStrValue
+from dlt.sources.helpers.rest_client import AuthConfigBase, RESTClient
+
+# access secrets to get openai key
+openai_api_key: str = dlt.secrets.get(
+    "destination.lancedb.credentials.embedding_model_provider_api_key"
+)
+# usually the api-key would be provided to the embedding function via the registry, but there
+# currently is a bug: https://github.com/lancedb/lancedb/issues/2387
+registry = get_registry()
+registry.set_var("openai_api_key", openai_api_key)
+# create the embedding function
+func = (
+    get_registry()
+    .get("openai")
+    .create(
+        name="text-embedding-3-small",
+        # api_key="$var:api_key" # << currently broken
+    )
+)
+# so instead we provide it via environment variable
+os.environ["OPENAI_API_KEY"] = openai_api_key
+
+
+class EpisodeSchema(LanceModel):
+    """Used for dlt and lance schema validation"""
+
+    id: int  # noqa: A003
+    title: str
+    description: str = func.SourceField()
+    datePublished: int
+    link: str
+    duration: int
+    # there is more data but we are not using it ...
+
+
+class EpisodeSchemaVector(EpisodeSchema):
+    """Adds lance vector field"""
+
+    vector: Vector(func.ndims()) = func.VectorField()  # type: ignore[valid-type]
+
+
+@dataclass(frozen=True)
+class Shows:
+    latent_space: str = "6058902"
+    superdatascience_podcast: str = "4299005"
+    lex_fridman: str = "745287"
+
+
+@configspec
+class PodcastIndexAuth(AuthConfigBase):
+    api_key: str = None
+    api_secret: TSecretStrValue = None
+
+    def __call__(self, request) -> Any:
+        epoch_time = int(time.time())
+        signature = hashlib.sha1(
+            f"{self.api_key}{self.api_secret}{str(epoch_time)}".encode()
+        ).hexdigest()
+        headers = {
+            "X-Auth-Date": str(epoch_time),
+            "X-Auth-Key": self.api_key,
+            "Authorization": signature,
+            "User-Agent": "DltPipeline/1.0",
+        }
+        request.headers.update(headers)
+        return request
+
+
+@dlt.source
+def podcast_episodes(
+    api_key: str = dlt.secrets.value,
+    api_secret: str = dlt.secrets.value,
+):
+    podcast_index_base_api_url = "https://api.podcastindex.org/api/1.0"
+    client = RESTClient(
+        base_url=podcast_index_base_api_url,
+        auth=PodcastIndexAuth(api_key=api_key, api_secret=api_secret),
+    )
+
+    for show in fields(Shows):
+        show_name = show.name
+        show_id = show.default
+        url = f"/episodes/byfeedid?id={show_id}"
+        yield dlt.resource(
+            client.get(url, params={"limit": 50}).json()["items"] or [],
+            name=show_name,
+            primary_key="id",
+            max_table_nesting=0,
+            # reuse lance model to filter out all non-matching items and extra columns from the Podcast Index API
+            # 1. unknown columns are removed ("columns": "discard_value")
+            # 2. non-validating items (for example missing `id` or `link`) are removed ("data_type": "discard_row")
+            columns=EpisodeSchema,
+            schema_contract={
+                "tables": "evolve",
+                "columns": "discard_value",
+                "data_type": "discard_row",
+            },
+        ).add_filter(lambda i: i["description"] != "")
+
+
+@dlt.destination(batch_size=250, name="lancedb")
+def lancedb_destination(items: TDataItems, table: TTableSchema) -> None:
+    db_path = Path(dlt.config.get("lancedb.db_path"))
+    db = lancedb.connect(db_path)
+
+    try:
+        tbl = db.open_table(table["name"])
+    except ValueError:
+        tbl = db.create_table(table["name"], schema=EpisodeSchemaVector)
+
+    tbl.add(items)
+
+
+if __name__ == "__main__":
+    db_path = Path(dlt.config.get("lancedb.db_path"))
+    db = lancedb.connect(db_path)
+
+    for show in fields(Shows):
+        try:
+            db.drop_table(show.name)
+        except ValueError:
+            # table is not there
+            pass
+
+    pipeline = dlt.pipeline(
+        pipeline_name="podcastindex",
+        destination=lancedb_destination,
+        dataset_name="podcastindex_data",
+        progress="log",
+    )
+
+    load_info = pipeline.run(podcast_episodes())
+    print(load_info)
+
+    row_counts = pipeline.last_trace.last_normalize_info
+    print(row_counts)
+
+    query = "French AI scientist with Lex, talking about AGI and Meta and Llama"
+    table_to_query = "lex_fridman"
+
+    tbl = db.open_table(table_to_query)
+
+    results = tbl.search(query=query).to_list()
+    assert results
+```
+
+
+===== FILE: docs/website/docs/examples/custom_naming.md =====
+
+---
+title: Create and use own naming convention
+description: We demonstrate how to create naming conventions that allow UNICODE letters and never generate collisions
+keywords: [example]
+---
+# Create and use own naming convention
+
+This example shows how to add and use custom naming convention. Naming conventions translate identifiers found in source data into identifiers in
+destination, where rules for a valid identifier are constrained.
+
+Custom naming conventions are classes that derive from `NamingConvention` that you can import from `dlt.common.normalizers.naming`. We recommend the following module layout:
+
+1. Each naming convention resides in a separate Python module (file)
+2. The class is always named `NamingConvention`
+
+There are two naming conventions in this example:
+
+1. A variant of `sql_ci` that generates identifier collisions with a low (user defined) probability by appending a deterministic tag to each name.
+2. A variant of `sql_cs` that allows for LATIN (ie. umlaut) characters
+
+With this example you will learn to:
+
+* Create a naming convention module with a recommended layout
+* Use naming convention by explicitly passing module name to `postgres` destination factory
+* Use naming convention by configuring it config.toml
+* Changing the declared case sensitivity by overriding `is_case_sensitive` property
+* Providing custom normalization logic by overriding `normalize_identifier` method
+
+## Full source code
+
+```py noexecute notype
+import dlt
+
+if __name__ == "__main__":
+    # NOTE: ql_cs_latin2 is case sensitive and postgres accepts UNICODE letters in identifiers
+    # create postgres destination with a custom naming convention. sql_cs_latin2 is an importable
+    # module
+    # import sql_cs_latin2  # is resolving in this context
+
+    dest_ = dlt.destinations.postgres(naming_convention="sql_cs_latin2")
+
+    # run a pipeline
+    pipeline = dlt.pipeline(
+        pipeline_name="sql_cs_latin2_pipeline",
+        destination=dest_,
+        dataset_name="example_data",
+        dev_mode=True,
+    )
+    # Extract, normalize, and load the data
+    load_info = pipeline.run([{"StückId": 1}], table_name="Ausrüstung")
+    print(load_info)
+    with pipeline.sql_client() as client:
+        # NOTE: we quote case sensitive identifers
+        with client.execute_query('SELECT "StückId" FROM "Ausrüstung"') as cur:
+            print(cur.description)
+            print(cur.fetchone())
+
+    # sql_ci_no_collision (configured in config toml)
+    # NOTE: pipeline with name `sql_ci_no_collision` will create default schema with the same name
+    # so we are free to use it in config.toml to just affect this pipeline and leave the postgres pipeline as it is
+    pipeline = dlt.pipeline(
+        pipeline_name="sql_ci_no_collision",
+        destination="duckdb",
+        dataset_name="example_data",
+        dev_mode=True,
+    )
+    # duckdb is case insensitive so tables and columns below would clash but sql_ci_no_collision prevents that
+    data_1 = {"ItemID": 1, "itemid": "collides"}
+    load_info = pipeline.run([data_1], table_name="BigData")
+
+    data_2 = {"1Data": 1, "_1data": "collides"}
+    # use colliding table
+    load_info = pipeline.run([data_2], table_name="bigdata")
+
+    with pipeline.sql_client() as client:
+        from duckdb import DuckDBPyConnection
+
+        conn: DuckDBPyConnection = client.native_connection
+        # tags are deterministic so we can just use the naming convention to get table names to select
+        first_table = pipeline.default_schema.naming.normalize_table_identifier(
+            "BigData"
+        )
+        sql = f"DESCRIBE TABLE {first_table}"
+        print(sql)
+        print(conn.sql(sql))
+        second_table = pipeline.default_schema.naming.normalize_table_identifier(
+            "bigdata"
+        )
+        sql = f"DESCRIBE TABLE {second_table}"
+        print(sql)
+        print(conn.sql(sql))
+
+    # print(pipeline.default_schema.to_pretty_yaml())
+```
+
+
+===== FILE: docs/website/docs/examples/data_masking.md =====
+
+---
+title: Data masking for SQL database sources
+description: Learn how to mask sensitive columns using closures that work with all sql_database backends
+keywords: [data masking, pseudonymize, anonymize, sql_database, example]
+---
+# Data masking for SQL database sources
+
+This example shows how to build a reusable column-masking function for the
+`sql_database` source. The function uses a closure to capture masking
+configuration, so you can apply it to any resource via `add_map()`.
+
+Based on an implementation by [Michał Zawadzki](https://github.com/trymzet)
+and [Varun Chawla](https://github.com/veeceey).
+
+We'll learn how to:
+
+- Use a [closure](https://docs.python.org/3/faq/programming.html#why-am-i-getting-an-unboundlocalerror-when-the-variable-has-a-value) to create a configurable masking callback
+- Handle all backends supported by [sql_database](../dlt-ecosystem/verified-sources/sql_database/index.md): PyArrow, ConnectorX, Pandas, and SQLAlchemy
+- Support two masking strategies: replace with a mask string, or nullify
+
+## Usage with `sql_table`
+
+```py noexecute notype
+from dlt.sources.sql_database import sql_table
+
+table = sql_table(table="users")
+table.add_map(mask_columns(columns=["email", "ssn"]))
+
+pipeline = dlt.pipeline(
+    pipeline_name="masked_data",
+    destination="duckdb",
+    dataset_name="mydata",
+)
+load_info = pipeline.run(table)
+```
+
+### Full source code
+
+```py execute notype
+from enum import Enum
+from typing import Any, Callable, Optional, Union
+
+import pyarrow as pa
+import pandas as pd
+
+
+class MaskingMethod(str, Enum):
+    MASK = "mask"
+    NULLIFY = "nullify"
+
+
+def mask_columns(
+    columns: list[str],
+    method: Optional[MaskingMethod] = None,
+    mask: str = "******",
+) -> Callable[..., Any]:
+    """Return a mapping function that masks the specified columns.
+
+    Args:
+        columns (List[str]): Column names to mask.
+        method (Optional[MaskingMethod]): MASK replaces with `mask` string,
+            NULLIFY sets to None. Defaults to MASK.
+        mask (str): Replacement string used when method is MASK.
+
+    Returns:
+        Callable: A function suitable for `resource.add_map()`.
+    """
+    resolved_method: MaskingMethod = (
+        method if method is not None else MaskingMethod.MASK
+    )
+
+    def _apply(
+        table_or_row: Union[pa.Table, pd.DataFrame, dict[str, Any]],
+    ) -> Union[pa.Table, pd.DataFrame, dict[str, Any]]:
+        # pyarrow / connectorx backends
+        if isinstance(table_or_row, pa.Table):
+            table = table_or_row
+            for col in table.schema.names:
+                if col in columns:
+                    if resolved_method == MaskingMethod.MASK:
+                        replacement = pa.array([mask] * table.num_rows)
+                    else:
+                        replacement = pa.nulls(
+                            table.num_rows, type=table.schema.field(col).type
+                        )
+                    table = table.set_column(
+                        table.schema.get_field_index(col), col, replacement
+                    )
+            return table
+
+        # pandas backend
+        if isinstance(table_or_row, pd.DataFrame):
+            df = table_or_row
+            for col in df.columns:
+                if col in columns:
+                    df[col] = mask if resolved_method == MaskingMethod.MASK else None
+            return df
+
+        # sqlalchemy backend (dict rows)
+        if isinstance(table_or_row, dict):
+            row = table_or_row
+            for col in row:
+                if col in columns:
+                    row[col] = mask if resolved_method == MaskingMethod.MASK else None
+            return row
+
+        raise NotImplementedError(f"Unsupported data type: {type(table_or_row)}")
+
+    return _apply
+
+
+import dlt
+
+
+# create a dummy source with sensitive columns
+@dlt.resource(write_disposition="replace")
+def users():
+    yield [
+        {
+            "id": 1,
+            "name": "Alice",
+            "email": "alice@example.com",
+            "ssn": "123-45-6789",
+        },
+        {"id": 2, "name": "Bob", "email": "bob@example.com", "ssn": "987-65-4321"},
+        {
+            "id": 3,
+            "name": "Charlie",
+            "email": "charlie@example.com",
+            "ssn": "555-12-3456",
+        },
+    ]
+
+
+# mask email and ssn before loading
+masked_users = users()
+masked_users.add_map(mask_columns(columns=["email", "ssn"]))
+
+pipeline = dlt.pipeline(
+    pipeline_name="data_masking_example",
+    destination="duckdb",
+    dataset_name="mydata",
+)
+load_info = pipeline.run(masked_users)
+# print(load_info)
+
+# verify: sensitive columns are masked, other columns are untouched
+with pipeline.sql_client() as client:
+    rows = client.execute_sql("SELECT id, name, email, ssn FROM mydata.users ORDER BY id")
+
+for row in rows:
+    assert row[2] == "******", f"email should be masked, got {row[2]}"
+    assert row[3] == "******", f"ssn should be masked, got {row[3]}"
+assert rows[0][1] == "Alice"
+assert rows[1][1] == "Bob"
+
+
+# now demonstrate NULLIFY method on a second table
+@dlt.resource(
+    write_disposition="replace",
+    columns={"phone": {"data_type": "text"}},
+)
+def customers():
+    yield [
+        {"id": 1, "name": "Dana", "phone": "555-0001"},
+        {"id": 2, "name": "Eve", "phone": "555-0002"},
+    ]
+
+
+nullified_customers = customers()
+nullified_customers.add_map(mask_columns(columns=["phone"], method=MaskingMethod.NULLIFY))
+
+load_info = pipeline.run(nullified_customers)
+# print(load_info)
+
+with pipeline.sql_client() as client:
+    rows = client.execute_sql("SELECT id, name, phone FROM mydata.customers ORDER BY id")
+
+for row in rows:
+    assert row[2] is None, f"phone should be nullified, got {row[2]}"
+assert rows[0][1] == "Dana"
+```
+
+
+===== FILE: docs/website/docs/examples/dlthub_cicd.md =====
+
+---
+title: dltHub CI/CD deployment via GitHub Actions
+description: Deploy your dltHub workspace using GitHub Actions. Each change requires a pull request review and is automatically deployed when merged.
+keywords: [dlthub, github, cicd, deployment, workspace, gitops]
+---
+# dltHub CI/CD deployment via GitHub Actions
+
+import Link from '../_book-onboarding-call.md';
+
+Follow this guide to manage dltHub workspace deployments using GitHub Actions for CI/CD. By the end, every change to your ELT solution will follow good software development practices: issues, branches, pull requests, reviews, etc.
+
+Benefits:
+
+- Auditable: Everything the workspace does is declared as code, in version control
+- Quality control: Every change goes through automated checks and requires human review before reaching production.
+- Change isolation: Changes never break production by using isolated workspaces and dedicated destinations.
+
+These properties are essential to enable AI-coding and agents productivity.
+
+:::info
+This page assumes basic familiarity with dltHub [profiles](../hub/pipeline-operations/profiles.md), [triggers](../hub/pipeline-operations/triggers.md), and [secrets](../hub/pipeline-operations/secrets-management.md).
+:::
+
+## Development lifecycle
+
+This section starts with a flowchart of the dltHub + GitHub development workflow. It is followed by an illustrative scenario.
+
+<div className="mermaid-td">
+
+```mermaid
+flowchart TD
+    A[local: code changes on feature branch] --> B[GitHub: open pull request]
+    B --> C{GitHub: automated checks}
+    C -- pass --> D{GitHub: has staging-deploy label?}
+    C -- fail --> A
+    D -- yes --> E[GitHub: deploy to dltHub staging workspace]
+    D -- no --> G[GitHub: review]
+    E --> F[dltHub: staging pipeline run with changes]
+    F -- success --> G
+    F -- fail --> A
+    G -- approve --> H[GitHub: merge feature branch to main]
+    G -- reject --> A
+    H --> I[GitHub: deploy to dltHub production workspace]
+    I --> J[dltHub: runs pipelines on schedule with changes]
+```
+
+</div>
+
+### Scenario: how to fix a pipeline
+
+1. Branch off `main`.
+
+    ```shell
+    git checkout -b <feature-branch-name>
+    ```
+
+2. Make your changes (make a source incremental, add a pipeline, enable schema contract, etc.)
+3. Commit your code. Code quality checks and tests will run locally. This enables fast iterations for you and your agents.
+
+    ```shell
+    git commit -m "made quickbooks source incremental"
+    ```
+
+4. Push your code and open a pull request. This will trigger GitHub Actions to run automated checks remotely.
+
+    ```shell
+    git push
+    # include `--label` to trigger staging deployment
+    gh pr create --fill --label staging-deploy
+    ```
+
+5. Add the `staging-deploy` label on the GitHub pull request to trigger deployment to the staging dltHub workspace. Then, you can run pipelines on dltHub with small data loads.
+
+    <div className="doc-screenshot">
+
+    ![A pull request showing the code-quality and staging-deploy checks, with the staging-deploy label applied](https://storage.googleapis.com/dlt-blog-images/dlthub-cicd-blueprint/dlthub-github-pr-actions.png)
+
+    </div>
+
+6. Get a pull request review of the code and the run results on the staging workspace.
+7. Merge to `main`. This will deploy the new `main` branch to the production dltHub workspace.
+
+## Teams using dltHub
+
+This approach allows team to scale from 10s to 100s to 1000s of pipelines without frictions. Good practices and hard requirements are codified. When something fails, you trace the issue to specific code changes.
+
+:::info
+This guide is a starting point. The workflow can be tailored to your organization.
+
+<Link/>
+:::
+
+- **Add a source**: Create the source under `workspace/sources`. Then, define the pipeline in `workspace/__deployment__.py` and register it in `__all__`.
+- **Manage Python dependencies**: Avoid Python dependency conflicts or slow pipeline jobs by creating dependency groups in `workspace/pyproject.toml`. Then, individual pipelines can specify `@run.pipeline(..., require= {"dependency_groups": ["<group-name>"]}`)
+- **Add environments**: Tailor your workflow and add environments as you need. Simply add another `.dlt/<env>.config.toml` with matching dltHub workspace and GitHub environment.
+- **Promote via tags instead of `main`**: Manually deploy to `main` by using an explicit release step rather than deploying every merge. Edit `prod-deploy.yaml` to trigger on commits with specific tags.
+
+## Repository content
+
+Here's an overview of the files found in the repository:
+
+```text
+├── .github/workflows/           # GitHub Actions workflows
+│   ├── pr-checks.yaml           # lint, type-check, test; optional staging deploy
+│   └── prod-deploy.yaml         # deploy to production on push to `main`
+├── workspace/                   # dltHub workspace
+│   ├── .dlt/                    # workspace configuration
+│   │   ├── .workspace           
+│   │   ├── config.toml          # config shared by all profiles
+│   │   ├── prod.config.toml     # production-specific config
+│   │   └── stg.config.toml      # staging-specific config
+│   ├── sources/                 # dlt source definitions
+│   ├── notebooks/               # notebooks definitions
+│   ├── __deployment__.py        # production deployment: defines all pipelines
+│   ├── __staging__.py           # staging deployment: sets limits for staging runs
+│   └── pyproject.toml           # configure Python runtime and dependencies
+├── tests/                       # tests for sources, pipelines, deployments
+├── justfile                     # developer commands
+├── pyproject.toml               # configure developer tooling
+└── uv.lock                      # single lockfile for workspace + development
+```
+
+Key design decisions:
+
+- Separate developer tooling and dltHub workspace. Only the content of `workspace/` is deployed to dltHub. The developer tooling, tests, and CI/CD automations are defined outside of it. This handled using [`uv` workspaces](https://docs.astral.sh/uv/concepts/projects/workspaces/) and the files `pyproject.toml` and `workspace/pyproject.toml`.
+
+- dltHub workspace configurations committed to the repository `workspace/.dlt/{prod,stg}.config.toml`. Nonsensitive configuration changes are versioned-controlled, tested, and reviewed along the code. Sensitive credentials (i.e., secrets) are set on the dltHub platform or via an external secret provider.
+
+- `workspace/__deployment__.py` is the single reviewable source of truth for the dltHub workspace. It includes all the pipelines, jobs, and data apps definitions. `workspace/__staging__.py` reads its content and applies additional configuration for staging (e.g., remove scheduling, set data load limit)
+
+## Guide
+
+Prerequisites:
+
+- dltHub account
+- GitHub account
+- [`uv`](https://docs.astral.sh/uv/) package manager installed
+- [`gh`](https://cli.github.com/) official GitHub CLI installed
+
+### 1. Set up GitHub repository
+
+1. Clone the blueprint repository, then collapse its commit history into a single commit.
+
+    ```shell
+    git clone https://github.com/dlt-hub/dlthub-cicd-blueprint.git
+    cd dlthub-cicd-blueprint
+
+    # drop the blueprint's `.git` history and start with a fresh history
+    rm -rf .git
+    git init -b main
+    git add .
+    git commit -m "Initial commit from dltHub CI/CD blueprint"
+    ```
+
+2. Create your own GitHub repository from the clone, and push it
+
+    ```shell
+    # creates the repo on GitHub
+    gh repo create <your-org>/<your-repo> --private
+    git remote add origin https://github.com/<your-org>/<your-repo>
+    git push -u origin main
+    ```
+
+### 2. Configure dltHub workspaces
+
+1. Login to dltHub. The command will open a browser page for you to authenticate.
+
+    ```shell
+    cd workspace
+    uv run dlthub login
+    ```
+
+    :::info
+    You may need to upgrade the dltHub client. Run this command, then rerun the above:
+
+    ```shell
+    uv sync --upgrade-package dlthub-client
+    ```
+
+    :::
+
+2. Create the `staging` workspace and set its `workspace_id` in `workspace/.dlt/stg.config.toml`
+
+    ```toml
+    # workspace/.dlt/stg.config.toml
+    [runtime]
+    workspace_id = "<staging-workspace-id>"
+    ```
+
+3. Get a dltHub [workspace API key](../hub/platform-capabilities/settings.md#workspace-api-keys) and set it on the GitHub repository
+
+    ```shell
+    gh api repos/{owner}/{repo}/environments/staging --method PUT
+    gh secret set DLTHUB_API_KEY --env staging --body "<staging-workspace-api-key>"
+    ```
+
+4. Create the `production` workspace and set its `workspace_id` in `workspace/.dlt/prod.config.toml`
+
+    ```toml
+    # workspace/.dlt/prod.config.toml
+    [runtime]
+    workspace_id = "<production-workspace-id>"
+    ```
+
+5. Get a dltHub [workspace API key](../hub/platform-capabilities/settings.md#workspace-api-keys) and set it on the GitHub repository
+
+    ```shell
+    gh api repos/{owner}/{repo}/environments/production --method PUT
+    gh secret set DLTHUB_API_KEY --env production --body "<production-workspace-api-key>"
+    ```
+
+5. Commit configurations and push to GitHub.
+
+    ```shell
+    git add .
+    git commit -m "configured dlthub workspaces"
+    git push
+    ```
+
+If everything is set up properly, the push to `main` will trigger GitHub Actions to check the code and deploy to dltHub. It takes around 1 minute to complete.
+
+<div className="doc-screenshot doc-screenshot--small">
+
+![successful GitHub actions on first deployment](https://storage.googleapis.com/dlt-blog-images/dlthub-cicd-blueprint/dlthub-github-first-deploy.png)
+
+</div>
+
+:::info
+We suggest setting **branch protection rules** on GitHub to make sure that failing automated checks block PR from being mergeable and require at least 1 pull request review before merging.
+:::
+
+## Next steps
+
+- [Deployments](../hub/pipeline-operations/deployments.md) — the manifest model behind `dlthub deploy`
+- [Profiles](../hub/pipeline-operations/profiles.md) — how `dev`, `prod`, and `access` profiles work
+- [Secrets management](../hub/pipeline-operations/secrets-management.md) — vaults and access controls for production secrets
+- [Triggers and scheduling](../hub/pipeline-operations/triggers.md) — cron, intervals, follow-ups, freshness
+- [Environment variables](../hub/pipeline-operations/environment-variables.md) — workspace- and profile-scoped process environment
+- [Monitoring and debugging](../hub/pipeline-operations/monitoring.md) — logs, dashboards, and failed-run diagnostics
+- [Workspace API keys](../hub/platform-capabilities/settings.md#workspace-api-keys)
+
+
+===== FILE: docs/website/docs/examples/google_sheets.md =====
+
+---
+title: Google Sheets minimal example
+description: Learn how work with Google services
+keywords: [google sheets, credentials, example]
+---
+# Google Sheets minimal example
+
+In this example, you'll find a Python script that demonstrates how to load Google Sheets data using the `dlt` library.
+
+We'll learn how to:
+
+- use [built-in credentials](../general-usage/credentials/complex_types#gcp-credentials);
+- use [union of credentials](../general-usage/credentials/complex_types#working-with-alternatives-of-credentials-union-types);
+- create [dynamically generated resources](../general-usage/source#create-resources-dynamically).
+
+:::tip
+This example is for educational purposes. For best practices, we recommend using [Google Sheets verified source](../dlt-ecosystem/verified-sources/google_sheets.md).
+:::
+
+## Full source code
+
+```py noexecute notype
+# NOTE: this line is only for dlt CI purposes, you may delete it if you are using this example
+__source_name__ = "google_sheets"
+
+from typing import Any, Iterator, Sequence, Union, cast
+
+from googleapiclient.discovery import build
+
+import dlt
+from dlt.common.configuration.specs import (
+    GcpOAuthCredentials,
+    GcpServiceAccountCredentials,
+)
+from dlt.common.typing import DictStrAny, StrAny
+
+
+def _initialize_sheets(
+    credentials: Union[GcpOAuthCredentials, GcpServiceAccountCredentials],
+) -> Any:
+    # Build the service object.
+    service = build("sheets", "v4", credentials=credentials.to_native_credentials())
+    return service
+
+
+@dlt.source
+def google_spreadsheet(
+    spreadsheet_id: str,
+    sheet_names: Sequence[str],
+    credentials: Union[
+        GcpServiceAccountCredentials, GcpOAuthCredentials, str, StrAny
+    ] = dlt.secrets.value,
+) -> Any:
+    sheets = _initialize_sheets(cast(GcpServiceAccountCredentials, credentials))
+
+    def get_sheet(sheet_name: str) -> Iterator[DictStrAny]:
+        # get list of list of typed values
+        result = (
+            sheets.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                range=sheet_name,
+                # unformatted returns typed values
+                valueRenderOption="UNFORMATTED_VALUE",
+                # will return formatted dates
+                dateTimeRenderOption="FORMATTED_STRING",
+            )
+            .execute()
+        )
+
+        # pprint.pprint(result)
+        values = result.get("values")
+
+        # yield dicts assuming row 0 contains headers and following rows values and all rows have identical length
+        for v in values[1:]:
+            yield {h: v for h, v in zip(values[0], v)}
+
+    # create resources from supplied sheet names
+    return [
+        dlt.resource(get_sheet(name), name=name, write_disposition="replace")
+        for name in sheet_names
+    ]
+
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(destination="duckdb")
+    # see example.secrets.toml to where to put credentials
+    sheet_id = "1HhWHjqouQnnCIZAFa2rL6vT91YRN8aIhts22SUUR580"
+    range_names = ["hidden_columns_merged_cells", "Blank Columns"]
+    # "2022-05", "model_metadata"
+    load_info = pipeline.run(
+        google_spreadsheet(
+            spreadsheet_id=sheet_id,
+            sheet_names=range_names,
+        )
+    )
+
+    print(load_info)
+
+    row_counts = pipeline.last_trace.last_normalize_info.row_counts
+    print(row_counts.keys())
+    assert row_counts["hidden_columns_merged_cells"] == 7
+    assert row_counts["blank_columns"] == 21
+```
+
+
+===== FILE: docs/website/docs/examples/incremental_loading.md =====
+
+---
+title: Load Zendesk tickets incrementally
+description: Learn how do incremental loading in consecutive runs
+keywords: [incremental loading, example]
+---
+# Load Zendesk tickets incrementally
+
+In this example, you'll find a Python script that interacts with the Zendesk Support API to extract ticket events data.
+
+We'll learn:
+
+- How to pass [credentials](../general-usage/credentials) as dict and how to type the `@dlt.source` function arguments.
+- How to set [the nesting level](../general-usage/source#reduce-the-nesting-level-of-generated-tables).
+- How to enable [incremental loading](../general-usage/incremental-loading) for efficient data extraction.
+- How to specify [the start and end dates](../general-usage/incremental/cursor.md#using-end_value-for-backfill) for the data loading and how to [opt-in to Airflow scheduler](../general-usage/incremental/cursor.md#using-airflow-schedule-for-backfill-and-incremental-loading) by setting `allow_external_schedulers` to `True`.
+- How to work with timestamps, specifically converting them to Unix timestamps for incremental data extraction.
+- How to use the `start_time` parameter in API requests to retrieve data starting from a specific timestamp.
+
+## Full source code
+
+```py noexecute notype
+# NOTE: this line is only for dlt CI purposes, you may delete it if you are using this example
+__source_name__ = "zendesk"
+
+from typing import Optional, Any, Iterable
+
+import dlt
+from dlt.common import pendulum
+from dlt.common.time import ensure_pendulum_datetime
+from dlt.common.typing import TAnyDateTime
+from dlt.sources.helpers import requests
+from dlt.extract import DltResource
+
+
+@dlt.source(max_table_nesting=2)
+def zendesk_support(
+    credentials: dict[str, str] = dlt.secrets.value,
+    start_date: Optional[TAnyDateTime] = pendulum.datetime(
+        year=2000, month=1, day=1
+    ),  # noqa: B008
+    end_date: Optional[TAnyDateTime] = None,
+) -> DltResource:
+    """
+    Retrieves data from Zendesk Support for tickets events.
+
+    Args:
+        credentials (Dict[str, str]): Zendesk credentials (default: dlt.secrets.value)
+        start_date (Optional[TAnyDateTime]): Start date for data extraction (default: 2000-01-01)
+        end_date (Optional[TAnyDateTime]): End date for data extraction (default: None).
+            If end time is not provided, the incremental loading will be
+            enabled, and after the initial run, only new data will be retrieved.
+
+    Returns:
+        DltResource: a resource with ticket events
+    """
+    # Convert start_date and end_date to Pendulum datetime objects
+    start_date_obj = ensure_pendulum_datetime(start_date)
+    end_date_obj = ensure_pendulum_datetime(end_date) if end_date else None
+
+    # Convert Pendulum datetime objects to Unix timestamps
+    start_date_ts = start_date_obj.int_timestamp
+    end_date_ts: Optional[int] = None
+    if end_date_obj:
+        end_date_ts = end_date_obj.int_timestamp
+
+    # Extract credentials from secrets dictionary
+    auth = (credentials["email"], credentials["password"])
+    subdomain = credentials["subdomain"]
+    url = f"https://{subdomain}.zendesk.com"
+
+    # we use `append` write disposition, because objects in ticket_events endpoint are never updated
+    #  so we do not need to merge
+    # we set primary_key so allow deduplication of events by the `incremental` below in the rare case
+    #  when two events have the same timestamp
+    @dlt.resource(primary_key="id", write_disposition="append")
+    def ticket_events(
+        timestamp: dlt.sources.incremental[int] = dlt.sources.incremental(
+            "timestamp",
+            initial_value=start_date_ts,
+            end_value=end_date_ts,
+            allow_external_schedulers=True,
+        ),
+    ):
+        # URL For ticket events
+        # 'https://d3v-dlthub.zendesk.com/api/v2/incremental/ticket_events.json?start_time=946684800'
+        event_pages = get_pages(
+            url=url,
+            endpoint="/api/v2/incremental/ticket_events.json",
+            auth=auth,
+            data_point_name="ticket_events",
+            params={"start_time": timestamp.last_value},
+        )
+        for page in event_pages:
+            yield page
+            # stop loading when using end_value and end is reached.
+            # unfortunately, Zendesk API does not have the "end_time" parameter, so we stop iterating ourselves
+            if timestamp.end_out_of_range:
+                return
+
+    return ticket_events
+
+
+def get_pages(
+    url: str,
+    endpoint: str,
+    auth: tuple[str, str],
+    data_point_name: str,
+    params: Optional[dict[str, Any]] = None,
+) -> Iterable[list[dict[str, Any]]]:
+    """
+    Makes a request to a paginated endpoint and returns a generator of data items per page.
+
+    Args:
+        url (str): The base URL.
+        endpoint (str): The url to the endpoint, e.g. /api/v2/calls
+        auth (Tuple[str, str]): Credentials for authentication.
+        data_point_name (str): The key which data items are nested under in the response object (e.g. calls)
+        params (Optional[Dict[str, Any]], optional): Optional dict of query params to include in the request.
+
+    Yields:
+        List[Dict[str, Any]]: Generator of pages, each page is a list of dict data items.
+    """
+    # update the page size to enable cursor pagination
+    params = params or {}
+    params["per_page"] = 1000
+    headers = None
+
+    # make request and keep looping until there is no next page
+    get_url = f"{url}{endpoint}"
+    while get_url:
+        response = requests.get(get_url, headers=headers, auth=auth, params=params)
+        response.raise_for_status()
+        response_json = response.json()
+        result = response_json[data_point_name]
+        yield result
+
+        get_url = None
+        # See https://developer.zendesk.com/api-reference/ticketing/ticket-management/incremental_exports/#json-format
+        if not response_json["end_of_stream"]:
+            get_url = response_json["next_page"]
+
+
+if __name__ == "__main__":
+    # create dlt pipeline
+    pipeline = dlt.pipeline(
+        pipeline_name="zendesk", destination="duckdb", dataset_name="zendesk_data"
+    )
+
+    load_info = pipeline.run(zendesk_support())
+    print(load_info)
+
+    # check that stuff was loaded
+    row_counts = pipeline.last_trace.last_normalize_info.row_counts
+    assert row_counts["ticket_events"] > 0, "No ticket events were loaded"
+
+    with pipeline.sql_client() as client:
+        results = client.execute(
+            """
+            SELECT
+                COUNT(DISTINCT ticket_id) as unique_tickets,
+                COUNT(DISTINCT event_type) as event_types,
+            FROM ticket_events
+        """
+        ).fetchone()
+
+        unique_tickets, event_types = results
+        assert unique_tickets > 0, "No unique tickets were loaded"
+        assert event_types > 0, "No event types were found"
+```
+
+
+===== FILE: docs/website/docs/examples/index.md =====
+
+---
+title: Code Examples
+description: A list of comprehensive code examples that teach you how to solve real world problems.
+keywords: ['examples']
+---
+# Examples
+
+import DocCardList from '@theme/DocCardList';
+
+A list of comprehensive code examples that teach you how to solve real-world problems.
+
+<DocCardList />
+
+
+===== FILE: docs/website/docs/examples/langfuse_export.md =====
+
+---
+title: Export Langfuse Observability Data
+description: Export traces, evaluations, datasets, and cost data from Langfuse to your data lake
+keywords: [langfuse, llm, observability, traces, evaluations, datasets, scores, export]
+---
+# Export Langfuse Observability Data
+
+[Langfuse](https://langfuse.com/) is an open-source LLM observability and evaluation platform.
+It captures traces and observations from your AI applications, manages evaluation datasets, and
+tracks LLM costs — all in a self-hostable Postgres-backed store.
+
+To enable analytics, reporting, and offline evaluation, this data needs to be exported to a
+data lakehouse or warehouse. Langfuse persists relational metadata in **PostgreSQL**.
+
+The `dlt` library's built-in `sql_database()` source makes extraction straightforward:
+
+* Connect directly to Langfuse's Postgres backend with a connection string.
+* Use `resolve_foreign_keys=True` so dlt automatically links child tables (e.g. datasets → projects).
+* Load to **DuckDB** for zero-config local analytics, or swap to any other dlt destination.
+
+## Credentials
+
+Add the following block to `.dlt/secrets.toml`, filling in the values from your deployment:
+
+```toml
+# .dlt/secrets.toml
+[sources.sql_database.credentials]
+drivername = "postgresql"
+host = "localhost"
+port = 5432
+database = "langfuse"
+username = "langfuse"
+password = "langfuse"
+```
+
+You also need the psycopg2 driver installed:
+
+```sh
+pip install psycopg2-binary
+```
+
+Where to find these values:
+
+- **Docker Compose**: look for the `db` service in your `docker-compose.yml`. The credentials are
+  set via `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` environment variables. The host
+  is the service name (or `localhost` if the port is published to the host).
+- **Helm chart**: check `values.yaml` under `postgresql.auth` or the `DATABASE_URL`
+  environment variable on the Langfuse deployment.
+- **Langfuse Cloud**: direct database access is not available on Langfuse Cloud; use the
+  [Langfuse API](https://api.reference.langfuse.com/) instead.
+
+## Data model
+
+dlt automatically discovers every table in the Langfuse database and infers their relationships from
+foreign keys — no schema configuration required. The exact set of tables you get depends on which
+Langfuse features you have used: tables are only populated once the corresponding feature is
+exercised.
+
+The tables most relevant for LLM observability and evaluation are:
+
+- **`organizations`** — top-level multi-tenant containers; each org owns projects and members.
+- **`projects`** — a project scopes all traces, scores, and datasets for one application.
+- **`trace_sessions`** — groups related traces into a session (e.g. a multi-turn conversation),
+  tagged with an `environment` field for staging vs. production separation.
+- **`datasets`** — curated collections of examples used for evaluation runs, created via the
+  Langfuse web UI or SDK.
+- **`dataset_items`** — individual rows inside a dataset, each carrying an `input`,
+  optional `expected_output`, and a link back to the source trace/observation that produced it.
+- **`score_configs`** — named score type definitions (numeric or categorical) with optional
+  `min_value`/`max_value` bounds; child table `score_configs__categories` holds the category labels.
+- **`eval_templates`** — versioned LLM-as-judge templates with a `prompt`, `model`, `provider`,
+  and typed output schema; child table `eval_templates__vars` holds the variable names.
+- **`models`** — LLM model definitions with `input_price`, `output_price`, and tokenizer config
+  used to compute per-trace cost.
+- **`prices`** / **`pricing_tiers`** — tiered pricing rules linked to model definitions.
+- **`annotation_queues`** — human annotation workflows; items are tracked in
+  `annotation_queue_items` and assignees in `annotation_queue_assignments`.
+- **`comments`** — user comments attached to any Langfuse object (trace, dataset, etc.).
+- **`dashboards`** / **`dashboard_widgets`** — saved analytics dashboards with chart configuration.
+- **`audit_logs`** — full audit trail of create/update/delete actions across the platform.
+
+Some tables are internal to Langfuse (e.g. `_prisma_migrations`, `background_migrations`).
+You can explicitly select a subset of tables to load via `sql_database(..., table_names=...)`.
+
+```mermaid
+erDiagram
+    _dlt_version{
+    bigint version
+    bigint engine_version
+    timestamp inserted_at
+    text schema_name
+    text version_hash
+    text schema
+}
+    _dlt_loads{
+    text load_id
+    text schema_name
+    bigint status
+    timestamp inserted_at
+    text schema_version_hash
+}
+    _prisma_migrations{
+    text id PK
+    text checksum
+    timestamp finished_at
+    text migration_name
+    timestamp started_at
+    bigint applied_steps_count
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    users{
+    text id PK
+    text name
+    text email
+    text password
+    timestamp created_at
+    timestamp updated_at
+    bool admin
+    bool v4_beta_enabled
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    projects{
+    text id PK
+    timestamp created_at
+    text name
+    timestamp updated_at
+    text org_id
+    bool has_traces
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    organizations{
+    text id PK
+    text name
+    timestamp created_at
+    timestamp updated_at
+    bool ai_features_enabled
+    timestamp cloud_billing_cycle_anchor
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    score_configs{
+    text id PK
+    timestamp created_at
+    timestamp updated_at
+    text project_id
+    text name
+    text data_type
+    bool is_archived
+    text description
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    api_keys{
+    text id PK
+    timestamp created_at
+    text public_key
+    text hashed_secret_key
+    text display_secret_key
+    text project_id
+    text fast_hashed_secret_key
+    text scope
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    organization_memberships{
+    text id PK
+    text org_id
+    text user_id
+    text role
+    timestamp created_at
+    timestamp updated_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    datasets{
+    text id PK
+    text name
+    text project_id PK
+    timestamp created_at
+    timestamp updated_at
+    text description
+    bool remote_experiment_enabled
+    text metadata__foo
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    dataset_items{
+    text id PK
+    text source_observation_id
+    text dataset_id
+    timestamp created_at
+    timestamp updated_at
+    text status
+    text source_trace_id
+    text project_id PK
+    bool is_deleted
+    timestamp valid_from PK
+    text metadata__resource_attributes__service_name
+    text metadata__resource_attributes__telemetry_sdk_name
+    text metadata__resource_attributes__telemetry_sdk_version
+    text metadata__resource_attributes__telemetry_sdk_language
+    text metadata__attributes__gen_ai_system
+    text metadata__attributes__operation_cost
+    text metadata__attributes__server_address
+    text metadata__attributes__gen_ai_agent_name
+    text metadata__attributes__gen_ai_response_id
+    text metadata__attributes__logfire_json_schema
+    text metadata__attributes__gen_ai_agent_call_id
+    text metadata__attributes__gen_ai_provider_name
+    text metadata__attributes__gen_ai_request_model
+    text metadata__attributes__gen_ai_operation_name
+    text metadata__attributes__gen_ai_response_model
+    text metadata__attributes__gen_ai_conversation_id
+    text metadata__attributes__gen_ai_tool_definitions
+    text metadata__attributes__model_request_parameters
+    text metadata__attributes__gen_ai_usage_input_tokens
+    text metadata__attributes__gen_ai_usage_output_tokens
+    text metadata__attributes__gen_ai_response_finish_reasons
+    text metadata__scope__name
+    text metadata__scope__version
+    text _dlt_load_id
+    text _dlt_id UK
+    text expected_output
+    text metadata__attributes__logfire_msg
+    text metadata__attributes__tool_response
+    text metadata__attributes__tool_arguments
+    text metadata__attributes__gen_ai_tool_name
+    text metadata__attributes__gen_ai_tool_call_id
+    bigint input__square
+}
+    trace_sessions{
+    text id PK
+    timestamp created_at
+    timestamp updated_at
+    text project_id PK
+    bool bookmarked
+    bool public
+    text environment
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    models{
+    text id PK
+    timestamp created_at
+    timestamp updated_at
+    text model_name
+    text match_pattern
+    timestamp start_date
+    decimal input_price
+    decimal output_price
+    text unit
+    text tokenizer_id
+    bigint tokenizer_config__tokens_per_name
+    text tokenizer_config__tokenizer_model
+    bigint tokenizer_config__tokens_per_message
+    text _dlt_load_id
+    text _dlt_id UK
+    decimal total_price
+}
+    audit_logs{
+    text id PK
+    timestamp created_at
+    timestamp updated_at
+    text user_id
+    text resource_type
+    text resource_id
+    text action
+    text after
+    text org_id
+    text user_org_role
+    text type
+    text _dlt_load_id
+    text _dlt_id UK
+    text project_id
+    text user_project_role
+    text before
+}
+    eval_templates{
+    text id PK
+    timestamp created_at
+    timestamp updated_at
+    text name
+    bigint version
+    text prompt
+    text output_schema__score
+    text output_schema__reasoning
+    text _dlt_load_id
+    text _dlt_id UK
+    text partner
+}
+    comments{
+    text id PK
+    text project_id
+    text object_type
+    text object_id
+    timestamp created_at
+    timestamp updated_at
+    text content
+    text author_user_id
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    annotation_queues{
+    text id PK
+    text name
+    text description
+    text project_id
+    timestamp created_at
+    timestamp updated_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    annotation_queue_items{
+    text id PK
+    text queue_id
+    text object_id
+    text object_type
+    text status
+    text project_id
+    timestamp created_at
+    timestamp updated_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    background_migrations{
+    text id PK
+    text name
+    text script
+    timestamp finished_at
+    text worker_id
+    text _dlt_load_id
+    text _dlt_id UK
+    timestamp state__max_date
+    bigint state__offset
+}
+    prices{
+    text id PK
+    timestamp created_at
+    timestamp updated_at
+    text model_id
+    text usage_type
+    decimal price
+    text pricing_tier_id
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    pricing_tiers{
+    text id PK
+    timestamp created_at
+    timestamp updated_at
+    text model_id
+    text name
+    bool is_default
+    bigint priority
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    dashboard_widgets{
+    text id PK
+    timestamp created_at
+    timestamp updated_at
+    text name
+    text description
+    text view
+    text chart_type
+    bigint min_version
+    text chart_config__type
+    text _dlt_load_id
+    text _dlt_id UK
+    bigint chart_config__row_limit
+}
+    dashboards{
+    text id PK
+    timestamp created_at
+    timestamp updated_at
+    text name
+    text description
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    annotation_queue_assignments{
+    text id PK
+    text project_id
+    text user_id
+    text queue_id
+    timestamp created_at
+    timestamp updated_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    notification_preferences{
+    text id PK
+    text user_id
+    text project_id
+    text channel
+    text type
+    bool enabled
+    timestamp created_at
+    timestamp updated_at
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    _dlt_pipeline_state{
+    bigint version
+    bigint engine_version
+    text pipeline_name
+    text state
+    timestamp created_at
+    text version_hash
+    text _dlt_load_id
+    text _dlt_id UK
+}
+    eval_templates__vars{
+    text value
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    score_configs__categories{
+    text label
+    bigint value
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    dashboard_widgets__dimensions{
+    text field
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    dashboard_widgets__metrics{
+    text agg
+    text measure
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    annotation_queues__score_config_ids{
+    text value
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    pricing_tiers__conditions{
+    bigint value
+    text operator
+    bool case_sensitive
+    text usage_detail_pattern
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    dataset_items__expected_output{
+    text role
+    text finish_reason
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    dataset_items__expected_output__parts{
+    text id
+    text name
+    text type
+    text arguments
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    dataset_items__input__tools{
+    text name
+    text type
+    text description
+    text parameters__type
+    bool parameters__additional_properties
+    text parameters__properties__square__type
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    dataset_items__input__tools__parameters__required{
+    text value
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    dataset_items__input__messages{
+    text role
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    dataset_items__input__messages__parts{
+    text type
+    text content
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    dashboards__definition__widgets{
+    bigint x
+    bigint y
+    text id
+    text type
+    bigint x_size
+    bigint y_size
+    text widget_id
+    text _dlt_parent_id
+    bigint _dlt_list_idx
+    text _dlt_id UK
+}
+    _prisma_migrations }|--|| _dlt_loads : "_dlt_load"
+    users }|--|| _dlt_loads : "_dlt_load"
+    projects }|--|| _dlt_loads : "_dlt_load"
+    projects ||--|{ organizations : ""
+    organizations }|--|| _dlt_loads : "_dlt_load"
+    score_configs }|--|| _dlt_loads : "_dlt_load"
+    score_configs ||--|{ projects : ""
+    api_keys }|--|| _dlt_loads : "_dlt_load"
+    api_keys ||--|{ organizations : ""
+    api_keys ||--|{ projects : ""
+    organization_memberships }|--|| _dlt_loads : "_dlt_load"
+    organization_memberships ||--|{ users : ""
+    organization_memberships ||--|{ organizations : ""
+    datasets }|--|| _dlt_loads : "_dlt_load"
+    datasets ||--|{ projects : ""
+    dataset_items }|--|| _dlt_loads : "_dlt_load"
+    dataset_items ||--|{ datasets : ""
+    trace_sessions }|--|| _dlt_loads : "_dlt_load"
+    trace_sessions ||--|{ projects : ""
+    models }|--|| _dlt_loads : "_dlt_load"
+    models ||--|{ projects : ""
+    audit_logs }|--|| _dlt_loads : "_dlt_load"
+    eval_templates }|--|| _dlt_loads : "_dlt_load"
+    eval_templates ||--|{ projects : ""
+    comments }|--|| _dlt_loads : "_dlt_load"
+    comments ||--|{ projects : ""
+    annotation_queues }|--|| _dlt_loads : "_dlt_load"
+    annotation_queues ||--|{ projects : ""
+    annotation_queue_items }|--|| _dlt_loads : "_dlt_load"
+    annotation_queue_items ||--|{ annotation_queues : ""
+    annotation_queue_items ||--|{ projects : ""
+    annotation_queue_items ||--|{ users : ""
+    background_migrations }|--|| _dlt_loads : "_dlt_load"
+    prices }|--|| _dlt_loads : "_dlt_load"
+    prices ||--|{ pricing_tiers : ""
+    prices ||--|{ models : ""
+    prices ||--|{ projects : ""
+    pricing_tiers }|--|| _dlt_loads : "_dlt_load"
+    pricing_tiers ||--|{ models : ""
+    dashboard_widgets }|--|| _dlt_loads : "_dlt_load"
+    dashboard_widgets ||--|{ users : ""
+    dashboard_widgets ||--|{ projects : ""
+    dashboards }|--|| _dlt_loads : "_dlt_load"
+    dashboards ||--|{ users : ""
+    dashboards ||--|{ projects : ""
+    annotation_queue_assignments }|--|| _dlt_loads : "_dlt_load"
+    annotation_queue_assignments ||--|{ annotation_queues : ""
+    annotation_queue_assignments ||--|{ projects : ""
+    annotation_queue_assignments ||--|{ users : ""
+    notification_preferences }|--|| _dlt_loads : "_dlt_load"
+    notification_preferences ||--|{ users : ""
+    notification_preferences ||--|{ projects : ""
+    _dlt_pipeline_state }|--|| _dlt_loads : "_dlt_load"
+    eval_templates__vars }|--|| eval_templates : "_dlt_parent"
+    score_configs__categories }|--|| score_configs : "_dlt_parent"
+    dashboard_widgets__dimensions }|--|| dashboard_widgets : "_dlt_parent"
+    dashboard_widgets__metrics }|--|| dashboard_widgets : "_dlt_parent"
+    annotation_queues__score_config_ids }|--|| annotation_queues : "_dlt_parent"
+    pricing_tiers__conditions }|--|| pricing_tiers : "_dlt_parent"
+    dataset_items__expected_output }|--|| dataset_items : "_dlt_parent"
+    dataset_items__expected_output__parts }|--|| dataset_items__expected_output : "_dlt_parent"
+    dataset_items__input__tools }|--|| dataset_items : "_dlt_parent"
+    dataset_items__input__tools__parameters__required }|--|| dataset_items__input__tools : "_dlt_parent"
+    dataset_items__input__messages }|--|| dataset_items : "_dlt_parent"
+    dataset_items__input__messages__parts }|--|| dataset_items__input__messages : "_dlt_parent"
+    dashboards__definition__widgets }|--|| dashboards : "_dlt_parent"
+    _dlt_version ||--|{ _dlt_loads : "_dlt_schema_version"
+    _dlt_version }|--|{ _dlt_loads : "_dlt_schema_name"
+```
+
+### Full source code
+
+```py noexecute
+import dlt
+from dlt.sources.sql_database import sql_database
+
+
+@dlt.source
+def langfuse_source(credentials=dlt.secrets.value):
+    return sql_database(
+        credentials=credentials,
+        reflection_level="minimal",
+        resolve_foreign_keys=True,
+    )
+
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(
+        pipeline_name="langfuse",
+        # can be configure to any dlt destination
+        destination="duckdb",
+    )
+    load_info = pipeline.run(langfuse_source)
+    print(load_info)
+```
+
+
+===== FILE: docs/website/docs/examples/logfire_telemetry_export.md =====
+
+---
+title: Export Logfire Telemetry
+description: Incrementally export traces and metrics from Pydantic Logfire to your data lake
+keywords: [logfire, opentelemetry, traces, metrics, observability, telemetry, export]
+---
+# Export Logfire Telemetry
+
+[Pydantic Logfire](https://logfire.pydantic.dev/) is an observability platform from agents and LLM
+created by the team behind Pydantic.
+
+To enable analytics, reporting, and evaluations, this telemetry (traces, metrics, etc.) needs to be
+exported to the data lakehouse / warehouse. Pydantic Logfire provides convenient methods to export data via
+a Python SDK or HTTP requests ([docs](https://pydantic.dev/docs/logfire/manage/query-api/#client-usage-examples))
+
+To avoid download the entire history of data on each export (telemetry quickly grows in size), users need
+**incremental loading**. This requires a stateful mechanism to track previously loaded data and
+adjust future exports to fetch only new records.
+
+The `dlt` library makes this trivial. In this example:
+
+* Use `dlt.sources.incremental()` to do stateful, cursor-based extraction on a date column
+* Yield Arrow tables directly from an async resource for efficient columnar ingestion
+* Authenticate with the Logfire Read API using a secret token
+
+NOTE. You will need a Pydantic Logfire read token. It can be obtained via the CLI or UI
+([guide](https://pydantic.dev/docs/logfire/manage/query-api/#how-to-create-a-read-token))
+
+## Full source code
+
+```py noexecute
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import dlt
+from logfire.query_client import AsyncLogfireQueryClient
+
+
+@dlt.resource
+async def metrics(
+    read_token=dlt.secrets.value,
+    batch_size: int = 1000,
+    min_timestamp=dlt.sources.incremental(
+        "created_at",
+        initial_value=datetime(1970, 1, 1, tzinfo=ZoneInfo("UTC")),
+    ),
+):
+    """Fetches rows from the Logfire `metrics` table incrementally.
+
+    `metrics` contains pre-aggregated numerical data. It is more efficient than
+    querying `records` for time-series aggregations but has no dedicated Logfire UI.
+
+    Args:
+        read_token (str): Logfire read API token, loaded from `secrets.toml`.
+        batch_size (int): Maximum number of rows returned per query.
+        min_timestamp: Incremental cursor on `created_at`; only rows newer than
+            the last pipeline run are fetched.
+
+    Yields:
+        pyarrow.Table: A batch of metric rows as an Arrow table.
+    """
+    async with AsyncLogfireQueryClient(read_token=read_token) as client:
+        batch = await client.query_arrow(
+            sql=f"SELECT * FROM metrics LIMIT {batch_size}",
+            min_timestamp=min_timestamp.start_value,
+        )
+        yield batch.to_pylist()
+
+
+@dlt.resource
+async def records(
+    read_token=dlt.secrets.value,
+    batch_size: int = 1000,
+    min_timestamp=dlt.sources.incremental(
+        "created_at",
+        initial_value=datetime(1970, 1, 1, tzinfo=ZoneInfo("UTC")),
+    ),
+):
+    """Fetches rows from the Logfire `records` table incrementally.
+
+    Each row is a span or a log (a span with no duration). Spans sharing the same
+    `trace_id` form a trace, structured as a tree. This is the primary table shown
+    in the Logfire Live View and the one most queries should target.
+
+    Note: `records` excludes pending spans. The full table including pending spans
+    is `records_all`, but it is not needed for most use cases.
+
+    Args:
+        read_token (str): Logfire read API token, loaded from `secrets.toml`.
+        batch_size (int): Maximum number of rows returned per query.
+        min_timestamp: Incremental cursor on `created_at`; only rows newer than
+            the last pipeline run are fetched.
+
+    Yields:
+        pyarrow.Table: A batch of span/log rows as an Arrow table.
+    """
+    async with AsyncLogfireQueryClient(read_token=read_token) as client:
+        batch = await client.query_arrow(
+            sql=f"SELECT * FROM records LIMIT {batch_size}",
+            min_timestamp=min_timestamp.start_value,
+        )
+        yield batch.to_pylist()
+
+
+@dlt.source
+def logfire_source():
+    """Returns all Logfire resources (metrics and records) as a dlt source."""
+    return [metrics, records]
+
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(
+        pipeline_name="logfire",
+        destination="duckdb",
+    )
+    pipeline.run(logfire_source)
+```
+
+
+===== FILE: docs/website/docs/examples/nested_data.md =====
+
+---
+title: Control nested MongoDB data
+description: Learn how control nested data
+keywords: [incremental loading, example]
+---
+# Control nested MongoDB data
+
+In this example, you'll find a Python script that demonstrates how to control nested data using the `dlt` library.
+
+We'll learn how to:
+
+- [Adjust maximum nesting level in three ways:](../general-usage/source#reduce-the-nesting-level-of-generated-tables)
+  - Limit nesting levels with dlt decorator.
+  - Dynamic nesting level adjustment.
+  - Apply data type hints.
+- Work with [MongoDB](../dlt-ecosystem/verified-sources/mongodb) in Python and `dlt`.
+- Enable [incremental loading](../general-usage/incremental-loading) for efficient data extraction.
+
+## Full source code
+
+```py noexecute notype
+# NOTE: this line is only for dlt CI purposes, you may delete it if you are using this example
+__source_name__ = "mongodb"
+
+from itertools import islice
+from typing import Any, Iterator, Optional
+
+from bson.decimal128 import Decimal128
+from bson.objectid import ObjectId
+from pendulum import _datetime  # noqa: I251
+from pymongo import MongoClient
+
+import dlt
+from dlt.common.time import ensure_pendulum_datetime
+from dlt.common.typing import TDataItem
+from dlt.common.utils import map_nested_values_in_place
+
+CHUNK_SIZE = 10000
+
+
+# You can limit how deep dlt goes when generating nested tables.
+# By default, the library will descend and generate nested tables
+# for all nested lists, without a limit.
+# In this example, we specify that we only want to generate nested tables up to level 2,
+# so there will be only one level of nested tables within nested tables.
+@dlt.source(max_table_nesting=2)
+def mongodb_collection(
+    connection_url: str = dlt.secrets.value,
+    database: Optional[str] = dlt.config.value,
+    collection: str = dlt.config.value,
+    incremental: Optional[dlt.sources.incremental] = None,  # type: ignore[type-arg]
+    write_disposition: Optional[str] = dlt.config.value,
+) -> Any:
+    # set up mongo client
+    client: Any = MongoClient(connection_url, uuidRepresentation="standard", tz_aware=True)
+    mongo_database = client.get_default_database() if not database else client[database]
+    collection_obj = mongo_database[collection]
+
+    def collection_documents(
+        client: Any,
+        collection: Any,
+        incremental: Optional[dlt.sources.incremental[Any]] = None,
+    ) -> Iterator[TDataItem]:
+        LoaderClass = CollectionLoader
+
+        loader = LoaderClass(client, collection, incremental=incremental)
+        yield from loader.load_documents()
+
+    return dlt.resource(  # type: ignore
+        collection_documents,
+        name=collection_obj.name,
+        primary_key="_id",
+        write_disposition=write_disposition,
+    )(client, collection_obj, incremental=incremental)
+
+
+class CollectionLoader:
+    def __init__(
+        self,
+        client: Any,
+        collection: Any,
+        incremental: Optional[dlt.sources.incremental[Any]] = None,
+    ) -> None:
+        self.client = client
+        self.collection = collection
+        self.incremental = incremental
+        if incremental:
+            self.cursor_field = incremental.cursor_path
+            self.last_value = incremental.last_value
+        else:
+            self.cursor_column = None
+            self.last_value = None
+
+    @property
+    def _filter_op(self) -> dict[str, Any]:
+        if not self.incremental or not self.last_value:
+            return {}
+        if self.incremental.last_value_func is max:
+            return {self.cursor_field: {"$gte": self.last_value}}
+        elif self.incremental.last_value_func is min:
+            return {self.cursor_field: {"$lt": self.last_value}}
+        return {}
+
+    def load_documents(self) -> Iterator[TDataItem]:
+        cursor = self.collection.find(self._filter_op)
+        while docs_slice := list(islice(cursor, CHUNK_SIZE)):
+            yield map_nested_values_in_place(convert_mongo_objs, docs_slice)
+
+
+def convert_mongo_objs(value: Any) -> Any:
+    if isinstance(value, (ObjectId, Decimal128)):
+        return str(value)
+    if isinstance(value, _datetime.datetime):
+        return ensure_pendulum_datetime(value)
+    return value
+
+
+if __name__ == "__main__":
+    # When we created the source, we set max_table_nesting to 2.
+    # This ensures that the generated tables do not have more than two
+    # levels of nesting, even if the original data structure is more deeply nested.
+    pipeline = dlt.pipeline(
+        pipeline_name="mongodb_pipeline",
+        destination="duckdb",
+        dataset_name="unpacked_data",
+    )
+    source_data = mongodb_collection(collection="movies", write_disposition="replace")
+    load_info = pipeline.run(source_data)
+    print(load_info)
+    tables = pipeline.last_trace.last_normalize_info.row_counts
+    tables.pop("_dlt_pipeline_state")
+    assert len(tables) == 7, pipeline.last_trace.last_normalize_info
+
+    # The second method involves setting the max_table_nesting attribute directly
+    # on the source data object.
+    # This allows for dynamic control over the maximum nesting
+    # level for a specific data source.
+    # Here the nesting level is adjusted before running the pipeline.
+    pipeline = dlt.pipeline(
+        pipeline_name="mongodb_pipeline",
+        destination="duckdb",
+        dataset_name="not_unpacked_data",
+    )
+    source_data = mongodb_collection(collection="movies", write_disposition="replace")
+    source_data.max_table_nesting = 0
+    load_info = pipeline.run(source_data)
+    print(load_info)
+    tables = pipeline.last_trace.last_normalize_info.row_counts
+    tables.pop("_dlt_pipeline_state")
+    assert len(tables) == 1, pipeline.last_trace.last_normalize_info
+
+    # The third method involves applying data type hints to specific columns in the data.
+    # In this case, we tell dlt that column 'cast' (containing a list of actors)
+    # in 'movies' table should have type 'json' which means
+    # that it will be loaded as JSON/struct and not as nested table.
+    pipeline = dlt.pipeline(
+        pipeline_name="mongodb_pipeline",
+        destination="duckdb",
+        dataset_name="unpacked_data_without_cast",
+    )
+    source_data = mongodb_collection(collection="movies", write_disposition="replace")
+    source_data.movies.apply_hints(columns={"cast": {"data_type": "json"}})
+    load_info = pipeline.run(source_data)
+    print(load_info)
+    tables = pipeline.last_trace.last_normalize_info.row_counts
+    tables.pop("_dlt_pipeline_state")
+    assert len(tables) == 6, pipeline.last_trace.last_normalize_info
+```
+
+
+===== FILE: docs/website/docs/examples/partial_loading.md =====
+
+---
+title: Backfill to Filesystem with partial replace
+description: Load chess game data from Chess.com into a filesystem destination, while deleting old backfill files.
+keywords: [incremental loading, REST API, dlt, chess.com, data pipeline, backfill management, filesystem]
+---
+# Backfill to Filesystem with partial replace
+
+This script interacts with the Chess.com REST API to extract game data for a specific user on a monthly basis.
+The script retrieves game data for a specified time range, and when additional data is loaded for a different time range,
+it automatically handles de-duplication by deleting any previously loaded files for overlapping time range.
+
+We'll learn:
+
+- How to configure a [REST API source](../dlt-ecosystem/verified-sources/rest_api/basic.md) using
+ the `dlt` library.
+- How to manage and delete old backfill files for de-duplication.
+- How to use [Filesystem](../dlt-ecosystem/destinations/filesystem.md) as a destination for storing extracted data.
+
+## Full source code
+
+```py execute notype
+import os
+import re
+from dlt.common import pendulum as p
+from typing import Iterator
+
+import dlt
+from dlt.sources import DltResource
+from dlt.common.pipeline import LoadInfo
+from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
+from dlt.sources.rest_api import RESTAPIConfig, rest_api_resources
+
+
+@dlt.source
+def chess_com_source(
+    username: str, months: list[dict[str, str]]
+) -> Iterator[DltResource]:
+    """
+    Configures and yields resources to fetch chess game data for a given user across specified months.
+
+    Args:
+        username (str): Chess.com username to fetch games for.
+        months (List[Dict[str, str]]): List of dictionaries containing 'year' and 'month' keys.
+
+    Yields:
+        DltResource: Resource objects containing fetched game data.
+    """
+    for month in months:
+        year = month["year"]
+        month_str = month["month"]
+        # Configure REST API endpoint for the specific month
+        config: RESTAPIConfig = {
+            "client": {
+                "base_url": "https://api.chess.com/pub/",  # Base URL for Chess.com API
+            },
+            "resources": [
+                {
+                    "name": f"chess_com_games_{year}_{month_str}",  # Unique resource name
+                    "write_disposition": "append",
+                    "endpoint": {
+                        "path": f"player/{username}/games/{year}/{month_str}",  # API endpoint path
+                        "response_actions": [
+                            {"status_code": 404, "action": "ignore"},
+                        ],
+                    },
+                    "primary_key": ["url"],  # Primary key to prevent duplicates
+                }
+            ],
+        }
+        yield from rest_api_resources(config)
+
+
+def generate_months(
+    start_year: int, start_month: int, end_year: int, end_month: int
+) -> Iterator[dict[str, str]]:
+    """
+    Generates a list of months between the start and end dates.
+
+    Args:
+        start_year (int): Starting year.
+        start_month (int): Starting month.
+        end_year (int): Ending year.
+        end_month (int): Ending month.
+
+    Yields:
+        Dict[str, str]: Dictionary containing 'year' and 'month' as strings.
+    """
+    start_date = p.datetime(start_year, start_month, 1)
+    end_date = p.datetime(end_year, end_month, 1)
+    current_date = start_date
+    while current_date <= end_date:
+        yield {"year": str(current_date.year), "month": f"{current_date.month:02d}"}
+        # Move to the next month
+        if current_date.month == 12:
+            current_date = current_date.replace(year=current_date.year + 1, month=1)
+        else:
+            current_date = current_date.replace(month=current_date.month + 1)
+
+
+def delete_old_backfills(load_info: LoadInfo, p: dlt.Pipeline, table_name: str) -> None:
+    """
+    Deletes old backfill files that do not match the current load ID to maintain data integrity.
+
+    Args:
+        load_info (LoadInfo): Information about the current load.
+        p (dlt.Pipeline): The dlt pipeline instance.
+        table_name (str): Name of the table to clean up backfills for.
+    """
+    # Fetch current load id
+    load_id = load_info.loads_ids[0]
+    pattern = re.compile(rf"{load_id}")  # Compile regex pattern for the current load ID
+
+    # Initialize the filesystem client
+    fs_client: FilesystemClient = p._get_destination_clients()[0]  # type: ignore
+
+    # Construct the table directory path
+    table_dir = os.path.join(fs_client.dataset_path, table_name)
+
+    # Check if the table directory exists
+    if fs_client.fs_client.exists(table_dir):
+        # Traverse the table directory
+        for root, _dirs, files in fs_client.fs_client.walk(table_dir, maxdepth=None):
+            for file in files:
+                # Construct the full file path
+                file_path = os.path.join(root, file)
+                # If the file does not match the current load ID, delete it
+                if not pattern.search(file_path):
+                    try:
+                        fs_client.fs_client.rm(
+                            file_path
+                        )  # Remove the old backfill file
+                    except Exception as e:
+                        print(f"Error deleting file {file_path}: {e}")
+
+
+def load_chess_data():
+    """
+    Sets up and runs the dlt pipeline to load chess game data, then manages backfills.
+    """
+    # Initialize the dlt pipeline with filesystem destination, here we use local storage
+    dest_ = dlt.destinations.filesystem("_storage")
+    pipeline = dlt.pipeline(
+        pipeline_name="chess_com_data", destination=dest_, dataset_name="chess_games"
+    )
+
+    # Generate the list of months for the desired date range
+    months = list(generate_months(2023, 1, 2023, 12))
+
+    # Create the source with all specified months
+    source = chess_com_source("MagnusCarlsen", months)
+
+    # Run the pipeline to fetch and load data
+    info = pipeline.run(source)
+    # print(info)
+
+    # After the run, delete old backfills for each table to maintain data consistency
+    for month in months:
+        table_name = f"chess_com_games_{month['year']}_{month['month']}"
+        delete_old_backfills(info, pipeline, table_name)
+
+    return info
+
+
+info = load_chess_data()
+assert len(info.loads_ids) == 1
+```
+
+
+===== FILE: docs/website/docs/examples/pdf_to_weaviate.md =====
+
+---
+title: Load PDFs to Weaviate
+description: Extract text from PDF and load it into a vector database
+keywords: [pdf, weaviate, vector store, vector database, ]
+---
+# Load PDFs to Weaviate
+
+We'll use PyPDF2 to extract text from PDFs. Make sure you have it installed:
+
+```sh
+pip install PyPDF2
+```
+
+We start with a simple resource that lists files in specified folder. To that we add a **filter** function that removes all files that are not pdfs.
+
+To parse PDFs we use [PyPDF](https://pypdf2.readthedocs.io/en/3.0.0/user/extract-text.html) and return each page from a given PDF as separate data item.
+
+Parsing happens in `@dlt.transformer` which receives data from `list_files` resource. It splits PDF into pages, extracts text and yields pages separately
+so each PDF will correspond to many items in Weaviate `InvoiceText` class. We set the primary key and use merge disposition so if the same PDF comes twice
+we'll just update the vectors, and not duplicate.
+
+Look how we pipe data from `list_files` resource (note that resource is deselected so we do not load raw file items to destination) into `pdf_to_text` using **|** operator.
+
+## Full source code
+
+```py noexecute
+import os
+import dlt
+from dlt.destinations.adapters import weaviate_adapter
+from PyPDF2 import PdfReader  # ]
+
+
+@dlt.resource(selected=False)
+def list_files(folder_path: str):
+    folder_path = os.path.abspath(folder_path)
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+        yield {
+            "file_name": filename,
+            "file_path": file_path,
+            "mtime": os.path.getmtime(file_path),
+        }
+
+
+@dlt.transformer(primary_key="page_id", write_disposition="merge")
+def pdf_to_text(file_item, separate_pages: bool = False):
+    if not separate_pages:
+        raise NotImplementedError()
+    # extract data from PDF page by page
+    reader = PdfReader(file_item["file_path"])
+    for page_no in range(len(reader.pages)):
+        # add page content to file item
+        page_item = dict(file_item)
+        page_item["text"] = reader.pages[page_no].extract_text()
+        page_item["page_id"] = file_item["file_name"] + "_" + str(page_no)
+        yield page_item
+
+
+if __name__ == "__main__":
+    pipeline = dlt.pipeline(pipeline_name="pdf_to_text", destination="weaviate")
+
+    # this constructs a simple pipeline that: (1) reads files from "invoices" folder (2) filters only those ending with ".pdf"
+    # (3) sends them to pdf_to_text transformer with pipe (|) operator
+    pdf_pipeline = list_files("assets/invoices").add_filter(
+        lambda item: item["file_name"].endswith(".pdf")
+    ) | pdf_to_text(separate_pages=True)
+
+    # set the name of the destination table to receive pages
+    # NOTE: Weaviate, dlt's tables are mapped to classes
+    pdf_pipeline.table_name = "InvoiceText"
+
+    # use weaviate_adapter to tell destination to vectorize "text" column
+    load_info = pipeline.run(weaviate_adapter(pdf_pipeline, vectorize="text"))
+    row_counts = pipeline.last_trace.last_normalize_info.row_counts   # ty: ignore[unresolved-attribute]
+    print(row_counts)
+    print("------")
+    print(load_info)
+
+    import weaviate
+
+    # Connect using v4 client API
+    client = weaviate.connect_to_local()
+    try:
+        # get text of all the invoices in InvoiceText collection we just created above
+        invoice_collection = client.collections.get("InvoiceText")
+        result = invoice_collection.query.fetch_objects(
+            return_properties=["text", "file_name", "mtime", "page_id"]
+        )
+        for obj in result.objects:
+            print(obj.properties)
+    finally:
+        client.close()
+```
+
+
+===== FILE: docs/website/docs/examples/postgres_to_postgres.md =====
+
+---
+title: Load from Postgres to Postgres faster
+description: Load data fast from Postgres to Postgres with ConnectorX & Arrow export as Parquet, normalizing and exporting as DuckDB, and attaching it to Postgres for bigger Postgres tables (GBs)
+keywords: [connector x, pyarrow, zero copy, duckdb, postgres, initial load]
+---
+# Load from Postgres to Postgres faster
+
+:::info
+Huge shout out to [Simon Späti](https://github.com/sspaeti) for this example!
+:::
+
+This examples shows you how to export and import data from Postgres to Postgres in a fast way with ConnectorX and DuckDB
+since the default export will generate `Insert_statement` during the normalization phase, which is super slow for large tables.
+
+As it's an initial load, we create a separate schema with timestamp initially and then replace the existing schema with the new one.
+
+:::note
+This approach is tested and works well for an initial load (`--replace`), however, the incremental load (`--merge`) might need some adjustments (loading of load-tables of dlt, setting up first run after an initial
+load, etc.).
+:::
+
+We'll learn:
+
+- How to get arrow tables from [connector X](https://github.com/sfu-db/connector-x) and yield them in chunks.
+- That merge and incremental loads work with arrow tables.
+- How to use DuckDB for a speedy normalization.
+- How to use `argparse` to turn your pipeline script into a CLI.
+- How to work with `ConnectionStringCredentials` spec.
+
+Be aware that you need to define the database credentials in `.dlt/secrets.toml` or dlt ENVs and adjust the tables names ("customers" and "inventory").
+
+Install `dlt` with `duckdb` as extra, also `connectorx`, Postgres adapter and progress bar tool:
+
+```sh
+pip install "dlt[duckdb]" connectorx pyarrow psycopg2-binary alive-progress
+```
+
+Run the example:
+
+```sh
+python postgres_to_postgres.py --replace
+```
+
+:::warning
+Attention: There were problems with data type TIME that includes nano seconds. More details in
+[Slack](https://dlthub-community.slack.com/archives/C04DQA7JJN6/p1711579390028279?thread_ts=1711477727.553279&cid=C04DQA7JJN60)
+
+As well as with installing DuckDB extension (see [issue
+here](https://github.com/duckdb/duckdb/issues/8035#issuecomment-2020803032)), that's why I manually installed the `postgres_scanner.duckdb_extension` in my Dockerfile to load the data into Postgres.
+:::
+
+## Full source code
+
+```py noexecute notype
+import argparse
+import os
+from dlt.common import pendulum
+
+import connectorx as cx
+import duckdb
+import psycopg2
+
+import dlt
+from dlt.sources.credentials import ConnectionStringCredentials
+
+CHUNKSIZE = int(
+    os.getenv("CHUNKSIZE", 1000000)
+)  # 1 mio rows works well with 1GiB RAM memory (if no parallelism)
+
+
+def read_sql_x_chunked(conn_str: str, query: str, chunk_size: int = CHUNKSIZE):
+    offset = 0
+    while True:
+        chunk_query = f"{query} LIMIT {chunk_size} OFFSET {offset}"
+        data_chunk = cx.read_sql(
+            conn_str,
+            chunk_query,
+            return_type="arrow",
+            protocol="binary",
+        )
+        yield data_chunk
+        if data_chunk.num_rows < chunk_size:
+            break  # No more data to read
+        offset += chunk_size
+
+
+@dlt.source(max_table_nesting=0)
+def pg_resource_chunked(
+    table_name: str,
+    primary_key: list[str],
+    schema_name: str,
+    order_date: str,
+    load_type: str = "merge",
+    columns: str = "*",
+    credentials: ConnectionStringCredentials = None,
+):
+    print(
+        f"dlt.resource write_disposition: `{load_type}` -- ",
+        "connection string:"
+        f" postgresql://{credentials.username}:*****@{credentials.host}:{credentials.host}/{credentials.database}",
+    )
+
+    query = (  # Needed to have an idempotent query
+        f"SELECT {columns} FROM {schema_name}.{table_name} ORDER BY {order_date}"
+    )
+
+    source = dlt.resource(  # type: ignore
+        name=table_name,
+        table_name=table_name,
+        write_disposition=load_type,  # use `replace` for initial load, `merge` for incremental
+        primary_key=primary_key,
+        parallelized=True,
+    )(read_sql_x_chunked)(
+        credentials.to_native_representation(),  # Pass the connection string directly
+        query,
+    )
+
+    if load_type == "merge":
+        # Retrieve the last value processed for incremental loading
+        source.apply_hints(incremental=dlt.sources.incremental(order_date))
+
+    return source
+
+
+def table_desc(table_name, pk, schema_name, order_date, columns="*"):
+    return {
+        "table_name": table_name,
+        "pk": pk,
+        "schema_name": schema_name,
+        "order_date": order_date,
+        "columns": columns,
+    }
+
+
+if __name__ == "__main__":
+    # Input Handling
+    parser = argparse.ArgumentParser(
+        description="Run specific functions in the script."
+    )
+    parser.add_argument("--replace", action="store_true", help="Run initial load")
+    parser.add_argument("--merge", action="store_true", help="Run delta load")
+    args = parser.parse_args()
+
+    source_schema_name = "fixture_postgres_to_postgres"
+    target_schema_name = "destination_schema"
+    pipeline_name = "loading_postgres_to_postgres"
+
+    tables = [
+        table_desc("customers", ["id"], source_schema_name, "id"),
+        table_desc("inventory", ["id"], source_schema_name, "id"),
+    ]
+
+    # default is initial loading (replace)
+    load_type = "merge" if args.merge else "replace"
+    print(f"LOAD-TYPE: {load_type}")
+
+    resources = []
+    for table in tables:
+        resources.append(
+            pg_resource_chunked(
+                table["table_name"],
+                table["pk"],
+                table["schema_name"],
+                table["order_date"],
+                load_type=load_type,
+                columns=table["columns"],
+                credentials=dlt.secrets["sources.postgres.credentials"],
+            )
+        )
+
+    if load_type == "replace":
+        pipeline = dlt.pipeline(
+            pipeline_name=pipeline_name,
+            destination="duckdb",
+            dataset_name=target_schema_name,
+            dev_mode=True,
+            progress="alive_progress",
+        )
+    else:
+        pipeline = dlt.pipeline(
+            pipeline_name=pipeline_name,
+            destination="postgres",
+            dataset_name=target_schema_name,
+            dev_mode=False,
+        )  # dev_mode=False
+
+    # start timer
+    startTime = pendulum.now()
+
+    # 1. extract
+    print("##################################### START EXTRACT ########")
+    pipeline.extract(resources, loader_file_format="parquet")
+    print(f"--Time elapsed: {pendulum.now() - startTime}")
+
+    # 2. normalize
+    print("##################################### START NORMALIZATION ########")
+    if load_type == "replace":
+        info = pipeline.normalize(
+            workers=2,
+        )  # https://dlthub.com/docs/blog/dlt-arrow-loading
+    else:
+        info = pipeline.normalize()
+
+    print(info)
+    print(pipeline.last_trace.last_normalize_info)
+    print(f"--Time elapsed: {pendulum.now() - startTime}")
+
+    # 3. load
+    print("##################################### START LOAD ########")
+    load_info = pipeline.load()
+    print(load_info)
+    print(f"--Time elapsed: {pendulum.now() - startTime}")
+
+    # check that stuff was loaded
+    row_counts = pipeline.last_trace.last_normalize_info.row_counts
+    assert row_counts["customers"] == 13
+    assert row_counts["inventory"] == 3
+
+    if load_type == "replace":
+        # 4. Load DuckDB local database into Postgres
+        print("##################################### START DUCKDB LOAD ########")
+        # connect to local duckdb dump
+        conn = duckdb.connect(
+            f"{load_info.destination_displayable_credentials}".split(":///")[1]
+        )
+        conn.sql("INSTALL postgres;")
+        conn.sql("LOAD postgres;")
+        # select generated timestamp schema
+        timestamped_schema = conn.sql(
+            f"""select distinct table_schema from information_schema.tables
+                     where table_schema like '{target_schema_name}%'
+                     and table_schema NOT LIKE '%_staging'
+                     order by table_schema desc"""
+        ).fetchone()[0]
+        print(f"timestamped_schema: {timestamped_schema}")
+
+        target_credentials = ConnectionStringCredentials(
+            dlt.secrets["destination.postgres.credentials"]
+        )
+        # connect to destination (timestamped schema)
+        conn.sql(
+            "ATTACH"
+            f" 'dbname={target_credentials.database} user={target_credentials.username} password={target_credentials.password} host={target_credentials.host} port={target_credentials.port}'"
+            " AS pg_db (TYPE postgres);"
+        )
+        conn.sql(f"CREATE SCHEMA IF NOT EXISTS pg_db.{timestamped_schema};")
+
+        for table in tables:
+            print(
+                f"LOAD DuckDB -> Postgres: table: {timestamped_schema}.{table['table_name']} TO"
+                f" Postgres {timestamped_schema}.{table['table_name']}"
+            )
+
+            conn.sql(
+                f"CREATE OR REPLACE TABLE pg_db.{timestamped_schema}.{table['table_name']} AS"
+                f" SELECT * FROM {timestamped_schema}.{table['table_name']};"
+            )
+            conn.sql(
+                f"SELECT count(*) as count FROM pg_db.{timestamped_schema}.{table['table_name']};"
+            ).show()
+
+        print(f"--Time elapsed: {pendulum.now() - startTime}")
+        print("##################################### FINISHED ########")
+
+        # check that stuff was loaded
+        rows = conn.sql(
+            f"SELECT count(*) as count FROM pg_db.{timestamped_schema}.{table['table_name']};"
+        ).fetchone()[0]
+        assert int(rows) == 13 if table["table_name"] == "customers" else 3
+
+        # 5. Cleanup and rename Schema
+        print(
+            "##################################### RENAME Schema and CLEANUP ########"
+        )
+        try:
+            con_hd = psycopg2.connect(
+                dbname=target_credentials.database,
+                user=target_credentials.username,
+                password=target_credentials.password,
+                host=target_credentials.host,
+                port=target_credentials.port,
+            )
+            con_hd.autocommit = True
+            print(
+                "Connected to HD-DB: "
+                + target_credentials.host
+                + ", DB: "
+                + target_credentials.username
+            )
+        except Exception as e:
+            print(f"Unable to connect to HD-database! The reason: {e}")
+
+        with con_hd.cursor() as cur:
+            # Drop existing target_schema_name
+            print(f"Drop existing {target_schema_name}")
+            cur.execute(f"DROP SCHEMA IF EXISTS {target_schema_name} CASCADE;")
+            # Rename timestamped-target_schema_name to target_schema_name
+            print(
+                f"Going to rename schema {timestamped_schema} to {target_schema_name}"
+            )
+            cur.execute(
+                f"ALTER SCHEMA {timestamped_schema} RENAME TO {target_schema_name};"
+            )
+
+        con_hd.close()
+```
+
+
+===== FILE: docs/website/docs/examples/propagate_hints.md =====
+
+---
+title: Propagate primary_key from root to nested tables
+description: Learn how to propagate any column to nested tables
+keywords: [root table, nested reference, parent key]
+---
+# Propagate primary_key from root to nested tables
+
+You learn how to propagate specific fields (e.g., primary, foreign keys) from a parent record into each child record.
+
+In this example, we'll explore how to:
+
+- Add `parent_id` into each child record using `add_parent_id` function
+- Use the [`add_map` function](https://dlthub.com/docs/api_reference/extract/resource#add_map) to apply this
+custom logic to every record in the dataset
+
+:::note important
+Please note that dlt metadata, including `_dlt_id` and `_dlt_load_id`, will still be loaded into the tables.
+:::
+
+## Full source code
+
+```py execute notype
+from typing import Any, Generator
+import dlt
+
+
+# Define a dlt resource with write disposition to 'merge'
+@dlt.resource(name="parent_with_children", write_disposition={"disposition": "merge"})
+def data_source() -> Generator[list[dict[str, Any]], None, None]:
+    # Example data
+    data = [
+        {
+            "parent_id": 1,
+            "parent_name": "Alice",
+            "children": [
+                {"child_id": 1, "child_name": "Child 1"},
+                {"child_id": 2, "child_name": "Child 2"},
+            ],
+        },
+        {
+            "parent_id": 2,
+            "parent_name": "Bob",
+            "children": [{"child_id": 3, "child_name": "Child 3"}],
+        },
+    ]
+
+    yield data
+
+
+# Function to add parent_id to each child record within a parent record
+def add_parent_id(record: dict[str, Any]) -> dict[str, Any]:
+    parent_id_key = "parent_id"
+    for child in record["children"]:
+        child[parent_id_key] = record[parent_id_key]
+    return record
+
+
+# Create and configure the dlt pipeline
+pipeline = dlt.pipeline(
+    pipeline_name="generic_pipeline",
+    destination="duckdb",
+    dataset_name="dataset",
+)
+
+# Run the pipeline
+load_info = pipeline.run(data_source().add_map(add_parent_id), primary_key="parent_id")
+# print(load_info)
+
+# the primary key `parent_id` is propagated into the nested `children` table
+row_counts = pipeline.last_trace.last_normalize_info.row_counts
+assert row_counts["parent_with_children"] == 2
+assert row_counts["parent_with_children__children"] == 3
+```
+
+
+===== FILE: docs/website/docs/examples/qdrant_zendesk.md =====
+
+---
+title: Similarity searching with Qdrant
+description: Learn how to use the dlt source, Zendesk and dlt destination, Qdrant to conduct a similarity search on your tickets data.
+keywords: [similarity search, example]
+---
+# Similarity searching with Qdrant
+
+This article outlines a system to map vectorized ticket data from Zendesk to Qdrant, similar to our guide on the topic concerning [Weaviate](https://dlthub.com/docs/dlt-ecosystem/destinations/qdrant). In this example, we will:
+
+- Connect to our [Zendesk source](https://dlthub.com/docs/dlt-ecosystem/verified-sources/zendesk).
+- Extract tickets data from our Zendesk source.
+- [Create a dlt pipeline](https://dlthub.com/docs/tutorial/load-data-from-an-api) with Qdrant as destination.
+- Vectorize/embed the tickets data from Zendesk.
+- Pass the vectorized data to be stored in Qdrant via the dlt pipeline.
+- Query data that we stored in Qdrant.
+- Explore the similarity search results.
+
+First, configure the destination credentials for [Qdrant](https://dlthub.com/docs/dlt-ecosystem/destinations/qdrant#setup-guide) and [Zendesk](https://dlthub.com/docs/walkthroughs/zendesk-weaviate#configuration) in `.dlt/secrets.toml`.
+
+Next, make sure you have the following dependencies installed:
+
+```sh
+pip install qdrant-client>=1.6.9
+pip install fastembed>=0.1.1
+```
+
+## Full source code
+
+```py noexecute notype
+# NOTE: this line is only for dlt CI purposes, you may delete it if you are using this example
+__source_name__ = "zendesk"
+
+from typing import Optional, Any, Iterable
+
+import dlt
+from dlt.common import pendulum
+from dlt.common.time import ensure_pendulum_datetime
+from dlt.common.typing import TAnyDateTime
+from dlt.sources.helpers.requests import client
+from dlt.destinations.adapters import qdrant_adapter
+from qdrant_client import QdrantClient
+from dlt.extract import DltResource
+
+
+# function from: https://github.com/dlt-hub/verified-sources/tree/master/sources/zendesk
+@dlt.source(max_table_nesting=2)
+def zendesk_support(
+    credentials: dict[str, str] = dlt.secrets.value,
+    start_date: Optional[TAnyDateTime] = pendulum.datetime(
+        year=2000, month=1, day=1
+    ),  # noqa: B008
+    end_date: Optional[TAnyDateTime] = None,
+) -> DltResource:
+    """
+    Retrieves data from Zendesk Support for tickets events.
+
+    Args:
+        credentials (Dict[str, str]): Zendesk credentials (default: dlt.secrets.value)
+        start_date (Optional[TAnyDateTime]): Start date for data extraction (default: 2000-01-01)
+        end_date (Optional[TAnyDateTime]): End date for data extraction (default: None).
+            If end time is not provided, the incremental loading will be
+            enabled, and after the initial run, only new data will be retrieved.
+
+    Returns:
+        DltResource: a resource with ticket data
+    """
+    # Convert start_date and end_date to Pendulum datetime objects
+    start_date_obj = ensure_pendulum_datetime(start_date)
+    end_date_obj = ensure_pendulum_datetime(end_date) if end_date else None
+
+    # Extract credentials from secrets dictionary
+    auth = (credentials["email"], credentials["password"])
+    subdomain = credentials["subdomain"]
+    url = f"https://{subdomain}.zendesk.com"
+
+    # we use `append` write disposition, because objects in tickets_data endpoint are never updated
+    #  so we do not need to merge
+    # we set primary_key so allow deduplication of events by the `incremental` below in the rare case
+    #  when two events have the same timestamp
+    @dlt.resource(primary_key="id", write_disposition="append")
+    def tickets_data(
+        updated_at: dlt.sources.incremental[datetime] = dlt.sources.incremental(
+            "updated_at",
+            initial_value=start_date_obj,
+            end_value=end_date_obj,
+            allow_external_schedulers=True,
+        ),
+    ):
+        # URL For ticket events
+        # 'https://d3v-dlthub.zendesk.com/api/v2/incremental/tickets_data.json?start_time=946684800'
+        # `last_value` is a stdlib datetime once it comes back from state, whatever type went in
+        event_pages = get_pages(
+            url=url,
+            endpoint="/api/v2/incremental/tickets",
+            auth=auth,
+            data_point_name="tickets",
+            params={"start_time": int(updated_at.last_value.timestamp())},
+        )
+        for page in event_pages:
+            yield ([_fix_date(ticket) for ticket in page])
+
+            # stop loading when using end_value and end is reached.
+            # unfortunately, Zendesk API does not have the "end_time" parameter, so we stop iterating ourselves
+            if updated_at.end_out_of_range:
+                return
+
+    return tickets_data
+
+
+# helper function to fix the datetime format
+def _parse_date_or_none(value: Optional[str]) -> Optional[pendulum.DateTime]:
+    if not value:
+        return None
+    return ensure_pendulum_datetime(value)
+
+
+# modify dates to return datetime objects instead
+def _fix_date(ticket):
+    ticket["updated_at"] = _parse_date_or_none(ticket["updated_at"])
+    ticket["created_at"] = _parse_date_or_none(ticket["created_at"])
+    ticket["due_at"] = _parse_date_or_none(ticket["due_at"])
+    return ticket
+

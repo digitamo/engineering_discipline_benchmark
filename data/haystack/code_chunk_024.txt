@@ -1,0 +1,3005 @@
+diff --git a/dlt/destinations/impl/bigquery/configuration.py b/dlt/destinations/impl/bigquery/configuration.py
+index 65a64fa94..792a5f7ee 100644
+--- a/dlt/destinations/impl/bigquery/configuration.py
++++ b/dlt/destinations/impl/bigquery/configuration.py
+@@ -1,8 +1,8 @@
+ import dataclasses
+-from typing import ClassVar, List, Final, Optional
++from typing import ClassVar, List, Final, Optional, Union
+ 
+ from dlt.common.configuration import configspec
+-from dlt.common.configuration.specs import GcpServiceAccountCredentials
++from dlt.common.configuration.specs import GcpServiceAccountCredentials, GcpOAuthCredentials
+ from dlt.common.utils import digest128
+ 
+ from dlt.common.destination.client import DestinationClientDwhWithStagingConfiguration
+@@ -11,7 +11,7 @@ from dlt.common.destination.client import DestinationClientDwhWithStagingConfigu
+ @configspec
+ class BigQueryClientConfiguration(DestinationClientDwhWithStagingConfiguration):
+     destination_type: Final[str] = dataclasses.field(default="bigquery", init=False, repr=False, compare=False)  # type: ignore
+-    credentials: GcpServiceAccountCredentials = None
++    credentials: Union[GcpServiceAccountCredentials, GcpOAuthCredentials] = None
+     location: str = "US"
+     project_id: Optional[str] = None
+     """Note, that this is BigQuery project_id which could be different from credentials.project_id"""
+diff --git a/dlt/destinations/impl/bigquery/sql_client.py b/dlt/destinations/impl/bigquery/sql_client.py
+index e976ec5ff..b41e28a47 100644
+--- a/dlt/destinations/impl/bigquery/sql_client.py
++++ b/dlt/destinations/impl/bigquery/sql_client.py
+@@ -1,5 +1,5 @@
+ from contextlib import contextmanager
+-from typing import Any, AnyStr, ClassVar, Iterator, List, Optional, Sequence, Generator
++from typing import Any, AnyStr, ClassVar, Iterator, List, Optional, Sequence, Generator, Union
+ 
+ import google.cloud.bigquery as bigquery  # noqa: I250
+ from google.api_core import exceptions as api_core_exceptions
+@@ -9,7 +9,10 @@ from google.cloud.bigquery.dbapi import Connection as DbApiConnection, Cursor as
+ from google.cloud.bigquery.dbapi import exceptions as dbapi_exceptions
+ 
+ from dlt.common import logger
+-from dlt.common.configuration.specs import GcpServiceAccountCredentialsWithoutDefaults
++from dlt.common.configuration.specs import (
++    GcpServiceAccountCredentialsWithoutDefaults,
++    GcpOAuthCredentials,
++)
+ from dlt.common.destination import DestinationCapabilitiesContext
+ from dlt.common.typing import StrAny
+ from dlt.destinations.exceptions import (
+@@ -63,7 +66,7 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
+         self,
+         dataset_name: str,
+         staging_dataset_name: str,
+-        credentials: GcpServiceAccountCredentialsWithoutDefaults,
++        credentials: Union[GcpServiceAccountCredentialsWithoutDefaults, GcpOAuthCredentials],
+         capabilities: DestinationCapabilitiesContext,
+         location: str = "US",
+         project_id: Optional[str] = None,
+@@ -71,7 +74,9 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
+         retry_deadline: float = 60.0,
+     ) -> None:
+         self._client: bigquery.Client = None
+-        self.credentials: GcpServiceAccountCredentialsWithoutDefaults = credentials
++        self.credentials: Union[
++            GcpServiceAccountCredentialsWithoutDefaults, GcpOAuthCredentials
++        ] = credentials
+         self.location = location
+         self.project_id = project_id or self.credentials.project_id
+         self.http_timeout = http_timeout
+diff --git a/tests/load/bigquery/test_bigquery_client.py b/tests/load/bigquery/test_bigquery_client.py
+index 678312f1f..c484d9fab 100644
+--- a/tests/load/bigquery/test_bigquery_client.py
++++ b/tests/load/bigquery/test_bigquery_client.py
+@@ -462,3 +462,45 @@ def prepare_service_json() -> Tuple[str, str]:
+         services_str = base64.b64decode(f.read().strip(), validate=True).decode()
+     dest_path = storage.save("level-dragon-333019-707809ee408a.json", services_str)
+     return services_str, dest_path
++
++
++def test_bigquery_configuration_accepts_oauth_credentials() -> None:
++    # Create OAuth credentials
++    oauth_creds = GcpOAuthCredentials()
++    oauth_creds.project_id = "test-project"
++    oauth_creds.token = "test-token"
++    oauth_creds.client_id = ""
++    oauth_creds.refresh_token = ""
++    oauth_creds.resolve()
++
++    # Test that configuration accepts OAuth credentials
++    config = BigQueryClientConfiguration(credentials=oauth_creds)._bind_dataset_name(
++        dataset_name="test_dataset"
++    )
++
++    assert config.credentials == oauth_creds
++    assert config.credentials.project_id == "test-project"
++
++
++def test_bigquery_configuration_accepts_base_gcp_credentials() -> None:
++    from google.oauth2.credentials import Credentials as GoogleOAuth2Credentials
++
++    # Create a wrapper that uses base GcpCredentials type
++    # This mimics what happens with Workload Identity Federation
++    native_credentials = GoogleOAuth2Credentials(token="test-token")
++    native_credentials.expiry = None  # Non-refreshable
++
++    # Wrap in GcpServiceAccountCredentials (which extends GcpCredentials)
++    wrapper_creds = GcpServiceAccountCredentials()
++    wrapper_creds.project_id = "test-project"
++    wrapper_creds._set_default_credentials(native_credentials)
++    wrapper_creds.__is_resolved__ = True
++
++    # Test that configuration accepts wrapped credentials
++    config = BigQueryClientConfiguration(credentials=wrapper_creds)._bind_dataset_name(
++        dataset_name="test_dataset"
++    )
++
++    assert config.credentials == wrapper_creds
++    assert config.credentials.project_id == "test-project"
++    assert config.credentials.has_default_credentials()
+
+
+===== COMMIT 052a1580 =====
+
+
+commit 052a15803
+Author: anuunchin
+Date: 2025-12-16
+
+    poke test disabled (#3487)
+
+diff --git a/tests/load/sources/rest_api/test_rest_api_source.py b/tests/load/sources/rest_api/test_rest_api_source.py
+index 302f054ac..0a8a98c2f 100644
+--- a/tests/load/sources/rest_api/test_rest_api_source.py
++++ b/tests/load/sources/rest_api/test_rest_api_source.py
+@@ -22,6 +22,7 @@ def _make_pipeline(destination_name: str):
+     )
+ 
+ 
++@pytest.mark.skip("Reenable after #3343 is resolved")
+ @pytest.mark.parametrize(
+     "destination_config",
+     destinations_configs(default_sql_configs=True, local_filesystem_configs=True),
+@@ -58,6 +59,7 @@ def test_rest_api_source(destination_config: DestinationTestConfiguration) -> No
+     assert table_counts.items() >= POKEMON_EXPECTED_TABLE_COUNTS.items()
+ 
+ 
++@pytest.mark.skip("Reenable after #3343 is resolved")
+ @pytest.mark.parametrize(
+     "destination_config",
+     destinations_configs(default_sql_configs=True, local_filesystem_configs=True),
+diff --git a/tests/sources/rest_api/test_rest_api_source.py b/tests/sources/rest_api/test_rest_api_source.py
+index 1eeeb5000..0dcd7b293 100644
+--- a/tests/sources/rest_api/test_rest_api_source.py
++++ b/tests/sources/rest_api/test_rest_api_source.py
+@@ -22,6 +22,7 @@ def _make_pipeline(destination_name: str):
+     )
+ 
+ 
++@pytest.mark.skip("Reenable after #3343 is resolved")
+ def test_rest_api_config_provider(toml_providers: ConfigProvidersContainer) -> None:
+     # mock dicts in toml provider
+     dlt.config["client"] = {
+@@ -45,6 +46,7 @@ def test_rest_api_config_provider(toml_providers: ConfigProvidersContainer) -> N
+     print(load_info)
+ 
+ 
++@pytest.mark.skip("Reenable after #3343 is resolved")
+ @pytest.mark.parametrize("destination_name", ALL_DESTINATIONS)
+ @pytest.mark.parametrize("invocation_type", ("deco", "factory"))
+ def test_rest_api_source(destination_name: str, invocation_type: str) -> None:
+@@ -82,6 +84,7 @@ def test_rest_api_source(destination_name: str, invocation_type: str) -> None:
+     assert table_counts.items() >= POKEMON_EXPECTED_TABLE_COUNTS.items()
+ 
+ 
++@pytest.mark.skip("Reenable after #3343 is resolved")
+ @pytest.mark.parametrize("destination_name", ALL_DESTINATIONS)
+ @pytest.mark.parametrize("invocation_type", ("deco", "factory"))
+ def test_dependent_resource(destination_name: str, invocation_type: str) -> None:
+
+
+===== COMMIT 87b812e3 =====
+
+
+commit 87b812e3a
+Author: Somasundaram Sekar
+Date: 2025-12-15
+
+    feat(snowflake): add column_comment/description hint support (#3462)
+
+diff --git a/dlt/common/data_writers/escape.py b/dlt/common/data_writers/escape.py
+index 393e9e850..c4a792b4f 100644
+--- a/dlt/common/data_writers/escape.py
++++ b/dlt/common/data_writers/escape.py
+@@ -152,6 +152,23 @@ def escape_snowflake_identifier(v: str) -> str:
+     return escape_postgres_identifier(v)
+ 
+ 
++def escape_snowflake_literal(v: Any) -> Any:
++    """Escape string literals for Snowflake using standard SQL escaping.
++
++    Snowflake uses '' to escape single quotes (not backslash escaping).
++    """
++    if isinstance(v, str):
++        # Snowflake uses standard SQL escaping: ' -> ''
++        return "'" + v.replace("'", "''") + "'"
++    if isinstance(v, (datetime, date, time)):
++        return f"'{v.isoformat()}'"
++    if isinstance(v, (list, dict)):
++        return "'" + json.dumps(v).replace("'", "''") + "'"
++    if isinstance(v, bytes):
++        return f"X'{v.hex()}'"
++    return "NULL" if v is None else str(v)
++
++
+ escape_databricks_identifier = escape_hive_identifier
+ 
+ 
+diff --git a/dlt/destinations/impl/snowflake/snowflake.py b/dlt/destinations/impl/snowflake/snowflake.py
+index 8d725c5e2..f49141f9d 100644
+--- a/dlt/destinations/impl/snowflake/snowflake.py
++++ b/dlt/destinations/impl/snowflake/snowflake.py
+@@ -1,6 +1,7 @@
+-from typing import Optional, Sequence, List, Dict
++from typing import Optional, Sequence, List, Dict, Literal
+ 
+ from dlt.common import logger
++from dlt.common.data_writers.escape import escape_snowflake_literal
+ from dlt.common.destination import DestinationCapabilitiesContext
+ from dlt.common.destination.client import (
+     FollowupJobRequest,
+@@ -27,6 +28,7 @@ from dlt.destinations.sql_jobs import SqlMergeFollowupJob
+ from dlt.destinations.path_utils import get_file_format_and_compression
+ 
+ SUPPORTED_HINTS: Dict[TColumnHint, str] = {"unique": "UNIQUE"}
++COLUMN_COMMENT_HINT: Literal["x-snowflake-column-comment"] = "x-snowflake-column-comment"
+ 
+ 
+ class SnowflakeMergeJob(SqlMergeFollowupJob):
+@@ -169,6 +171,15 @@ class SnowflakeClient(SqlJobClientWithStagingDataset, SupportsStagingDestination
+             "ADD COLUMN\n" + ",\n".join(self._get_column_def_sql(c, table) for c in new_columns)
+         ]
+ 
++    def _get_column_def_sql(self, column: TColumnSchema, table: PreparedTableSchema = None) -> str:
++        column_def_sql = super()._get_column_def_sql(column, table)
++
++        if column.get(COLUMN_COMMENT_HINT) or column.get("description"):
++            comment = column.get(COLUMN_COMMENT_HINT) or column.get("description")
++            escaped_comment = escape_snowflake_literal(comment)
++            column_def_sql = f"{column_def_sql} COMMENT {escaped_comment}"
++        return column_def_sql
++
+     def _get_constraints_sql(
+         self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
+     ) -> str:
+diff --git a/tests/load/snowflake/test_snowflake_table_builder.py b/tests/load/snowflake/test_snowflake_table_builder.py
+index 72d614ccf..1073eb6f7 100644
+--- a/tests/load/snowflake/test_snowflake_table_builder.py
++++ b/tests/load/snowflake/test_snowflake_table_builder.py
+@@ -11,7 +11,11 @@ from dlt.common.utils import uniq_id
+ from dlt.common.schema import Schema
+ from dlt.common.schema.utils import new_table
+ from dlt.destinations import snowflake
+-from dlt.destinations.impl.snowflake.snowflake import SnowflakeClient, SUPPORTED_HINTS
++from dlt.destinations.impl.snowflake.snowflake import (
++    SnowflakeClient,
++    SUPPORTED_HINTS,
++    COLUMN_COMMENT_HINT,
++)
+ from dlt.destinations.impl.snowflake.configuration import (
+     SnowflakeClientConfiguration,
+     SnowflakeCredentials,
+@@ -259,3 +263,54 @@ def test_create_table_with_partition_and_cluster(snowflake_client: SnowflakeClie
+ 
+     # clustering must be the last
+     assert sql.endswith('CLUSTER BY ("COL2","COL5")')
++
++
++def test_create_table_with_column_comments(snowflake_client: SnowflakeClient) -> None:
++    """Test that column comments are added to CREATE TABLE SQL."""
++    mod_update = deepcopy(TABLE_UPDATE[:3])
++
++    # Add description (generic field) to first column
++    mod_update[0]["description"] = "This is the first column"
++
++    # Add snowflake-specific column comment hint to second column
++    mod_update[1][COLUMN_COMMENT_HINT] = "Snowflake specific comment"  # type: ignore[typeddict-unknown-key]
++
++    statements = snowflake_client._get_table_update_sql("event_test_table", mod_update, False)
++    assert len(statements) == 1
++    sql = statements[0]
++
++    # Verify column comments are in the SQL
++    assert "COMMENT 'This is the first column'" in sql
++    assert "COMMENT 'Snowflake specific comment'" in sql
++
++    # Third column should not have a comment
++    assert '"COL3" BOOLEAN  NOT NULL' in sql
++    assert sql.count("COMMENT") == 2
++
++
++def test_column_comment_escaping(snowflake_client: SnowflakeClient) -> None:
++    """Test that special characters in column comments are properly escaped."""
++    mod_update = deepcopy(TABLE_UPDATE[:1])
++
++    # Add comment with special characters that need escaping
++    mod_update[0]["description"] = "User's \"data\" with 'quotes'"
++
++    statements = snowflake_client._get_table_update_sql("event_test_table", mod_update, False)
++    sql = statements[0]
++
++    # Snowflake escapes single quotes by doubling them
++    assert "COMMENT 'User''s \"data\" with ''quotes'''" in sql
++
++
++def test_alter_table_with_column_comments(snowflake_client: SnowflakeClient) -> None:
++    """Test that column comments work with ALTER TABLE."""
++    new_columns = deepcopy(TABLE_UPDATE[1:3])
++    new_columns[0]["description"] = "Added column with comment"
++
++    statements = snowflake_client._get_table_update_sql("event_test_table", new_columns, True)
++
++    # First statement should be ADD COLUMN
++    add_column_sql = statements[0]
++    assert add_column_sql.startswith("ALTER TABLE")
++    assert "ADD COLUMN" in add_column_sql
++    assert "COMMENT 'Added column with comment'" in add_column_sql
+
+
+===== COMMIT f4169878 =====
+
+
+commit f4169878a
+Author: anuunchin
+Date: 2025-12-15
+
+    Docstring fix (#3482)
+
+diff --git a/dlt/helpers/airflow_helper.py b/dlt/helpers/airflow_helper.py
+index 245534162..eecbebbab 100644
+--- a/dlt/helpers/airflow_helper.py
++++ b/dlt/helpers/airflow_helper.py
+@@ -94,7 +94,7 @@ class PipelineTasksGroup(TaskGroup):
+             buffer_max_items (int, optional): Maximum number of buffered items. Use 0 to keep dlt built-in limit. Defaults to 1000.
+             retry_policy (_type_, optional): Tenacity retry policy. Defaults to no retry.
+             retry_pipeline_steps (Sequence[TPipelineStep], optional): Which pipeline steps are eligible for retry. Defaults to ("load", ).
+-            wipe_local_data (bool, optional): Will wipe all the data created by pipeline, also in case of exception. Defaults to False.
++            wipe_local_data (bool, optional): Will wipe all the data created by pipeline, also in case of exception. Defaults to True.
+             save_load_info (bool, optional): Will save extensive load info to the destination. Defaults to False.
+             save_trace_info (bool, optional): Will save trace info to the destination. Defaults to False.
+         """
+
+
+===== COMMIT bb8ab627 =====
+
+
+commit bb8ab6272
+Author: Thierry Jean
+Date: 2025-12-12
+
+    add None to Container._Instance typing (#3469)
+
+diff --git a/dlt/common/configuration/container.py b/dlt/common/configuration/container.py
+index 9d4521fdc..77ed36fb0 100644
+--- a/dlt/common/configuration/container.py
++++ b/dlt/common/configuration/container.py
+@@ -29,7 +29,7 @@ class Container:
+ 
+     """
+ 
+-    _INSTANCE: ClassVar["Container"] = None
++    _INSTANCE: ClassVar[Optional["Container"]] = None
+     _LOCK: ClassVar[threading.Lock] = threading.Lock()
+     _MAIN_THREAD_ID: ClassVar[int] = threading.get_ident()
+     """A main thread id to which get item will fallback for contexts without default"""
+
+
+===== COMMIT 6658d546 =====
+
+
+commit 6658d5468
+Author: Menna
+Date: 2025-12-10
+
+    Fix load retrieval to only show loads that contain a schema name that is in the pipeline.schema_names (#3446)
+
+diff --git a/dlt/_workspace/helpers/dashboard/utils.py b/dlt/_workspace/helpers/dashboard/utils.py
+index 7b3d614ee..85b522096 100644
+--- a/dlt/_workspace/helpers/dashboard/utils.py
++++ b/dlt/_workspace/helpers/dashboard/utils.py
+@@ -414,10 +414,14 @@ def get_loads(
+     Get the loads of a pipeline.
+     """
+     try:
+-        loads = pipeline.dataset()._dlt_loads
++        loads = (
++            pipeline.dataset()
++            ._dlt_loads.filter("schema_name", "in", pipeline.schema_names)
++            .order_by("inserted_at", "desc")
++        )
+         if limit:
+             loads = loads.limit(limit)
+-        loads = loads.order_by("inserted_at", "desc")
++
+         loads_list = loads.arrow().to_pylist()
+         loads_list = [_humanize_datetime_values(c, load) for load in loads_list]
+         return loads_list, None, None
+diff --git a/tests/workspace/helpers/dashboard/example_pipelines.py b/tests/workspace/helpers/dashboard/example_pipelines.py
+index a4a5616ae..b1abe3ba7 100644
+--- a/tests/workspace/helpers/dashboard/example_pipelines.py
++++ b/tests/workspace/helpers/dashboard/example_pipelines.py
+@@ -5,11 +5,16 @@
+ #
+ 
+ from typing import Any
++
++import duckdb
+ import dlt
+ import pytest
+ from dlt._workspace._templates._single_file_templates.fruitshop_pipeline import (
+     fruitshop as fruitshop_source,
+ )
++from dlt._workspace._templates._single_file_templates.arrow_pipeline import (
++    resource as humans,
++)
+ from dlt.common.destination.exceptions import (
+     DestinationTerminalException,
+ )
+@@ -125,6 +130,39 @@ def create_success_pipeline_filesystem(
+     return pipeline
+ 
+ 
++def create_fruitshop_duckdb_with_shared_dataset(pipelines_dir: str = None):
++    """Create a test pipeline with in memory duckdb destination, properties see `run_success_pipeline`"""
++    import duckdb
++
++    pipeline = dlt.pipeline(
++        pipeline_name="fruits_test_pipeline",
++        pipelines_dir=pipelines_dir,
++        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:/data.db")),
++        dataset_name="test_shared_dataset",
++    )
++
++    run_success_pipeline(pipeline)
++
++    return pipeline
++
++
++def create_humans_arrow_duckdb_with_shared_dataset(
++    pipelines_dir: str = None,
++):
++    """Create a test pipeline with filesystem destination, properties see `run_success_pipeline`"""
++
++    pipeline = dlt.pipeline(
++        pipeline_name="humans_test_pipeline",
++        pipelines_dir=pipelines_dir,
++        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:/data.db")),
++        dataset_name="test_shared_dataset",
++    )
++
++    pipeline.run(humans())
++
++    return pipeline
++
++
+ def create_extract_exception_pipeline(pipelines_dir: str = None):
+     """Create a test pipeline with duckdb destination, raises an exception in the extract step"""
+     import duckdb
+diff --git a/tests/workspace/helpers/dashboard/test_utils.py b/tests/workspace/helpers/dashboard/test_utils.py
+index 8784f09fd..06487d8aa 100644
+--- a/tests/workspace/helpers/dashboard/test_utils.py
++++ b/tests/workspace/helpers/dashboard/test_utils.py
+@@ -5,6 +5,7 @@ from datetime import datetime
+ from pathlib import Path
+ import re
+ 
++import duckdb
+ import marimo as mo
+ import pyarrow
+ import pytest
+@@ -62,6 +63,8 @@ from tests.workspace.helpers.dashboard.example_pipelines import (
+     LOAD_EXCEPTION_PIPELINE,
+     NO_DESTINATION_PIPELINE,
+     create_success_pipeline_duckdb,
++    create_fruitshop_duckdb_with_shared_dataset,
++    create_humans_arrow_duckdb_with_shared_dataset,
+ )
+ from tests.workspace.helpers.dashboard.example_pipelines import (
+     ALL_PIPELINES,
+@@ -939,3 +942,28 @@ def test_collect_load_packages_from_trace(
+     elif pipeline.pipeline_name == "normalize_exception_pipeline":
+         assert len(list_of_load_package_info) == 1
+         assert "pending" in str(list_of_load_package_info[0]["status"].text)
++
++
++def test_pipeline_loads_are_isolated_in_shared_dataset() -> None:
++    config = DashboardConfiguration()
++
++    duckdb_p = create_fruitshop_duckdb_with_shared_dataset()
++    filesystem_p = create_humans_arrow_duckdb_with_shared_dataset()
++
++    fruits_loads, _, _ = get_loads(config, duckdb_p, limit=100)
++    humans_loads, _, _ = get_loads(config, filesystem_p, limit=100)
++
++    assert mo.ui.table(fruits_loads).text is not None
++    assert mo.ui.table(humans_loads).text is not None
++
++    assert len(fruits_loads) >= 1
++    assert len(humans_loads) >= 1
++
++    fruit_schemas = set(duckdb_p.schema_names)
++    human_schemas = set(filesystem_p.schema_names)
++
++    # humans_loads must not contain fruits schemas
++    assert all(row["schema_name"] not in fruit_schemas for row in humans_loads)
++
++    # fruits_loads must not contain human schemas
++    assert all(row["schema_name"] not in human_schemas for row in fruits_loads)
+
+
+===== COMMIT 1c49c208 =====
+
+
+commit 1c49c2081
+Author: Anton Burnashev
+Date: 2025-12-10
+
+    wait in marimo UI in test_e2e.py to for schema selection (#3453)
+
+diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
+index 926b69b85..612cb1bc7 100644
+--- a/tests/e2e/helpers/dashboard/test_e2e.py
++++ b/tests/e2e/helpers/dashboard/test_e2e.py
+@@ -119,6 +119,20 @@ def test_multi_schema_selection(page: Page, multi_schema_pipeline: Any):
+ 
+     expect(page.get_by_text("name: fruitshop_customers").nth(1)).to_be_attached()
+ 
++    def _select_schema_and_verify(
++        schema_selector: Any,
++        schema_name: str,
++        expected: str,
++        not_expected: set[str],
++    ):
++        schema_selector.select_option(schema_name)
++        expect(schema_selector).to_have_value(schema_name)
++        # allow marimo reactivity to process
++        page.wait_for_timeout(500)
++        expect(page.get_by_text(expected, exact=True).nth(0)).to_be_visible(timeout=15000)
++        for table in not_expected:
++            expect(page.get_by_text(table, exact=True)).to_have_count(0, timeout=10000)
++
+     # select each schema and see if the right tables are shown
+     # do this both for schema and data section
+     for section in ["schema", "data"]:
+@@ -126,27 +140,30 @@ def test_multi_schema_selection(page: Page, multi_schema_pipeline: Any):
+ 
+         # NOTE: this is using unspecific selector and may select other dropdowns id present (?)
+         schema_selector = page.get_by_test_id("marimo-plugin-dropdown")
+-        schema_selector.select_option("fruitshop_customers")
+-        expect(schema_selector).to_have_value("fruitshop_customers")
+-        schema_selector.scroll_into_view_if_needed()
+-
+-        expect(page.get_by_text("customers", exact=True).nth(0)).to_be_visible()
+-        expect(page.get_by_text("inventory", exact=True)).to_have_count(0)
+-        expect(page.get_by_text("purchases", exact=True)).to_have_count(0)
+ 
+-        schema_selector.select_option("fruitshop_inventory")
+-        expect(schema_selector).to_have_value("fruitshop_inventory")
++        all_tables = {"customers", "inventory", "purchases"}
+ 
+-        expect(page.get_by_text("inventory", exact=True).nth(0)).to_be_visible()
+-        expect(page.get_by_text("customers", exact=True)).to_have_count(0)
+-        expect(page.get_by_text("purchases", exact=True)).to_have_count(0)
+-
+-        schema_selector.select_option("fruitshop_purchases")
+-        expect(schema_selector).to_have_value("fruitshop_purchases")
++        _select_schema_and_verify(
++            schema_selector,
++            "fruitshop_customers",
++            expected="customers",
++            not_expected=all_tables - {"customers"},
++        )
++        schema_selector.scroll_into_view_if_needed()
+ 
+-        expect(page.get_by_text("purchases", exact=True).nth(0)).to_be_visible()
+-        expect(page.get_by_text("inventory", exact=True)).to_have_count(0)
+-        expect(page.get_by_text("customers", exact=True)).to_have_count(0)
++        _select_schema_and_verify(
++            schema_selector,
++            "fruitshop_inventory",
++            expected="inventory",
++            not_expected=all_tables - {"inventory"},
++        )
++
++        _select_schema_and_verify(
++            schema_selector,
++            "fruitshop_purchases",
++            expected="purchases",
++            not_expected=all_tables - {"purchases"},
++        )
+ 
+         _close_sections(page)
+         # make sure schema selector removed from page
+
+
+===== COMMIT be9aa1bf =====
+
+
+commit be9aa1bf0
+Author: djudjuu
+Date: 2025-12-10
+
+    pyarrow: respect resource hints before extract  (#3436)
+
+diff --git a/dlt/sources/sql_database/helpers.py b/dlt/sources/sql_database/helpers.py
+index 49ded14dc..68ab0e23e 100644
+--- a/dlt/sources/sql_database/helpers.py
++++ b/dlt/sources/sql_database/helpers.py
+@@ -24,6 +24,7 @@ from dlt.common.configuration.specs import (
+ from dlt.common.exceptions import DltException, MissingDependencyException
+ from dlt.common.schema import TTableSchemaColumns
+ from dlt.common.schema.typing import TWriteDispositionDict
++from dlt.common.schema.utils import merge_columns
+ from dlt.common.typing import TColumnNames, TDataItem, TSortOrder
+ from dlt.common.jsonpath import extract_simple_field_name
+ from dlt.common.utils import is_typeerror_due_to_wrong_call
+@@ -304,6 +305,21 @@ def table_rows(
+     query_adapter_callback: Optional[TQueryAdapter],
+     resolve_foreign_keys: bool,
+ ) -> Iterator[TDataItem]:
++    resource = None
++    limit = None
++    try:
++        resource = dlt.current.resource()
++        limit = resource.limit
++        resource_columns_hints_require_data = callable(resource.columns)
++        if resource_columns_hints_require_data and backend == "pyarrow":
++            table_name = table.name if isinstance(table, Table) else table
++            logger.warning(
++                f"Dynamic column hints for '{table_name}' cannot be applied with pyarrow "
++                "backend. Use static hints (dict/list) to override reflected types."
++            )
++    except DltException:
++        # in old versions of dlt, resource is not available, so we need to reflect the table again
++        pass
+     if isinstance(table, str):  # Reflection is deferred
+         table = Table(
+             table,
+@@ -324,39 +340,49 @@ def table_rows(
+         )
+ 
+         # set the primary_key in the incremental
++        # TODO: check for primary key in resource._hints
+         if incremental and incremental.primary_key is None:
+             primary_key = hints["primary_key"]
+             if primary_key is not None:
+                 incremental.primary_key = primary_key
+ 
+-        # yield empty record to set hints
++        # Merge resource hints with reflection hints before yielding
++        if resource and hints.get("columns") and not callable(resource.columns):
++            hints["columns"] = merge_columns(hints["columns"], resource.columns)
++
++        # yield empty record to set hints and create schema
++        # Note: Empty list [] will be written as typed-jsonl (object format), but actual
++        # data rows will be written in their native format (e.g., parquet for arrow backend).
+         yield dlt.mark.with_hints(
+             [],
+             dlt.mark.make_hints(
+                 **hints,
+             ),
+         )
++        # Set columns_hints for TableLoader
++        columns_hints = hints["columns"]
+     else:
+-        # table was already reflected
+-        hints = table_to_resource_hints(
+-            table,
+-            reflection_level,
+-            type_adapter_callback,
+-            backend == "sqlalchemy",  # skip nested types
+-            resolve_foreign_keys=resolve_foreign_keys,
+-        )
++        # table was already reflected -> try to use resource hints
++        if not resource or callable(resource.columns):
++            hints = table_to_resource_hints(
++                table,
++                reflection_level,
++                type_adapter_callback,
++                backend == "sqlalchemy",  # skip nested types
++                resolve_foreign_keys=resolve_foreign_keys,
++            )
++            columns_hints = hints["columns"]
+ 
+-    limit = None
+-    try:
+-        limit = dlt.current.resource().limit
+-    except DltException:
+-        pass
++        else:
++            # take column hints from resource (which includes user applied hints)
++            # Handle callable columns hint (can't resolve without data item)
++            columns_hints = resource.columns
+ 
+     loader = TableLoader(
+         engine,
+         backend,
+         table,
+-        hints["columns"],
++        columns_hints,
+         incremental=incremental,
+         chunk_size=chunk_size,
+         limit=limit,
+diff --git a/tests/load/sources/sql_database/test_sql_database_source.py b/tests/load/sources/sql_database/test_sql_database_source.py
+index a01b16fa6..9630e0b97 100644
+--- a/tests/load/sources/sql_database/test_sql_database_source.py
++++ b/tests/load/sources/sql_database/test_sql_database_source.py
+@@ -6,6 +6,9 @@ from importlib.metadata import version
+ import pytest
+ from pytest_mock import MockerFixture
+ 
++import pyarrow as pa
++import pyarrow.parquet as pq
++
+ import dlt
+ from dlt.common import logger
+ from dlt.common import json
+@@ -84,6 +87,68 @@ def convert_time_to_us(table):
+     return new_table
+ 
+ 
++@pytest.mark.parametrize(
++    "defer_table_reflect",
++    [False, True],
++    ids=lambda x: "defer_table_reflect" + ("_true" if x else "=false"),
++)
++def test_pyarrow_applies_hints_before_extract(
++    postgres_db: PostgresSourceDB,
++    defer_table_reflect: bool,
++) -> None:
++    """Test that user-provided hints (via apply_hints) are merged with reflection hints
++    for all backends (unless hints are dynamic)
++    """
++
++    table = sql_table(
++        credentials=postgres_db.credentials,
++        schema=postgres_db.schema,
++        table="has_precision",
++        backend="pyarrow",
++        reflection_level="full_with_precision",
++        defer_table_reflect=defer_table_reflect,
++    )
++
++    # Apply hints to override numeric_col to double (even though DB has decimal type)
++    table.apply_hints(
++        write_disposition="replace",
++        file_format="parquet",
++        columns={
++            "numeric_col": {
++                "data_type": "double",
++            },
++        },
++    )
++
++    pipeline = make_pipeline("duckdb")
++    # Use count_rows so empty Arrow Table (0 rows) for defered-reflect doesn't count toward limit
++    load_info = pipeline.run(table.add_limit(1, count_rows=True))
++
++    # verify
++    # 1: pipeline schema
++    numeric_col_schema_in_pipeline = pipeline.default_schema.get_table("has_precision")["columns"][
++        "numeric_col"
++    ]
++    assert numeric_col_schema_in_pipeline["data_type"] == "double"
++
++    # 2: loader file format (file ends with .parquet)
++    load_package = pipeline.get_load_package_info(load_info.loads_ids[0])
++    completed_jobs = load_package.jobs["completed_jobs"]
++    has_precision_jobs = [
++        job
++        for job in completed_jobs
++        if job.job_file_info.table_name == "has_precision" and job.file_path.endswith(".parquet")
++    ]
++    assert len(has_precision_jobs) == 1
++
++    # 3: column schema in parquet file should also be double (float64)
++    parquet_path = has_precision_jobs[0].file_path
++    parquet_schema = pq.read_schema(parquet_path)
++    numeric_col_schema_in_parquet = parquet_schema.field("numeric_col").type
++
++    assert pa.types.is_float64(numeric_col_schema_in_parquet)
++
++
+ def test_sqlalchemy_no_quoted_name(postgres_db: PostgresSourceDB, mocker: MockerFixture) -> None:
+     """
+     Ensures that table names internally passed as `quoted_name` to `sql_table` are not persisted
+
+
+===== COMMIT db8a66b0 =====
+
+
+commit db8a66b08
+Author: rudolfix
+Date: 2025-12-09
+
+    (chores) bumps to version 1.20.0 (#3443)
+
+
+===== COMMIT d17b0cb9 =====
+
+
+commit d17b0cb93
+Author: Thierry Jean
+Date: 2025-12-09
+
+    docs: LLM workflow update (#3422)
+
+diff --git a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+index 3f6051eb5..af92524d9 100644
+--- a/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
++++ b/docs/website/docs/dlt-ecosystem/llm-tooling/llm-native-workflow.md
+@@ -1,210 +1,458 @@
+ ---
+-title: Build pipelines and reports with LLMs
+-description: How to extract and explore data from REST API with AI editors/agents
++title: REST API source in 10min
++description: Build a custom REST API connector in 10min
+ keywords: [cursor, llm, restapi, ai]
+ ---
+ 
+-# Build dlt pipelines and reports with LLMs
++# REST API source in 10min
+ 
+ ## Overview
+ 
+-This guide walks you through a collaborative AI-human workflow for extracting and exploring data from REST API sources using an AI editor/agent of your choice and dlt. It introduces the first workflow available in dltHub workspace — an LLM-native development environment for data engineering tasks.
+-
+-You will learn:
+-1. How to initialize a dltHub workspace for your source using dltHub’s [LLM-context database](https://dlthub.com/workspace).
+-2. How to build a REST API source in minutes with AI assistance.
+-3. How to debug a pipeline and explore data using the workspace dashboard.
+-4. How to start a new notebook and work with the pipeline’s dataset in it.
+-
+-## Prerequisites
++The Python library `dlt` provides a powerful [REST API toolkit](../../dlt-ecosystem/verified-sources/rest_api/basic.md) to ingest data. Combined with our [LLM scaffolds](https://dlthub.com/workspace) and [MCP server](../../hub/features/mcp-server.md), you can build a custom connector for any of the 8k+ available sources in 10 minutes by following this guide.
++
++Building with LLMs is an iterative process. We will follow this general workflow and give practical tips for each step.
++
++```mermaid
++stateDiagram-v2
++    setup: setup workspace
++    instructions: initial instructions
++    codegen: generate code
++    run: run pipeline
++    context: manage context
++    data: check data
++    commit: commit working code
++
++    [*] --> setup: start
++    setup --> instructions: workspace is ready
++    instructions --> codegen: ask to ingest endpoint
++    codegen --> run: code generated
++    run --> context: fails
++    run --> data: completes
++    context --> codegen: context updated
++    data --> context: is incorrect
++    data --> commit: is correct
++    commit --> instructions: add endpoint / refine config
++    commit --> [*]
++```
+ 
+-Have one of the following AI editors/agents installed:
+-- [Cursor IDE](https://cursor.com/)
+-- [Continue](https://www.continue.dev/)
+-- [Cody](https://sourcegraph.com/cody)
+-- [Claude](https://docs.anthropic.com/en/docs/claude-code/ide-integrations)
+-- [Cline](https://cline.bot/)
+-- [Codex](https://openai.com/codex/)
+-- [Copilot](https://github.com/features/copilot)
+-- [Amp](https://ampcode.com/)
+-- [Windsurf](https://windsurf.com/)
++:::note
++You will need an AI-enabled IDE or agent, such as Copilot, Claude Code, Cursor, Continue, etc.
++:::
+ 
+-## Concepts used in this guide
+ 
+-Before diving into the workflow, here’s a quick overview of key terms you’ll encounter:
++## Setup
++Before starting to build our connector, we need to initialize our [dltHub workspace](../../hub/workspace/overview.md) and configure our IDE.
+ 
+-1. **dlt workspace** - An environment where all data engineering tasks, from writing code to maintenance in production, can be executed by a single developer:
+-   - Develop and test data pipelines locally
+-   - Run dlt pipelines, transformations, and notebooks with one command
+-   - Deliver live, production-ready reports with streamlined access to the dataset
+ 
+-   We plan to support more functionality in the future, such as:
+-   - Deploy and run your data workflows in the cloud without any changes to code and schemas
+-   - Maintain pipelines with a Runtime Agent, customizable dashboards, and validation tests
+-   - Deploy live reports without worrying about schema drift or silent failures
++### Python dependencies
+ 
+-2. **[Cursor](https://cursor.com/)** - An AI-powered code editor that lets you express tasks in natural language for an LLM agent to implement. Cursor is the first AI code editor we’ve integrated with, so the examples use Cursor, but the same workflow applies to Continue, Copilot, Cody, Windsurf, Cline, Claude, Amp, and Codex (only the UI/shortcuts differ).
++Run this command to install the Python library `dlt` with the `workspace` extra.
+ 
+-3. **LLM-context** - A curated collection of prompts, rules, docs, and examples provided to an LLM for specific tasks. A rich context leads to more accurate, bug-free code generation. dltHub provides tailored [LLM-contexts for 1,000+ REST API sources](https://dlthub.com/workspace), so you can go from idea to working pipeline in under 10 minutes.
++```sh
++pip install "dlt[workspace]"
++```
+ 
+-## Setup
++### Initialize workspace
+ 
+-### Setup your AI editor/agent
++To initialize your workspace, you will run a command of this shape:
+ 
+-#### 1. Use the right model
++```sh
++dlt init dlthub:{source} {destination}
++```
+ 
+-For best results, use newer models. For example, in Cursor we’ve found that Claude-4-sonnet performs best (available in the paid version). Older or weaker models often struggle with context comprehension and workflows.
++For the destination, `duckdb` is recommend for local development.
++Once you have a working pipeline, you easily change the destination to your
++data warehouse.
+ 
+-#### 2. Add documentation
++For the source, select one of the 8k+ REST API sources available
++at [https://dlthub.com/workspace](https://dlthub.com/workspace). The source's page includes a command you can copy-paste to initialize your workspace.
+ 
+-AI code editors let you upload documentation and code examples to provide additional context. The exact steps vary by tool, but here are two examples:
++For example, this command setups ingestion from GitHub to local DuckDB.
++```sh
++dlt init dlthub:github duckdb
++```
+ 
+-1. Cursor ([guide](https://docs.cursor.com/context/@-symbols/@-docs)): Go to `Settings > Indexing & Docs` to add documentation.
+-2. Continue ([guide](https://docs.continue.dev/customize/context/documentation)): In chat, type `@Docs` and press `Enter`, then click `Add Docs`.
++Several files will be added to your directory, similar to this:
+ 
+-For any editor or agent, we recommend adding documentation scoped to a specific task.
+-At minimum, include:
++```text
++my_project/
++├── .cursor/  # rules for Cursor IDE
++│   ├── rules.mdc
++│   └── ... # more rules
++├── .dlt/
++│   ├── config.toml  # dlt configuration
++│   └── secrets.toml  # dlt secrets
++├── .cursorignore
++├── .gitignore
++├── github_pipeline.py  # pipeline template
++├── requirements.txt
++└── github-docs.yaml  # GitHub LLM scaffold
++```
+ 
+-* [REST API source](../verified-sources/rest_api/) as `@dlt_rest_api`
+-* [Core dlt concepts & usage](../../general-usage/) as `@dlt_docs`
++### Configure IDE
+ 
+-### Install dlt workspace
++When running `dlt init`, you will be prompted to select the IDE or agent that you want to use.
+ 
+ ```sh
+-pip install "dlt[workspace]"
++❯ dlt init dlthub:github duckdb
++dlt will generate useful project rules tailored to your assistant/IDE.
++Press Enter to accept the default (cursor), or type a name:
+ ```
+ 
+-### Initialize workspace
++Run this command to manually setup another IDE.
+ 
+-We provide LLM context from over 5,000 sources, available at [https://dlthub.com/workspace](https://dlthub.com/workspace). To get started, search for your API and follow the tailored instructions.
++```sh
++dlt ai setup {IDE}
++```
+ 
+-<div style={{textAlign: 'center'}}>
+-![search for your source](https://storage.googleapis.com/dlt-blog-images/llm_workflows_search.png)
+-</div>
++### Choose an LLM
+ 
+-To initialize a dltHub workspace, execute the following:
++Your experience will greatly depend on the capabilities of the LLM you use. We suggest minimally using `GPT-4.1` from OpenAI or `Claude Sonnet 4` from Anthropic.
+ 
+-```sh
+-dlt init dlthub:{source_name} duckdb
+-```
+ 
+-This command will first prompt you to choose an AI editor/agent. If you pick the wrong one, no problem. After initializing the workspace, you can delete the incorrect editor rules and run `dlt ai setup` to select the editor again. This time it will only load the rules.
++### Install MCP server (optional)
+ 
+-The dltHub workspace will be initialized with:
+-- Files and folder structure you know from [dlt init](../../walkthroughs/create-a-pipeline.md)
+-- Documentation scaffold for the specific source (typically a `yaml` file) optimized for LLMs
+-- Rules for `dlt`, configured for your selected AI editor/agent
+-- Pipeline script and REST API source (`{source_name}_pipeline.py`) definition that you'll customize in the next step
++You can install the [dlt MCP server ](https://github.com/dlt-hub/dlt-mcp) by adding this snippet to your IDE's configuration.
+ 
+-:::tip
+-If you can't find the source you need, start with a generic REST API source template. Choose a source name you need i.e.
+-```sh
+-dlt init dlthub:my_internal_fast_api duckdb
++This default configuration will support local DuckDB destination
++```json
++{
++  "name": "dlt",
++  "command": "uv",
++  "args": [
++    "run",
++    "--with",
++    "dlt-mcp[search]",
++    "python",
++    "-m",
++    "dlt_mcp"
++  ]
++}
+ ```
+-This will generate the full pipeline setup, including the script (`my_internal_fast_api_pipeline.py`) and all the files and folders you’d normally get with a standard [dlt init](../../walkthroughs/create-a-pipeline.md).
+-To make your source available to the LLM, be sure to [include the documentation](#addon-bring-your-own-llm-scaffold) in the context so the model can understand how to use it.
+-:::
+ 
+-## Create dlt pipeline
++:::note
++The configuration file format varies slightly across IDEs
++:::
+ 
+-### Generate code
++## Initial instructions
+ 
+-To get started quickly, we recommend using our pre-defined prompts tailored for each API. Visit [https://dlthub.com/workspace](https://dlthub.com/workspace) and copy the prompt for your selected source.
+-Prompts are adjusted per API to provide the most accurate and relevant context.
++To get good result and make progress, it's best to implement one REST endpoint at a time.
+ 
+-Here's a general prompt template you can adapt:
++The source's page on dlthub.com/workspace includes a prompt to get you started that looks
++like this:
+ 
+ ```text
+-Please generate a REST API source for {source} API, as specified in @{source}-docs.yaml
+-Start with endpoints {endpoints you want} and skip incremental loading for now.
++Generate a REST API Source for {source}, as specified in @{source}-docs.yaml
++Start with endpoint {endpoint_name} and skip incremental loading for now.
+ Place the code in {source}_pipeline.py and name the pipeline {source}_pipeline.
+ If the file exists, use it as a starting point.
+ Do not add or modify any other files.
+-Use @dlt_rest_api as a tutorial.
+-After adding the endpoints, allow the user to run the pipeline with python {source}_pipeline.py and await further instructions.
++After adding the endpoint, allow the user to run the pipeline with
++`python {source}_pipeline.py`
++and await further instructions.
+ ```
+ 
+-In this prompt, we use `@` references to link source specifications and documentation. Make sure Cursor (or whichevert AI editor/agent you use) recognizes the referenced docs.
+-For example, see [Cursor’s guide](https://docs.cursor.com/context/@-symbols/overview) to @ references.
++:::tip
++Reference `{'{'}source{'}'}-docs.yaml` and ask what the available endpoints are.
++:::
++
++## Generate code
++
++The LLM can quickly produce a lot of code. When reviewing its proposed changes, your role is to nudge it in the right direction.
++
++### Anatomy of a REST API source
++Before practical tips, let's look at a minimal REST API source:
++
++```py
++import dlt
++from dlt.sources.rest_api import rest_api_resources
++from dlt.sources.rest_api.typing import RESTAPIConfig
++
++# decorator indicates that this function produces a source
++@dlt.source
++def github_source(
++    # the `access_token` will be retrieved from `.dlt/secrets.toml` by default
++    access_token: str = dlt.secrets.value
++):
++    config: RESTAPIConfig = {
++        # client section
++        "client": {
++            "base_url": "https://api.github.com/v3/",
++            # access token will be passed via headers
++            "auth": {"type": "bearer", "token": access_token},
++        },
++        # endpoint section
++        "resources": [
++            # refers to GET endpoint `/issues`
++            "issues",
++        ],
++    }
++    # returns a list of resources
++    return rest_api_resources(config)
++```
++
++For now, it's best to delete all the code you don't understand (e.g., paginator, incremental, data selector). This keeps the LLM focused and reduces the surface for bugs. After generating a working pipeline and committing code, you can go back configure endpoints more precisely.
++
++:::tip
++Reference `{'{'}source{'}'}-docs.yaml` and ask what the available endpoints parameters are.
++:::
++
++### Leveraging the IDE
+ 
+-* `@{source}-docs.yaml` contains the source specification and describes the source with endpoints, parameters, and other details.
+-* `@dlt_rest_api` contains the documentation for dlt's REST API source.
++`dlt` provides extensive validation and completion suggestions inside the IDE.
+ 
+-### Add credentials
++Invalid code generated by the LLM produce red error lines, simplifying code review.
+ 
+-Prompt the LLM for credential setup instructions and add them to your workspace secrets file `.dlt/secrets.toml`.
++![invalid rest api config](https://storage.googleapis.com/dlt-blog-images/docs-llm-tooling-invalid-rest-api-config.png)
+ 
+-## Run the pipeline
++Completion suggestions makes it easy to fix LLM errors or set configuration options.
+ 
+-Run your pipeline:
++![rest api config completion suggestion](https://storage.googleapis.com/dlt-blog-images/docs-llm-tooling-rest-api-config-completion.png)
++
++## Run pipeline
++### Agent running the pipeline
++Typically, the agent will ask permission to run the pipeline via the chat:
+ 
+ ```sh
+-python {source}_pipeline.py
++python github_pipeline.py
+ ```
+ 
+-Expected output:
++If you accept, it will run the pipeline and directly receive the output of the command (success or error).
++Then, it can automatically start fixing things or ask follow-up questions.
++
++:::note
++Depending on the IDE, the pipeline may fail because of missing Python dependencies. In this case,
++you should run the pipeline manually.
++:::
++
++### Manually running the pipeline
++You can manually run this command in the terminal to run the pipeline.
++
+ ```sh
+-Pipeline {source} load step completed in 0.26 seconds
+-1 load package(s) were loaded to destination duckdb and into dataset {source}_data
+-The duckdb destination used duckdb:/{source}.duckdb location to store data
++python github_pipeline.py
++```
++
++Then, use `@terminal` inside the chat window to add the success / error message to the LLM context.
++
++### Success: pipeline completed without error
++A successful execution should print a message similar to this one:
++
++```sh
++Pipeline github_source load step completed in 0.26 seconds
++1 load package(s) were loaded to destination duckdb and into dataset github_source_data
++The duckdb destination used duckdb:/github_source.duckdb location to store data
+ Load package 1749667187.541553 is LOADED and contains no failed jobs
+ ```
+ 
++### Failure: source credentials
++
++Your first iterations will likely trigger credentials errors similar to the one below. The error message indicates how you can set credential values using `.dlt/config.toml`  and `.dlt/secrets.toml` or environment variables ([learn more](../../general-usage/credentials/setup))
++
++```text
++dlt.common.configuration.exceptions.ConfigFieldMissingException: Missing 1 field(s) in configuration `GithubRestApiSourceConfiguration`: `access_token`
++for field `access_token` the following (config provider, key) were tried in order:
++  (Environment Variables, GITHUB_PIPELINE__SOURCES__GITHUB_PIPELINE__GITHUB_REST_API_SOURCE__ACCESS_TOKEN)
++  (Environment Variables, GITHUB_PIPELINE__SOURCES__GITHUB_PIPELINE__ACCESS_TOKEN)
++  (Environment Variables, GITHUB_PIPELINE__SOURCES__ACCESS_TOKEN)
++  (Environment Variables, GITHUB_PIPELINE__ACCESS_TOKEN)
++  (secrets.toml, github_pipeline.sources.github_pipeline.github_rest_api_source.access_token)
++  (secrets.toml, github_pipeline.sources.github_pipeline.access_token)
++  (secrets.toml, github_pipeline.sources.access_token)
++  (secrets.toml, github_pipeline.access_token)
++  (Environment Variables, SOURCES__GITHUB_PIPELINE__GITHUB_REST_API_SOURCE__ACCESS_TOKEN)
++  (Environment Variables, SOURCES__GITHUB_PIPELINE__ACCESS_TOKEN)
++  (Environment Variables, SOURCES__ACCESS_TOKEN)
++  (Environment Variables, ACCESS_TOKEN)
++  (secrets.toml, sources.github_pipeline.github_rest_api_source.access_token)
++  (secrets.toml, sources.github_pipeline.access_token)
++  (secrets.toml, sources.access_token)
++  (secrets.toml, access_token)
++Provider `secrets.toml` loaded values from locations:
++        - /home/user/path/to/my_project/.dlt/secrets.toml
++        - /home/user/.dlt/secrets.toml
++Provider `config.toml` loaded values from locations:
++        - /home/user/path/to/my_project/.dlt/config.toml
++        - /home/user/.dlt/config.toml
++```
++
+ :::tip
+-If the pipeline fails, pass error messages to the LLM. Restart after 4-8 failed attempts.
++Getting credentials or API keys from a source system can be tedious. For popular sources, LLMs can provide step-by-step instructions
+ :::
+ 
+-### Validate with workspace dashboard
+ 
+-Launch the dashboard to validate your pipeline:
++### Failure: destination credentials
+ 
+-```sh
+-dlt pipeline {source}_pipeline show
++Destination credentials are similar to source credentials errors and can be fixed via `.dlt/config.toml`  and `.dlt/secrets.toml` or environment variables ([learn more](../../general-usage/credentials/setup)). Destination-specific information can be found in [the documentation](../../dlt-ecosystem/destinations).
++
++Alternatively, you can point the LLM to the Python code that defines the configuration. It's typically found in `from dlt.destinations.impl.{'{'}destination{'}'}.configuration`. For example, this retrieves the Snowflake configuration and credentials
++
++```py
++from dlt.destinations.impl.snowflake.configuration import SnowflakeCredentials, SnowflakeClientConfiguration
+ ```
+ 
+-The dashboard shows:
+-- Pipeline overview with state and metrics
+-- Data schema (tables, columns, types)
+-- Data itself, you can even write custom queries
++Credentials are what you typically put in `secrets.toml` and configuration in `config.toml`.
+ 
+-The dashboard helps detect silent failures due to pagination errors, schema drift, or incremental load misconfigurations.
++## Manage context
++
++"Managing context" is about providing the right information to the LLM and help it focus on the right task. Below is a list of practical tips:
++
++- Specify: "I'm a data engineer using the Python library `dlt` to ingest data from {'{'}source{'}'} to {'{'}destination{'}'}. I'm also using the Python libraries X,Y,Z."
++- Specify: "Focus on a single REST API endpoint `X`."
++- In later iteration when you're tuning your pipeline, specify "The current Python code works as expected. Make minimal and focused changes to do X"
++- Use the `@` symbol to reference the terminal output after running the pipeline
++- Use the `@` symbol to reference to the LLM scaffolds
++- Ingest documentation and index your code using your IDE. Refer to it explicitly using `@`
++- Ask the LLM to list available tools and explain them.
++- If the LLM goes on a tangent, trim the conversation history or create a new conversation
++
++:::note
++These tips will differ slightly across IDEs
++:::
++
++## Check data
++
++### dlt Dashboard
++
++Lauch the local [dlt Dashboard](../../general-usage/dashboard) to inspect your pipeline execution including:
++- pipeline state and metrics
++- data schema
++- SQL data explorer
++
++```sh
++dlt pipeline github_pipeline show
++```
+ 
+ <div style={{textAlign: 'center'}}>
+ ![dashboard](https://storage.googleapis.com/dlt-blog-images/llm-native-dashboard.png)
+ </div>
+ 
+-## Use the data in a notebook
++The dashboard helps detect silent failures due to pagination errors, schema drift, or incremental load misconfigurations.
++
++:::tip
++Inside Cursor 2.0, you can open the [dashboard's web page inside the IDE](https://cursor.com/docs/agent/browser) and directly reference visual elements inside the chat.
++:::
++
++
++### Ask the dlt MCP server
++If the [dlt MCP server](https://github.com/dlt-hub/dlt-mcp) is connected, you can directly ask in the IDE chat window if the data was successfully loaded. Based on your MCP configuration, it can have access to:
++- pipeline metadata
++- loaded data
++- dlt documentation and source code
++
++It can answer questions such as:
++- What are the available pipelines?
++- What are the available tables?
++- What's table X's schema?
++- When was data last loaded?
++- Did schema change last run?
++- Display the pipeline's schema
++- How many rows are in table X?
++- Give me a data sample of table X
+ 
+-With the pipeline and data validated, you can continue with custom data explorations and reports. You can use your preferred environment, for example, [Jupyter Notebook](https://jupyter.org/), [Marimo Notebook](https://marimo.io/), or a plain Python file.
++
++### Python data exploration
++
++Running a `dlt` pipeline creates a dataset, which can be accessed via Python code:
++
++```py
++import dlt
++
++# this refers to my previously ran pipeline
++github_pipeline = dlt.pipeline("github_pipeline")
++github_dataset = github_pipeline.dataset()
++# list tables
++github_dataset.tables
++# list columns
++github_dataset.table("pull_requests").columns
++# load the results as a pandas dataframe
++github_dataset.table("pull_requests").df()
++```
++
++This shines in interactive environments like [marimo](../../general-usage/dataset-access/marimo) and Jupyter for data explorations. It's a great way to add data quality checks.
++
++### Automated data quality
++
++Once you're familiar with the data, you can write expectations about the data in code. This section is an introduction to deep topics with their own documentation page.
+ 
+ :::tip
+-For an optimized data exploration experience, we recommend using a Marimo notebook. Check out the [detailed guide on using dlt with Marimo](../../general-usage/dataset-access/marimo).
++Instead of asking the LLM to make data a certain way, you can ask the LLM to help you write automated data quality. Then, you can feedback the data quality information back to the LLM after each pipeline run.
+ :::
+ 
+-To access the data, you can use the `dataset()` method:
++#### Schema contract
++Enabling [schema contracts](../../general-usage/schema-contracts) lets you configure what aspect of the data can change or not between pipeline runs.
++
++For example, this configuration allows to add new tables, raises on new columns, and drops records with incorrect data type:
++
++```py
++@dlt.source(
++    schema_contract={
++        "tables": "evolve",
++        "columns": "freeze",
++        "data_type": "discard_row",
++    }
++)
++def github_source(): ...
++```
++
++#### Data validation
++Using [Pydantic](https://docs.pydantic.dev), you can define extend schema contract features and validate individual records one-by-one ([learn more](../../general-usage/resource#define-a-schema-with-pydantic)).
++
++This allows to catch invalid data early, cancel the pipeline run, and prevent data being written to the destination
++
++Data validation needs to be set on the **resource** rather than the **source**. We need a few more lines of code to retrieve them.
+ 
+ ```py
+ import dlt
++from pydantic import BaseModel
++
++class PullRequestModel(BaseModel):
++    ...
++
++@dlt.source
++def github_source(): ...
++
++if __name__ == "__main__":
++    source = github_source()
++    # "pull_requests" would be one of the endpoints defined by `github_source`
++    source.resources["pull_requests"].apply_hints(columns=PullRequestModel)
+ 
+-my_data = dlt.pipeline("{source}_pipeline").dataset()
+-# get any table as Pandas frame
+-my_data.table("table_name").df().head()
++    pipeline = dlt.pipeline("github_pipeline")
++    pipeline.run(source)
+ ```
+ 
+-For more, see the [dataset access guide](../../general-usage/dataset-access).
++#### Data quality checks
++A [data quality check](../../hub/features/quality/data-quality) declares how the data on the destination should look like. It can be executed on the destination and efficiently process large data volume.
+ 
+-## Next steps: production deployment
++```py
++from dlt.hub import data_quality as dq
++
++pipeline = dlt.pipeline("github_pipeline")
++pipeline.run(github_source())
++
++dataset = pipeline.dataset()
+ 
+-- [Prepare production deployment](../../walkthroughs/share-a-dataset.md)
+-- [Deploy a pipeline](../../walkthroughs/deploy-a-pipeline/)
++pull_requests_checks = [
++    dq.checks.is_not_null("id"),
++    dq.checks.is_in("author", ["Romeo", "Foxtrot", "Tango"]),
++    dq.checks.case("created_at > 2025-01-01"),
++]
+ 
++dq.run_checks(dataset, checks={"pull_requests": pull_requests_checks})
++```
+ 
+-## Addon: bring your own LLM scaffold
++:::tip
++Data quality checks write results to the destination, which can be inspected via the dashboard, MCP server, and manual exploration
++:::
+ 
+-LLMs can infer a REST API source definition from various types of input, and in many cases, it’s easy to provide what’s needed.
+ 
+-Here are a few effective ways to scaffold your source:
++## Conclusion
++By the end of this guide, you should have:
++- a local workspace
++- a working REST API source
++- a working pipeline
++- a local dataset
+ 
+-1. **FastAPI (Internal APIs)**. If you're using FastAPI, simply add a file with the autogenerated OpenAPI spec to your workspace and reference it in your prompt.
+-2. **Legacy code in any programming language**. Add the relevant code files to your workspace and reference them directly in your prompt. LLMs can extract useful structure even from older codebases.
+-3. **Human-readable documentation**. Well-written documentation works too. You can add it to your AI editor docs and reference it in your prompt for context.
+\ No newline at end of file
++Next steps:
++- [explore the dataset and build a data product](../../general-usage/dataset-access/dataset)
++- [replace the local destination with your data warehouse](../../walkthroughs/share-a-dataset)
++- [deploy the pipeline](../../walkthroughs/deploy-a-pipeline/)
+diff --git a/docs/website/docs/hub/workspace/init.md b/docs/website/docs/hub/workspace/init.md
+index 4920347ea..1e76519ea 100644
+--- a/docs/website/docs/hub/workspace/init.md
++++ b/docs/website/docs/hub/workspace/init.md
+@@ -65,7 +65,7 @@ A collaborative AI-human workflow that integrates `dlt` with AI editors and agen
+ - **Cursor**,
+ - **Continue**,
+ - **Copilot**,
+-- [the full list](../../dlt-ecosystem/llm-tooling/llm-native-workflow#prerequisites)
++- [the full list](../../dlt-ecosystem/llm-tooling/llm-native-workflow#configure-ide)
+ 
+ 
+ **Initialize your first workspace pipeline**
+
+
+===== COMMIT a9b526e7 =====
+
+
+commit a9b526e75
+Author: rudolfix
+Date: 2025-12-09
+
+    (feat) small dashboard improvements (#3450)
+
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index 3244b36a6..36882f773 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -1385,7 +1385,7 @@ def ui_controls(mo_cli_arg_with_test_identifiers: bool):
+         label=f"<small>{strings.ui_show_dlt_tables}</small>"
+     )
+     dlt_schema_show_child_tables: mo.ui.switch = mo.ui.switch(
+-        label=f"<small>{strings.ui_show_child_tables}</small>", value=False
++        label=f"<small>{strings.ui_show_child_tables}</small>", value=True
+     )
+     dlt_schema_show_row_counts: mo.ui.run_button = mo.ui.run_button(
+         label=f"<small>{strings.ui_load_row_counts}</small>"
+diff --git a/dlt/_workspace/helpers/dashboard/strings.py b/dlt/_workspace/helpers/dashboard/strings.py
+index a021b65b6..582b3124f 100644
+--- a/dlt/_workspace/helpers/dashboard/strings.py
++++ b/dlt/_workspace/helpers/dashboard/strings.py
+@@ -125,7 +125,7 @@ schema_raw_yaml_title = "Raw Schema as YAML"
+ schema_show_raw_yaml_text = "Show raw schema as YAML"
+ 
+ # Schema UI controls
+-ui_show_dlt_tables = "Show `_dlt` tables"
++ui_show_dlt_tables = "Show internal tables"
+ ui_show_child_tables = "Show child tables"
+ ui_load_row_counts = "Load row counts"
+ ui_show_dlt_columns = "Show `_dlt` columns"
+diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
+index d8d172ce3..926b69b85 100644
+--- a/tests/e2e/helpers/dashboard/test_e2e.py
++++ b/tests/e2e/helpers/dashboard/test_e2e.py
+@@ -193,7 +193,7 @@ def test_simple_incremental_pipeline(page: Page, simple_incremental_pipeline: An
+     page.get_by_role("button", name="Run Query").click()
+ 
+     # enable dlt tables
+-    page.get_by_role("switch", name="Show _dlt tables").check()
++    page.get_by_role("switch", name="Show internal tables").check()
+ 
+     # state page
+     _open_section(page, "state")
+
+
+===== COMMIT c678d353 =====
+
+
+commit c678d3534
+Author: segetsy
+Date: 2025-12-08
+
+    [fix/3358] add pagination stopping to `JSONResponseCursorPaginator` (#3374)
+
+diff --git a/dlt/sources/helpers/rest_client/paginators.py b/dlt/sources/helpers/rest_client/paginators.py
+index 09faa3472..bcc921963 100644
+--- a/dlt/sources/helpers/rest_client/paginators.py
++++ b/dlt/sources/helpers/rest_client/paginators.py
+@@ -846,6 +846,9 @@ class JSONResponseCursorPaginator(BaseReferencePaginator):
+         cursor_path: jsonpath.TJsonPath = "cursors.next",
+         cursor_param: Optional[str] = None,
+         cursor_body_path: Optional[str] = None,
++        *,
++        stop_after_empty_page: bool = False,
++        has_more_path: Optional[jsonpath.TJsonPath] = None,
+     ):
+         """
+         Args:
+@@ -854,6 +857,10 @@ class JSONResponseCursorPaginator(BaseReferencePaginator):
+             cursor_param: The name of the query parameter to be used in
+                 the request to get the next page.
+             cursor_body_path: The dot-separated path where to place the cursor in the request body.
++            stop_after_empty_page: Whether pagination should stop when
++                a page contains no result items. Defaults to `False`.
++            has_more_path: The JSON path to a boolean value in the response
++                indicating whether there are more items to fetch.
+         """
+         super().__init__()
+         self.cursor_path = jsonpath.compile_path(cursor_path)
+@@ -869,12 +876,48 @@ class JSONResponseCursorPaginator(BaseReferencePaginator):
+ 
+         self.cursor_param = cursor_param
+         self.cursor_body_path = cursor_body_path
++        self.stop_after_empty_page = stop_after_empty_page
++        self.has_more_path = jsonpath.compile_path(has_more_path) if has_more_path else None
+ 
+     def update_state(self, response: Response, data: Optional[List[Any]] = None) -> None:
+         """Extracts the cursor value from the JSON response."""
+-        values = jsonpath.find_values(self.cursor_path, response.json())
++        response_json = response.json()
++        values = jsonpath.find_values(self.cursor_path, response_json)
+         self._next_reference = values[0] if values and values[0] else None
+ 
++        if self.stop_after_empty_page and not data:
++            self._has_next_page = False
++            return
++
++        has_more = None
++        if self.has_more_path:
++            values = jsonpath.find_values(self.has_more_path, response_json)
++            has_more = values[0] if values else None
++            if has_more is None:
++                self._handle_missing_has_more(response_json)
++            elif isinstance(has_more, str):
++                try:
++                    has_more = str2bool(has_more)
++                except ValueError:
++                    self._handle_invalid_has_more(has_more)
++            elif not isinstance(has_more, bool):
++                self._handle_invalid_has_more(has_more)
++
++            self._has_next_page = has_more
++
++    def _handle_invalid_has_more(self, has_more: Any) -> None:
++        raise ValueError(
++            f"'{self.has_more_path}' is not a `bool` in the response in"
++            f" `{self.__class__.__name__}`. Expected a boolean, got `{has_more}`"
++        )
++
++    def _handle_missing_has_more(self, response_json: Dict[str, Any]) -> None:
++        raise ValueError(
++            f"Has more value not found in the response in `{self.__class__.__name__}`. "
++            f"Expected a response with a `{self.has_more_path}` key, got"
++            f" `{response_json}`."
++        )
++
+     def update_request(self, request: Request) -> None:
+         """Updates the request with the cursor value either in query parameters
+         or in the request JSON body."""
+diff --git a/tests/sources/helpers/rest_client/test_paginators.py b/tests/sources/helpers/rest_client/test_paginators.py
+index 8467e3e88..d6b8a8bec 100644
+--- a/tests/sources/helpers/rest_client/test_paginators.py
++++ b/tests/sources/helpers/rest_client/test_paginators.py
+@@ -953,6 +953,59 @@ class TestJSONResponseCursorPaginator:
+         paginator.update_state(response)
+         assert paginator.has_next_page is False
+ 
++    def test_update_state_stop_after_empty_page(self):
++        paginator = JSONResponseCursorPaginator(
++            cursor_path="next_cursor", stop_after_empty_page=True
++        )
++        response = Mock(Response, json=lambda: {"next_cursor": "cursor", "results": []})
++        paginator.update_state(response, [])
++        assert paginator.has_next_page is False
++
++    def test_update_has_more_path(self):
++        paginator = JSONResponseCursorPaginator(cursor_path="next_cursor", has_more_path="has_more")
++        response = Mock(
++            Response, json=lambda: {"next_cursor": "cursor", "results": [], "has_more": False}
++        )
++        paginator.update_state(response)
++        assert paginator.has_next_page is False
++
++    def test_update_has_more_path_string(self):
++        paginator = JSONResponseCursorPaginator(cursor_path="next_cursor", has_more_path="has_more")
++        response = Mock(
++            Response, json=lambda: {"next_cursor": "cursor", "results": [], "has_more": "false"}
++        )
++        paginator.update_state(response)
++        assert paginator.has_next_page is False
++
++    def test_update_has_more_path_true_nonempty_result(self):
++        paginator = JSONResponseCursorPaginator(cursor_path="next_cursor", has_more_path="has_more")
++        response = Mock(
++            Response,
++            json=lambda: {
++                "next_cursor": "cursor",
++                "results": [{"hello": "world"}],
++                "has_more": True,
++            },
++        )
++        paginator.update_state(response)
++        assert paginator.has_next_page is True
++
++    def test_update_has_more_path_true(self):
++        paginator = JSONResponseCursorPaginator(cursor_path="next_cursor", has_more_path="has_more")
++        response = Mock(
++            Response, json=lambda: {"next_cursor": "cursor", "results": [], "has_more": True}
++        )
++        paginator.update_state(response)
++        assert paginator.has_next_page is True
++
++    def test_update_has_more_path_missing(self):
++        paginator = JSONResponseCursorPaginator(cursor_path="next_cursor", has_more_path="has_more")
++        response = Mock(
++            Response, json=lambda: {"next_cursor": "cursor", "results": [{"hello", "world"}]}
++        )
++        with pytest.raises(ValueError, match="Has more value not found in the response"):
++            paginator.update_state(response)
++
+     def test_update_request_param(self):
+         paginator = JSONResponseCursorPaginator(cursor_path="next_cursor")
+         paginator._next_reference = "cursor-2"
+
+
+===== COMMIT c4515d71 =====
+
+
+commit c4515d711
+Author: King Chung Huang
+Date: 2025-12-08
+
+    Add offset/limit body_path fields to OffsetPaginatorConfig (#3260)
+
+diff --git a/dlt/sources/rest_api/typing.py b/dlt/sources/rest_api/typing.py
+index 4785f46cb..e2f8318da 100644
+--- a/dlt/sources/rest_api/typing.py
++++ b/dlt/sources/rest_api/typing.py
+@@ -76,7 +76,9 @@ class OffsetPaginatorConfig(PaginatorTypeConfig, total=False):
+     limit: int
+     offset: Optional[int]
+     offset_param: Optional[str]
++    offset_body_path: Optional[str]
+     limit_param: Optional[str]
++    limit_body_path: Optional[str]
+     total_path: Optional[jsonpath.TJsonPath]
+     maximum_offset: Optional[int]
+     stop_after_empty_page: Optional[bool]
+diff --git a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
+index 0bde49d1f..ae89b4fca 100644
+--- a/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
++++ b/docs/website/docs/dlt-ecosystem/verified-sources/rest_api/basic.md
+@@ -452,7 +452,7 @@ These are the available paginators:
+ | `json_link` | [JSONLinkPaginator](../../../general-usage/http/rest-client.md#jsonlinkpaginator) | The link to the next page is in the body (JSON) of the response.<br/>*Parameters:*<ul><li>`next_url_path` (str) - the JSONPath to the next page URL</li></ul> |
+ | `header_link` | [HeaderLinkPaginator](../../../general-usage/http/rest-client.md#headerlinkpaginator) | The links to the next page are in the response headers.<br/>*Parameters:*<ul><li>`links_next_key` (str) - the name of the header containing the links. Default is "next".</li></ul> |
+ | `header_cursor` | [HeaderCursorPaginator](../../../general-usage/http/rest-client.md#headercursorpaginator) | The cursor for the next page is in the response headers.<br/>*Parameters:*<ul><li>`cursor_key` (str) - the name of the header containing the cursor. Defaults to "next"</li><li>`cursor_param` (str) - the query parameter name for the cursor. Defaults to "cursor"</li></ul> |
+-| `offset` | [OffsetPaginator](../../../general-usage/http/rest-client.md#offsetpaginator) | The pagination is based on an offset parameter, with the total items count either in the response body or explicitly provided.<br/>*Parameters:*<ul><li>`limit` (int) - the maximum number of items to retrieve in each request</li><li>`offset` (int) - the initial offset for the first request. Defaults to `0`</li><li>`offset_param` (str) - the name of the query parameter used to specify the offset. Defaults to "offset"</li><li>`limit_param` (str) - the name of the query parameter used to specify the limit. Defaults to "limit"</li><li>`total_path` (str) - a JSONPath expression for the total number of items. If not provided, pagination is controlled by `maximum_offset` and `stop_after_empty_page`</li><li>`maximum_offset` (int) - optional maximum offset value. Limits pagination even without total count</li><li>`stop_after_empty_page` (bool) - Whether pagination should stop when a page contains no result items. Defaults to `True`</li><li>`has_more_path` (str) - a JSONPath expression for the boolean value indicating whether there are more items to fetch. Defaults to `None`.</li></ul> |
++| `offset` | [OffsetPaginator](../../../general-usage/http/rest-client.md#offsetpaginator) | The pagination is based on an offset parameter, with the total items count either in the response body or explicitly provided.<br/>*Parameters:*<ul><li>`limit` (int) - the maximum number of items to retrieve in each request</li><li>`offset` (int) - the initial offset for the first request. Defaults to `0`</li><li>`offset_param` (str) - the name of the query parameter used to specify the offset. Defaults to "offset"</li><li>`offset_body_path` (str) - a dot-separated path specifying where to place the offset in the request JSON body. Defaults to `None`</li><li>`limit_param` (str) - the name of the query parameter used to specify the limit. Defaults to "limit"</li><li>`limit_body_path` (str) - a dot-separated path specifying where to place the limit in the request JSON body. Defaults to `None`</li><li>`total_path` (str) - a JSONPath expression for the total number of items. If not provided, pagination is controlled by `maximum_offset` and `stop_after_empty_page`</li><li>`maximum_offset` (int) - optional maximum offset value. Limits pagination even without total count</li><li>`stop_after_empty_page` (bool) - Whether pagination should stop when a page contains no result items. Defaults to `True`</li><li>`has_more_path` (str) - a JSONPath expression for the boolean value indicating whether there are more items to fetch. Defaults to `None`.</li></ul> |
+ | `page_number` | [PageNumberPaginator](../../../general-usage/http/rest-client.md#pagenumberpaginator) | The pagination is based on a page number parameter, with the total pages count either in the response body or explicitly provided.<br/>*Parameters:*<ul><li>`base_page` (int) - the starting page number. Defaults to `0`</li><li>`page_param` (str) - the query parameter name for the page number. Defaults to "page"</li><li>`total_path` (str) - a JSONPath expression for the total number of pages. If not provided, pagination is controlled by `maximum_page` and `stop_after_empty_page`</li><li>`maximum_page` (int) - optional maximum page number. Stops pagination once this page is reached</li><li>`stop_after_empty_page` (bool) - Whether pagination should stop when a page contains no result items. Defaults to `True`</li><li>`has_more_path` (str) - a JSONPath expression for the boolean value indicating whether there are more items to fetch. Defaults to `None`.</li></ul> |
+ | `cursor` | [JSONResponseCursorPaginator](../../../general-usage/http/rest-client.md#jsonresponsecursorpaginator) | The pagination is based on a cursor parameter, with the value of the cursor in the response body (JSON).<br/>*Parameters:*<ul><li>`cursor_path` (str) - the JSONPath to the cursor value. Defaults to "cursors.next"</li><li>`cursor_param` (str) - the query parameter name for the cursor. Defaults to "cursor" if neither `cursor_param` nor `cursor_body_path` is provided.</li><li>`cursor_body_path` (str, optional) - the JSONPath to place the cursor in the request body.</li></ul>Note: You must provide either `cursor_param` or `cursor_body_path`, but not both. If neither is provided, `cursor_param` will default to "cursor". |
+ | `single_page` | SinglePagePaginator | The response will be interpreted as a single-page response, ignoring possible pagination metadata. |
+
+
+===== COMMIT 17133426 =====
+
+
+commit 171334262
+Author: Anton Burnashev
+Date: 2025-12-08
+
+    Fix race condition in LimitItem causing extra items with parallelized resources (#3442)
+
+diff --git a/dlt/extract/items_transform.py b/dlt/extract/items_transform.py
+index 24e2edaf0..a1e1d682b 100644
+--- a/dlt/extract/items_transform.py
++++ b/dlt/extract/items_transform.py
+@@ -199,6 +199,10 @@ class LimitItem(ItemTransform[TDataItem, Dict[str, Any]]):
+         if item is None:
+             return None
+ 
++        # do not return any late arriving items
++        if self.exhausted:
++            return None
++
+         if self.count_rows:
+             self.count += count_rows_in_items(item)
+         else:
+@@ -219,9 +223,6 @@ class LimitItem(ItemTransform[TDataItem, Dict[str, Any]]):
+             # otherwise never return anything
+             if self.max_items != 0:
+                 return item
+-
+-        # do not return any late arriving items
+-        if self.exhausted:
+             return None
+ 
+         return item
+
+
+===== COMMIT d0fb75b7 =====
+
+
+commit d0fb75b74
+Author: Anton Burnashev
+Date: 2025-12-08
+
+    Skip examples requiring secrets on fork PRs (#3438)
+
+diff --git a/docs/docs_tools/examples/prepare_examples_tests.py b/docs/docs_tools/examples/prepare_examples_tests.py
+index b5dcc69ec..86c0c9a4b 100644
+--- a/docs/docs_tools/examples/prepare_examples_tests.py
++++ b/docs/docs_tools/examples/prepare_examples_tests.py
+@@ -13,9 +13,30 @@ EXAMPLES_DIR = "./examples"
+ # settings
+ SKIP_FOLDERS = ["archive", ".", "_", "local_cache"]
+ # @pytest.mark.rfam
+-SKIP_EXAMPLES: List[str] = ["backfill_in_chunks", "connector_x_arrow", "transformers"]
++SKIP_EXAMPLES: List[str] = [
++    "backfill_in_chunks",
++    "connector_x_arrow",
++    "transformers",
++]
++# Examples will be skipped from forked subprocesses
+ SKIP_FORK_EXAMPLES: List[str] = ["custom_destination_lancedb"]
+ 
++# Examples that require external secrets (cloud credentials, API keys, etc.)
++# These will be skipped when running on fork PRs where secrets are not available
++EXAMPLES_REQUIRING_SECRETS: List[str] = [
++    "chess",
++    "chess_production",
++    "custom_destination_bigquery",
++    "custom_destination_lancedb",
++    "custom_naming",
++    "google_sheets",
++    "incremental_loading",
++    "nested_data",
++    "pdf_to_weaviate",
++    "postgres_to_postgres",
++    "qdrant_zendesk",
++]
++
+ 
+ # the entry point for the script
+ MAIN_CLAUSE = 'if __name__ == "__main__":'
+@@ -40,7 +61,11 @@ def main() -> None:
+     # get args
+     args = parser.parse_args()
+ 
++    # Check if CI is running on a fork pull request
++    is_fork = os.environ.get("IS_FORK") == "true"
++
+     count = 0
++    skipped_for_fork = 0
+     for example in next(os.walk(EXAMPLES_DIR))[1]:
+         # skip some
+         if any(map(lambda skip: example.startswith(skip), SKIP_FOLDERS)):
+@@ -49,6 +74,12 @@ def main() -> None:
+         if example in SKIP_EXAMPLES:
+             continue
+ 
++        # Skip examples requiring secrets when running on fork PRs
++        if is_fork and example in EXAMPLES_REQUIRING_SECRETS:
++            skipped_for_fork += 1
++            fmt.note(f"Skipping {example} (requires secrets, running on fork PR)")
++            continue
++
+         count += 1
+         example_file = f"{EXAMPLES_DIR}/{example}/{example}.py"
+         test_example_file = f"{EXAMPLES_DIR}/{example}/test_{example}.py"
+@@ -89,4 +120,7 @@ def main() -> None:
+     if args.clear:
+         fmt.note("Cleared generated test files.")
+     else:
+-        fmt.note(f"Prepared {count} examples for testing.")
++        msg = f"Prepared {count} examples for testing."
++        if skipped_for_fork > 0:
++            msg += f" Skipped {skipped_for_fork} examples requiring secrets (fork PR)."
++        fmt.note(msg)
+
+
+===== COMMIT c3d8afe5 =====
+
+
+commit c3d8afe51
+Author: anuunchin
+Date: 2025-12-06
+
+    Color fix in dashboard (#3439)
+
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index 4057c9fff..5a39dbb49 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -86,6 +86,7 @@ def render_workspace_home(
+ ) -> List[Any]:
+     """Render the workspace-level home view (no pipeline selected)."""
+     return [
++        ui.section_marker(strings.app_section_name, has_content=True),
+         build_home_header_row(dlt_profile_select, dlt_pipeline_select),
+         mo.md(strings.app_title).center(),
+         mo.md(strings.app_intro).center(),
+@@ -185,7 +186,7 @@ def render_pipeline_home(
+         )
+         _pipeline_execution_exception = utils.build_exception_section(dlt_pipeline)
+ 
+-    _stack = [ui.section_marker(strings.home_section_name)]
++    _stack = [ui.section_marker(strings.home_section_name, has_content=dlt_pipeline is not None)]
+     _stack.extend(
+         render_pipeline_header_row(
+             dlt_pipeline_name, dlt_profile_select, dlt_pipeline_select, _buttons
+@@ -304,7 +305,9 @@ def section_info(
+     Overview page of currently selected pipeline
+     """
+ 
+-    _result = [ui.section_marker(strings.overview_section_name)]
++    _result = [
++        ui.section_marker(strings.overview_section_name, has_content=dlt_pipeline is not None)
++    ]
+     _result.extend(
+         ui.build_page_header(
+             dlt_pipeline,
+@@ -363,7 +366,7 @@ def section_schema(
+     Show schema of the currently selected pipeline
+     """
+ 
+-    _result = [ui.section_marker(strings.schema_section_name)]
++    _result = [ui.section_marker(strings.schema_section_name, has_content=dlt_pipeline is not None)]
+     _result.extend(
+         ui.build_page_header(
+             dlt_pipeline,
+@@ -460,7 +463,9 @@ def section_browse_data_table_list(
+     Show data of the currently selected pipeline
+     """
+ 
+-    _result = [ui.section_marker(strings.browse_data_section_name)]
++    _result = [
++        ui.section_marker(strings.browse_data_section_name, has_content=dlt_pipeline is not None)
++    ]
+     _result.extend(
+         ui.build_page_header(
+             dlt_pipeline,
+@@ -705,7 +710,7 @@ def section_state(
+     """
+     Show state of the currently selected pipeline
+     """
+-    _result = [ui.section_marker(strings.state_section_name)]
++    _result = [ui.section_marker(strings.state_section_name, has_content=dlt_pipeline is not None)]
+     _result.extend(
+         ui.build_page_header(
+             dlt_pipeline,
+@@ -737,7 +742,7 @@ def section_trace(
+     Show last trace of the currently selected pipeline
+     """
+ 
+-    _result = [ui.section_marker(strings.trace_section_name)]
++    _result = [ui.section_marker(strings.trace_section_name, has_content=dlt_pipeline is not None)]
+     _result.extend(
+         ui.build_page_header(
+             dlt_pipeline,
+@@ -851,7 +856,7 @@ def section_loads(
+     Show loads of the currently selected pipeline
+     """
+ 
+-    _result = [ui.section_marker(strings.loads_section_name)]
++    _result = [ui.section_marker(strings.loads_section_name, has_content=dlt_pipeline is not None)]
+     _result.extend(
+         ui.build_page_header(
+             dlt_pipeline,
+@@ -964,7 +969,9 @@ def section_ibis_backend(
+     """
+     Connects to ibis backend and makes it available in the datasources panel
+     """
+-    _result = [ui.section_marker(strings.ibis_backend_section_name)]
++    _result = [
++        ui.section_marker(strings.ibis_backend_section_name, has_content=dlt_pipeline is not None)
++    ]
+     _result.extend(
+         ui.build_page_header(
+             dlt_pipeline,
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard_styles.css b/dlt/_workspace/helpers/dashboard/dlt_dashboard_styles.css
+index 5ed9252d4..d66ef8b04 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard_styles.css
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard_styles.css
+@@ -56,22 +56,25 @@
+ 
+ /* add colors to cells */
+ 
+-/* Default: all sections get purple border and background */
+-#App .marimo-cell .output-area {
++/* Default: all sections that have content get purple border and background */
++#App .marimo-cell .output-area:has(.section-marker.has-content) {
+   border: 1px dashed var(--dlt-color-purple);
+   background-color: var(--dlt-color-purple-background);
+ }
+ 
+-/* All cells with section markers get margin-top */
+-#App .marimo-cell .output-area:has(.section-marker) {
++
++/* All cells with section markers and have content get margin-top */
++#App .marimo-cell .output-area:has(.section-marker.has-content) {
+   margin-top: 0.5rem;
+ }
+ 
+-/* Aqua sections - identified by section name in strings.py */
+-#App .marimo-cell .output-area:has([data-section="home_section"]),
+-#App .marimo-cell .output-area:has([data-section="schema_section"]),
+-#App .marimo-cell .output-area:has([data-section="state_section"]),
+-#App .marimo-cell .output-area:has([data-section="loads_section"]) {
++
++/* Aqua sections - identified by section name in strings.py and the availability of content */
++#App .marimo-cell .output-area:has([data-section="workspace_home"].has-content),
++#App .marimo-cell .output-area:has([data-section="home_section"].has-content),
++#App .marimo-cell .output-area:has([data-section="schema_section"].has-content),
++#App .marimo-cell .output-area:has([data-section="state_section"].has-content),
++#App .marimo-cell .output-area:has([data-section="loads_section"].has-content) {
+   background-color: var(--dlt-color-aqua-background);
+   border: 1px dashed var(--dlt-color-aqua);
+ }
+diff --git a/dlt/_workspace/helpers/dashboard/strings.py b/dlt/_workspace/helpers/dashboard/strings.py
+index 8e32313f7..7cff45249 100644
+--- a/dlt/_workspace/helpers/dashboard/strings.py
++++ b/dlt/_workspace/helpers/dashboard/strings.py
+@@ -18,6 +18,7 @@ _credentials_info = (
+ #
+ # App general
+ #
++app_section_name = "workspace_home"
+ app_title = """
+ # Welcome to the dltHub workspace dashboard...
+ """
+diff --git a/dlt/_workspace/helpers/dashboard/ui_elements.py b/dlt/_workspace/helpers/dashboard/ui_elements.py
+index 62049e02c..926100ed4 100644
+--- a/dlt/_workspace/helpers/dashboard/ui_elements.py
++++ b/dlt/_workspace/helpers/dashboard/ui_elements.py
+@@ -78,6 +78,18 @@ def build_page_header(
+     ]
+ 
+ 
+-def section_marker(section_name: str) -> mo.Html:
+-    """Create an invisible marker element to identify sections for CSS styling."""
+-    return mo.Html(f'<div class="section-marker" data-section="{section_name}" hidden"></div>')
++def section_marker(section_name: str, has_content: bool = False) -> mo.Html:
++    """Create an invisible marker element to identify sections for CSS styling.
++
++    Args:
++        section_name: Name identifier for the section (e.g., "home_section", "schema_section")
++        has_content: If True, adds 'has-content' class to enable CSS styling (borders, backgrounds).
++                     Should be True only when the section has actual content and is displayed.
++
++    Returns:
++        Hidden HTML div element with section marker classes for CSS targeting.
++    """
++    content_class = "has-content" if has_content else ""
++    return mo.Html(
++        f'<div class="section-marker {content_class}" data-section="{section_name}" hidden"></div>'
++    )
+
+
+===== COMMIT aed34a06 =====
+
+
+commit aed34a065
+Author: anuunchin
+Date: 2025-12-05
+
+    extensive .gitignore (#3437)
+
+diff --git a/dlt/_workspace/_templates/_single_file_templates/.gitignore b/dlt/_workspace/_templates/_single_file_templates/.gitignore
+index f58b951bf..d773f1a49 100644
+--- a/dlt/_workspace/_templates/_single_file_templates/.gitignore
++++ b/dlt/_workspace/_templates/_single_file_templates/.gitignore
+@@ -1,4 +1,5 @@
+-# ignore secrets, virtual environments and typical python compilation artifacts
++# dlt-specific ignores
++# secrets and credentials
+ secrets.toml
+ *.secrets.toml
+ # ignore pinned profile name
+@@ -7,11 +8,199 @@ secrets.toml
+ .dlt/.var
+ # ignore default local dir (loaded data)
+ _local
+-# ignore basic python artifacts
+-.env
+-**/__pycache__/
+-**/*.py[cod]
+-**/*$py.class
+ # ignore duckdb
+ *.duckdb
+-*.wal
+\ No newline at end of file
++*.wal 
++
++# Git repository
++.git/
++
++# Byte-compiled / optimized / DLL files
++__pycache__/
++*.py[codz]
++*$py.class
++
++# C extensions
++*.so
++
++# Distribution / packaging
++.Python
++build/
++develop-eggs/
++dist/
++downloads/
++eggs/
++.eggs/
++lib/
++lib64/
++parts/
++sdist/
++var/
++wheels/
++share/python-wheels/
++*.egg-info/
++.installed.cfg
++*.egg
++MANIFEST
++
++# PyInstaller
++#   Usually these files are written by a python script from a template
++#   before PyInstaller builds the exe, so as to inject date/other infos into it.
++*.manifest
++*.spec
++
++# Installer logs
++pip-log.txt
++pip-delete-this-directory.txt
++
++# Unit test / coverage reports
++htmlcov/
++.tox/
++.nox/
++.coverage
++.coverage.*
++.cache
++nosetests.xml
++coverage.xml
++*.cover
++*.py.cover
++.hypothesis/
++.pytest_cache/
++cover/
++
++# Translations
++*.mo
++*.pot
++
++# Django stuff:
++*.log
++local_settings.py
++db.sqlite3
++db.sqlite3-journal
++
++# Flask stuff:
++instance/
++.webassets-cache
++
++# Scrapy stuff:
++.scrapy
++
++# Sphinx documentation
++docs/_build/
++
++# PyBuilder
++.pybuilder/
++target/
++
++# Jupyter Notebook
++.ipynb_checkpoints
++
++# IPython
++profile_default/
++ipython_config.py
++
++# pyenv
++.python-version
++
++# pipenv
++Pipfile.lock
++
++# UV
++uv.lock
++
++# poetry
++poetry.lock
++poetry.toml
++
++# pdm
++pdm.lock
++pdm.toml
++.pdm-python
++.pdm-build/
++
++# pixi
++pixi.lock
++.pixi
++
++# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
++__pypackages__/
++
++# Celery stuff
++celerybeat-schedule
++celerybeat.pid
++
++# Redis
++*.rdb
++*.aof
++*.pid
++
++# RabbitMQ
++mnesia/
++rabbitmq/
++rabbitmq-data/
++
++# ActiveMQ
++activemq-data/
++
++# SageMath parsed files
++*.sage.py
++
++# Environments
++.env
++.envrc
++.venv
++env/
++venv/
++ENV/
++env.bak/
++venv.bak/
++
++# Spyder project settings
++.spyderproject
++.spyproject
++
++# Rope project settings
++.ropeproject
++
++# mkdocs documentation
++/site
++
++# mypy
++.mypy_cache/
++.dmypy.json
++dmypy.json
++
++# Pyre type checker
++.pyre/
++
++# pytype static type analyzer
++.pytype/
++
++# Cython debug symbols
++cython_debug/
++
++# PyCharm
++.idea/
++
++# Abstra
++.abstra/
++
++# Visual Studio Code
++.vscode/
++
++# Ruff stuff:
++.ruff_cache/
++
++# PyPI configuration file
++.pypirc
++
++# Marimo
++marimo/_static/
++marimo/_lsp/
++__marimo__/
++
++# Streamlit
++.streamlit/secrets.toml
++
++# macOS
++.DS_Store
+
+
+===== COMMIT e8d45369 =====
+
+
+commit e8d45369f
+Author: ivasio
+Date: 2025-12-04
+
+    implements run artifacts sync to a bucket using `filesystem` (#3339)
+
+diff --git a/.gitignore b/.gitignore
+index 56875ee42..1ee072ccd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -149,4 +149,4 @@ local_cache/
+ 
+ # test file for examples are generated and should not be committed
+ docs/examples/**/test*.py
+-compiled_requirements.txt
+\ No newline at end of file
++compiled_requirements.txt
+diff --git a/dlt/_workspace/_workspace_context.py b/dlt/_workspace/_workspace_context.py
+index 5fb617bb2..132365409 100644
+--- a/dlt/_workspace/_workspace_context.py
++++ b/dlt/_workspace/_workspace_context.py
+@@ -98,6 +98,14 @@ class WorkspaceRunContext(ProfilesRunContext):
+         # this also resolves workspace config if necessary
+         initialize_runtime(self.name, self.config.runtime)
+ 
++        # if on runtime, add additional tracker
++        if self.runtime_config.run_id:
++            from dlt._workspace.helpers.runtime import runtime_artifacts
++            from dlt.pipeline import trace
++
++            if runtime_artifacts not in trace.TRACKING_MODULES:
++                trace.TRACKING_MODULES.append(runtime_artifacts)
++
+     @property
+     def runtime_config(self) -> WorkspaceRuntimeConfiguration:
+         return self.config.runtime
+diff --git a/dlt/_workspace/configuration.py b/dlt/_workspace/configuration.py
+index 21560bcc7..6cfa9b8bf 100644
+--- a/dlt/_workspace/configuration.py
++++ b/dlt/_workspace/configuration.py
+@@ -33,6 +33,8 @@ class WorkspaceRuntimeConfiguration(RuntimeConfiguration):
+     invite_code: Optional[str] = None
+     """Invite code for dltHub Runtime"""
+ 
++    __section__: ClassVar[str] = "runtime"
++
+ 
+ @configspec
+ class WorkspaceConfiguration(BaseConfiguration):
+diff --git a/dlt/_workspace/deployment/package_builder.py b/dlt/_workspace/deployment/package_builder.py
+index 4bd822d99..64e033eb5 100644
+--- a/dlt/_workspace/deployment/package_builder.py
++++ b/dlt/_workspace/deployment/package_builder.py
+@@ -64,7 +64,10 @@ class PackageBuilder:
+             manifest_info.size = len(manifest_yaml)
+             tar.addfile(manifest_info, BytesIO(manifest_yaml))
+ 
+-        return digest256_tar_stream(output_stream)
++        content_hash, _ = digest256_tar_stream(
++            output_stream, filter_file_names=lambda x: x != DEFAULT_MANIFEST_FILE_NAME
++        )
++        return content_hash
+ 
+     def build_package(self, file_selector: BaseFileSelector) -> Tuple[Path, str]:
+         """Create deployment package file, return (path, content_hash)"""
+diff --git a/dlt/_workspace/helpers/dashboard/config.py b/dlt/_workspace/helpers/dashboard/config.py
+index 13d253296..c875b7a4c 100644
+--- a/dlt/_workspace/helpers/dashboard/config.py
++++ b/dlt/_workspace/helpers/dashboard/config.py
+@@ -33,6 +33,12 @@ class DashboardConfiguration(BaseConfiguration):
+     datetime_format: str = "YYYY-MM-DD HH:mm:ss Z"
+     """The format of the datetime strings"""
+ 
++    sync_from_runtime: bool = False
++    """
++    Whether to sync the pipeline states and traces from the runtime backup.
++    Needs to be run inside a dlt workspace with runtime artifacts credentials set.
++    """
++
+     # this is needed for using this as a param in the cache
+     def __hash__(self) -> int:
+         return hash(
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index 8af954083..aa9bcaee3 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -999,6 +999,14 @@ def utils_discover_pipelines(
+     Discovers local pipelines and returns a multiselect widget to select one of the pipelines
+     """
+ 
++    # sync from runtime if enabled
++    _tmp_config = utils.resolve_dashboard_config(None)
++    if _tmp_config.sync_from_runtime:
++        from dlt._workspace.helpers.runtime.runtime_artifacts import sync_from_runtime
++
++        with mo.status.spinner(title="Syncing pipeline list from runtime"):
++            sync_from_runtime()
++
+     _run_context = dlt.current.run_context()
+     if (
+         isinstance(_run_context, ProfilesRunContext)
+@@ -1011,7 +1019,7 @@ def utils_discover_pipelines(
+     dlt_all_pipelines: List[Dict[str, Any]] = []
+     dlt_pipelines_dir, dlt_all_pipelines = utils.get_local_pipelines(
+         mo_cli_arg_pipelines_dir,
+-        addtional_pipelines=[mo_cli_arg_pipeline, mo_query_var_pipeline_name],
++        additional_pipelines=[mo_cli_arg_pipeline, mo_query_var_pipeline_name],
+     )
+ 
+     dlt_pipeline_select: mo.ui.multiselect = mo.ui.multiselect(
+diff --git a/dlt/_workspace/helpers/dashboard/utils.py b/dlt/_workspace/helpers/dashboard/utils.py
+index 7f92de098..98b5fec40 100644
+--- a/dlt/_workspace/helpers/dashboard/utils.py
++++ b/dlt/_workspace/helpers/dashboard/utils.py
+@@ -9,7 +9,6 @@ from typing import (
+     List,
+     Mapping,
+     Optional,
+-    Set,
+     Tuple,
+     Union,
+     cast,
+@@ -27,6 +26,7 @@ import dlt
+ import marimo as mo
+ import pyarrow
+ import traceback
++import datetime  # noqa: I251
+ 
+ from dlt.common.configuration import resolve_configuration
+ from dlt.common.configuration.specs import known_sections
+@@ -44,6 +44,7 @@ from dlt.common.storages.configuration import WithLocalFiles
+ from dlt.common.configuration.exceptions import ConfigFieldMissingException
+ from dlt.common.typing import DictStrAny, TypedDict
+ from dlt.common.utils import map_nested_keys_in_place
++from dlt.common.pipeline import get_dlt_pipelines_dir
+ 
+ from dlt._workspace.helpers.dashboard import ui_elements as ui
+ from dlt._workspace.helpers.dashboard.config import DashboardConfiguration
+@@ -116,7 +117,7 @@ def get_pipeline_last_run(pipeline_name: str, pipelines_dir: str) -> float:
+ 
+ 
+ def get_local_pipelines(
+-    pipelines_dir: str = None, sort_by_trace: bool = True, addtional_pipelines: List[str] = None
++    pipelines_dir: str = None, sort_by_trace: bool = True, additional_pipelines: List[str] = None
+ ) -> Tuple[str, List[Dict[str, Any]]]:
+     """Get the local pipelines directory and the list of pipeline names in it.
+ 
+@@ -134,8 +135,8 @@ def get_local_pipelines(
+     except Exception:
+         pipelines = []
+ 
+-    if addtional_pipelines:
+-        for pipeline in addtional_pipelines:
++    if additional_pipelines:
++        for pipeline in additional_pipelines:
+             if pipeline and pipeline not in pipelines:
+                 pipelines.append(pipeline)
+ 
+@@ -215,7 +216,11 @@ def pipeline_details(
+         credentials = "Could not resolve credentials."
+ 
+     # find the pipeline in all_pipelines and get the timestamp
+-    pipeline_timestamp = get_pipeline_last_run(pipeline.pipeline_name, pipeline.pipelines_dir)
++    trace = pipeline.last_trace
++
++    last_executed = "No trace found"
++    if trace and hasattr(trace, "started_at"):
++        last_executed = _date_from_timestamp_with_ago(c, trace.started_at)
+ 
+     details_dict = {
+         "pipeline_name": pipeline.pipeline_name,
+@@ -224,7 +229,7 @@ def pipeline_details(
+             if pipeline.destination
+             else "No destination set"
+         ),
+-        "last executed": _date_from_timestamp_with_ago(c, pipeline_timestamp),
++        "last executed": last_executed,
+         "credentials": credentials,
+         "dataset_name": pipeline.dataset_name,
+         "working_dir": pipeline.working_dir,
+@@ -663,7 +668,7 @@ def build_pipeline_link_list(
+ ) -> str:
+     """Build a list of links to the pipeline."""
+     if not pipelines:
+-        return "No local pipelines found."
++        return "No pipelines found."
+ 
+     count = 0
+     link_list: str = ""
+@@ -746,12 +751,15 @@ def build_exception_section(p: dlt.Pipeline) -> List[Any]:
+ 
+ 
+ def _date_from_timestamp_with_ago(
+-    config: DashboardConfiguration, timestamp: Union[int, float]
++    config: DashboardConfiguration, timestamp: Union[int, float, datetime.datetime]
+ ) -> str:
+     """Return a date with ago section"""
+     if not timestamp or timestamp == 0:
+         return "never"
+-    p_ts = pendulum.from_timestamp(timestamp)
++    if isinstance(timestamp, datetime.datetime):
++        p_ts = pendulum.instance(timestamp)
++    else:
++        p_ts = pendulum.from_timestamp(timestamp)
+     time_formatted = p_ts.format(config.datetime_format)
+     ago = p_ts.diff_for_humans()
+     return f"{ago} ({time_formatted})"
+diff --git a/dlt/_workspace/helpers/runtime/__init__.py b/dlt/_workspace/helpers/runtime/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/dlt/_workspace/helpers/runtime/runtime_artifacts.py b/dlt/_workspace/helpers/runtime/runtime_artifacts.py
+new file mode 100644
+index 000000000..dd3ba6e31
+--- /dev/null
++++ b/dlt/_workspace/helpers/runtime/runtime_artifacts.py
+@@ -0,0 +1,191 @@
++"""Implements SupportsTracking"""
++from typing import Any, ClassVar, List, Optional, Tuple, Union
++import fsspec
++import pickle
++import os
++
++import dlt
++from dlt.common import logger
++from dlt.common.configuration.exceptions import ConfigurationException
++from dlt.common.configuration.resolve import resolve_configuration
++from dlt.common.configuration.specs.base_configuration import BaseConfiguration, configspec
++from dlt.common.storages.configuration import FilesystemConfiguration
++from dlt.common.storages.fsspec_filesystem import FileItemDict, fsspec_from_config, glob_files
++from dlt.common.versioned_state import json_encode_state
++
++from dlt.pipeline.trace import PipelineTrace, PipelineStepTrace, TPipelineStep, SupportsPipeline
++from dlt._workspace.run_context import DEFAULT_WORKSPACE_WORKING_FOLDER
++from dlt._workspace._workspace_context import WorkspaceRunContext
++
++
++@configspec
++class RuntimeArtifactsConfiguration(BaseConfiguration):
++    artifacts: FilesystemConfiguration = None
++
++
++def sync_from_runtime() -> None:
++    """Sync the pipeline states and traces from the runtime backup, recursively."""
++    from dlt._workspace.helpers.runtime.runtime_artifacts import _get_runtime_artifacts_fs
++
++    def sync_dir(fs: fsspec.AbstractFileSystem, src_root: str, dst_root: str) -> None:
++        """Recursively sync src_root on fs into dst_root locally, always using fs.walk."""
++
++        os.makedirs(dst_root, exist_ok=True)
++
++        for file_dict in glob_files(fs, src_root):
++            file_item = FileItemDict(file_dict, fs)
++
++            relative_dir = os.path.dirname(file_dict["relative_path"])
++            local_dir = dst_root if relative_dir == "." else os.path.join(dst_root, relative_dir)
++            os.makedirs(local_dir, exist_ok=True)
++
++            local_file = os.path.join(dst_root, file_dict["relative_path"])
++
++            logger.info(f"Restoring artifact {local_file}")
++            with open(local_file, "wb") as lf:
++                lf.write(file_item.read_bytes())
++
++            ts = file_dict["modification_date"].timestamp()
++            os.utime(local_file, (ts, ts))  # (atime, mtime)
++
++    context = dlt.current.run_context()
++
++    if not context.runtime_config.run_id:
++        return
++
++    if not isinstance(context, WorkspaceRunContext):
++        return
++
++    fs, config = _get_runtime_artifacts_fs(section="sync")
++    if not fs:
++        return
++
++    # TODO: there's no good way to get this value on sync.
++    data_dir_root = os.path.join(
++        context.settings_dir, DEFAULT_WORKSPACE_WORKING_FOLDER
++    )  # the local .var folder
++
++    # Just sync the whole base folder into the local pipelines dir
++    sync_dir(fs, config.bucket_url, data_dir_root)
++
++
++def _get_runtime_artifacts_fs(
++    section: str,
++) -> Tuple[fsspec.AbstractFileSystem, FilesystemConfiguration]:
++    try:
++        config = resolve_configuration(RuntimeArtifactsConfiguration(), sections=(section,))
++    except ConfigurationException:
++        logger.info(f"No artifact storage credentials found for {section}")
++        return None, None
++
++    return fsspec_from_config(config.artifacts)[0], config.artifacts
++
++
++def _write_to_bucket(
++    fs: fsspec.AbstractFileSystem,
++    bucket_url: str,
++    pipeline_name: str,
++    paths: List[str],
++    data: Union[str, bytes],
++    mode: str = "w",
++) -> None:
++    # write to bucket using the config, same object may be written to multiple paths
++
++    for path in paths:
++        with fs.open(f"{bucket_url}/{pipeline_name}/{path}", mode=mode) as f:
++            f.write(data)
++
++
++def _send_trace_to_bucket(
++    fs: fsspec.AbstractFileSystem, bucket_url: str, trace: PipelineTrace, pipeline: SupportsPipeline
++) -> None:
++    """
++    Send the full trace pickled to the runtime bucket
++    """
++    pickled_trace = pickle.dumps(trace)
++    _write_to_bucket(
++        fs,
++        bucket_url,
++        pipeline.pipeline_name,
++        [
++            "trace.pickle",
++        ],  # save current and by start time
++        pickled_trace,
++        mode="wb",
++    )
++
++
++def _send_state_to_bucket(
++    fs: fsspec.AbstractFileSystem, bucket_url: str, pipeline: SupportsPipeline
++) -> None:
++    encoded_state = json_encode_state(pipeline.state)
++    _write_to_bucket(
++        fs,
++        bucket_url,
++        pipeline.pipeline_name,
++        [
++            "state.json",
++        ],  # save current and by start time
++        encoded_state,
++        mode="w",
++    )
++
++
++def _send_schemas_to_bucket(
++    fs: fsspec.AbstractFileSystem, bucket_url: str, pipeline: SupportsPipeline
++) -> None:
++    schema_dir = os.path.join(pipeline.working_dir, "schemas")
++    for schema_file in os.listdir(schema_dir):
++        _write_to_bucket(
++            fs,
++            bucket_url,
++            pipeline.pipeline_name,
++            [f"schemas/{schema_file}"],
++            open(os.path.join(schema_dir, schema_file), "rb").read(),
++            mode="wb",
++        )
++
++
++def on_start_trace(trace: PipelineTrace, step: TPipelineStep, pipeline: SupportsPipeline) -> None:
++    pass
++
++
++def on_start_trace_step(
++    trace: PipelineTrace, step: TPipelineStep, pipeline: SupportsPipeline
++) -> None:
++    pass
++
++
++def on_end_trace_step(
++    trace: PipelineTrace,
++    step: PipelineStepTrace,
++    pipeline: SupportsPipeline,
++    step_info: Any,
++    send_state: bool,
++) -> None:
++    pass
++
++
++def on_end_trace(trace: PipelineTrace, pipeline: SupportsPipeline, send_state: bool) -> None:
++    # skip if runtime not running
++    if pipeline.run_context.runtime_config.run_id is None:
++        return
++
++    fs, config = _get_runtime_artifacts_fs(section="send")
++    if fs:
++        logger.info(
++            f"Sending run artifacts from pipeline `{pipeline.pipeline_name}` to"
++            f" `{config.bucket_url}`"
++        )
++        try:
++            _send_trace_to_bucket(fs, config.bucket_url, trace, pipeline)
++            _send_state_to_bucket(fs, config.bucket_url, pipeline)
++            _send_schemas_to_bucket(fs, config.bucket_url, pipeline)
++        except Exception:
++            logger.exception(
++                f"Sending run artifacts from pipeline `{pipeline.pipeline_name}` to"
++                f" `{config.bucket_url}`"
++            )
++            raise
++        else:
++            logger.info("Pipeline results reported to runtime")
+diff --git a/dlt/common/configuration/specs/runtime_configuration.py b/dlt/common/configuration/specs/runtime_configuration.py
+index 068a45aa6..e8b52abfd 100644
+--- a/dlt/common/configuration/specs/runtime_configuration.py
++++ b/dlt/common/configuration/specs/runtime_configuration.py
+@@ -33,6 +33,7 @@ class RuntimeConfiguration(BaseConfiguration):
+     config_files_storage_path: str = "/run/config/"
+     """Platform connection"""
+     dlthub_dsn: Optional[TSecretStrValue] = None
++    run_id: Optional[str] = None
+     http_show_error_body: bool = False
+     """Include HTTP response body in raised exceptions/logs. Default is False"""
+     http_max_error_body_length: int = 8192
+diff --git a/dlt/common/utils.py b/dlt/common/utils.py
+index 21b1cc7a7..5f0783ca2 100644
+--- a/dlt/common/utils.py
++++ b/dlt/common/utils.py
+@@ -1,5 +1,5 @@
+ import re
+-from typing import TYPE_CHECKING, Any, BinaryIO, Literal
++from typing import TYPE_CHECKING, Any, BinaryIO, IO
+ import os
+ from pathlib import Path
+ import sys
+@@ -131,33 +131,50 @@ def digest256_file_stream(stream: BinaryIO, chunk_size: int = 4096) -> str:
+     return base64.b64encode(digest).decode("ascii")
+ 
+ 
+-def digest256_tar_stream(stream: BinaryIO, chunk_size: int = 8192) -> str:
+-    """Returns a base64 encoded sha3_256 hash of tar archive contents.
++def digest256_tar_stream(
++    stream: IO[bytes],
++    filter_file_names: Callable[[str], bool] = lambda x: True,
++    chunk_size: int = 8192,
++) -> Tuple[str, List[str]]:
++    """Calculates hash and collects file names from tar archive in a single pass.
+ 
+-    Hashes only filenames and file contents, ignoring timestamps and other metadata.
+-    Members are sorted by name before hashing, so tar member order doesn't affect
+-    the hash.
++    Hashes only file names and file contents of filtered members, ignoring timestamps
++    and other tar metadata. Members are sorted by name before hashing for consistency.
++    Operates entirely in-memory to prevent leakage of sensitive data.
+ 
+-    Note: This function operates entirely in-memory using tar.extractfile() which reads
+-    from the archive stream. No files are written to disk, preventing leakage of sensitive
+-    data that may be contained in the archive.
++    Args:
++        stream: Binary stream containing the tar archive
++        filter_file_names: Callable that returns True for members to include in hash
++            and file names list. Default includes all members. Use this to exclude
++            metadata files (e.g., manifest.yaml) from the hash calculation.
++        chunk_size: Size of chunks to read when hashing file contents. Default 8192.
++
++    Returns:
++        tuple: (content_hash, file_names)
+     """
+     stream.seek(0)
+     hash_obj = hashlib.sha3_256()
++    file_names = []
+ 
+     with tarfile.open(fileobj=stream, mode="r:*") as tar:
+         members = sorted(tar.getmembers(), key=lambda m: m.name)
+ 
+         for member in members:
++            if not filter_file_names(member.name):
++                continue
++
+             hash_obj.update(member.name.encode())
+             if member.isfile():
++                file_names.append(member.name)
+                 f = tar.extractfile(member)
+                 if f:
+                     while chunk := f.read(chunk_size):
+                         hash_obj.update(chunk)
+ 
+     digest = hash_obj.digest()
+-    return base64.b64encode(digest).decode("ascii")
++    content_hash = base64.b64encode(digest).decode("ascii")
++
++    return content_hash, file_names
+ 
+ 
+ def str2bool(v: str) -> bool:
+diff --git a/docs/uv.lock b/docs/uv.lock
+index a1822e37c..b67554a4a 100644
+--- a/docs/uv.lock
++++ b/docs/uv.lock
+@@ -822,7 +822,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.19.0"
++version = "1.19.1"
+ source = { editable = "../" }
+ dependencies = [
+     { name = "click" },
+@@ -983,7 +983,7 @@ requires-dist = [
+     { name = "sqlalchemy", marker = "extra == 'pyiceberg'", specifier = ">=1.4" },
+     { name = "sqlalchemy", marker = "extra == 'sql-database'", specifier = ">=1.4" },
+     { name = "sqlalchemy", marker = "extra == 'sqlalchemy'", specifier = ">=1.4" },
+-    { name = "sqlglot", specifier = ">=25.4.0" },
++    { name = "sqlglot", specifier = ">=25.4.0,!=28.1" },
+     { name = "tantivy", marker = "extra == 'lancedb'", specifier = ">=0.22.0" },
+     { name = "tenacity", specifier = ">=8.0.2" },
+     { name = "tomlkit", specifier = ">=0.11.3" },
+diff --git a/tests/common/configuration/test_configuration.py b/tests/common/configuration/test_configuration.py
+index d1748d58a..86138c87a 100644
+--- a/tests/common/configuration/test_configuration.py
++++ b/tests/common/configuration/test_configuration.py
+@@ -753,6 +753,7 @@ def test_configuration_is_mutable_mapping(environment: Any, env_provider: Config
+         "request_max_retry_delay": 300,
+         "config_files_storage_path": "storage",
+         "dlthub_dsn": None,
++        "run_id": None,
+         "http_show_error_body": False,
+         "http_max_error_body_length": 8192,
+         "secret_value": None,
+diff --git a/tests/workspace/test_workspace_context.py b/tests/workspace/test_workspace_context.py
+index 029c862d1..43fd4752c 100644
+--- a/tests/workspace/test_workspace_context.py
++++ b/tests/workspace/test_workspace_context.py
+@@ -1,11 +1,13 @@
+ import os
+ import pytest
+ import pickle
++import tempfile
+ 
+ import dlt
+ from dlt._workspace._workspace_context import WorkspaceRunContext, switch_context
+ from dlt._workspace.cli.utils import check_delete_local_data, delete_local_data
+ from dlt._workspace.exceptions import WorkspaceRunContextNotAvailable
++from dlt._workspace.helpers.runtime.runtime_artifacts import sync_from_runtime
+ from dlt._workspace.profile import DEFAULT_PROFILE, read_profile_pin, save_profile_pin
+ from dlt._workspace.run_context import (
+     DEFAULT_LOCAL_FOLDER,
+@@ -16,7 +18,9 @@ from dlt._workspace.cli.echo import always_choose
+ from dlt.common.runtime.exceptions import RunContextNotAvailable
+ from dlt.common.runtime.run_context import DOT_DLT, RunContext, global_dir
+ 
++from dlt.common.storages.file_storage import FileStorage
+ from tests.pipeline.utils import assert_table_counts
++from tests.utils import clean_test_storage
+ from tests.workspace.utils import isolated_workspace
+ 
+ 
+@@ -146,6 +150,43 @@ def test_workspace_pipeline() -> None:
+         assert os.path.isdir(os.path.join(ctx.local_dir, "prod_ducklake.files"))
+ 
+ 
++def test_workspace_send_artifacts() -> None:
++    pytest.importorskip("duckdb", minversion="1.3.2")
++
++    # create a random temp directory for the test bucket
++    with tempfile.TemporaryDirectory() as temp_bucket_dir:
++        bucket_base = os.path.join(temp_bucket_dir, "local_bucket", "workspace_id")
++        send_bucket_url = os.path.join(bucket_base, "tests", "pipelines")
++
++        # mock run id to enable artifact storage
++        os.environ["RUNTIME__RUN_ID"] = "uniq_run_id"
++        # emit runtime filesystem info
++        os.environ["SEND__ARTIFACTS__BUCKET_URL"] = send_bucket_url
++        # auto create dirs
++        os.environ["ARTIFACTS__KWARGS"] = '{"auto_mkdir": true}'
++
++        with isolated_workspace("pipelines", profile="tests") as ctx:
++            # `ducklake_pipeline` configured in config.toml
++            pipeline = dlt.pipeline(pipeline_name="ducklake_pipeline")
++            pipeline.run([{"foo": 1}, {"foo": 2}], table_name="table_foo")
++
++            print(ctx.run_dir)
++
++        # delete the whole workspace
++        clean_test_storage()
++
++        with isolated_workspace("pipelines", profile="tests") as ctx:
++            # now restore pipeline from bucket
++            os.environ["SYNC__ARTIFACTS__BUCKET_URL"] = bucket_base
++            sync_from_runtime()
++            # now pipeline sees restored state
++            pipeline = dlt.pipeline(pipeline_name="ducklake_pipeline")
++            assert pipeline.first_run is False
++            assert pipeline.default_schema_name == "ducklake"
++            assert pipeline.default_schema.tables["table_foo"] is not None
++            assert pipeline.last_trace is not None
++
++
+ def assert_dev_config() -> None:
+     # check profile toml providers
+     assert dlt.config["config_val"] == "config.toml"
+
+
+===== COMMIT 28557bc8 =====
+
+
+commit 28557bc82
+Author: ivasio
+Date: 2025-12-04
+
+    Add config value for Runtime CLI invite code (#3432)
+
+diff --git a/dlt/_workspace/configuration.py b/dlt/_workspace/configuration.py
+index 11645762c..21560bcc7 100644
+--- a/dlt/_workspace/configuration.py
++++ b/dlt/_workspace/configuration.py
+@@ -26,10 +26,12 @@ class WorkspaceRuntimeConfiguration(RuntimeConfiguration):
+     """Id of the remote workspace that local one should be connected to"""
+     auth_token: Optional[TSecretStrValue] = None
+     """JWT token for Runtime API"""
+-    auth_base_url: Optional[str] = None
++    auth_base_url: Optional[str] = "https://dlthub.app/api/auth"
+     """Base URL for the dltHub Runtime authentication API"""
+-    api_base_url: Optional[str] = None
++    api_base_url: Optional[str] = "https://dlthub.app/api/api"
+     """Base URL for the dltHub Runtime API"""
++    invite_code: Optional[str] = None
++    """Invite code for dltHub Runtime"""
+ 
+ 
+ @configspec
+
+
+===== COMMIT 044ea90d =====
+
+
+commit 044ea90d0
+Author: ivasio
+Date: 2025-12-03
+
+    add runtime CLI configs in WorkspaceRuntimeConfiguration (#3424)
+
+diff --git a/dlt/_workspace/configuration.py b/dlt/_workspace/configuration.py
+index 52726711a..11645762c 100644
+--- a/dlt/_workspace/configuration.py
++++ b/dlt/_workspace/configuration.py
+@@ -2,6 +2,7 @@ from typing import ClassVar, Optional, Sequence
+ from dlt.common.configuration.specs import known_sections
+ from dlt.common.configuration.specs.base_configuration import BaseConfiguration, configspec
+ from dlt.common.configuration.specs.runtime_configuration import RuntimeConfiguration
++from dlt.common.typing import TSecretStrValue
+ 
+ 
+ @configspec
+@@ -21,8 +22,14 @@ class WorkspaceSettings(BaseConfiguration):
+ class WorkspaceRuntimeConfiguration(RuntimeConfiguration):
+     """Extends runtime configuration with dlthub runtime"""
+ 
+-    # TODO: connect workspace to runtime here
+-    # TODO: optionally define scripts and other runtime settings
++    workspace_id: Optional[str] = None
++    """Id of the remote workspace that local one should be connected to"""
++    auth_token: Optional[TSecretStrValue] = None
++    """JWT token for Runtime API"""
++    auth_base_url: Optional[str] = None
++    """Base URL for the dltHub Runtime authentication API"""
++    api_base_url: Optional[str] = None
++    """Base URL for the dltHub Runtime API"""
+ 
+ 
+ @configspec
+
+
+===== COMMIT 86081970 =====
+
+
+commit 860819702
+Author: ivasio
+Date: 2025-12-03
+
+    Fix: reset config in PluggableRunContext.reload_providers (#3409)
+
+diff --git a/.github/workflows/test_hub.yml b/.github/workflows/test_hub.yml
+index d91e90a70..555c3fb79 100644
+--- a/.github/workflows/test_hub.yml
++++ b/.github/workflows/test_hub.yml
+@@ -81,7 +81,7 @@ jobs:
+         run: make dev
+ 
+       - name: Install dlthub
+-        run: uv run pip install --upgrade --force-reinstall --no-cache-dir ${{ matrix.dlthub_dep }}
++        run: uv run pip install --upgrade --force-reinstall --pre --no-cache-dir ${{ matrix.dlthub_dep }}
+ 
+       - name: Run tests
+         run: pytest tests/hub
+diff --git a/dlt/_workspace/_workspace_context.py b/dlt/_workspace/_workspace_context.py
+index 0e22c1abf..5fb617bb2 100644
+--- a/dlt/_workspace/_workspace_context.py
++++ b/dlt/_workspace/_workspace_context.py
+@@ -100,7 +100,7 @@ class WorkspaceRunContext(ProfilesRunContext):
+ 
+     @property
+     def runtime_config(self) -> WorkspaceRuntimeConfiguration:
+-        return self._config.runtime
++        return self.config.runtime
+ 
+     @property
+     def config(self) -> WorkspaceConfiguration:
+@@ -162,6 +162,11 @@ class WorkspaceRunContext(ProfilesRunContext):
+     def unplug(self) -> None:
+         pass
+ 
++    def reset_config(self) -> None:
++        # Drop resolved configuration to force re-resolve with refreshed providers
++        self._config = None
++        # no need to initialize the _config anew as it's done in .config property
++
+     # SupportsProfilesOnContext
+ 
+     @property
+diff --git a/dlt/common/configuration/specs/pluggable_run_context.py b/dlt/common/configuration/specs/pluggable_run_context.py
+index 4388517a8..56a5233e7 100644
+--- a/dlt/common/configuration/specs/pluggable_run_context.py
++++ b/dlt/common/configuration/specs/pluggable_run_context.py
+@@ -137,6 +137,10 @@ class RunContextBase(ABC):
+                 f"`{run_dir=:}` doesn't belong to module `{m_.__file__}` which seems unrelated."
+             )
+ 
++    @abstractmethod
++    def reset_config(self) -> None:
++        """Hook for contexts that store resolved configuration to reset it"""
++
+ 
+ class ProfilesRunContext(RunContextBase):
+     """Adds profile support on run context. Note: runtime checkable protocols are slow on isinstance"""
+@@ -206,7 +210,10 @@ class PluggableRunContext(ContainerInjectableContext):
+ 
+     def reload_providers(self) -> None:
+         self.providers = ConfigProvidersContainer(self.context.initial_providers())
++        # Re-add extras and re-initialize runtime so changes take effect
+         self.providers.add_extras()
++        # Invalidate any cached configuration on the context so it re-resolves using new providers
++        self.context.reset_config()
+ 
+     def after_add(self) -> None:
+         super().after_add()
+diff --git a/dlt/common/runtime/run_context.py b/dlt/common/runtime/run_context.py
+index daf5b76d6..c7a09f92c 100644
+--- a/dlt/common/runtime/run_context.py
++++ b/dlt/common/runtime/run_context.py
+@@ -81,6 +81,8 @@ class RunContext(RunContextBase):
+ 
+     @property
+     def runtime_config(self) -> RuntimeConfiguration:
++        if self._runtime_config is None:
++            self.initialize_runtime()
+         return self._runtime_config
+ 
+     @property
+@@ -114,6 +116,9 @@ class RunContext(RunContextBase):
+     def unplug(self) -> None:
+         pass
+ 
++    def reset_config(self) -> None:
++        self._runtime_config = None
++
+     @property
+     def name(self) -> str:
+         return "dlt"
+diff --git a/dlt/helpers/ibis.py b/dlt/helpers/ibis.py
+index 6431724fc..c2a731eb7 100644
+--- a/dlt/helpers/ibis.py
++++ b/dlt/helpers/ibis.py
+@@ -11,7 +11,6 @@ from dlt.destinations.impl.athena.configuration import AthenaClientConfiguration
+ from dlt.destinations.impl.duckdb.configuration import DuckDbClientConfiguration
+ from dlt.destinations.impl.databricks.configuration import DatabricksClientConfiguration
+ from dlt.destinations.impl.ducklake.configuration import DuckLakeClientConfiguration
+-from dlt.destinations.impl.ducklake.ducklake import DuckLakeClient
+ from dlt.destinations.impl.motherduck.configuration import MotherDuckClientConfiguration
+ from dlt.destinations.impl.postgres.configuration import PostgresClientConfiguration
+ from dlt.destinations.impl.redshift.configuration import RedshiftClientConfiguration
+@@ -74,6 +73,8 @@ def create_ibis_backend(
+             # move main connection ownership to ibis
+             con = ibis.duckdb.from_connection(client.config.credentials.conn_pool.move_conn())
+     elif issubclass(destination.spec, DuckLakeClientConfiguration):
++        from dlt.destinations.impl.ducklake.ducklake import DuckLakeClient
++
+         assert isinstance(client, DuckLakeClient)
+         # open connection but do not close it, ducklake always creates a separate connection
+         # and will not close it in destructor
+diff --git a/tests/common/runtime/test_run_context.py b/tests/common/runtime/test_run_context.py
+index 79379af34..316e6a8bd 100644
+--- a/tests/common/runtime/test_run_context.py
++++ b/tests/common/runtime/test_run_context.py
+@@ -46,11 +46,6 @@ def test_run_context() -> None:
+     # check config providers
+     assert len(run_context.initial_providers()) == 3
+ 
+-    assert ctx.context.runtime_config is None
+-    ctx.add_extras()
+-    # still not applied - must be in container
+-    assert ctx.context.runtime_config is None
+-
+     with Container().injectable_context(ctx):
+         ctx.initialize_runtime()
+     assert ctx.context.runtime_config is not None
+diff --git a/tests/load/test_lineage.py b/tests/load/test_lineage.py
+index a85c174c4..5300f1a6a 100644
+--- a/tests/load/test_lineage.py
++++ b/tests/load/test_lineage.py
+@@ -137,7 +137,10 @@ def test_various_queries(destination_config: DestinationTestConfiguration, examp
+         0
+     ] == {
+         "name": {"name": "name", "data_type": "text", "x-annotation-pii": True},
+-        "total_amount": {"name": "total_amount", "data_type": "double"},  # , "data_type": "double"},
++        "total_amount": {
++            "name": "total_amount",
++            "data_type": "double",
++        },  # , "data_type": "double"},
+     }
+ 
+     # test WITH clause
+
+
+===== COMMIT af890896 =====
+
+
+commit af8908968
+Author: ivasio
+Date: 2025-12-02
+
+    reimplement, add tests (#3418)
+

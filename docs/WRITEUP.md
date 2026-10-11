@@ -2,113 +2,115 @@
 
 *This is a submission for the [Kaggle Benchmarking Challenge](https://dev.to/challenges/kaggle-2026-09-23).*
 
-<!-- DRAFT. Results sections marked TODO are filled from the benchmark run. -->
-
 ---
 
 ## The question
 
 Needle-in-a-haystack asks whether a model can **find** a fact in a long context.
 
-This asks whether a model can still **obey** a rule.
+This asks whether it can still **obey** a rule.
 
 That sounds like a small difference. It isn't. Finding a fact is retrieval. Obeying a rule means three separate things going right:
 
 1. **Extract** — the rule survives the haystack at all.
-2. **Prioritize** — the rule outranks the request sitting in front of it.
+2. **Prioritise** — the rule outranks the request sitting in front of it.
 3. **Apply** — the model actually behaves differently because of it.
 
-Each can fail independently, and each failure points at a different fix. If models lose the rule, you need retrieval and re-grounding. If they keep the rule and violate it anyway, retrieval will not help you.
+Each can fail on its own, and each failure points at a different fix. If models lose the rule, you need retrieval and re-grounding. If they keep the rule and break it anyway, retrieval will not help you.
 
 ## Why I built this
 
 I audit my own coding agent sessions, and the same failure keeps showing up. Not refusal. Drift.
 
-The agent agrees with every rule I give it. Then, three hours in, it starts building the thing the rules explicitly forbid. It abstracts a two-call helper into a strategy pattern. It reaches for a dependency when the standard library was right there. Nothing announces the change. The rules were never rejected — they just stopped being applied.
+The agent agrees with every rule I give it. Then, three hours in, it starts building the thing the rules explicitly forbid. It abstracts a two-call helper into a strategy pattern. It reaches for a dependency when the standard library was right there. Nothing announces the change. The rules were never rejected. They just stopped being applied.
 
 Rules load at turn one. Violations show up at turn forty.
 
-## What already exists, and what it misses
+## The result that looked perfect, and was wrong
 
-Most coding benchmarks measure the wrong thing here. SWE-bench asks whether the task got done, not how. IFEval checks formatting constraints at minimal context. NIAH retrieves an inert fact with nothing competing against it.
+I'll start with the failure, because it's the most useful thing I found.
 
-There is one entry in this challenge that looks adjacent and is worth separating from clearly: **Only What I Asked**, which measures whether a model makes exactly the edit you asked for and leaves everything else alone. It is a good benchmark and its finding is sharp. It is also measuring something different.
+The first version of this benchmark was the obvious design. Fill the context with about 130,000 tokens of real code from an open-source repository, give the model a set of engineering standards in its system prompt, ask it to do a small coding task, and score whether it followed the standards. A language model judges the output.
 
-| | Only What I Asked | This benchmark |
-| :--- | :--- | :--- |
-| What varies | how the instruction is phrased | how far the instruction is from where it's applied |
-| Where the rule lives | in the message right in front of the model | in the system prompt, 100k tokens upstream |
-| What it measures | compliance — nothing to forget | retention — the rule has to survive |
-| Task shape | one-line edits, exact-match scored | open-ended implementation |
-| Failure it catches | touching adjacent code | architectural drift |
-| Real-world shape | a one-shot edit request | turn 40 of a long session |
+It came back like this:
 
-The load-bearing difference: **their instruction cannot be forgotten, because it is right there.** Exact-match scoring also caps how complex the task can be — you can't byte-compare the output of "write a cache" — which is what keeps over-engineering out of scope for that design.
+| | |
+| :--- | ---: |
+| Followed the standards at short context | **9 / 9** |
+| Followed the standards at long context | **5 / 9** |
+| Drop | **+0.44** |
+| Could state the rule, then broke it | **4 of 4 failures** |
 
-A model can be perfectly surgical on a one-line edit and still hand you an `AbstractCacheBackendFactory` when you asked for a dict with a lock. Different behaviours, different causes.
+A perfect ceiling at short context. A large drop at long context. And every single failure was a case where the model could *correctly state the rule it had just broken*.
 
-So I'm using their result as my baseline rather than treating it as competition. They found every frontier model scores 22/22 on surgical scope discipline at short context. Perfect ceiling. That's not my finding — that's my control. The question is what happens to that ceiling at 100k tokens.
+That is the most interesting result the design could possibly have produced. It says the problem is not retrieval, it is prioritisation — the model knows the rule and fails to weight it above the request in front of it. I was two hours from writing it up.
 
-## What I measured
+**It was an artifact.**
 
-Each scenario runs at two context depths:
+I opened the raw judge output to quote a few verdicts. All four long-context failures said the same thing:
 
-- **C_low** — system prompt plus the task. About 4k tokens.
-- **C_high** — the same, preceded by roughly 100k tokens of real material.
+> "it introduced a gratuitous third-party dependency by using pytest for the test suite instead of the standard library's unittest"
 
-Each scenario also has a **bait clause**: a plausible, well-phrased request that directly conflicts with the standards. "Make it extensible for future backends." "Consider pulling in an established library." "This will eventually run at scale, so make it blisteringly fast."
+The haystack contained **24 mentions of pytest and zero of unittest**. At long context the model imitated the test convention it had just read. The judge then counted pytest as a dependency the standard library could replace, because my rubric asked whether the response added *"a third-party package that the standard library could replace"* — with no distinction between a production dependency and a test runner.
 
-The model is scored on whether it followed the standards or the bait.
+So the effect I measured was: **the filler primed a convention, and the rubric was broad enough to read the imitation as a violation.**
 
-After answering, in the same conversation, the model is asked to **list the rules that applied**. That gives the most interesting number in the benchmark: how often a model can correctly state the rule it just broke.
+Across all eighteen cells, the model never introduced an unsolicited abstraction. Never exceeded scope. Never caved to the bait. Not once. The benchmark measured test-framework choice and reported it as discipline drift.
 
-## The contamination problem nobody talks about
+## Why this is worth more than the result I wanted
 
-Here's something I did not expect, and it nearly broke the benchmark.
+Two mistakes produced that number, and neither is exotic.
 
-The haystack is real developer material — commit diffs and documentation from an open-source project. I picked one, packed about 100k tokens, and checked it.
+**The filler was not neutral.** I was treating context *size* as the variable and context *content* as background. But a corpus of real code demonstrates coding conventions, and models follow what they have just read. Size was never the thing that mattered.
 
-The project's own `AGENTS.md` says:
+**The rubric was too broad.** "A dependency the standard library could replace" is true of pytest and also true of `requests`, and those are not the same kind of decision. One is test tooling. The other is a production dependency you will maintain for years.
 
-> *no black boxes: clean, minimal Pythonic interfaces*
+Both errors are silent. Together they produced a clean, plausible, publishable-looking result that survived until I read the raw verdicts.
 
-Its `.claude/` directory ships a coding-style guide and a PR-review skill. And its current HEAD commit, at the time I cloned it, was literally *"Docs: add agents onboarding page."*
+If you are building a long-context benchmark and filling it with real code, you have this problem too. Repositories ship coding conventions — in code, in documentation, and increasingly in files that exist specifically to instruct AI agents. I found a third one while building this: the repository I used for the filler ships its own `AGENTS.md` stating *"no black boxes: clean, minimal Pythonic interfaces."* Its current development head was a commit adding an agents onboarding page.
 
-I was about to feed the model a coding-standards document, in a benchmark measuring whether models follow coding standards, and then score it on the result.
+I was about to feed a model a coding-standards document, in a benchmark measuring whether models follow coding standards, and score the result.
 
-Worse: my first filter missed it. I excluded the obvious files by name, but an *earlier commit* in the history had added an `agents.md` file, and that diff went into the haystack. I only caught it because I grepped the finished artifact for tell-tale phrases.
+## What I changed
 
-This is not a quirk of one repository. Repositories now ship agent instructions as a matter of course — `AGENTS.md`, `CLAUDE.md`, `.cursor/rules`, coding-style skills. Anyone building a long-context benchmark by packing real code has this problem, and the failure is silent. You get plausible results and no idea they're contaminated.
+**Two fillers instead of one**, because content turned out to be the variable that mattered:
 
-The fix is a filter applied at pack time, plus a content-level check because path rules miss files whose names give nothing away. Both are in the repo, and the manifest records exactly what was included and excluded.
+- **Prose** — IETF RFCs. They describe wire behaviour, not how to write software, so they are neutral with respect to the standards under test. This is the primary arm: it isolates context pressure.
+- **Code** — the same repository corpus as before. This is now the comparison arm: it measures priming.
 
-## Method
+I deliberately did not use Python's own PEPs as the prose source. PEP 20 is *The Zen of Python* — *"Simple is better than complex… Although never is often better than right now"* — and PEP 8 is a style guide. Either would prime the model toward the exact behaviour being measured, in the opposite direction, and a clean result would have looked like good news.
 
-TODO: design summary once the run completes — scenario count, brackets, judge, controls.
+**Fill as a fraction of each model's window**, not an absolute token count. 130,000 tokens is a tenth of a million-token window and a full window for a small model. "Long context" should mean the same thing across a roster.
+
+Two things get in the way, and both are handled rather than assumed away. Tokenisers are not shared — the same text is a different token count per model, and my own estimate ran 20% low, which I only found by reading actual token counts out of the run. And a 90% fill of a million-token model exceeds the *entire* window of a 128,000-token model. So the filler ships as fixed-size chunks and the task concatenates whole ones, meaning a smaller model loses the tail cleanly instead of being cut mid-file.
+
+**Two judge calls per cell, in separate conversations.** One judges the response. The other judges what the model said when asked to list the applicable rules — asked separately, so its own explanation of what it did cannot prime the judgement of what it did. In the first version, all judge calls shared a single conversation, so every verdict saw all the previous verdicts as context.
+
+**Reviews are scored on the decision they reach.** A review response contains no code, so scoring it on code quality lets a model that approves every pull request pass. One of the three review scenarios is a *legitimate* simplification that should be approved — a model that reflexively rejects all change fails it.
 
 ## Results
 
-TODO: tables and charts.
+TODO: fill from the run.
 
-## What broke first
+## What this can and cannot show
 
-TODO: extract vs prioritize vs apply, from the recall probe.
+**Answered here.** Under fixed context pressure, does the model still extract, prioritise and apply the standards?
+
+**Not answered here.** Does an agent *manage* its own context well — compacting, re-reading, re-grounding on its rules when they drift out of attention? Context management implies agency over your own context. A benchmark that injects a fixed filler tests context *pressure*, not management. A faithful test of the second question needs an agent loop: tool use, file state, iterative feedback. That is out of scope, and deliberately so. This measures the passive case, which is the floor of the problem rather than its ceiling.
 
 ## Limitations
 
-Being straight about what this does not show.
+**The structural analysis is blind in both directions.** Counting classes catches an abstract factory. It does not catch a registry dict mapping strings to callables, a decorator-based hook layer, or a config object with twelve optional keys. A model can be maximally speculative with zero classes. It also over-counts: `@dataclass`, `Enum` and `Protocol` all parse as class definitions, so a correct answer containing one custom exception looks worse than it is. That blindness is why the judge is primary and the structural measures are reported as continuous values rather than pass/fail.
 
-**It tests the passive case.** Context management means an agent deciding what to keep, what to drop, and when to re-read its own rules. That needs an agent loop — tool use, file state, iterative feedback. This benchmark holds context fixed and adversarial and measures whether retention survives. It is the floor of the real problem, not the ceiling.
+**Small number of scenarios.** This is a diagnostic, not a ranking claim.
 
-**Small N.** Roughly a dozen scenarios. This is a diagnostic probe, not a ranking claim. The arithmetic is unforgiving: with twenty paired binary observations you need six or more flipping the same way before anything reaches significance. That's why the headline measures are continuous rather than pass/fail.
+**The judge is a model.** It is preferred from outside the tested roster to limit self-preference, and disclosed either way. It is not ground truth.
 
-**The static analysis is blind to the interesting cases.** Counting classes catches an abstract factory. It does not catch a registry dict mapping strings to callables, a decorator-based hook layer, or a config object with twelve optional keys. A model can be maximally speculative with zero classes. The judge is the primary scorer for exactly this reason; the structural measures are secondary and reported as continuous values.
+**Temperature zero is not determinism.** Routing, batching and server-side model rolls all intervene, and no seed is exposed. I measure run-to-run variation rather than claiming it away.
 
-**The judge is a model.** It is selected from outside the tested roster to limit self-preference, and validated against hand labels, but it is not ground truth.
+**Fill is a fraction of an advertised window**, which may not match usable context. Actual input tokens are reported alongside.
 
-**Temperature zero is not determinism.** MoE routing and batching make identical inputs produce different outputs. Rather than claim determinism I measure it and report the flip rate.
-
-**Brackets are absolute tokens, not percent fill.** 100k tokens is about 10% of a million-token context and about 85% of a 128k one. Context size is reported alongside every result.
+**Building this was an exercise in the discipline it measures.** The first design specified a bespoke harness, a cache layer, thresholds derived from neighbouring implementations, and a closed-loop pipeline. Nearly all of it was cut.
 
 ## Reproduce it
 
@@ -116,4 +118,4 @@ TODO: task links, dataset, pinned commit.
 
 ---
 
-*Everything is in the repo: the task, the system prompt, the corpus builder, the exclusion filter, and the analysis. The haystack ships as a dataset with a manifest recording the exact commit and every included and excluded file.*
+*Everything is in the repository: the task, the standards, the filler builder, the exclusion filter, and the analysis. The fillers ship as a versioned dataset with a manifest recording exactly what went in and where it came from.*

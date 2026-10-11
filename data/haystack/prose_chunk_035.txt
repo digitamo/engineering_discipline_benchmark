@@ -1,0 +1,3244 @@
+   1. Introduction ....................................................2
+   2. Contributors ....................................................3
+   3. Conventions Used in This Document ...............................3
+   4. Global Requests .................................................4
+   5. Channel Mechanism ...............................................5
+      5.1. Opening a Channel ..........................................5
+      5.2. Data Transfer ..............................................7
+      5.3. Closing a Channel ..........................................9
+      5.4. Channel-Specific Requests ..................................9
+   6. Interactive Sessions ...........................................10
+      6.1. Opening a Session .........................................10
+      6.2. Requesting a Pseudo-Terminal ..............................11
+      6.3. X11 Forwarding ............................................11
+           6.3.1. Requesting X11 Forwarding ..........................11
+           6.3.2. X11 Channels .......................................12
+      6.4. Environment Variable Passing ..............................12
+      6.5. Starting a Shell or a Command .............................13
+      6.6. Session Data Transfer .....................................14
+      6.7. Window Dimension Change Message ...........................14
+      6.8. Local Flow Control ........................................14
+      6.9. Signals ...................................................15
+      6.10. Returning Exit Status ....................................15
+   7. TCP/IP Port Forwarding .........................................16
+      7.1. Requesting Port Forwarding ................................16
+      7.2. TCP/IP Forwarding Channels ................................18
+   8. Encoding of Terminal Modes .....................................19
+   9. Summary of Message Numbers .....................................21
+   10. IANA Considerations ...........................................21
+   11. Security Considerations .......................................21
+   12. References ....................................................22
+      12.1. Normative References .....................................22
+      12.2. Informative References ...................................22
+   Authors' Addresses ................................................23
+   Trademark Notice ..................................................23
+
+1.  Introduction
+
+   The SSH Connection Protocol has been designed to run on top of the
+   SSH transport layer and user authentication protocols ([SSH-TRANS]
+   and [SSH-USERAUTH]).  It provides interactive login sessions, remote
+   execution of commands, forwarded TCP/IP connections, and forwarded
+   X11 connections.
+
+   The 'service name' for this protocol is "ssh-connection".
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                     [Page 2]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   This document should be read only after reading the SSH architecture
+   document [SSH-ARCH].  This document freely uses terminology and
+   notation from the architecture document without reference or further
+   explanation.
+
+2.  Contributors
+
+   The major original contributors of this set of documents have been:
+   Tatu Ylonen, Tero Kivinen, Timo J. Rinne, Sami Lehtinen (all of SSH
+   Communications Security Corp), and Markku-Juhani O. Saarinen
+   (University of Jyvaskyla).  Darren Moffat was the original editor of
+   this set of documents and also made very substantial contributions.
+
+   Many people contributed to the development of this document over the
+   years.  People who should be acknowledged include Mats Andersson, Ben
+   Harris, Bill Sommerfeld, Brent McClure, Niels Moller, Damien Miller,
+   Derek Fawcus, Frank Cusack, Heikki Nousiainen, Jakob Schlyter, Jeff
+   Van Dyke, Jeffrey Altman, Jeffrey Hutzelman, Jon Bright, Joseph
+   Galbraith, Ken Hornstein, Markus Friedl, Martin Forssen, Nicolas
+   Williams, Niels Provos, Perry Metzger, Peter Gutmann, Simon
+   Josefsson, Simon Tatham, Wei Dai, Denis Bider, der Mouse, and
+   Tadayoshi Kohno.  Listing their names here does not mean that they
+   endorse this document, but that they have contributed to it.
+
+3.  Conventions Used in This Document
+
+   All documents related to the SSH protocols shall use the keywords
+   "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
+   "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" to describe
+   requirements.  These keywords are to be interpreted as described in
+   [RFC2119].
+
+   The keywords "PRIVATE USE", "HIERARCHICAL ALLOCATION", "FIRST COME
+   FIRST SERVED", "EXPERT REVIEW", "SPECIFICATION REQUIRED", "IESG
+   APPROVAL", "IETF CONSENSUS", and "STANDARDS ACTION" that appear in
+   this document when used to describe namespace allocation are to be
+   interpreted as described in [RFC2434].
+
+   Protocol fields and possible values to fill them are defined in this
+   set of documents.  Protocol fields will be defined in the message
+   definitions.  As an example, SSH_MSG_CHANNEL_DATA is defined as
+   follows.
+
+      byte      SSH_MSG_CHANNEL_DATA
+      uint32    recipient channel
+      string    data
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                     [Page 3]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   Throughout these documents, when the fields are referenced, they will
+   appear within single quotes.  When values to fill those fields are
+   referenced, they will appear within double quotes.  Using the above
+   example, possible values for 'data' are "foo" and "bar".
+
+4.  Global Requests
+
+   There are several kinds of requests that affect the state of the
+   remote end globally, independent of any channels.  An example is a
+   request to start TCP/IP forwarding for a specific port.  Note that
+   both the client and server MAY send global requests at any time, and
+   the receiver MUST respond appropriately.  All such requests use the
+   following format.
+
+      byte      SSH_MSG_GLOBAL_REQUEST
+      string    request name in US-ASCII only
+      boolean   want reply
+      ....      request-specific data follows
+
+   The value of 'request name' follows the DNS extensibility naming
+   convention outlined in [SSH-ARCH].
+
+   The recipient will respond to this message with
+   SSH_MSG_REQUEST_SUCCESS or SSH_MSG_REQUEST_FAILURE if 'want reply' is
+   TRUE.
+
+      byte      SSH_MSG_REQUEST_SUCCESS
+      ....     response specific data
+
+   Usually, the 'response specific data' is non-existent.
+
+   If the recipient does not recognize or support the request, it simply
+   responds with SSH_MSG_REQUEST_FAILURE.
+
+      byte      SSH_MSG_REQUEST_FAILURE
+
+   In general, the reply messages do not include request type
+   identifiers.  To make it possible for the originator of a request to
+   identify to which request each reply refers, it is REQUIRED that
+   replies to SSH_MSG_GLOBAL_REQUESTS MUST be sent in the same order as
+   the corresponding request messages.  For channel requests, replies
+   that relate to the same channel MUST also be replied to in the right
+   order.  However, channel requests for distinct channels MAY be
+   replied to out-of-order.
+
+
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                     [Page 4]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+5.  Channel Mechanism
+
+   All terminal sessions, forwarded connections, etc., are channels.
+   Either side may open a channel.  Multiple channels are multiplexed
+   into a single connection.
+
+   Channels are identified by numbers at each end.  The number referring
+   to a channel may be different on each side.  Requests to open a
+   channel contain the sender's channel number.  Any other channel-
+   related messages contain the recipient's channel number for the
+   channel.
+
+   Channels are flow-controlled.  No data may be sent to a channel until
+   a message is received to indicate that window space is available.
+
+5.1.  Opening a Channel
+
+   When either side wishes to open a new channel, it allocates a local
+   number for the channel.  It then sends the following message to the
+   other side, and includes the local channel number and initial window
+   size in the message.
+
+      byte      SSH_MSG_CHANNEL_OPEN
+      string    channel type in US-ASCII only
+      uint32    sender channel
+      uint32    initial window size
+      uint32    maximum packet size
+      ....      channel type specific data follows
+
+   The 'channel type' is a name, as described in [SSH-ARCH] and
+   [SSH-NUMBERS], with similar extension mechanisms.  The 'sender
+   channel' is a local identifier for the channel used by the sender of
+   this message.  The 'initial window size' specifies how many bytes of
+   channel data can be sent to the sender of this message without
+   adjusting the window.  The 'maximum packet size' specifies the
+   maximum size of an individual data packet that can be sent to the
+   sender.  For example, one might want to use smaller packets for
+   interactive connections to get better interactive response on slow
+   links.
+
+   The remote side then decides whether it can open the channel, and
+   responds with either SSH_MSG_CHANNEL_OPEN_CONFIRMATION or
+   SSH_MSG_CHANNEL_OPEN_FAILURE.
+
+
+
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                     [Page 5]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+      byte      SSH_MSG_CHANNEL_OPEN_CONFIRMATION
+      uint32    recipient channel
+      uint32    sender channel
+      uint32    initial window size
+      uint32    maximum packet size
+      ....      channel type specific data follows
+
+   The 'recipient channel' is the channel number given in the original
+   open request, and 'sender channel' is the channel number allocated by
+   the other side.
+
+      byte      SSH_MSG_CHANNEL_OPEN_FAILURE
+      uint32    recipient channel
+      uint32    reason code
+      string    description in ISO-10646 UTF-8 encoding [RFC3629]
+      string    language tag [RFC3066]
+
+   If the recipient of the SSH_MSG_CHANNEL_OPEN message does not support
+   the specified 'channel type', it simply responds with
+   SSH_MSG_CHANNEL_OPEN_FAILURE.  The client MAY show the 'description'
+   string to the user.  If this is done, the client software should take
+   the precautions discussed in [SSH-ARCH].
+
+   The SSH_MSG_CHANNEL_OPEN_FAILURE 'reason code' values are defined in
+   the following table.  Note that the values for the 'reason code' are
+   given in decimal format for readability, but they are actually uint32
+   values.
+
+             Symbolic name                           reason code
+             -------------                           -----------
+            SSH_OPEN_ADMINISTRATIVELY_PROHIBITED          1
+            SSH_OPEN_CONNECT_FAILED                       2
+            SSH_OPEN_UNKNOWN_CHANNEL_TYPE                 3
+            SSH_OPEN_RESOURCE_SHORTAGE                    4
+
+   Requests for assignments of new SSH_MSG_CHANNEL_OPEN 'reason code'
+   values (and associated 'description' text) in the range of 0x00000005
+   to 0xFDFFFFFF MUST be done through the IETF CONSENSUS method, as
+   described in [RFC2434].  The IANA will not assign Channel Connection
+   Failure 'reason code' values in the range of 0xFE000000 to
+   0xFFFFFFFF.  Channel Connection Failure 'reason code' values in that
+   range are left for PRIVATE USE, as described in [RFC2434].
+
+   While it is understood that the IANA will have no control over the
+   range of 0xFE000000 to 0xFFFFFFFF, this range will be split in two
+   parts and administered by the following conventions.
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                     [Page 6]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   o  The range of 0xFE000000 to 0xFEFFFFFF is to be used in conjunction
+      with locally assigned channels.  For example, if a channel is
+      proposed with a 'channel type' of "example_session@example.com",
+      but fails, then the response will contain either a 'reason code'
+      assigned by the IANA (as listed above and in the range of
+      0x00000001 to 0xFDFFFFFF) or a locally assigned value in the range
+      of 0xFE000000 to 0xFEFFFFFF.  Naturally, if the server does not
+      understand the proposed 'channel type', even if it is a locally
+      defined 'channel type', then the 'reason code' MUST be 0x00000003,
+      as described above, if the 'reason code' is sent.  If the server
+      does understand the 'channel type', but the channel still fails to
+      open, then the server SHOULD respond with a locally assigned
+      'reason code' value consistent with the proposed, local 'channel
+      type'.  It is assumed that practitioners will first attempt to use
+      the IANA assigned 'reason code' values and then document their
+      locally assigned 'reason code' values.
+
+   o  There are no restrictions or suggestions for the range starting
+      with 0xFF.  No interoperability is expected for anything used in
+      this range.  Essentially, it is for experimentation.
+
+5.2.  Data Transfer
+
+   The window size specifies how many bytes the other party can send
+   before it must wait for the window to be adjusted.  Both parties use
+   the following message to adjust the window.
+
+      byte      SSH_MSG_CHANNEL_WINDOW_ADJUST
+      uint32    recipient channel
+      uint32    bytes to add
+
+   After receiving this message, the recipient MAY send the given number
+   of bytes more than it was previously allowed to send; the window size
+   is incremented.  Implementations MUST correctly handle window sizes
+   of up to 2^32 - 1 bytes.  The window MUST NOT be increased above
+   2^32 - 1 bytes.
+
+   Data transfer is done with messages of the following type.
+
+      byte      SSH_MSG_CHANNEL_DATA
+      uint32    recipient channel
+      string    data
+
+   The maximum amount of data allowed is determined by the maximum
+   packet size for the channel, and the current window size, whichever
+   is smaller.  The window size is decremented by the amount of data
+   sent.  Both parties MAY ignore all extra data sent after the allowed
+   window is empty.
+
+
+
+Ylonen & Lonvick            Standards Track                     [Page 7]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   Implementations are expected to have some limit on the SSH transport
+   layer packet size (any limit for received packets MUST be 32768 bytes
+   or larger, as described in [SSH-TRANS]).  The implementation of the
+   SSH connection layer
+
+   o  MUST NOT advertise a maximum packet size that would result in
+      transport packets larger than its transport layer is willing to
+      receive.
+
+   o  MUST NOT generate data packets larger than its transport layer is
+      willing to send, even if the remote end would be willing to accept
+      very large packets.
+
+   Additionally, some channels can transfer several types of data.  An
+   example of this is stderr data from interactive sessions.  Such data
+   can be passed with SSH_MSG_CHANNEL_EXTENDED_DATA messages, where a
+   separate integer specifies the type of data.  The available types and
+   their interpretation depend on the type of channel.
+
+      byte      SSH_MSG_CHANNEL_EXTENDED_DATA
+      uint32    recipient channel
+      uint32    data_type_code
+      string    data
+
+   Data sent with these messages consumes the same window as ordinary
+   data.
+
+   Currently, only the following type is defined.  Note that the value
+   for the 'data_type_code' is given in decimal format for readability,
+   but the values are actually uint32 values.
+
+               Symbolic name                  data_type_code
+               -------------                  --------------
+             SSH_EXTENDED_DATA_STDERR               1
+
+   Extended Channel Data Transfer 'data_type_code' values MUST be
+   assigned sequentially.  Requests for assignments of new Extended
+   Channel Data Transfer 'data_type_code' values and their associated
+   Extended Channel Data Transfer 'data' strings, in the range of
+   0x00000002 to 0xFDFFFFFF, MUST be done through the IETF CONSENSUS
+   method as described in [RFC2434].  The IANA will not assign Extended
+   Channel Data Transfer 'data_type_code' values in the range of
+   0xFE000000 to 0xFFFFFFFF.  Extended Channel Data Transfer
+   'data_type_code' values in that range are left for PRIVATE USE, as
+   described in [RFC2434].  As is noted, the actual instructions to the
+   IANA are in [SSH-NUMBERS].
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                     [Page 8]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+5.3.  Closing a Channel
+
+   When a party will no longer send more data to a channel, it SHOULD
+   send SSH_MSG_CHANNEL_EOF.
+
+      byte      SSH_MSG_CHANNEL_EOF
+      uint32    recipient channel
+
+   No explicit response is sent to this message.  However, the
+   application may send EOF to whatever is at the other end of the
+   channel.  Note that the channel remains open after this message, and
+   more data may still be sent in the other direction.  This message
+   does not consume window space and can be sent even if no window space
+   is available.
+
+   When either party wishes to terminate the channel, it sends
+   SSH_MSG_CHANNEL_CLOSE.  Upon receiving this message, a party MUST
+   send back an SSH_MSG_CHANNEL_CLOSE unless it has already sent this
+   message for the channel.  The channel is considered closed for a
+   party when it has both sent and received SSH_MSG_CHANNEL_CLOSE, and
+   the party may then reuse the channel number.  A party MAY send
+   SSH_MSG_CHANNEL_CLOSE without having sent or received
+   SSH_MSG_CHANNEL_EOF.
+
+      byte      SSH_MSG_CHANNEL_CLOSE
+      uint32    recipient channel
+
+   This message does not consume window space and can be sent even if no
+   window space is available.
+
+   It is RECOMMENDED that all data sent before this message be delivered
+   to the actual destination, if possible.
+
+5.4.  Channel-Specific Requests
+
+   Many 'channel type' values have extensions that are specific to that
+   particular 'channel type'.  An example is requesting a pty (pseudo
+   terminal) for an interactive session.
+
+   All channel-specific requests use the following format.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    request type in US-ASCII characters only
+      boolean   want reply
+      ....      type-specific data follows
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                     [Page 9]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   If 'want reply' is FALSE, no response will be sent to the request.
+   Otherwise, the recipient responds with either
+   SSH_MSG_CHANNEL_SUCCESS, SSH_MSG_CHANNEL_FAILURE, or request-specific
+   continuation messages.  If the request is not recognized or is not
+   supported for the channel, SSH_MSG_CHANNEL_FAILURE is returned.
+
+   This message does not consume window space and can be sent even if no
+   window space is available.  The values of 'request type' are local to
+   each channel type.
+
+   The client is allowed to send further messages without waiting for
+   the response to the request.
+
+   'request type' names follow the DNS extensibility naming convention
+   outlined in [SSH-ARCH] and [SSH-NUMBERS].
+
+      byte      SSH_MSG_CHANNEL_SUCCESS
+      uint32    recipient channel
+
+
+      byte      SSH_MSG_CHANNEL_FAILURE
+      uint32    recipient channel
+
+   These messages do not consume window space and can be sent even if no
+   window space is available.
+
+6.  Interactive Sessions
+
+   A session is a remote execution of a program.  The program may be a
+   shell, an application, a system command, or some built-in subsystem.
+   It may or may not have a tty, and may or may not involve X11
+   forwarding.  Multiple sessions can be active simultaneously.
+
+6.1.  Opening a Session
+
+   A session is started by sending the following message.
+
+      byte      SSH_MSG_CHANNEL_OPEN
+      string    "session"
+      uint32    sender channel
+      uint32    initial window size
+      uint32    maximum packet size
+
+   Client implementations SHOULD reject any session channel open
+   requests to make it more difficult for a corrupt server to attack the
+   client.
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 10]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+6.2.  Requesting a Pseudo-Terminal
+
+   A pseudo-terminal can be allocated for the session by sending the
+   following message.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "pty-req"
+      boolean   want_reply
+      string    TERM environment variable value (e.g., vt100)
+      uint32    terminal width, characters (e.g., 80)
+      uint32    terminal height, rows (e.g., 24)
+      uint32    terminal width, pixels (e.g., 640)
+      uint32    terminal height, pixels (e.g., 480)
+      string    encoded terminal modes
+
+   The 'encoded terminal modes' are described in Section 8.  Zero
+   dimension parameters MUST be ignored.  The character/row dimensions
+   override the pixel dimensions (when nonzero).  Pixel dimensions refer
+   to the drawable area of the window.
+
+   The dimension parameters are only informational.
+
+   The client SHOULD ignore pty requests.
+
+6.3.  X11 Forwarding
+
+6.3.1.  Requesting X11 Forwarding
+
+   X11 forwarding may be requested for a session by sending a
+   SSH_MSG_CHANNEL_REQUEST message.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "x11-req"
+      boolean   want reply
+      boolean   single connection
+      string    x11 authentication protocol
+      string    x11 authentication cookie
+      uint32    x11 screen number
+
+   It is RECOMMENDED that the 'x11 authentication cookie' that is sent
+   be a fake, random cookie, and that the cookie be checked and replaced
+   by the real cookie when a connection request is received.
+
+   X11 connection forwarding should stop when the session channel is
+   closed.  However, already opened forwardings should not be
+   automatically closed when the session channel is closed.
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 11]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   If 'single connection' is TRUE, only a single connection should be
+   forwarded.  No more connections will be forwarded after the first, or
+   after the session channel has been closed.
+
+   The 'x11 authentication protocol' is the name of the X11
+   authentication method used, e.g., "MIT-MAGIC-COOKIE-1".
+
+   The 'x11 authentication cookie' MUST be hexadecimal encoded.
+
+   The X Protocol is documented in [SCHEIFLER].
+
+6.3.2.  X11 Channels
+
+   X11 channels are opened with a channel open request.  The resulting
+   channels are independent of the session, and closing the session
+   channel does not close the forwarded X11 channels.
+
+      byte      SSH_MSG_CHANNEL_OPEN
+      string    "x11"
+      uint32    sender channel
+      uint32    initial window size
+      uint32    maximum packet size
+      string    originator address (e.g., "192.168.7.38")
+      uint32    originator port
+
+   The recipient should respond with SSH_MSG_CHANNEL_OPEN_CONFIRMATION
+   or SSH_MSG_CHANNEL_OPEN_FAILURE.
+
+   Implementations MUST reject any X11 channel open requests if they
+   have not requested X11 forwarding.
+
+6.4.  Environment Variable Passing
+
+   Environment variables may be passed to the shell/command to be
+   started later.  Uncontrolled setting of environment variables in a
+   privileged process can be a security hazard.  It is recommended that
+   implementations either maintain a list of allowable variable names or
+   only set environment variables after the server process has dropped
+   sufficient privileges.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "env"
+      boolean   want reply
+      string    variable name
+      string    variable value
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 12]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+6.5.  Starting a Shell or a Command
+
+   Once the session has been set up, a program is started at the remote
+   end.  The program can be a shell, an application program, or a
+   subsystem with a host-independent name.  Only one of these requests
+   can succeed per channel.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "shell"
+      boolean   want reply
+
+   This message will request that the user's default shell (typically
+   defined in /etc/passwd in UNIX systems) be started at the other end.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "exec"
+      boolean   want reply
+      string    command
+
+   This message will request that the server start the execution of the
+   given command.  The 'command' string may contain a path.  Normal
+   precautions MUST be taken to prevent the execution of unauthorized
+   commands.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "subsystem"
+      boolean   want reply
+      string    subsystem name
+
+   This last form executes a predefined subsystem.  It is expected that
+   these will include a general file transfer mechanism, and possibly
+   other features.  Implementations may also allow configuring more such
+   mechanisms.  As the user's shell is usually used to execute the
+   subsystem, it is advisable for the subsystem protocol to have a
+   "magic cookie" at the beginning of the protocol transaction to
+   distinguish it from arbitrary output generated by shell
+   initialization scripts, etc.  This spurious output from the shell may
+   be filtered out either at the server or at the client.
+
+   The server SHOULD NOT halt the execution of the protocol stack when
+   starting a shell or a program.  All input and output from these
+   SHOULD be redirected to the channel or to the encrypted tunnel.
+
+   It is RECOMMENDED that the reply to these messages be requested and
+   checked.  The client SHOULD ignore these messages.
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 13]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   Subsystem names follow the DNS extensibility naming convention
+   outlined in [SSH-NUMBERS].
+
+6.6.  Session Data Transfer
+
+   Data transfer for a session is done using SSH_MSG_CHANNEL_DATA and
+   SSH_MSG_CHANNEL_EXTENDED_DATA packets and the window mechanism.  The
+   extended data type SSH_EXTENDED_DATA_STDERR has been defined for
+   stderr data.
+
+6.7.  Window Dimension Change Message
+
+   When the window (terminal) size changes on the client side, it MAY
+   send a message to the other side to inform it of the new dimensions.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "window-change"
+      boolean   FALSE
+      uint32    terminal width, columns
+      uint32    terminal height, rows
+      uint32    terminal width, pixels
+      uint32    terminal height, pixels
+
+   A response SHOULD NOT be sent to this message.
+
+6.8.  Local Flow Control
+
+   On many systems, it is possible to determine if a pseudo-terminal is
+   using control-S/control-Q flow control.  When flow control is
+   allowed, it is often desirable to do the flow control at the client
+   end to speed up responses to user requests.  This is facilitated by
+   the following notification.  Initially, the server is responsible for
+   flow control.  (Here, again, client means the side originating the
+   session, and server means the other side.)
+
+   The message below is used by the server to inform the client when it
+   can or cannot perform flow control (control-S/control-Q processing).
+   If 'client can do' is TRUE, the client is allowed to do flow control
+   using control-S and control-Q.  The client MAY ignore this message.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "xon-xoff"
+      boolean   FALSE
+      boolean   client can do
+
+   No response is sent to this message.
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 14]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+6.9.  Signals
+
+   A signal can be delivered to the remote process/service using the
+   following message.  Some systems may not implement signals, in which
+   case they SHOULD ignore this message.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "signal"
+      boolean   FALSE
+      string    signal name (without the "SIG" prefix)
+
+   'signal name' values will be encoded as discussed in the passage
+   describing SSH_MSG_CHANNEL_REQUEST messages using "exit-signal" in
+   this section.
+
+6.10.  Returning Exit Status
+
+   When the command running at the other end terminates, the following
+   message can be sent to return the exit status of the command.
+   Returning the status is RECOMMENDED.  No acknowledgement is sent for
+   this message.  The channel needs to be closed with
+   SSH_MSG_CHANNEL_CLOSE after this message.
+
+   The client MAY ignore these messages.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "exit-status"
+      boolean   FALSE
+      uint32    exit_status
+
+   The remote command may also terminate violently due to a signal.
+   Such a condition can be indicated by the following message.  A zero
+   'exit_status' usually means that the command terminated successfully.
+
+      byte      SSH_MSG_CHANNEL_REQUEST
+      uint32    recipient channel
+      string    "exit-signal"
+      boolean   FALSE
+      string    signal name (without the "SIG" prefix)
+      boolean   core dumped
+      string    error message in ISO-10646 UTF-8 encoding
+      string    language tag [RFC3066]
+
+
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 15]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   The 'signal name' is one of the following (these are from [POSIX]).
+
+            ABRT
+            ALRM
+            FPE
+            HUP
+            ILL
+            INT
+            KILL
+            PIPE
+            QUIT
+            SEGV
+            TERM
+            USR1
+            USR2
+
+   Additional 'signal name' values MAY be sent in the format
+   "sig-name@xyz", where "sig-name" and "xyz" may be anything a
+   particular implementer wants (except the "@" sign).  However, it is
+   suggested that if a 'configure' script is used, any non-standard
+   'signal name' values it finds be encoded as "SIG@xyz.config.guess",
+   where "SIG" is the 'signal name' without the "SIG" prefix, and "xyz"
+   is the host type, as determined by "config.guess".
+
+   The 'error message' contains an additional textual explanation of the
+   error message.  The message may consist of multiple lines separated
+   by CRLF (Carriage Return - Line Feed) pairs.  The client software MAY
+   display this message to the user.  If this is done, the client
+   software should take the precautions discussed in [SSH-ARCH].
+
+7.  TCP/IP Port Forwarding
+
+7.1.  Requesting Port Forwarding
+
+   A party need not explicitly request forwardings from its own end to
+   the other direction.  However, if it wishes that connections to a
+   port on the other side be forwarded to the local side, it must
+   explicitly request this.
+
+      byte      SSH_MSG_GLOBAL_REQUEST
+      string    "tcpip-forward"
+      boolean   want reply
+      string    address to bind (e.g., "0.0.0.0")
+      uint32    port number to bind
+
+
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 16]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   The 'address to bind' and 'port number to bind' specify the IP
+   address (or domain name) and port on which connections for forwarding
+   are to be accepted.  Some strings used for 'address to bind' have
+   special-case semantics.
+
+   o  "" means that connections are to be accepted on all protocol
+      families supported by the SSH implementation.
+
+   o  "0.0.0.0" means to listen on all IPv4 addresses.
+
+   o  "::" means to listen on all IPv6 addresses.
+
+   o  "localhost" means to listen on all protocol families supported by
+      the SSH implementation on loopback addresses only ([RFC3330] and
+      [RFC3513]).
+
+   o  "127.0.0.1" and "::1" indicate listening on the loopback
+      interfaces for IPv4 and IPv6, respectively.
+
+   Note that the client can still filter connections based on
+   information passed in the open request.
+
+   Implementations should only allow forwarding privileged ports if the
+   user has been authenticated as a privileged user.
+
+   Client implementations SHOULD reject these messages; they are
+   normally only sent by the client.
+
+   If a client passes 0 as port number to bind and has 'want reply' as
+   TRUE, then the server allocates the next available unprivileged port
+   number and replies with the following message; otherwise, there is no
+   response-specific data.
+
+      byte     SSH_MSG_REQUEST_SUCCESS
+      uint32   port that was bound on the server
+
+   A port forwarding can be canceled with the following message.  Note
+   that channel open requests may be received until a reply to this
+   message is received.
+
+      byte      SSH_MSG_GLOBAL_REQUEST
+      string    "cancel-tcpip-forward"
+      boolean   want reply
+      string    address_to_bind (e.g., "127.0.0.1")
+      uint32    port number to bind
+
+   Client implementations SHOULD reject these messages; they are
+   normally only sent by the client.
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 17]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+7.2.  TCP/IP Forwarding Channels
+
+   When a connection comes to a port for which remote forwarding has
+   been requested, a channel is opened to forward the port to the other
+   side.
+
+      byte      SSH_MSG_CHANNEL_OPEN
+      string    "forwarded-tcpip"
+      uint32    sender channel
+      uint32    initial window size
+      uint32    maximum packet size
+      string    address that was connected
+      uint32    port that was connected
+      string    originator IP address
+      uint32    originator port
+
+   Implementations MUST reject these messages unless they have
+   previously requested a remote TCP/IP port forwarding with the given
+   port number.
+
+   When a connection comes to a locally forwarded TCP/IP port, the
+   following packet is sent to the other side.  Note that these messages
+   MAY also be sent for ports for which no forwarding has been
+   explicitly requested.  The receiving side must decide whether to
+   allow the forwarding.
+
+      byte      SSH_MSG_CHANNEL_OPEN
+      string    "direct-tcpip"
+      uint32    sender channel
+      uint32    initial window size
+      uint32    maximum packet size
+      string    host to connect
+      uint32    port to connect
+      string    originator IP address
+      uint32    originator port
+
+   The 'host to connect' and 'port to connect' specify the TCP/IP host
+   and port where the recipient should connect the channel.  The 'host
+   to connect' may be either a domain name or a numeric IP address.
+
+   The 'originator IP address' is the numeric IP address of the machine
+   from where the connection request originates, and the 'originator
+   port' is the port on the host from where the connection originated.
+
+   Forwarded TCP/IP channels are independent of any sessions, and
+   closing a session channel does not in any way imply that forwarded
+   connections should be closed.
+
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 18]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   Client implementations SHOULD reject direct TCP/IP open requests for
+   security reasons.
+
+8.  Encoding of Terminal Modes
+
+   All 'encoded terminal modes' (as passed in a pty request) are encoded
+   into a byte stream.  It is intended that the coding be portable
+   across different environments.  The stream consists of opcode-
+   argument pairs wherein the opcode is a byte value.  Opcodes 1 to 159
+   have a single uint32 argument.  Opcodes 160 to 255 are not yet
+   defined, and cause parsing to stop (they should only be used after
+   any other data).  The stream is terminated by opcode TTY_OP_END
+   (0x00).
+
+   The client SHOULD put any modes it knows about in the stream, and the
+   server MAY ignore any modes it does not know about.  This allows some
+   degree of machine-independence, at least between systems that use a
+   POSIX-like tty interface.  The protocol can support other systems as
+   well, but the client may need to fill reasonable values for a number
+   of parameters so the server pty gets set to a reasonable mode (the
+   server leaves all unspecified mode bits in their default values, and
+   only some combinations make sense).
+
+   The naming of opcode values mostly follows the POSIX terminal mode
+   flags.  The following opcode values have been defined.  Note that the
+   values given below are in decimal format for readability, but they
+   are actually byte values.
+
+          opcode  mnemonic       description
+          ------  --------       -----------
+          0     TTY_OP_END  Indicates end of options.
+          1     VINTR       Interrupt character; 255 if none.  Similarly
+                             for the other characters.  Not all of these
+                             characters are supported on all systems.
+          2     VQUIT       The quit character (sends SIGQUIT signal on
+                             POSIX systems).
+          3     VERASE      Erase the character to left of the cursor.
+          4     VKILL       Kill the current input line.
+          5     VEOF        End-of-file character (sends EOF from the
+                             terminal).
+          6     VEOL        End-of-line character in addition to
+                             carriage return and/or linefeed.
+          7     VEOL2       Additional end-of-line character.
+          8     VSTART      Continues paused output (normally
+                             control-Q).
+          9     VSTOP       Pauses output (normally control-S).
+          10    VSUSP       Suspends the current program.
+          11    VDSUSP      Another suspend character.
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 19]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+          12    VREPRINT    Reprints the current input line.
+          13    VWERASE     Erases a word left of cursor.
+          14    VLNEXT      Enter the next character typed literally,
+                             even if it is a special character
+          15    VFLUSH      Character to flush output.
+          16    VSWTCH      Switch to a different shell layer.
+          17    VSTATUS     Prints system status line (load, command,
+                             pid, etc).
+          18    VDISCARD    Toggles the flushing of terminal output.
+          30    IGNPAR      The ignore parity flag.  The parameter
+                             SHOULD be 0 if this flag is FALSE,
+                             and 1 if it is TRUE.
+          31    PARMRK      Mark parity and framing errors.
+          32    INPCK       Enable checking of parity errors.
+          33    ISTRIP      Strip 8th bit off characters.
+          34    INLCR       Map NL into CR on input.
+          35    IGNCR       Ignore CR on input.
+          36    ICRNL       Map CR to NL on input.
+          37    IUCLC       Translate uppercase characters to
+                             lowercase.
+          38    IXON        Enable output flow control.
+          39    IXANY       Any char will restart after stop.
+          40    IXOFF       Enable input flow control.
+          41    IMAXBEL     Ring bell on input queue full.
+          50    ISIG        Enable signals INTR, QUIT, [D]SUSP.
+          51    ICANON      Canonicalize input lines.
+          52    XCASE       Enable input and output of uppercase
+                             characters by preceding their lowercase
+                             equivalents with "\".
+          53    ECHO        Enable echoing.
+          54    ECHOE       Visually erase chars.
+          55    ECHOK       Kill character discards current line.
+          56    ECHONL      Echo NL even if ECHO is off.
+          57    NOFLSH      Don't flush after interrupt.
+          58    TOSTOP      Stop background jobs from output.
+          59    IEXTEN      Enable extensions.
+          60    ECHOCTL     Echo control characters as ^(Char).
+          61    ECHOKE      Visual erase for line kill.
+          62    PENDIN      Retype pending input.
+          70    OPOST       Enable output processing.
+          71    OLCUC       Convert lowercase to uppercase.
+          72    ONLCR       Map NL to CR-NL.
+          73    OCRNL       Translate carriage return to newline
+                             (output).
+          74    ONOCR       Translate newline to carriage
+                             return-newline (output).
+          75    ONLRET      Newline performs a carriage return
+                             (output).
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 20]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+          90    CS7         7 bit mode.
+          91    CS8         8 bit mode.
+          92    PARENB      Parity enable.
+          93    PARODD      Odd parity, else even.
+
+          128 TTY_OP_ISPEED  Specifies the input baud rate in
+                              bits per second.
+          129 TTY_OP_OSPEED  Specifies the output baud rate in
+                              bits per second.
+
+9.  Summary of Message Numbers
+
+   The following is a summary of messages and their associated message
+   number.
+
+            SSH_MSG_GLOBAL_REQUEST                  80
+            SSH_MSG_REQUEST_SUCCESS                 81
+            SSH_MSG_REQUEST_FAILURE                 82
+            SSH_MSG_CHANNEL_OPEN                    90
+            SSH_MSG_CHANNEL_OPEN_CONFIRMATION       91
+            SSH_MSG_CHANNEL_OPEN_FAILURE            92
+            SSH_MSG_CHANNEL_WINDOW_ADJUST           93
+            SSH_MSG_CHANNEL_DATA                    94
+            SSH_MSG_CHANNEL_EXTENDED_DATA           95
+            SSH_MSG_CHANNEL_EOF                     96
+            SSH_MSG_CHANNEL_CLOSE                   97
+            SSH_MSG_CHANNEL_REQUEST                 98
+            SSH_MSG_CHANNEL_SUCCESS                 99
+            SSH_MSG_CHANNEL_FAILURE                100
+
+10.  IANA Considerations
+
+   This document is part of a set.  The IANA considerations for the SSH
+   protocol as defined in [SSH-ARCH], [SSH-TRANS], [SSH-USERAUTH], and
+   this document, are detailed in [SSH-NUMBERS].
+
+11.  Security Considerations
+
+   This protocol is assumed to run on top of a secure, authenticated
+   transport.  User authentication and protection against network-level
+   attacks are assumed to be provided by the underlying protocols.
+
+   Full security considerations for this protocol are provided in
+   [SSH-ARCH].  Specific to this document, it is RECOMMENDED that
+   implementations disable all the potentially dangerous features (e.g.,
+   agent forwarding, X11 forwarding, and TCP/IP forwarding) if the host
+   key has changed without notice or explanation.
+
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 21]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+12.  References
+
+12.1.  Normative References
+
+   [SSH-ARCH]     Ylonen, T. and C. Lonvick, Ed., "The Secure Shell
+                  (SSH) Protocol Architecture", RFC 4251, January 2006.
+
+   [SSH-TRANS]    Ylonen, T. and C. Lonvick, Ed., "The Secure Shell
+                  (SSH) Transport Layer Protocol", RFC 4253, January
+                  2006.
+
+   [SSH-USERAUTH] Ylonen, T. and C. Lonvick, Ed., "The Secure Shell
+                  (SSH) Authentication Protocol", RFC 4252, January
+                  2006.
+
+   [SSH-NUMBERS]  Lehtinen, S. and C. Lonvick, Ed., "The Secure Shell
+                  (SSH) Protocol Assigned Numbers", RFC 4250, January
+                  2006.
+
+   [RFC2119]      Bradner, S., "Key words for use in RFCs to Indicate
+                  Requirement Levels", BCP 14, RFC 2119, March 1997.
+
+   [RFC2434]      Narten, T. and H. Alvestrand, "Guidelines for Writing
+                  an IANA Considerations Section in RFCs", BCP 26, RFC
+                  2434, October 1998.
+
+   [RFC3066]      Alvestrand, H., "Tags for the Identification of
+                  Languages", BCP 47, RFC 3066, January 2001.
+
+   [RFC3629]      Yergeau, F., "UTF-8, a transformation format of ISO
+                  10646", STD 63, RFC 3629, November 2003.
+
+12.2.  Informative References
+
+   [RFC3330]      IANA, "Special-Use IPv4 Addresses", RFC 3330,
+                  September 2002.
+
+   [RFC3513]      Hinden, R. and S. Deering, "Internet Protocol Version
+                  6 (IPv6) Addressing Architecture", RFC 3513, April
+                  2003.
+
+   [SCHEIFLER]    Scheifler, R., "X Window System : The Complete
+                  Reference to Xlib, X Protocol, Icccm, Xlfd, 3rd
+                  edition.", Digital Press ISBN 1555580882, February
+                  1992.
+
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 22]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+   [POSIX]        ISO/IEC, 9945-1., "Information technology -- Portable
+                  Operating System Interface  (POSIX)-Part 1: System
+                  Application Program Interface (API) C Language", ANSI/
+                  IEE Std 1003.1, July 1996.
+
+Authors' Addresses
+
+   Tatu Ylonen
+   SSH Communications Security Corp
+   Valimotie 17
+   00380 Helsinki
+   Finland
+
+   EMail: ylo@ssh.com
+
+
+   Chris Lonvick (editor)
+   Cisco Systems, Inc.
+   12515 Research Blvd.
+   Austin  78759
+   USA
+
+   EMail: clonvick@cisco.com
+
+Trademark Notice
+
+   "ssh" is a registered trademark in the United States and/or other
+   countries.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 23]
+
+RFC 4254                SSH Connection Protocol             January 2006
+
+
+Full Copyright Statement
+
+   Copyright (C) The Internet Society (2006).
+
+   This document is subject to the rights, licenses and restrictions
+   contained in BCP 78, and except as set forth therein, the authors
+   retain all their rights.
+
+   This document and the information contained herein are provided on an
+   "AS IS" basis and THE CONTRIBUTOR, THE ORGANIZATION HE/SHE REPRESENTS
+   OR IS SPONSORED BY (IF ANY), THE INTERNET SOCIETY AND THE INTERNET
+   ENGINEERING TASK FORCE DISCLAIM ALL WARRANTIES, EXPRESS OR IMPLIED,
+   INCLUDING BUT NOT LIMITED TO ANY WARRANTY THAT THE USE OF THE
+   INFORMATION HEREIN WILL NOT INFRINGE ANY RIGHTS OR ANY IMPLIED
+   WARRANTIES OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+Intellectual Property
+
+   The IETF takes no position regarding the validity or scope of any
+   Intellectual Property Rights or other rights that might be claimed to
+   pertain to the implementation or use of the technology described in
+   this document or the extent to which any license under such rights
+   might or might not be available; nor does it represent that it has
+   made any independent effort to identify any such rights.  Information
+   on the procedures with respect to rights in RFC documents can be
+   found in BCP 78 and BCP 79.
+
+   Copies of IPR disclosures made to the IETF Secretariat and any
+   assurances of licenses to be made available, or the result of an
+   attempt made to obtain a general license or permission for the use of
+   such proprietary rights by implementers or users of this
+   specification can be obtained from the IETF on-line IPR repository at
+   http://www.ietf.org/ipr.
+
+   The IETF invites any interested party to bring to its attention any
+   copyrights, patents or patent applications, or other proprietary
+   rights that may cover technology that may be required to implement
+   this standard.  Please address the information to the IETF at
+   ietf-ipr@ietf.org.
+
+Acknowledgement
+
+   Funding for the RFC Editor function is provided by the IETF
+   Administrative Support Activity (IASA).
+
+
+
+
+
+
+
+Ylonen & Lonvick            Standards Track                    [Page 24]
+
+
+
+===== RFC4291 =====
+
+
+
+
+
+
+
+Network Working Group                                          R. Hinden
+Request for Comments: 4291                                         Nokia
+Obsoletes: 3513                                               S. Deering
+Category: Standards Track                                  Cisco Systems
+                                                           February 2006
+
+
+                  IP Version 6 Addressing Architecture
+
+Status of This Memo
+
+   This document specifies an Internet standards track protocol for the
+   Internet community, and requests discussion and suggestions for
+   improvements.  Please refer to the current edition of the "Internet
+   Official Protocol Standards" (STD 1) for the standardization state
+   and status of this protocol.  Distribution of this memo is unlimited.
+
+Copyright Notice
+
+   Copyright (C) The Internet Society (2006).
+
+Abstract
+
+   This specification defines the addressing architecture of the IP
+   Version 6 (IPv6) protocol.  The document includes the IPv6 addressing
+   model, text representations of IPv6 addresses, definition of IPv6
+   unicast addresses, anycast addresses, and multicast addresses, and an
+   IPv6 node's required addresses.
+
+   This document obsoletes RFC 3513, "IP Version 6 Addressing
+   Architecture".
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Hinden                      Standards Track                     [Page 1]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+Table of Contents
+
+   1. Introduction ....................................................2
+   2. IPv6 Addressing .................................................2
+      2.1. Addressing Model ...........................................3
+      2.2. Text Representation of Addresses ...........................4
+      2.3. Text Representation of Address Prefixes ....................5
+      2.4. Address Type Identification ................................6
+      2.5. Unicast Addresses ..........................................6
+           2.5.1. Interface Identifiers ...............................7
+           2.5.2. The Unspecified Address .............................9
+           2.5.3. The Loopback Address ................................9
+           2.5.4. Global Unicast Addresses ............................9
+           2.5.5. IPv6 Addresses with Embedded IPv4 Addresses ........10
+           2.5.6. Link-Local IPv6 Unicast Addresses ..................11
+           2.5.7. Site-Local IPv6 Unicast Addresses ..................11
+      2.6. Anycast Addresses .........................................12
+           2.6.1. Required Anycast Address ...........................12
+      2.7. Multicast Addresses .......................................13
+           2.7.1. Pre-Defined Multicast Addresses ....................15
+      2.8. A Node's Required Addresses ...............................17
+   3. Security Considerations ........................................18
+   4. IANA Considerations ............................................18
+   5. Acknowledgements ...............................................18
+   6. References .....................................................18
+      6.1. Normative References ......................................18
+      6.2. Informative References ....................................18
+   Appendix A: Creating Modified EUI-64 Format Interface Identifiers .20
+   Appendix B: Changes from RFC 3513 .................................22
+
+1.  Introduction
+
+   This specification defines the addressing architecture of the IP
+   Version 6 protocol.  It includes the basic formats for the various
+   types of IPv6 addresses (unicast, anycast, and multicast).
+
+2.  IPv6 Addressing
+
+   IPv6 addresses are 128-bit identifiers for interfaces and sets of
+   interfaces (where "interface" is as defined in Section 2 of [IPV6]).
+   There are three types of addresses:
+
+    Unicast:   An identifier for a single interface.  A packet sent to a
+               unicast address is delivered to the interface identified
+               by that address.
+
+
+
+
+
+
+Hinden                      Standards Track                     [Page 2]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+    Anycast:   An identifier for a set of interfaces (typically
+               belonging to different nodes).  A packet sent to an
+               anycast address is delivered to one of the interfaces
+               identified by that address (the "nearest" one, according
+               to the routing protocols' measure of distance).
+
+    Multicast: An identifier for a set of interfaces (typically
+               belonging to different nodes).  A packet sent to a
+               multicast address is delivered to all interfaces
+               identified by that address.
+
+   There are no broadcast addresses in IPv6, their function being
+   superseded by multicast addresses.
+
+   In this document, fields in addresses are given a specific name, for
+   example, "subnet".  When this name is used with the term "ID" for
+   identifier after the name (e.g., "subnet ID"), it refers to the
+   contents of the named field.  When it is used with the term "prefix"
+   (e.g., "subnet prefix"), it refers to all of the address from the
+   left up to and including this field.
+
+   In IPv6, all zeros and all ones are legal values for any field,
+   unless specifically excluded.  Specifically, prefixes may contain, or
+   end with, zero-valued fields.
+
+2.1.  Addressing Model
+
+   IPv6 addresses of all types are assigned to interfaces, not nodes.
+   An IPv6 unicast address refers to a single interface.  Since each
+   interface belongs to a single node, any of that node's interfaces'
+   unicast addresses may be used as an identifier for the node.
+
+   All interfaces are required to have at least one Link-Local unicast
+   address (see Section 2.8 for additional required addresses).  A
+   single interface may also have multiple IPv6 addresses of any type
+   (unicast, anycast, and multicast) or scope.  Unicast addresses with a
+   scope greater than link-scope are not needed for interfaces that are
+   not used as the origin or destination of any IPv6 packets to or from
+   non-neighbors.  This is sometimes convenient for point-to-point
+   interfaces.  There is one exception to this addressing model:
+
+      A unicast address or a set of unicast addresses may be assigned to
+      multiple physical interfaces if the implementation treats the
+      multiple physical interfaces as one interface when presenting it
+      to the internet layer.  This is useful for load-sharing over
+      multiple physical interfaces.
+
+
+
+
+
+Hinden                      Standards Track                     [Page 3]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   Currently, IPv6 continues the IPv4 model in that a subnet prefix is
+   associated with one link.  Multiple subnet prefixes may be assigned
+   to the same link.
+
+2.2.  Text Representation of Addresses
+
+   There are three conventional forms for representing IPv6 addresses as
+   text strings:
+
+   1. The preferred form is x:x:x:x:x:x:x:x, where the 'x's are one to
+      four hexadecimal digits of the eight 16-bit pieces of the address.
+      Examples:
+
+         ABCD:EF01:2345:6789:ABCD:EF01:2345:6789
+
+         2001:DB8:0:0:8:800:200C:417A
+
+      Note that it is not necessary to write the leading zeros in an
+      individual field, but there must be at least one numeral in every
+      field (except for the case described in 2.).
+
+   2. Due to some methods of allocating certain styles of IPv6
+      addresses, it will be common for addresses to contain long strings
+      of zero bits.  In order to make writing addresses containing zero
+      bits easier, a special syntax is available to compress the zeros.
+      The use of "::" indicates one or more groups of 16 bits of zeros.
+      The "::" can only appear once in an address.  The "::" can also be
+      used to compress leading or trailing zeros in an address.
+
+      For example, the following addresses
+
+         2001:DB8:0:0:8:800:200C:417A   a unicast address
+         FF01:0:0:0:0:0:0:101           a multicast address
+         0:0:0:0:0:0:0:1                the loopback address
+         0:0:0:0:0:0:0:0                the unspecified address
+
+      may be represented as
+
+         2001:DB8::8:800:200C:417A      a unicast address
+         FF01::101                      a multicast address
+         ::1                            the loopback address
+         ::                             the unspecified address
+
+   3. An alternative form that is sometimes more convenient when dealing
+      with a mixed environment of IPv4 and IPv6 nodes is
+      x:x:x:x:x:x:d.d.d.d, where the 'x's are the hexadecimal values of
+      the six high-order 16-bit pieces of the address, and the 'd's are
+
+
+
+
+Hinden                      Standards Track                     [Page 4]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+      the decimal values of the four low-order 8-bit pieces of the
+      address (standard IPv4 representation).  Examples:
+
+         0:0:0:0:0:0:13.1.68.3
+
+         0:0:0:0:0:FFFF:129.144.52.38
+
+      or in compressed form:
+
+         ::13.1.68.3
+
+         ::FFFF:129.144.52.38
+
+2.3.  Text Representation of Address Prefixes
+
+   The text representation of IPv6 address prefixes is similar to the
+   way IPv4 address prefixes are written in Classless Inter-Domain
+   Routing (CIDR) notation [CIDR].  An IPv6 address prefix is
+   represented by the notation:
+
+      ipv6-address/prefix-length
+
+   where
+
+      ipv6-address    is an IPv6 address in any of the notations listed
+                      in Section 2.2.
+
+      prefix-length   is a decimal value specifying how many of the
+                      leftmost contiguous bits of the address comprise
+                      the prefix.
+
+   For example, the following are legal representations of the 60-bit
+   prefix 20010DB80000CD3 (hexadecimal):
+
+      2001:0DB8:0000:CD30:0000:0000:0000:0000/60
+      2001:0DB8::CD30:0:0:0:0/60
+      2001:0DB8:0:CD30::/60
+
+   The following are NOT legal representations of the above prefix:
+
+      2001:0DB8:0:CD3/60   may drop leading zeros, but not trailing
+                           zeros, within any 16-bit chunk of the address
+
+      2001:0DB8::CD30/60   address to left of "/" expands to
+                           2001:0DB8:0000:0000:0000:0000:0000:CD30
+
+      2001:0DB8::CD3/60    address to left of "/" expands to
+                           2001:0DB8:0000:0000:0000:0000:0000:0CD3
+
+
+
+Hinden                      Standards Track                     [Page 5]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   When writing both a node address and a prefix of that node address
+   (e.g., the node's subnet prefix), the two can be combined as follows:
+
+      the node address      2001:0DB8:0:CD30:123:4567:89AB:CDEF
+      and its subnet number 2001:0DB8:0:CD30::/60
+
+      can be abbreviated as 2001:0DB8:0:CD30:123:4567:89AB:CDEF/60
+
+2.4.  Address Type Identification
+
+   The type of an IPv6 address is identified by the high-order bits of
+   the address, as follows:
+
+      Address type         Binary prefix        IPv6 notation   Section
+      ------------         -------------        -------------   -------
+      Unspecified          00...0  (128 bits)   ::/128          2.5.2
+      Loopback             00...1  (128 bits)   ::1/128         2.5.3
+      Multicast            11111111             FF00::/8        2.7
+      Link-Local unicast   1111111010           FE80::/10       2.5.6
+      Global Unicast       (everything else)
+
+   Anycast addresses are taken from the unicast address spaces (of any
+   scope) and are not syntactically distinguishable from unicast
+   addresses.
+
+   The general format of Global Unicast addresses is described in
+   Section 2.5.4.  Some special-purpose subtypes of Global Unicast
+   addresses that contain embedded IPv4 addresses (for the purposes of
+   IPv4-IPv6 interoperation) are described in Section 2.5.5.
+
+   Future specifications may redefine one or more sub-ranges of the
+   Global Unicast space for other purposes, but unless and until that
+   happens, implementations must treat all addresses that do not start
+   with any of the above-listed prefixes as Global Unicast addresses.
+
+2.5.  Unicast Addresses
+
+   IPv6 unicast addresses are aggregatable with prefixes of arbitrary
+   bit-length, similar to IPv4 addresses under Classless Inter-Domain
+   Routing.
+
+   There are several types of unicast addresses in IPv6, in particular,
+   Global Unicast, site-local unicast (deprecated, see Section 2.5.7),
+   and Link-Local unicast.  There are also some special-purpose subtypes
+   of Global Unicast, such as IPv6 addresses with embedded IPv4
+   addresses.  Additional address types or subtypes can be defined in
+   the future.
+
+
+
+
+Hinden                      Standards Track                     [Page 6]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   IPv6 nodes may have considerable or little knowledge of the internal
+   structure of the IPv6 address, depending on the role the node plays
+   (for instance, host versus router).  At a minimum, a node may
+   consider that unicast addresses (including its own) have no internal
+   structure:
+
+   |                           128 bits                              |
+   +-----------------------------------------------------------------+
+   |                          node address                           |
+   +-----------------------------------------------------------------+
+
+   A slightly sophisticated host (but still rather simple) may
+   additionally be aware of subnet prefix(es) for the link(s) it is
+   attached to, where different addresses may have different values for
+   n:
+
+   |          n bits               |           128-n bits            |
+   +-------------------------------+---------------------------------+
+   |       subnet prefix           |           interface ID          |
+   +-------------------------------+---------------------------------+
+
+   Though a very simple router may have no knowledge of the internal
+   structure of IPv6 unicast addresses, routers will more generally have
+   knowledge of one or more of the hierarchical boundaries for the
+   operation of routing protocols.  The known boundaries will differ
+   from router to router, depending on what positions the router holds
+   in the routing hierarchy.
+
+   Except for the knowledge of the subnet boundary discussed in the
+   previous paragraphs, nodes should not make any assumptions about the
+   structure of an IPv6 address.
+
+2.5.1.  Interface Identifiers
+
+   Interface identifiers in IPv6 unicast addresses are used to identify
+   interfaces on a link.  They are required to be unique within a subnet
+   prefix.  It is recommended that the same interface identifier not be
+   assigned to different nodes on a link.  They may also be unique over
+   a broader scope.  In some cases, an interface's identifier will be
+   derived directly from that interface's link-layer address.  The same
+   interface identifier may be used on multiple interfaces on a single
+   node, as long as they are attached to different subnets.
+
+   Note that the uniqueness of interface identifiers is independent of
+   the uniqueness of IPv6 addresses.  For example, a Global Unicast
+   address may be created with a local scope interface identifier and a
+   Link-Local address may be created with a universal scope interface
+   identifier.
+
+
+
+Hinden                      Standards Track                     [Page 7]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   For all unicast addresses, except those that start with the binary
+   value 000, Interface IDs are required to be 64 bits long and to be
+   constructed in Modified EUI-64 format.
+
+   Modified EUI-64 format-based interface identifiers may have universal
+   scope when derived from a universal token (e.g., IEEE 802 48-bit MAC
+   or IEEE EUI-64 identifiers [EUI64]) or may have local scope where a
+   global token is not available (e.g., serial links, tunnel end-points)
+   or where global tokens are undesirable (e.g., temporary tokens for
+   privacy [PRIV]).
+
+   Modified EUI-64 format interface identifiers are formed by inverting
+   the "u" bit (universal/local bit in IEEE EUI-64 terminology) when
+   forming the interface identifier from IEEE EUI-64 identifiers.  In
+   the resulting Modified EUI-64 format, the "u" bit is set to one (1)
+   to indicate universal scope, and it is set to zero (0) to indicate
+   local scope.  The first three octets in binary of an IEEE EUI-64
+   identifier are as follows:
+
+          0       0 0       1 1       2
+         |0       7 8       5 6       3|
+         +----+----+----+----+----+----+
+         |cccc|ccug|cccc|cccc|cccc|cccc|
+         +----+----+----+----+----+----+
+
+   written in Internet standard bit-order, where "u" is the
+   universal/local bit, "g" is the individual/group bit, and "c" is the
+   bits of the company_id.  Appendix A, "Creating Modified EUI-64 Format
+   Interface Identifiers", provides examples on the creation of Modified
+   EUI-64 format-based interface identifiers.
+
+   The motivation for inverting the "u" bit when forming an interface
+   identifier is to make it easy for system administrators to hand
+   configure non-global identifiers when hardware tokens are not
+   available.  This is expected to be the case for serial links and
+   tunnel end-points, for example.  The alternative would have been for
+   these to be of the form 0200:0:0:1, 0200:0:0:2, etc., instead of the
+   much simpler 0:0:0:1, 0:0:0:2, etc.
+
+   IPv6 nodes are not required to validate that interface identifiers
+   created with modified EUI-64 tokens with the "u" bit set to universal
+   are unique.
+
+   The use of the universal/local bit in the Modified EUI-64 format
+   identifier is to allow development of future technology that can take
+   advantage of interface identifiers with universal scope.
+
+
+
+
+
+Hinden                      Standards Track                     [Page 8]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   The details of forming interface identifiers are defined in the
+   appropriate "IPv6 over <link>" specification, such as "IPv6 over
+   Ethernet" [ETHER], and "IPv6 over FDDI" [FDDI].
+
+2.5.2.  The Unspecified Address
+
+   The address 0:0:0:0:0:0:0:0 is called the unspecified address.  It
+   must never be assigned to any node.  It indicates the absence of an
+   address.  One example of its use is in the Source Address field of
+   any IPv6 packets sent by an initializing host before it has learned
+   its own address.
+
+   The unspecified address must not be used as the destination address
+   of IPv6 packets or in IPv6 Routing headers.  An IPv6 packet with a
+   source address of unspecified must never be forwarded by an IPv6
+   router.
+
+2.5.3.  The Loopback Address
+
+   The unicast address 0:0:0:0:0:0:0:1 is called the loopback address.
+   It may be used by a node to send an IPv6 packet to itself.  It must
+   not be assigned to any physical interface.  It is treated as having
+   Link-Local scope, and may be thought of as the Link-Local unicast
+   address of a virtual interface (typically called the "loopback
+   interface") to an imaginary link that goes nowhere.
+
+   The loopback address must not be used as the source address in IPv6
+   packets that are sent outside of a single node.  An IPv6 packet with
+   a destination address of loopback must never be sent outside of a
+   single node and must never be forwarded by an IPv6 router.  A packet
+   received on an interface with a destination address of loopback must
+   be dropped.
+
+2.5.4.  Global Unicast Addresses
+
+   The general format for IPv6 Global Unicast addresses is as follows:
+
+   |         n bits         |   m bits  |       128-n-m bits         |
+   +------------------------+-----------+----------------------------+
+   | global routing prefix  | subnet ID |       interface ID         |
+   +------------------------+-----------+----------------------------+
+
+   where the global routing prefix is a (typically hierarchically-
+   structured) value assigned to a site (a cluster of subnets/links),
+   the subnet ID is an identifier of a link within the site, and the
+   interface ID is as defined in Section 2.5.1.
+
+
+
+
+
+Hinden                      Standards Track                     [Page 9]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   All Global Unicast addresses other than those that start with binary
+   000 have a 64-bit interface ID field (i.e., n + m = 64), formatted as
+   described in Section 2.5.1.  Global Unicast addresses that start with
+   binary 000 have no such constraint on the size or structure of the
+   interface ID field.
+
+   Examples of Global Unicast addresses that start with binary 000 are
+   the IPv6 address with embedded IPv4 addresses described in Section
+   2.5.5.  An example of global addresses starting with a binary value
+   other than 000 (and therefore having a 64-bit interface ID field) can
+   be found in [GLOBAL].
+
+2.5.5.  IPv6 Addresses with Embedded IPv4 Addresses
+
+   Two types of IPv6 addresses are defined that carry an IPv4 address in
+   the low-order 32 bits of the address.  These are the "IPv4-Compatible
+   IPv6 address" and the "IPv4-mapped IPv6 address".
+
+2.5.5.1.  IPv4-Compatible IPv6 Address
+
+   The "IPv4-Compatible IPv6 address" was defined to assist in the IPv6
+   transition.  The format of the "IPv4-Compatible IPv6 address" is as
+   follows:
+
+   |                80 bits               | 16 |      32 bits        |
+   +--------------------------------------+--------------------------+
+   |0000..............................0000|0000|    IPv4 address     |
+   +--------------------------------------+----+---------------------+
+
+   Note: The IPv4 address used in the "IPv4-Compatible IPv6 address"
+   must be a globally-unique IPv4 unicast address.
+
+   The "IPv4-Compatible IPv6 address" is now deprecated because the
+   current IPv6 transition mechanisms no longer use these addresses.
+   New or updated implementations are not required to support this
+   address type.
+
+2.5.5.2.  IPv4-Mapped IPv6 Address
+
+   A second type of IPv6 address that holds an embedded IPv4 address is
+   defined.  This address type is used to represent the addresses of
+   IPv4 nodes as IPv6 addresses.  The format of the "IPv4-mapped IPv6
+   address" is as follows:
+
+
+
+
+
+
+
+
+Hinden                      Standards Track                    [Page 10]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+
+   |                80 bits               | 16 |      32 bits        |
+   +--------------------------------------+--------------------------+
+   |0000..............................0000|FFFF|    IPv4 address     |
+   +--------------------------------------+----+---------------------+
+
+   See [RFC4038] for background on the usage of the "IPv4-mapped IPv6
+   address".
+
+2.5.6.  Link-Local IPv6 Unicast Addresses
+
+   Link-Local addresses are for use on a single link.  Link-Local
+   addresses have the following format:
+
+   |   10     |
+   |  bits    |         54 bits         |          64 bits           |
+   +----------+-------------------------+----------------------------+
+   |1111111010|           0             |       interface ID         |
+   +----------+-------------------------+----------------------------+
+
+   Link-Local addresses are designed to be used for addressing on a
+   single link for purposes such as automatic address configuration,
+   neighbor discovery, or when no routers are present.
+
+   Routers must not forward any packets with Link-Local source or
+   destination addresses to other links.
+
+2.5.7.  Site-Local IPv6 Unicast Addresses
+
+   Site-Local addresses were originally designed to be used for
+   addressing inside of a site without the need for a global prefix.
+   Site-local addresses are now deprecated as defined in [SLDEP].
+
+   Site-Local addresses have the following format:
+
+   |   10     |
+   |  bits    |         54 bits         |         64 bits            |
+   +----------+-------------------------+----------------------------+
+   |1111111011|        subnet ID        |       interface ID         |
+   +----------+-------------------------+----------------------------+
+
+   The special behavior of this prefix defined in [RFC3513] must no
+   longer be supported in new implementations (i.e., new implementations
+   must treat this prefix as Global Unicast).
+
+   Existing implementations and deployments may continue to use this
+   prefix.
+
+
+
+
+Hinden                      Standards Track                    [Page 11]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+2.6.  Anycast Addresses
+
+   An IPv6 anycast address is an address that is assigned to more than
+   one interface (typically belonging to different nodes), with the
+   property that a packet sent to an anycast address is routed to the
+   "nearest" interface having that address, according to the routing
+   protocols' measure of distance.
+
+   Anycast addresses are allocated from the unicast address space, using
+   any of the defined unicast address formats.  Thus, anycast addresses
+   are syntactically indistinguishable from unicast addresses.  When a
+   unicast address is assigned to more than one interface, thus turning
+   it into an anycast address, the nodes to which the address is
+   assigned must be explicitly configured to know that it is an anycast
+   address.
+
+   For any assigned anycast address, there is a longest prefix P of that
+   address that identifies the topological region in which all
+   interfaces belonging to that anycast address reside.  Within the
+   region identified by P, the anycast address must be maintained as a
+   separate entry in the routing system (commonly referred to as a "host
+   route"); outside the region identified by P, the anycast address may
+   be aggregated into the routing entry for prefix P.
+
+   Note that in the worst case, the prefix P of an anycast set may be
+   the null prefix, i.e., the members of the set may have no topological
+   locality.  In that case, the anycast address must be maintained as a
+   separate routing entry throughout the entire Internet, which presents
+   a severe scaling limit on how many such "global" anycast sets may be
+   supported.  Therefore, it is expected that support for global anycast
+   sets may be unavailable or very restricted.
+
+   One expected use of anycast addresses is to identify the set of
+   routers belonging to an organization providing Internet service.
+   Such addresses could be used as intermediate addresses in an IPv6
+   Routing header, to cause a packet to be delivered via a particular
+   service provider or sequence of service providers.
+
+   Some other possible uses are to identify the set of routers attached
+   to a particular subnet, or the set of routers providing entry into a
+   particular routing domain.
+
+2.6.1.  Required Anycast Address
+
+   The Subnet-Router anycast address is predefined.  Its format is as
+   follows:
+
+
+
+
+
+Hinden                      Standards Track                    [Page 12]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+
+   |                         n bits                 |   128-n bits   |
+   +------------------------------------------------+----------------+
+   |                   subnet prefix                | 00000000000000 |
+   +------------------------------------------------+----------------+
+
+   The "subnet prefix" in an anycast address is the prefix that
+   identifies a specific link.  This anycast address is syntactically
+   the same as a unicast address for an interface on the link with the
+   interface identifier set to zero.
+
+   Packets sent to the Subnet-Router anycast address will be delivered
+   to one router on the subnet.  All routers are required to support the
+   Subnet-Router anycast addresses for the subnets to which they have
+   interfaces.
+
+   The Subnet-Router anycast address is intended to be used for
+   applications where a node needs to communicate with any one of the
+   set of routers.
+
+2.7.  Multicast Addresses
+
+   An IPv6 multicast address is an identifier for a group of interfaces
+   (typically on different nodes).  An interface may belong to any
+   number of multicast groups.  Multicast addresses have the following
+   format:
+
+   |   8    |  4 |  4 |                  112 bits                   |
+   +------ -+----+----+---------------------------------------------+
+   |11111111|flgs|scop|                  group ID                   |
+   +--------+----+----+---------------------------------------------+
+
+      binary 11111111 at the start of the address identifies the address
+      as being a multicast address.
+
+                                    +-+-+-+-+
+      flgs is a set of 4 flags:     |0|R|P|T|
+                                    +-+-+-+-+
+
+         The high-order flag is reserved, and must be initialized to 0.
+
+         T = 0 indicates a permanently-assigned ("well-known") multicast
+         address, assigned by the Internet Assigned Numbers Authority
+         (IANA).
+
+         T = 1 indicates a non-permanently-assigned ("transient" or
+         "dynamically" assigned) multicast address.
+
+
+
+
+Hinden                      Standards Track                    [Page 13]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+         The P flag's definition and usage can be found in [RFC3306].
+
+         The R flag's definition and usage can be found in [RFC3956].
+
+      scop is a 4-bit multicast scope value used to limit the scope of
+      the multicast group.  The values are as follows:
+
+         0  reserved
+         1  Interface-Local scope
+         2  Link-Local scope
+         3  reserved
+         4  Admin-Local scope
+         5  Site-Local scope
+         6  (unassigned)
+         7  (unassigned)
+         8  Organization-Local scope
+         9  (unassigned)
+         A  (unassigned)
+         B  (unassigned)
+         C  (unassigned)
+         D  (unassigned)
+         E  Global scope
+         F  reserved
+
+         Interface-Local scope spans only a single interface on a node
+         and is useful only for loopback transmission of multicast.
+
+         Link-Local multicast scope spans the same topological region as
+         the corresponding unicast scope.
+
+         Admin-Local scope is the smallest scope that must be
+         administratively configured, i.e., not automatically derived
+         from physical connectivity or other, non-multicast-related
+         configuration.
+
+         Site-Local scope is intended to span a single site.
+
+         Organization-Local scope is intended to span multiple sites
+         belonging to a single organization.
+
+         scopes labeled "(unassigned)" are available for administrators
+         to define additional multicast regions.
+
+      group ID identifies the multicast group, either permanent or
+      transient, within the given scope.  Additional definitions of the
+      multicast group ID field structure are provided in [RFC3306].
+
+
+
+
+
+Hinden                      Standards Track                    [Page 14]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   The "meaning" of a permanently-assigned multicast address is
+   independent of the scope value.  For example, if the "NTP servers
+   group" is assigned a permanent multicast address with a group ID of
+   101 (hex), then
+
+      FF01:0:0:0:0:0:0:101 means all NTP servers on the same interface
+      (i.e., the same node) as the sender.
+
+      FF02:0:0:0:0:0:0:101 means all NTP servers on the same link as the
+      sender.
+
+      FF05:0:0:0:0:0:0:101 means all NTP servers in the same site as the
+      sender.
+
+      FF0E:0:0:0:0:0:0:101 means all NTP servers in the Internet.
+
+   Non-permanently-assigned multicast addresses are meaningful only
+   within a given scope.  For example, a group identified by the non-
+   permanent, site-local multicast address FF15:0:0:0:0:0:0:101 at one
+   site bears no relationship to a group using the same address at a
+   different site, nor to a non-permanent group using the same group ID
+   with a different scope, nor to a permanent group with the same group
+   ID.
+
+   Multicast addresses must not be used as source addresses in IPv6
+   packets or appear in any Routing header.
+
+   Routers must not forward any multicast packets beyond of the scope
+   indicated by the scop field in the destination multicast address.
+
+   Nodes must not originate a packet to a multicast address whose scop
+   field contains the reserved value 0; if such a packet is received, it
+   must be silently dropped.  Nodes should not originate a packet to a
+   multicast address whose scop field contains the reserved value F; if
+   such a packet is sent or received, it must be treated the same as
+   packets destined to a global (scop E) multicast address.
+
+2.7.1.  Pre-Defined Multicast Addresses
+
+   The following well-known multicast addresses are pre-defined.  The
+   group IDs defined in this section are defined for explicit scope
+   values.
+
+   Use of these group IDs for any other scope values, with the T flag
+   equal to 0, is not allowed.
+
+
+
+
+
+
+Hinden                      Standards Track                    [Page 15]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+      Reserved Multicast Addresses:   FF00:0:0:0:0:0:0:0
+                                      FF01:0:0:0:0:0:0:0
+                                      FF02:0:0:0:0:0:0:0
+                                      FF03:0:0:0:0:0:0:0
+                                      FF04:0:0:0:0:0:0:0
+                                      FF05:0:0:0:0:0:0:0
+                                      FF06:0:0:0:0:0:0:0
+                                      FF07:0:0:0:0:0:0:0
+                                      FF08:0:0:0:0:0:0:0
+                                      FF09:0:0:0:0:0:0:0
+                                      FF0A:0:0:0:0:0:0:0
+                                      FF0B:0:0:0:0:0:0:0
+                                      FF0C:0:0:0:0:0:0:0
+                                      FF0D:0:0:0:0:0:0:0
+                                      FF0E:0:0:0:0:0:0:0
+                                      FF0F:0:0:0:0:0:0:0
+
+   The above multicast addresses are reserved and shall never be
+   assigned to any multicast group.
+
+      All Nodes Addresses:    FF01:0:0:0:0:0:0:1
+                              FF02:0:0:0:0:0:0:1
+
+   The above multicast addresses identify the group of all IPv6 nodes,
+   within scope 1 (interface-local) or 2 (link-local).
+
+      All Routers Addresses:   FF01:0:0:0:0:0:0:2
+                               FF02:0:0:0:0:0:0:2
+                               FF05:0:0:0:0:0:0:2
+
+   The above multicast addresses identify the group of all IPv6 routers,
+   within scope 1 (interface-local), 2 (link-local), or 5 (site-local).
+
+      Solicited-Node Address:  FF02:0:0:0:0:1:FFXX:XXXX
+
+   Solicited-Node multicast address are computed as a function of a
+   node's unicast and anycast addresses.  A Solicited-Node multicast
+   address is formed by taking the low-order 24 bits of an address
+   (unicast or anycast) and appending those bits to the prefix
+   FF02:0:0:0:0:1:FF00::/104 resulting in a multicast address in the
+   range
+
+         FF02:0:0:0:0:1:FF00:0000
+
+   to
+
+         FF02:0:0:0:0:1:FFFF:FFFF
+
+
+
+
+Hinden                      Standards Track                    [Page 16]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   For example, the Solicited-Node multicast address corresponding to
+   the IPv6 address 4037::01:800:200E:8C6C is FF02::1:FF0E:8C6C.  IPv6
+   addresses that differ only in the high-order bits (e.g., due to
+   multiple high-order prefixes associated with different aggregations)
+   will map to the same Solicited-Node address, thereby reducing the
+   number of multicast addresses a node must join.
+
+   A node is required to compute and join (on the appropriate interface)
+   the associated Solicited-Node multicast addresses for all unicast and
+   anycast addresses that have been configured for the node's interfaces
+   (manually or automatically).
+
+2.8.  A Node's Required Addresses
+
+   A host is required to recognize the following addresses as
+   identifying itself:
+
+      o Its required Link-Local address for each interface.
+
+      o Any additional Unicast and Anycast addresses that have been
+        configured for the node's interfaces (manually or
+        automatically).
+
+      o The loopback address.
+
+      o The All-Nodes multicast addresses defined in Section 2.7.1.
+
+      o The Solicited-Node multicast address for each of its unicast and
+        anycast addresses.
+
+      o Multicast addresses of all other groups to which the node
+        belongs.
+
+   A router is required to recognize all addresses that a host is
+   required to recognize, plus the following addresses as identifying
+   itself:
+
+      o The Subnet-Router Anycast addresses for all interfaces for which
+        it is configured to act as a router.
+
+      o All other Anycast addresses with which the router has been
+        configured.
+
+      o The All-Routers multicast addresses defined in Section 2.7.1.
+
+
+
+
+
+
+
+Hinden                      Standards Track                    [Page 17]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+3.  Security Considerations
+
+   IPv6 addressing documents do not have any direct impact on Internet
+   infrastructure security.  Authentication of IPv6 packets is defined
+   in [AUTH].
+
+4.  IANA Considerations
+
+   The "IPv4-Compatible IPv6 address" is deprecated by this document.
+   The IANA should continue to list the address block containing these
+   addresses at http://www.iana.org/assignments/ipv6-address-space as
+   "Reserved by IETF" and not reassign it for any other purpose.  For
+   example:
+
+      0000::/8        Reserved by IETF        [RFC3513]      [1]
+
+   The IANA has added the following note and link to this address block.
+
+      [5]  0000::/96 was previously defined as the "IPv4-Compatible IPv6
+           address" prefix.  This definition has been deprecated by RFC
+           4291.
+
+   The IANA has updated the references for the IPv6 Address Architecture
+   in the IANA registries accordingly.
+
+5.  Acknowledgements
+
+   The authors would like to acknowledge the contributions of Paul
+   Francis, Scott Bradner, Jim Bound, Brian Carpenter, Matt Crawford,
+   Deborah Estrin, Roger Fajman, Bob Fink, Peter Ford, Bob Gilligan,
+   Dimitry Haskin, Tom Harsch, Christian Huitema, Tony Li, Greg
+   Minshall, Thomas Narten, Erik Nordmark, Yakov Rekhter, Bill Simpson,
+   Sue Thomson, Markku Savela, Larry Masinter, Jun-ichiro Itojun Hagino,
+   Tatuya Jinmei, Suresh Krishnan, and Mahmood Ali.
+
+6.  References
+
+6.1.  Normative References
+
+   [IPV6]    Deering, S. and R. Hinden, "Internet Protocol, Version 6
+             (IPv6) Specification", RFC 2460, December 1998.
+
+6.2.  Informative References
+
+   [AUTH]    Kent, S. and R. Atkinson, "IP Authentication Header", RFC
+             2402, November 1998.
+
+
+
+
+
+Hinden                      Standards Track                    [Page 18]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   [CIDR]    Fuller, V., Li, T., Yu, J., and K. Varadhan, "Classless
+             Inter-Domain Routing (CIDR): an Address Assignment and
+             Aggregation Strategy", RFC 1519, September 1993.
+
+   [ETHER]   Crawford, M., "Transmission of IPv6 Packets over Ethernet
+             Networks", RFC 2464, December 1998.
+
+   [EUI64]   IEEE, "Guidelines for 64-bit Global Identifier (EUI-64)
+             Registration Authority",
+             http://standards.ieee.org/regauth/oui/tutorials/EUI64.html,
+             March 1997.
+
+   [FDDI]    Crawford, M., "Transmission of IPv6 Packets over FDDI
+             Networks", RFC 2467, December 1998.
+
+   [GLOBAL]  Hinden, R., Deering, S., and E. Nordmark, "IPv6 Global
+             Unicast Address Format", RFC 3587, August 2003.
+
+   [PRIV]    Narten, T. and R. Draves, "Privacy Extensions for Stateless
+             Address Autoconfiguration in IPv6", RFC 3041, January 2001.
+
+   [RFC3513] Hinden, R. and S. Deering, "Internet Protocol Version 6
+             (IPv6) Addressing Architecture", RFC 3513, April 2005.
+
+   [RFC3306] Haberman, B. and D. Thaler, "Unicast-Prefix-based IPv6
+             Multicast Addresses", RFC 3306, August 2002.
+
+   [RFC3956] Savola, P. and B. Haberman, "Embedding the Rendezvous Point
+             (RP) Address in an IPv6 Multicast Address", RFC 3956,
+             November 2004.
+
+   [RFC4038] Shin, M-K., Hong, Y-G., Hagino, J., Savola, P., and E.
+             Castro, "Application Aspects of IPv6 Transition", RFC 4038,
+             March 2005.
+
+   [SLDEP]   Huitema, C. and B. Carpenter, "Deprecating Site Local
+             Addresses", RFC 3879, September 2004.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Hinden                      Standards Track                    [Page 19]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+Appendix A: Creating Modified EUI-64 Format Interface Identifiers
+
+   Depending on the characteristics of a specific link or node, there
+   are a number of approaches for creating Modified EUI-64 format
+   interface identifiers. This appendix describes some of these
+   approaches.
+
+   Links or Nodes with IEEE EUI-64 Identifiers
+
+   The only change needed to transform an IEEE EUI-64 identifier to an
+   interface identifier is to invert the "u" (universal/local) bit.  An
+   example is a globally unique IEEE EUI-64 identifier of the form:
+
+   |0              1|1              3|3              4|4              6|
+   |0              5|6              1|2              7|8              3|
+   +----------------+----------------+----------------+----------------+
+   |cccccc0gcccccccc|ccccccccmmmmmmmm|mmmmmmmmmmmmmmmm|mmmmmmmmmmmmmmmm|
+   +----------------+----------------+----------------+----------------+
+
+   where "c" is the bits of the assigned company_id, "0" is the value of
+   the universal/local bit to indicate universal scope, "g" is
+   individual/group bit, and "m" is the bits of the manufacturer-
+   selected extension identifier.  The IPv6 interface identifier would
+   be of the form:
+
+   |0              1|1              3|3              4|4              6|
+   |0              5|6              1|2              7|8              3|
+   +----------------+----------------+----------------+----------------+
+   |cccccc1gcccccccc|ccccccccmmmmmmmm|mmmmmmmmmmmmmmmm|mmmmmmmmmmmmmmmm|
+   +----------------+----------------+----------------+----------------+
+
+   The only change is inverting the value of the universal/local bit.
+
+   Links or Nodes with IEEE 802 48-bit MACs
+
+   [EUI64] defines a method to create an IEEE EUI-64 identifier from an
+   IEEE 48-bit MAC identifier.  This is to insert two octets, with
+   hexadecimal values of 0xFF and 0xFE (see the Note at the end of
+   appendix), in the middle of the 48-bit MAC (between the company_id
+   and vendor-supplied id).  An example is the 48-bit IEEE MAC with
+   Global scope:
+
+   |0              1|1              3|3              4|
+   |0              5|6              1|2              7|
+   +----------------+----------------+----------------+
+   |cccccc0gcccccccc|ccccccccmmmmmmmm|mmmmmmmmmmmmmmmm|
+   +----------------+----------------+----------------+
+
+
+
+
+Hinden                      Standards Track                    [Page 20]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   where "c" is the bits of the assigned company_id, "0" is the value of
+   the universal/local bit to indicate Global scope, "g" is
+   individual/group bit, and "m" is the bits of the manufacturer-
+   selected extension identifier.  The interface identifier would be of
+   the form:
+
+   |0              1|1              3|3              4|4              6|
+   |0              5|6              1|2              7|8              3|
+   +----------------+----------------+----------------+----------------+
+   |cccccc1gcccccccc|cccccccc11111111|11111110mmmmmmmm|mmmmmmmmmmmmmmmm|
+   +----------------+----------------+----------------+----------------+
+
+   When IEEE 802 48-bit MAC addresses are available (on an interface or
+   a node), an implementation may use them to create interface
+   identifiers due to their availability and uniqueness properties.
+
+   Links with Other Kinds of Identifiers
+
+   There are a number of types of links that have link-layer interface
+   identifiers other than IEEE EUI-64 or IEEE 802 48-bit MACs.  Examples
+   include LocalTalk and Arcnet.  The method to create a Modified EUI-64
+   format identifier is to take the link identifier (e.g., the LocalTalk
+   8-bit node identifier) and zero fill it to the left.  For example, a
+   LocalTalk 8-bit node identifier of hexadecimal value 0x4F results in
+   the following interface identifier:
+
+   |0              1|1              3|3              4|4              6|
+   |0              5|6              1|2              7|8              3|
+   +----------------+----------------+----------------+----------------+
+   |0000000000000000|0000000000000000|0000000000000000|0000000001001111|
+   +----------------+----------------+----------------+----------------+
+
+   Note that this results in the universal/local bit set to "0" to
+   indicate local scope.
+
+   Links without Identifiers
+
+   There are a number of links that do not have any type of built-in
+   identifier.  The most common of these are serial links and configured
+   tunnels.  Interface identifiers that are unique within a subnet
+   prefix must be chosen.
+
+   When no built-in identifier is available on a link, the preferred
+   approach is to use a universal interface identifier from another
+   interface or one that is assigned to the node itself.  When using
+   this approach, no other interface connecting the same node to the
+   same subnet prefix may use the same identifier.
+
+
+
+
+Hinden                      Standards Track                    [Page 21]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+   If there is no universal interface identifier available for use on
+   the link, the implementation needs to create a local-scope interface
+   identifier.  The only requirement is that it be unique within a
+   subnet prefix.  There are many possible approaches to select a
+   subnet-prefix-unique interface identifier.  These include the
+   following:
+
+      Manual Configuration
+      Node Serial Number
+      Other Node-Specific Token
+
+   The subnet-prefix-unique interface identifier should be generated in
+   a manner such that it does not change after a reboot of a node or if
+   interfaces are added or deleted from the node.
+
+   The selection of the appropriate algorithm is link and implementation
+   dependent.  The details on forming interface identifiers are defined
+   in the appropriate "IPv6 over <link>" specification.  It is strongly
+   recommended that a collision detection algorithm be implemented as
+   part of any automatic algorithm.
+
+   Note: [EUI-64] actually defines 0xFF and 0xFF as the bits to be
+         inserted to create an IEEE EUI-64 identifier from an IEEE MAC-
+         48 identifier.  The 0xFF and 0xFE values are used when starting
+         with an IEEE EUI-48 identifier.  The incorrect value was used
+         in earlier versions of the specification due to a
+         misunderstanding about the differences between IEEE MAC-48 and
+         EUI-48 identifiers.
+
+         This document purposely continues the use of 0xFF and 0xFE
+         because it meets the requirements for IPv6 interface
+         identifiers (i.e., that they must be unique on the link), IEEE
+         EUI-48 and MAC-48 identifiers are syntactically equivalent, and
+         that it doesn't cause any problems in practice.
+
+Appendix B: Changes from RFC 3513
+
+   The following changes were made from RFC 3513, "IP Version 6
+   Addressing Architecture":
+
+    o The restrictions on using IPv6 anycast addresses were removed
+      because there is now sufficient experience with the use of anycast
+      addresses, the issues are not specific to IPv6, and the GROW
+      working group is working in this area.
+
+    o Deprecated the Site-Local unicast prefix.  Changes include the
+      following:
+
+
+
+
+Hinden                      Standards Track                    [Page 22]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+       - Removed Site-Local from special list of prefixes in Section
+         2.4.
+
+       - Split section titled "Local-use IPv6 Unicast Addresses" into
+         two sections, "Link-Local IPv6 Unicast Addresses" and "Site-
+         Local IPv6 Unicast Addresses".
+
+       - Added text to new section describing Site-Local deprecation.
+
+    o Changes to resolve issues raised in IAB response to Robert Elz
+      appeal.  Changes include the following:
+
+       - Added clarification to Section 2.5 that nodes should make no
+         assumptions about the structure of an IPv6 address.
+
+       - Changed the text in Section 2.5.1 and Appendix A to refer to
+         the Modified EUI-64 format interface identifiers with the "u"
+         bit set to one (1) as universal.
+
+       - Added clarification to Section 2.5.1 that IPv6 nodes are not
+         required to validate that interface identifiers created in
+         Modified EUI-64 format with the "u" bit set to one are unique.
+
+    o Changed the reference indicated in Section 2.5.4 "Global Unicast
+      Addresses" to RFC 3587.
+
+    o Removed mention of NSAP addresses in examples.
+
+    o Clarified that the "x" in the textual representation can be one to
+      four digits.
+
+    o Deprecated the "IPv6 Compatible Address" because it is not being
+      used in the IPv6 transition mechanisms.
+
+    o Added the "R" and "P" flags to Section 2.7 on multicast addresses,
+      and pointers to the documents that define them.
+
+    o Editorial changes.
+
+
+
+
+
+
+
+
+
+
+
+
+
+Hinden                      Standards Track                    [Page 23]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+Authors' Addresses
+
+   Robert M. Hinden
+   Nokia
+   313 Fairchild Drive
+   Mountain View, CA 94043
+   USA
+
+   Phone: +1 650 625-2004
+   EMail: bob.hinden@nokia.com
+
+
+   Stephen E. Deering
+   Cisco Systems, Inc.
+   170 West Tasman Drive
+   San Jose, CA 95134-1706
+   USA
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Hinden                      Standards Track                    [Page 24]
+
+RFC 4291              IPv6 Addressing Architecture         February 2006
+
+
+Full Copyright Statement
+
+   Copyright (C) The Internet Society (2006).
+
+   This document is subject to the rights, licenses and restrictions
+   contained in BCP 78, and except as set forth therein, the authors
+   retain all their rights.
+
+   This document and the information contained herein are provided on an
+   "AS IS" basis and THE CONTRIBUTOR, THE ORGANIZATION HE/SHE REPRESENTS
+   OR IS SPONSORED BY (IF ANY), THE INTERNET SOCIETY AND THE INTERNET
+   ENGINEERING TASK FORCE DISCLAIM ALL WARRANTIES, EXPRESS OR IMPLIED,
+   INCLUDING BUT NOT LIMITED TO ANY WARRANTY THAT THE USE OF THE
+   INFORMATION HEREIN WILL NOT INFRINGE ANY RIGHTS OR ANY IMPLIED
+   WARRANTIES OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+Intellectual Property
+
+   The IETF takes no position regarding the validity or scope of any
+   Intellectual Property Rights or other rights that might be claimed to
+   pertain to the implementation or use of the technology described in
+   this document or the extent to which any license under such rights
+   might or might not be available; nor does it represent that it has
+   made any independent effort to identify any such rights.  Information
+   on the procedures with respect to rights in RFC documents can be
+   found in BCP 78 and BCP 79.
+
+   Copies of IPR disclosures made to the IETF Secretariat and any
+   assurances of licenses to be made available, or the result of an
+   attempt made to obtain a general license or permission for the use of
+   such proprietary rights by implementers or users of this
+   specification can be obtained from the IETF on-line IPR repository at
+   http://www.ietf.org/ipr.
+
+   The IETF invites any interested party to bring to its attention any
+   copyrights, patents or patent applications, or other proprietary
+   rights that may cover technology that may be required to implement
+   this standard.  Please address the information to the IETF at
+   ietf-ipr@ietf.org.
+
+Acknowledgement
+
+   Funding for the RFC Editor function is provided by the IETF
+   Administrative Support Activity (IASA).
+
+
+
+
+
+
+
+Hinden                      Standards Track                    [Page 25]
+
+
+
+===== RFC4301 =====
+
+
+
+
+
+
+
+Network Working Group                                            S. Kent
+Request for Comments: 4301                                        K. Seo
+Obsoletes: 2401                                         BBN Technologies
+Category: Standards Track                                  December 2005
+
+
+            Security Architecture for the Internet Protocol
+
+Status of This Memo
+
+   This document specifies an Internet standards track protocol for the
+   Internet community, and requests discussion and suggestions for
+   improvements.  Please refer to the current edition of the "Internet
+   Official Protocol Standards" (STD 1) for the standardization state
+   and status of this protocol.  Distribution of this memo is unlimited.
+
+Copyright Notice
+
+   Copyright (C) The Internet Society (2005).
+
+Abstract
+
+   This document describes an updated version of the "Security
+   Architecture for IP", which is designed to provide security services
+   for traffic at the IP layer.  This document obsoletes RFC 2401
+   (November 1998).
+
+Dedication
+
+   This document is dedicated to the memory of Charlie Lynn, a long-time
+   senior colleague at BBN, who made very significant contributions to
+   the IPsec documents.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Kent & Seo                  Standards Track                     [Page 1]
+
+RFC 4301              Security Architecture for IP         December 2005
+
+
+Table of Contents
+
+   1. Introduction ....................................................4
+      1.1. Summary of Contents of Document ............................4
+      1.2. Audience ...................................................4
+      1.3. Related Documents ..........................................5
+   2. Design Objectives ...............................................5
+      2.1. Goals/Objectives/Requirements/Problem Description ..........5
+      2.2. Caveats and Assumptions ....................................6
+   3. System Overview .................................................7
+      3.1. What IPsec Does ............................................7
+      3.2. How IPsec Works ............................................9
+      3.3. Where IPsec Can Be Implemented ............................10
+   4. Security Associations ..........................................11
+      4.1. Definition and Scope ......................................12
+      4.2. SA Functionality ..........................................16
+      4.3. Combining SAs .............................................17
+      4.4. Major IPsec Databases .....................................18
+           4.4.1. The Security Policy Database (SPD) .................19
+                  4.4.1.1. Selectors .................................26
+                  4.4.1.2. Structure of an SPD Entry .................30
+                  4.4.1.3. More Regarding Fields Associated
+                           with Next Layer Protocols .................32
+           4.4.2. Security Association Database (SAD) ................34
+                  4.4.2.1. Data Items in the SAD .....................36
+                  4.4.2.2. Relationship between SPD, PFP
+                           flag, packet, and SAD .....................38
+           4.4.3. Peer Authorization Database (PAD) ..................43
+                  4.4.3.1. PAD Entry IDs and Matching Rules ..........44
+                  4.4.3.2. IKE Peer Authentication Data ..............45
+                  4.4.3.3. Child SA Authorization Data ...............46
+                  4.4.3.4. How the PAD Is Used .......................46
+      4.5. SA and Key Management .....................................47
+           4.5.1. Manual Techniques ..................................48
+           4.5.2. Automated SA and Key Management ....................48
+           4.5.3. Locating a Security Gateway ........................49
+      4.6. SAs and Multicast .........................................50
+   5. IP Traffic Processing ..........................................50
+      5.1. Outbound IP Traffic Processing
+           (protected-to-unprotected) ................................52
+           5.1.1. Handling an Outbound Packet That Must Be
+                  Discarded ..........................................54
+           5.1.2. Header Construction for Tunnel Mode ................55
+                  5.1.2.1. IPv4: Header Construction for
+                           Tunnel Mode ...............................57
+                  5.1.2.2. IPv6: Header Construction for
+                           Tunnel Mode ...............................59
+      5.2. Processing Inbound IP Traffic (unprotected-to-protected) ..59
+
+
+
+Kent & Seo                  Standards Track                     [Page 2]
+
+RFC 4301              Security Architecture for IP         December 2005
+
+
+   6. ICMP Processing ................................................63
+      6.1. Processing ICMP Error Messages Directed to an
+           IPsec Implementation ......................................63
+           6.1.1. ICMP Error Messages Received on the
+                  Unprotected Side of the Boundary ...................63
+           6.1.2. ICMP Error Messages Received on the
+                  Protected Side of the Boundary .....................64
+      6.2. Processing Protected, Transit ICMP Error Messages .........64
+   7. Handling Fragments (on the protected side of the IPsec
+      boundary) ......................................................66
+      7.1. Tunnel Mode SAs that Carry Initial and Non-Initial
+           Fragments .................................................67
+      7.2. Separate Tunnel Mode SAs for Non-Initial Fragments ........67
+      7.3. Stateful Fragment Checking ................................68
+      7.4. BYPASS/DISCARD Traffic ....................................69
+   8. Path MTU/DF Processing .........................................69
+      8.1. DF Bit ....................................................69
+      8.2. Path MTU (PMTU) Discovery .................................70
+           8.2.1. Propagation of PMTU ................................70
+           8.2.2. PMTU Aging .........................................71
+   9. Auditing .......................................................71
+   10. Conformance Requirements ......................................71
+   11. Security Considerations .......................................72
+   12. IANA Considerations ...........................................72
+   13. Differences from RFC 2401 .....................................72
+   14. Acknowledgements ..............................................75
+   Appendix A: Glossary ..............................................76
+   Appendix B: Decorrelation .........................................79
+      B.1. Decorrelation Algorithm ...................................79
+   Appendix C: ASN.1 for an SPD Entry ................................82
+   Appendix D: Fragment Handling Rationale ...........................88
+      D.1. Transport Mode and Fragments ..............................88
+      D.2. Tunnel Mode and Fragments .................................89
+      D.3. The Problem of Non-Initial Fragments ......................90
+      D.4. BYPASS/DISCARD Traffic ....................................93
+      D.5. Just say no to ports? .....................................94
+      D.6. Other Suggested Solutions..................................94
+      D.7. Consistency................................................95
+      D.8. Conclusions................................................95
+   Appendix E: Example of Supporting Nested SAs via SPD and
+               Forwarding Table Entries...............................96
+   References.........................................................98
+      Normative References............................................98
+      Informative References..........................................99
+
+
+
+
+
+
+
+Kent & Seo                  Standards Track                     [Page 3]
+
+RFC 4301              Security Architecture for IP         December 2005
+
+
+1.  Introduction
+
+1.1.  Summary of Contents of Document
+
+   This document specifies the base architecture for IPsec-compliant
+   systems.  It describes how to provide a set of security services for
+   traffic at the IP layer, in both the IPv4 [Pos81a] and IPv6 [DH98]
+   environments.  This document describes the requirements for systems
+   that implement IPsec, the fundamental elements of such systems, and
+   how the elements fit together and fit into the IP environment.  It
+   also describes the security services offered by the IPsec protocols,
+   and how these services can be employed in the IP environment.  This
+   document does not address all aspects of the IPsec architecture.
+   Other documents address additional architectural details in
+   specialized environments, e.g., use of IPsec in Network Address
+   Translation (NAT) environments and more comprehensive support for IP
+   multicast.  The fundamental components of the IPsec security
+   architecture are discussed in terms of their underlying, required
+   functionality.  Additional RFCs (see Section 1.3 for pointers to
+   other documents) define the protocols in (a), (c), and (d).
+
+        a. Security Protocols -- Authentication Header (AH) and
+           Encapsulating Security Payload (ESP)
+        b. Security Associations -- what they are and how they work,
+           how they are managed, associated processing
+        c. Key Management -- manual and automated (The Internet Key
+           Exchange (IKE))
+        d. Cryptographic algorithms for authentication and encryption
+
+   This document is not a Security Architecture for the Internet; it
+   addresses security only at the IP layer, provided through the use of
+   a combination of cryptographic and protocol security mechanisms.
+
+   The spelling "IPsec" is preferred and used throughout this and all
+   related IPsec standards.  All other capitalizations of IPsec (e.g.,
+   IPSEC, IPSec, ipsec) are deprecated.  However, any capitalization of
+   the sequence of letters "IPsec" should be understood to refer to the
+   IPsec protocols.
+
+   The keywords MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD,
+   SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL, when they appear in this
+   document, are to be interpreted as described in RFC 2119 [Bra97].
+
+1.2.  Audience
+
+   The target audience for this document is primarily individuals who
+   implement this IP security technology or who architect systems that
+   will use this technology.  Technically adept users of this technology
+
+
+
+Kent & Seo                  Standards Track                     [Page 4]
+
+RFC 4301              Security Architecture for IP         December 2005
+
+
+   (end users or system administrators) also are part of the target
+   audience.  A glossary is provided in Appendix A to help fill in gaps
+   in background/vocabulary.  This document assumes that the reader is
+   familiar with the Internet Protocol (IP), related networking
+   technology, and general information system security terms and
+   concepts.
+
+1.3.  Related Documents
+
+   As mentioned above, other documents provide detailed definitions of
+   some of the components of IPsec and of their interrelationship.  They
+   include RFCs on the following topics:
+
+        a. security protocols -- RFCs describing the Authentication
+           Header (AH) [Ken05b] and Encapsulating Security Payload
+           (ESP) [Ken05a] protocols.
+        b. cryptographic algorithms for integrity and encryption -- one
+           RFC that defines the mandatory, default algorithms for use
+           with AH and ESP [Eas05], a similar RFC that defines the
+           mandatory algorithms for use with IKEv2 [Sch05] plus a
+           separate RFC for each cryptographic algorithm.
+        c. automatic key management -- RFCs on "The Internet Key
+           Exchange (IKEv2) Protocol" [Kau05] and "Cryptographic
+           Algorithms for Use in the Internet Key Exchange Version 2
+           (IKEv2)" [Sch05].
+
+2.  Design Objectives
+
+2.1.  Goals/Objectives/Requirements/Problem Description
+
+   IPsec is designed to provide interoperable, high quality,
+   cryptographically-based security for IPv4 and IPv6.  The set of
+   security services offered includes access control, connectionless
+   integrity, data origin authentication, detection and rejection of
+   replays (a form of partial sequence integrity), confidentiality (via
+   encryption), and limited traffic flow confidentiality.  These
+   services are provided at the IP layer, offering protection in a
+   standard fashion for all protocols that may be carried over IP
+   (including IP itself).
+
+   IPsec includes a specification for minimal firewall functionality,
+   since that is an essential aspect of access control at the IP layer.
+   Implementations are free to provide more sophisticated firewall
+   mechanisms, and to implement the IPsec-mandated functionality using
+   those more sophisticated mechanisms. (Note that interoperability may
+   suffer if additional firewall constraints on traffic flows are
+   imposed by an IPsec implementation but cannot be negotiated based on
+   the traffic selector features defined in this document and negotiated
+
+
+
+Kent & Seo                  Standards Track                     [Page 5]
+
+RFC 4301              Security Architecture for IP         December 2005
+
+
+   via IKEv2.)  The IPsec firewall function makes use of the
+   cryptographically-enforced authentication and integrity provided for
+   all IPsec traffic to offer better access control than could be
+   obtained through use of a firewall (one not privy to IPsec internal
+   parameters) plus separate cryptographic protection.
+
+   Most of the security services are provided through use of two traffic
+   security protocols, the Authentication Header (AH) and the
+   Encapsulating Security Payload (ESP), and through the use of
+   cryptographic key management procedures and protocols.  The set of
+   IPsec protocols employed in a context, and the ways in which they are
+   employed, will be determined by the users/administrators in that
+   context.  It is the goal of the IPsec architecture to ensure that
+   compliant implementations include the services and management
+   interfaces needed to meet the security requirements of a broad user
+   population.
+
+   When IPsec is correctly implemented and deployed, it ought not
+   adversely affect users, hosts, and other Internet components that do
+   not employ IPsec for traffic protection.  IPsec security protocols
+   (AH and ESP, and to a lesser extent, IKE) are designed to be
+   cryptographic algorithm independent.  This modularity permits
+   selection of different sets of cryptographic algorithms as
+   appropriate, without affecting the other parts of the implementation.
+   For example, different user communities may select different sets of
+   cryptographic algorithms (creating cryptographically-enforced
+   cliques) if required.
+
+   To facilitate interoperability in the global Internet, a set of
+   default cryptographic algorithms for use with AH and ESP is specified
+   in [Eas05] and a set of mandatory-to-implement algorithms for IKEv2
+   is specified in [Sch05].  [Eas05] and [Sch05] will be periodically
+   updated to keep pace with computational and cryptologic advances.  By
+   specifying these algorithms in documents that are separate from the
+   AH, ESP, and IKEv2 specifications, these algorithms can be updated or
+   replaced without affecting the standardization progress of the rest
+   of the IPsec document suite.  The use of these cryptographic
+   algorithms, in conjunction with IPsec traffic protection and key
+   management protocols, is intended to permit system and application
+   developers to deploy high quality, Internet-layer, cryptographic
+   security technology.
+
+2.2.  Caveats and Assumptions
+
+   The suite of IPsec protocols and associated default cryptographic
+   algorithms are designed to provide high quality security for Internet
+   traffic.  However, the security offered by use of these protocols
+   ultimately depends on the quality of their implementation, which is
+
+
+
+Kent & Seo                  Standards Track                     [Page 6]
+
+RFC 4301              Security Architecture for IP         December 2005
+
+
+   outside the scope of this set of standards.  Moreover, the security
+   of a computer system or network is a function of many factors,
+   including personnel, physical, procedural, compromising emanations,
+   and computer security practices.  Thus, IPsec is only one part of an
+   overall system security architecture.
+
+   Finally, the security afforded by the use of IPsec is critically
+   dependent on many aspects of the operating environment in which the
+   IPsec implementation executes.  For example, defects in OS security,
+   poor quality of random number sources, sloppy system management
+   protocols and practices, etc., can all degrade the security provided
+   by IPsec.  As above, none of these environmental attributes are
+   within the scope of this or other IPsec standards.
+
+3.  System Overview
+
+   This section provides a high level description of how IPsec works,
+   the components of the system, and how they fit together to provide
+   the security services noted above.  The goal of this description is
+   to enable the reader to "picture" the overall process/system, see how
+   it fits into the IP environment, and to provide context for later
+   sections of this document, which describe each of the components in
+   more detail.
+
+   An IPsec implementation operates in a host, as a security gateway
+   (SG), or as an independent device, affording protection to IP
+   traffic. (A security gateway is an intermediate system implementing
+   IPsec, e.g., a firewall or router that has been IPsec-enabled.) More
+   detail on these classes of implementations is provided later, in
+   Section 3.3. The protection offered by IPsec is based on requirements
+   defined by a Security Policy Database (SPD) established and
+   maintained by a user or system administrator, or by an application
+   operating within constraints established by either of the above.  In
+   general, packets are selected for one of three processing actions
+   based on IP and next layer header information ("Selectors", Section
+   4.4.1.1) matched against entries in the SPD.  Each packet is either
+   PROTECTed using IPsec security services, DISCARDed, or allowed to
+   BYPASS IPsec protection, based on the applicable SPD policies
+   identified by the Selectors.
+
+3.1.  What IPsec Does
+
+   IPsec creates a boundary between unprotected and protected
+   interfaces, for a host or a network (see Figure 1 below).  Traffic
+   traversing the boundary is subject to the access controls specified
+   by the user or administrator responsible for the IPsec configuration.
+   These controls indicate whether packets cross the boundary unimpeded,
+   are afforded security services via AH or ESP, or are discarded.
+
+
+
+Kent & Seo                  Standards Track                     [Page 7]
+
+RFC 4301              Security Architecture for IP         December 2005
+
+
+   IPsec security services are offered at the IP layer through selection
+   of appropriate security protocols, cryptographic algorithms, and
+   cryptographic keys.  IPsec can be used to protect one or more "paths"
+   (a) between a pair of hosts, (b) between a pair of security gateways,
+   or (c) between a security gateway and a host.  A compliant host
+   implementation MUST support (a) and (c) and a compliant security
+   gateway must support all three of these forms of connectivity, since
+   under certain circumstances a security gateway acts as a host.
+
+                        Unprotected
+                         ^       ^
+                         |       |
+           +-------------|-------|-------+
+           | +-------+   |       |       |
+           | |Discard|<--|       V       |
+           | +-------+   |B  +--------+  |
+         ................|y..| AH/ESP |..... IPsec Boundary
+           |   +---+     |p  +--------+  |
+           |   |IKE|<----|a      ^       |
+           |   +---+     |s      |       |
+           | +-------+   |s      |       |
+           | |Discard|<--|       |       |
+           | +-------+   |       |       |
+           +-------------|-------|-------+
+                         |       |
+                         V       V
+                         Protected
+
+            Figure 1.  Top Level IPsec Processing Model
+
+   In this diagram, "unprotected" refers to an interface that might also
+   be described as "black" or "ciphertext".  Here, "protected" refers to
+   an interface that might also be described as "red" or "plaintext".
+   The protected interface noted above may be internal, e.g., in a host
+   implementation of IPsec, the protected interface may link to a socket
+   layer interface presented by the OS.  In this document, the term
+   "inbound" refers to traffic entering an IPsec implementation via the
+   unprotected interface or emitted by the implementation on the
+   unprotected side of the boundary and directed towards the protected
+   interface.  The term "outbound" refers to traffic entering the
+   implementation via the protected interface, or emitted by the
+   implementation on the protected side of the boundary and directed
+   toward the unprotected interface.  An IPsec implementation may
+   support more than one interface on either or both sides of the
+   boundary.
+
+
+
+
+
+
+Kent & Seo                  Standards Track                     [Page 8]
+
+RFC 4301              Security Architecture for IP         December 2005
+
+
+   Note the facilities for discarding traffic on either side of the
+   IPsec boundary, the BYPASS facility that allows traffic to transit
+   the boundary without cryptographic protection, and the reference to
+   IKE as a protected-side key and security management function.
+
+   IPsec optionally supports negotiation of IP compression [SMPT01],
+   motivated in part by the observation that when encryption is employed
+   within IPsec, it prevents effective compression by lower protocol
+   layers.
+
+3.2.  How IPsec Works
+
+   IPsec uses two protocols to provide traffic security services --
+   Authentication Header (AH) and Encapsulating Security Payload (ESP).
+   Both protocols are described in detail in their respective RFCs
+   [Ken05b, Ken05a].  IPsec implementations MUST support ESP and MAY
+   support AH. (Support for AH has been downgraded to MAY because
+   experience has shown that there are very few contexts in which ESP
+   cannot provide the requisite security services.  Note that ESP can be
+   used to provide only integrity, without confidentiality, making it
+   comparable to AH in most contexts.)
+
+    o The IP Authentication Header (AH) [Ken05b] offers integrity and
+      data origin authentication, with optional (at the discretion of
+      the receiver) anti-replay features.
+
+    o The Encapsulating Security Payload (ESP) protocol [Ken05a] offers
+      the same set of services, and also offers confidentiality.  Use of
+      ESP to provide confidentiality without integrity is NOT
+      RECOMMENDED.  When ESP is used with confidentiality enabled, there
+      are provisions for limited traffic flow confidentiality, i.e.,
+      provisions for concealing packet length, and for facilitating
+      efficient generation and discard of dummy packets.  This
+      capability is likely to be effective primarily in virtual private
+      network (VPN) and overlay network contexts.
+
+    o Both AH and ESP offer access control, enforced through the
+      distribution of cryptographic keys and the management of traffic
+      flows as dictated by the Security Policy Database (SPD, Section
+      4.4.1).
+
+   These protocols may be applied individually or in combination with
+   each other to provide IPv4 and IPv6 security services.  However, most
+   security requirements can be met through the use of ESP by itself.
+   Each protocol supports two modes of use: transport mode and tunnel
+   mode.  In transport mode, AH and ESP provide protection primarily for
+
+
+
+
+
+Kent & Seo                  Standards Track                     [Page 9]
+
+RFC 4301              Security Architecture for IP         December 2005
+
+
+   next layer protocols; in tunnel mode, AH and ESP are applied to
+   tunneled IP packets.  The differences between the two modes are
+   discussed in Section 4.1.
+
+   IPsec allows the user (or system administrator) to control the
+   granularity at which a security service is offered.  For example, one
+   can create a single encrypted tunnel to carry all the traffic between
+   two security gateways, or a separate encrypted tunnel can be created
+   for each TCP connection between each pair of hosts communicating
+   across these gateways.  IPsec, through the SPD management paradigm,
+   incorporates facilities for specifying:
+
+    o which security protocol (AH or ESP) to employ, the mode (transport
+      or tunnel), security service options, what cryptographic
+      algorithms to use, and in what combinations to use the specified
+      protocols and services, and
+
+    o the granularity at which protection should be applied.
+
+   Because most of the security services provided by IPsec require the
+   use of cryptographic keys, IPsec relies on a separate set of
+   mechanisms for putting these keys in place.  This document requires
+   support for both manual and automated distribution of keys.  It
+   specifies a specific public-key based approach (IKEv2 [Kau05]) for
+   automated key management, but other automated key distribution
+   techniques MAY be used.
+
+   Note: This document mandates support for several features for which
+   support is available in IKEv2 but not in IKEv1, e.g., negotiation of
+   an SA representing ranges of local and remote ports or negotiation of
+   multiple SAs with the same selectors.  Therefore, this document
+   assumes use of IKEv2 or a key and security association management
+   system with comparable features.
+
+3.3.  Where IPsec Can Be Implemented
+
+   There are many ways in which IPsec may be implemented in a host, or
+   in conjunction with a router or firewall to create a security
+   gateway, or as an independent security device.
+

@@ -1,0 +1,2876 @@
+diff --git a/dlt/helpers/dbt/__init__.py b/dlt/helpers/dbt/__init__.py
+index 94f28f621..34d9d44ba 100644
+--- a/dlt/helpers/dbt/__init__.py
++++ b/dlt/helpers/dbt/__init__.py
+@@ -11,7 +11,7 @@ from dlt.version import get_installed_requirement_string
+ 
+ from dlt.helpers.dbt.runner import create_runner, DBTPackageRunner
+ 
+-DEFAULT_DBT_VERSION = ">=1.5,<2"
++DEFAULT_DBT_VERSION = ">=1.7,<2"
+ 
+ # a map of destination names to dbt package names in case they don't match the pure destination name
+ DBT_DESTINATION_MAP = {
+diff --git a/dlt/helpers/dbt/dbt_utils.py b/dlt/helpers/dbt/dbt_utils.py
+index ea5299fab..8b7124ea6 100644
+--- a/dlt/helpers/dbt/dbt_utils.py
++++ b/dlt/helpers/dbt/dbt_utils.py
+@@ -117,8 +117,8 @@ def run_dbt_command(
+             raise dbt_exc
+         return parsed_results or results
+     except SystemExit as sys_ex:
+-        # oftentimes dbt tries to exit on error
+-        # NOTE: current implementation handles BaseExceptions so in theory SystemExit will not come here
++        # dbt >= 1.7 uses dbtRunner which handles BaseExceptions internally,
++        # so SystemExit should not reach here, but we handle it defensively
+ 
+         raise DBTProcessingError(command, None, sys_ex)
+     finally:
+diff --git a/dlt/helpers/dbt/profiles.yml b/dlt/helpers/dbt/profiles.yml
+index 50d67c3c1..52f4494b9 100644
+--- a/dlt/helpers/dbt/profiles.yml
++++ b/dlt/helpers/dbt/profiles.yml
+@@ -181,6 +181,39 @@ synapse:
+       trust_cert: "{{ (env_var('DLT__CREDENTIALS__QUERY__TRUSTSERVERCERTIFICATE', 'yes') == 'yes')  | as_bool }}"
+ 
+ 
++fabric:
++  target: analytics
++  outputs:
++    analytics:
++      type: fabric
++      driver: "ODBC Driver 18 for SQL Server"
++      server: "{{ env_var('DLT__CREDENTIALS__HOST') }}"
++      port: "{{ env_var('DLT__CREDENTIALS__PORT', 1433) | as_number }}"
++      database: "{{ env_var('DLT__CREDENTIALS__DATABASE') }}"
++      schema: "{{ var('destination_dataset_name', var('source_dataset_name')) }}"
++      authentication: ServicePrincipal
++      tenant_id: "{{ env_var('DLT__CREDENTIALS__AZURE_TENANT_ID') }}"
++      client_id: "{{ env_var('DLT__CREDENTIALS__AZURE_CLIENT_ID') }}"
++      client_secret: "{{ env_var('DLT__CREDENTIALS__AZURE_CLIENT_SECRET') }}"
++      login_timeout: "{{ env_var('DLT__CREDENTIALS__CONNECT_TIMEOUT', '15') | as_number }}"
++      encrypt: true
++      trust_cert: false
++
++fabric_default:
++  target: analytics
++  outputs:
++    analytics:
++      type: fabric
++      driver: "ODBC Driver 18 for SQL Server"
++      server: "{{ env_var('DLT__CREDENTIALS__HOST') }}"
++      port: "{{ env_var('DLT__CREDENTIALS__PORT', 1433) | as_number }}"
++      database: "{{ env_var('DLT__CREDENTIALS__DATABASE') }}"
++      schema: "{{ var('destination_dataset_name', var('source_dataset_name')) }}"
++      authentication: auto
++      login_timeout: "{{ env_var('DLT__CREDENTIALS__CONNECT_TIMEOUT', '15') | as_number }}"
++      encrypt: true
++      trust_cert: false
++
+ databricks:
+   target: analytics
+   outputs:
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/fabric.md b/docs/website/docs/dlt-ecosystem/destinations/fabric.md
+index 932019f92..35b31f1af 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/fabric.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/fabric.md
+@@ -210,6 +210,9 @@ While Fabric Warehouse is based on SQL Server, there are key differences:
+ 3. **Collation**: Optimized for UTF-8 collations with automatic `LongAsMax` configuration
+ 4. **SQL Dialect**: Uses `fabric` SQLglot dialect for proper SQL generation
+ 
++### dbt support
++Integration with [dbt](../transformations/dbt/dbt.md) is supported via [dbt-fabric](https://github.com/Microsoft/dbt-fabric). Both Service Principal and default Azure credentials are supported and shared with dbt runners.
++
+ ## Troubleshooting
+ 
+ ### ODBC Driver Not Found
+diff --git a/pyproject.toml b/pyproject.toml
+index 793e8ecb8..c1c34975c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -303,13 +303,14 @@ dashboard-tests = [
+ providers = ["google-api-python-client>=2.86.0,<3"]
+ sentry-sdk = ["sentry-sdk>=2.0.0,<3"]
+ dbt = [
+-    "dbt-core>=1.5.0",
+-    "dbt-redshift>=1.5.0",
+-    "dbt-bigquery>=1.5.0",
+-    "dbt-duckdb>=1.5.0",
+-    "dbt-snowflake>=1.5.0",
+-    "dbt-athena-community>=1.5.0",
+-    "dbt-sqlserver>=1.5.0 ; python_version < '3.13'",
++    "dbt-core>=1.7.0",
++    "dbt-redshift>=1.7.0",
++    "dbt-bigquery>=1.7.0",
++    "dbt-duckdb>=1.7.0",
++    "dbt-snowflake>=1.7.0",
++    "dbt-athena-community>=1.7.0",
++    "dbt-sqlserver>=1.7.0 ; python_version < '3.13'",
++    "dbt-fabric>=1.7.0 ; python_version < '3.13'",
+ ]
+ adbc = [
+     "dbc>=0.1.0",
+diff --git a/tests/helpers/dbt_tests/test_runner_dbt_versions.py b/tests/helpers/dbt_tests/test_runner_dbt_versions.py
+index de403a73e..e196cd0d1 100644
+--- a/tests/helpers/dbt_tests/test_runner_dbt_versions.py
++++ b/tests/helpers/dbt_tests/test_runner_dbt_versions.py
+@@ -43,15 +43,15 @@ def client() -> Iterator[PostgresClient]:
+ 
+ 
+ PACKAGE_PARAMS = [
+-    ("postgres", "1.5.2"),
+-    ("postgres", "1.6.13"),
+     ("postgres", "1.8.6"),
+     ("postgres", "1.9.1"),
++    ("postgres", "1.10.19"),
++    ("postgres", "1.11.6"),
+     ("postgres", None),
+-    ("snowflake", "1.5.2"),
+-    ("snowflake", "1.6.13"),
+     ("snowflake", "1.8.6"),
+     ("snowflake", "1.9.1"),
++    ("snowflake", "1.10.19"),
++    ("snowflake", "1.11.6"),
+     ("snowflake", None),
+ ]
+ PACKAGE_IDS = [
+@@ -257,7 +257,7 @@ def test_run_jaffle_invalid_run_args(
+             dbt_func(
+                 client.config, test_storage.make_full_path("jaffle"), JAFFLE_SHOP_REPO
+             ).run_all(["--wrong_flag"])
+-        # dbt < 1.5 raises systemexit, dbt >= 1.5 just returns success False
++        # dbt >= 1.7 returns success False via dbtRunner, but SystemExit is handled defensively
+         assert isinstance(pr_exc.value.dbt_results, SystemExit) or pr_exc.value.dbt_results is None
+ 
+ 
+@@ -281,8 +281,8 @@ def test_run_jaffle_failed_run(
+ 
+ JAFFLE_MESSAGES_INCREMENTAL: Dict[str, Any] = {
+     "snowflake": {
+-        # Different message per version
+-        "customers": ("SUCCESS 1", "SUCCESS 100"),
++        # dbt < 1.10 returns "SUCCESS 1", dbt >= 1.10 returns actual row counts
++        "customers": ("SUCCESS 1", "SUCCESS 0", "SUCCESS 100"),
+     },
+     "postgres": {"customers": ("INSERT 0 100",)},
+ }
+diff --git a/tests/helpers/dbt_tests/utils.py b/tests/helpers/dbt_tests/utils.py
+index 17a4b7a4d..aad735131 100644
+--- a/tests/helpers/dbt_tests/utils.py
++++ b/tests/helpers/dbt_tests/utils.py
+@@ -1,5 +1,5 @@
+ import os
+-from typing import List, Sequence
++from typing import Dict, List, Sequence, Tuple
+ 
+ from dlt.common.storages import FileStorage
+ from dlt.common.libs.git import clone_repo
+@@ -8,15 +8,16 @@ from dlt.helpers.dbt.exceptions import DBTNodeResult
+ JAFFLE_SHOP_REPO = "https://github.com/dbt-labs/jaffle_shop.git"
+ TEST_CASES_PATH = "./tests/helpers/dbt_tests/cases/"
+ 
+-JAFFLE_RESULT_MESSAGES = {
++JAFFLE_RESULT_MESSAGES: Dict[str, Dict[str, Tuple[str, ...]]] = {
+     "postgres": {
+-        "stg_orders": "CREATE VIEW",
+-        "customers": "SELECT 100",
++        "stg_orders": ("CREATE VIEW",),
++        "customers": ("SELECT 100",),
+     },
+-    # Snowflake only returns generic success messages
++    # dbt < 1.10 returns generic "SUCCESS 1" for all models,
++    # dbt >= 1.10 returns actual row counts eg. "SUCCESS 100"
+     "snowflake": {
+-        "stg_orders": "SUCCESS 1",
+-        "customers": "SUCCESS 1",
++        "stg_orders": ("SUCCESS 1",),
++        "customers": ("SUCCESS 1", "SUCCESS 100"),
+     },
+ }
+ 
+@@ -48,9 +49,9 @@ def assert_jaffle_completed(
+     assert len(results) == 5
+     assert all(r.status == "success" for r in results)
+     stg_orders = find_run_result(results, "stg_orders")
+-    assert stg_orders.message == JAFFLE_RESULT_MESSAGES[destination_name]["stg_orders"]
++    assert stg_orders.message in JAFFLE_RESULT_MESSAGES[destination_name]["stg_orders"]
+     customers = find_run_result(results, "customers")
+-    assert customers.message == JAFFLE_RESULT_MESSAGES[destination_name]["customers"]
++    assert customers.message in JAFFLE_RESULT_MESSAGES[destination_name]["customers"]
+     # `run_dbt` has injected credentials into environ. make sure that credentials were removed
+     assert "CREDENTIALS__PASSWORD" not in os.environ
+     # make sure jaffle_shop was cloned into right dir
+diff --git a/tests/load/pipeline/test_dbt_helper.py b/tests/load/pipeline/test_dbt_helper.py
+index f3c5bdd25..ee3b5c768 100644
+--- a/tests/load/pipeline/test_dbt_helper.py
++++ b/tests/load/pipeline/test_dbt_helper.py
+@@ -23,12 +23,13 @@ from tests.utils import ACTIVE_SQL_DESTINATIONS
+ def dbt_venv() -> Iterator[Venv]:
+     # context manager will delete venv at the end
+     # yield Venv.restore_current()
+-    # NOTE: we limit the max version of dbt to allow all dbt adapters to run. ie. sqlserver does not work on 1.8
++    # NOTE: we limit the max version of dbt to the latest supported by all adapters.
++    # dbt-sqlserver and dbt-fabric lag behind dbt-core releases (currently max 1.9.x)
+     dbt_configs = set(
+         c.destination_type
+         for c in destinations_configs(default_sql_configs=True, supports_dbt=True)
+     )
+-    with create_venv(tempfile.mkdtemp(), list(dbt_configs), dbt_version="<1.9") as venv:
++    with create_venv(tempfile.mkdtemp(), list(dbt_configs), dbt_version="<1.10") as venv:
+         yield venv
+ 
+ 
+@@ -77,10 +78,10 @@ def test_run_jaffle_package(
+     ids=lambda x: x.name,
+ )
+ def test_run_chess_dbt(destination_config: DestinationTestConfiguration, dbt_venv: Venv) -> None:
+-    if destination_config.destination_type == "mssql":
++    if destination_config.destination_type in ("mssql", "fabric"):
+         pytest.skip(
+-            "mssql requires non standard SQL syntax and we do not have specialized dbt package"
+-            " for it"
++            "mssql/fabric require non standard SQL syntax and we do not have specialized dbt"
++            " package for it"
+         )
+ 
+     from docs.examples.chess.chess import chess
+@@ -140,10 +141,10 @@ def test_run_chess_dbt(destination_config: DestinationTestConfiguration, dbt_ven
+ def test_run_chess_dbt_to_other_dataset(
+     destination_config: DestinationTestConfiguration, dbt_venv: Venv
+ ) -> None:
+-    if destination_config.destination_type == "mssql":
++    if destination_config.destination_type in ("mssql", "fabric"):
+         pytest.skip(
+-            "mssql requires non standard SQL syntax and we do not have specialized dbt package"
+-            " for it"
++            "mssql/fabric require non standard SQL syntax and we do not have specialized dbt"
++            " package for it"
+         )
+     from docs.examples.chess.chess import chess
+ 
+diff --git a/tests/load/utils.py b/tests/load/utils.py
+index 6bf665815..5c7a7180b 100644
+--- a/tests/load/utils.py
++++ b/tests/load/utils.py
+@@ -543,7 +543,7 @@ def destinations_configs(
+         destination_configs += [
+             # DestinationTestConfiguration(destination_type="mssql", supports_dbt=False),
+             DestinationTestConfiguration(destination_type="synapse", supports_dbt=False),
+-            DestinationTestConfiguration(destination_type="fabric", supports_dbt=False),
++            DestinationTestConfiguration(destination_type="fabric", supports_dbt=True),
+         ]
+ 
+         # sanity check that when selecting default destinations, one of each sql destination is actually
+diff --git a/uv.lock b/uv.lock
+index d39fd4788..0d3888d88 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2242,6 +2242,7 @@ dbt = [
+     { name = "dbt-bigquery" },
+     { name = "dbt-core" },
+     { name = "dbt-duckdb" },
++    { name = "dbt-fabric", marker = "python_full_version < '3.13'" },
+     { name = "dbt-redshift" },
+     { name = "dbt-snowflake" },
+     { name = "dbt-sqlserver", marker = "python_full_version < '3.13'" },
+@@ -2452,13 +2453,14 @@ dashboard-tests = [
+     { name = "pytest-playwright", specifier = ">=0.7.0,<1" },
+ ]
+ dbt = [
+-    { name = "dbt-athena-community", specifier = ">=1.5.0" },
+-    { name = "dbt-bigquery", specifier = ">=1.5.0" },
+-    { name = "dbt-core", specifier = ">=1.5.0" },
+-    { name = "dbt-duckdb", specifier = ">=1.5.0" },
+-    { name = "dbt-redshift", specifier = ">=1.5.0" },
+-    { name = "dbt-snowflake", specifier = ">=1.5.0" },
+-    { name = "dbt-sqlserver", marker = "python_full_version < '3.13'", specifier = ">=1.5.0" },
++    { name = "dbt-athena-community", specifier = ">=1.7.0" },
++    { name = "dbt-bigquery", specifier = ">=1.7.0" },
++    { name = "dbt-core", specifier = ">=1.7.0" },
++    { name = "dbt-duckdb", specifier = ">=1.7.0" },
++    { name = "dbt-fabric", marker = "python_full_version < '3.13'", specifier = ">=1.7.0" },
++    { name = "dbt-redshift", specifier = ">=1.7.0" },
++    { name = "dbt-snowflake", specifier = ">=1.7.0" },
++    { name = "dbt-sqlserver", marker = "python_full_version < '3.13'", specifier = ">=1.7.0" },
+ ]
+ dev = [
+     { name = "bandit", specifier = ">=1.7.0,<2" },
+
+
+===== COMMIT 2b8307e5 =====
+
+
+commit 2b8307e56
+Author: Thierry Jean
+Date: 2026-02-20
+
+    docs(dq): add `dlthub` metrics section; update checks (#3641)
+
+diff --git a/docs/docs_tools/snippets/lint_embedded_snippets.py b/docs/docs_tools/snippets/lint_embedded_snippets.py
+index b90779ec7..15124f2cd 100644
+--- a/docs/docs_tools/snippets/lint_embedded_snippets.py
++++ b/docs/docs_tools/snippets/lint_embedded_snippets.py
+@@ -24,6 +24,7 @@ from docs_tools.utils import collect_markdown_files
+ SNIPPET_MARKER = "```"
+ ALLOWED_LANGUAGES = [
+     "py",
++    "python",
+     "toml",
+     "json",
+     "yaml",
+diff --git a/docs/website/docs/hub/features/quality/advanced.md b/docs/website/docs/hub/features/quality/advanced.md
+new file mode 100644
+index 000000000..a4b261574
+--- /dev/null
++++ b/docs/website/docs/hub/features/quality/advanced.md
+@@ -0,0 +1,62 @@
++---
++title: "Data quality (advanced)"
++description: Validate your data and control its quality
++keywords: ["dlthub", "data quality", "contracts", "check", "metrics"]
++---
++
++:::warning
++🚧 This feature is under development. Interested in becoming an early tester? [Join dltHub early access](https://info.dlthub.com/waiting-list).
++:::
++
++This page covers more in-depth details about data quality features, such as metrics and checks. It shows the full flexibility available for advanced use cases. It can also serve as an FAQ and helper for debugging.
++
++Note that these APIs are more likely to change than the basics page. 
++
++## Metrics and checks are `DltSource` objects.
++Internally, metrics and checks are defined as `dlt.source` objects that are executed by the pipeline. You can interact with these objects directly, unlocking the ability to:
++
++- load data into destination A and write metrics and checks to destination B
++- run data quality checks and metrics disjointed from the primary `pipeline.run()` (e.g., on a schedule, after another trigger, etc.)
++- dynamically modify metrics and checks to execute via Python code
++- have a central data quality pipeline that you run for multiple pipelines / datasets
++
++
++## Metrics and checks use a special `dlt.Schema`
++Currently, a `dlt.Dataset` is associated with a single `dlt.Schema`. This defines what tables are known and available to the dataset's API (e.g., `dataset.table(...)`).
++
++But a `dlt.Pipeline` can be associated with multiple `dlt.Schema`, such as when loading several sources.
++
++The data quality metrics and checks sources have a dedicated `_dlt_data_quality` schema with internal tables for metrics and checks results. These tables are not directly visible via the `dlt.Dataset` API. (this may change in the future)
++
++The `dq.read_metric()` and `dq.read_check()` retrieve data from these internal tables.
++
++
++## Checks anatomy: result, decision, outcome, level
++
++In its simplest form, a check is a function that returns an **outcome** (boolean) that indicates success or failure. Under the hood, it involves a **result** (any type) that is computed and converted to an **outcome** via a **decision** function.
++
++For example, the check `is_in(column_name, accepted_values)` has a success outcome if all values are valid values.
++
++A more granular implementation could be:
++- count the number of records with valid values (**result**)
++- count the number of records
++- if the ratio of valid records is higher than `0.95` (**decision**)
++- the **outcome** is a success, else it is a failure
++
++Most built-in checks return the outcome directly, but they can be configured to store intermediary results. Those are most useful for custom checks or when wanting to assign different tolerance thresholds based on the environment / context.
++
++### Check level
++So far, we explained how a result is converted into an outcome. The check **level** describes the granularity of the **result**.
++
++For instance:
++- **Row-level** checks produce a result per record. It's possible to inspect which specific records pass / failed the check.
++
++- **Table-level** checks produce a result per table (e.g., result is "the number of unique values" and decision is "is this greater than 5?"). 
++
++    These checks can often be rewritten as row-level checks (e.g., "is this value unique?")
++
++- **Dataset-level** checks produce a result per dataset. This typically involves multiple tables, temporal comparisons, or pipeline information (e.g., "the number of rows in `orders` is higher than the number of rows in 'customers')
++
++:::important
++Notice that the **check level** relates to the result and not the **input data** of the check. For instance, a row-level check can involve multiple tables as input.
++:::
+diff --git a/docs/website/docs/hub/features/quality/data-quality.md b/docs/website/docs/hub/features/quality/data-quality.md
+index 179a73747..be8c49cb8 100644
+--- a/docs/website/docs/hub/features/quality/data-quality.md
++++ b/docs/website/docs/hub/features/quality/data-quality.md
+@@ -8,16 +8,176 @@ keywords: ["dlthub", "data quality", "contracts", "check", "metrics"]
+ 🚧 This feature is under development. Interested in becoming an early tester? [Join dltHub early access](https://info.dlthub.com/waiting-list).
+ :::
+ 
+-dltHub will allow you to define data validation rules in Python. This ensures your data meets expected quality standards at the ingestion step.
++dltHub data quality features include metrics for monitoring dataset properties over time, and checks to validate them against expectations. Together, they offer visibility and allow to catch data issues early. Metrics and checks are defined via Python code. The extensive configuration allows you to specify what to monitor and validate, when, how, and where to store results.
+ 
+-## Key features
+-With dltHub, you will be able to:
++This page covers the basics of metrics and checks. You should notice a lot of symmetry (e.g., `with_metrics()` and `with_checks()`). The later parts of this page cover notions applicable to both. 
+ 
+-* Define data tests and quality contracts in Python.
+-* Apply both row-level and batch-level validation.
+-* Enforce constraints on distributions, boundaries, and expected values.
++## Metrics
++
++A **data quality metric** or **metric** a function applied to data that returns a scalar value describing a property of the data. A metric can take as input a column, a table, or the full dataset (i.e., all tables and historical metrics).
++
++### Define metrics
++#### Static
++
++You can define metrics along your `@dlt.resource` (and `@dlt.transformer`, `@dlt.hub.transformation`) via the new decorator `@with_metrics`. It is available under the `dlt.hub.data_quality` module, commonly imported as `dq`. Inside the decorator, you can set the individual metrics available through `dq.metrics.column.`, `dq.metrics.table.`, or `dq.metrics.dataset.`.
++
++The next snippet defines 3 metrics on the `customers` resource: the mean of the `amount` column, the number of null values in the `email` column, and the total number of rows in the table. 
++
++:::note
++Only column-level and table-level metrics can be defined on a `@dlt.resource`. To set dataset-level metrics, use `@with_metrics` on the `@dlt.source`.
++:::
++
++
++```python
++import dlt
++from dlt.hub import data_quality as dq
++
++@dq.with_metrics(
++    dq.metrics.column.mean("amount"),
++    dq.metrics.column.null_count("email"),
++    dq.metrics.table.row_count()
++)
++@dlt.resource
++def customers():
++    yield data
++```
++
++The next snippet shows how to add dataset-level metrics to a source. The `total_row_count` is added on the `crm` source.
++
++```python
++import dlt
++from dlt.hub import data_quality as dq
++
++@dq.with_metrics(
++    dq.metrics.column.mean("amount"),
++    dq.metrics.column.null_count("email"),
++    dq.metrics.table.row_count()
++)
++@dlt.resource
++def customers():
++    yield data
++
++
++@dq.with_metrics(
++    dq.metrics.dataset.total_row_count()
++)
++@dlt.source
++def crm():
++    return [customers]
++```
++
++#### Dynamic
++
++Similar to the static approach, you can add metrics to an instantiated resource or source object using `with_metrics`. This is particularly useful when using built-in sources and resources like `filesystem`, `rest_api` or `sql_database`.
++
++```python
++import dlt
++from dlt.hub import data_quality as dq
++
++@dlt.resource
++def customers():
++    yield from [...]
++
++# later; this mutates the resource object and sets metrics
++dq.with_metrics(
++    customers,
++    dq.metrics.column.mean("amount"),
++    dq.metrics.column.null_count("email"),
++    dq.metrics.table.row_count()
++)
++```
++
++### Available metrics
++
++Here's the list of built-in metrics:
++
++```python
++from dlt.hub import data_quality as dq
++
++# column-level
++dq.metrics.column.maximum("col")
++dq.metrics.column.minimum("col")
++dq.metrics.column.mean("col")
++dq.metrics.column.median("col")
++dq.metrics.column.mode("col")
++dq.metrics.column.sum("col")
++dq.metrics.column.standard_deviation("col")
++dq.metrics.column.quantile("col", quantile=0.95)
++dq.metrics.column.null_count("col")
++dq.metrics.column.null_rate("col")
++dq.metrics.column.unique_count("col")
++dq.metrics.column.average_length("col")
++dq.metrics.column.minimum_length("col")
++dq.metrics.column.maximum_length("col")
++
++# table-level
++dq.metrics.table.row_count()  # Number of rows in table
++dq.metrics.table.unique_count()  # Number of distinct / unique rows in table
++dq.metrics.table.null_row_count()  # Number of rows where all columns are null
++
++# dataset-level
++dq.metrics.dataset.total_row_count()  # Total number of rows
++dq.metrics.dataset.load_row_count()  # Rows added in latest load
++dq.metrics.dataset.latest_loaded_at()  # Timestamp of most recent load
++```
++
++:::note
++If you have built-in metrics requests, let us know. Custom metrics are planned.
++:::
++
++### Compute metrics
++
++Pass the pipeline to `dq.enable_data_quality()` to enable metrics. This will set a flag on the pipeline state to compute metrics and write results to destination after each `pipeline.run()` call.
++
++```python
++pipeline = dlt.pipeline("my_pipeline", destination="duckdb")
++
++dq.enable_data_quality(pipeline)
++
++pipeline.run(customers)
++```
++
++Since the flag is stored on the pipeline state, instantiating this pipeline from another script or notebook will remember that metrics are enabled and compute metrics when `pipeline.run()` is called.
++
++```python
++# another_file.py
++pipeline = dlt.attach("my_pipeline")
++
++# this will compute metrics too
++pipeline.run(customers)
++```
++
++
++### Read metrics
++
++The convenience function `dq.read_metric()` allows you to retrieve stored metrics with some metadata. This makes it easy to build reporting, dashboard, or analytics over this data.
++
++The function produces a `dlt.Relation` which can be converted to a list, pandas dataframe, arrow table, etc.
++
++```python
++dataset = pipeline.dataset()
++# column-level `mean` as pandas.DataFrame
++dq.read_metric(
++    dataset, 
++    table="customers", 
++    column="amount", 
++    metric="mean"
++).df()
++
++# table-level `row_count` as list of tuples
++dq.read_metric(
++    dataset, 
++    table="customers", 
++    metric="row_count"
++).fetchall()
++
++# dataset-level `total_row_count` as pyarrow.Table
++dq.read_metric(
++    dataset, 
++    metric="total_row_count"
++).arrow()
++```
+ 
+-Stay tuned for updates as we expand these capabilities! 🚀
+ 
+ ## Checks
+ A **data quality check** or **check** is a function applied to data that returns a **check result** or **result** (can be boolean, integer, float, etc.). The result that is converted to a success / fail **check outcome** or **outcome** (boolean) based on a **decision**.
+@@ -26,71 +186,104 @@ A **data quality check** or **check** is a function applied to data that returns
+ A **test** verifies that **code** behaves as expected. A **check** verifies that the **data** meets some expectations. Code tests enable you to make changes with confidence and data checks help monitor your live systems.
+ :::
+ 
+-For example, the check `is_in(column_name, accepted_values)` verifies that the column only includes accepted values. Running the check counts successful records to compute the success rate (**result**). The **outcome** will be a success if success rate is 100%, i.e., all records succeeded the check (**decision**).
++### Define checks
++#### Static
++
++You can define checks along your `@dlt.resource` (and `@dlt.transformer`, `@dlt.hub.transformation`) via the new decorator `@with_checks` available under the `dlt.hub.data_quality` module. Inside the decorator, you can set the individual checks available through `dq.checks.`.
+ 
+-This snippet shows a single `is_in()` check being ran against the `orders` table in the `point_of_sale` dataset.
++This snippet shows a single `is_in()` check being ran against the `orders` table.
+ 
+ ```py
+ import dlt
+ from dlt.hub import data_quality as dq
+ 
+-dataset = dlt.dataset("duckdb", "point_of_sale")
+-checks = [
+-    dq.checks.is_in("payment_methods", ["card", "cash", "voucher"])
+-]
++@dq.with_checks(  # type: ignore[attr-defined]
++    dq.checks.is_in("payment_methods", ["card", "cash", "voucher"]),
++)
++@dlt.resource
++def orders():
++    yield from [...]
++```
++
++#### Dynamic
++
++Similar to the static approach, you can add checks to an instantiated resource or source object using `with_checks`. This is particularly useful when using built-in sources and resources like `filesystem`, `rest_api` or `sql_database`.
++
++```python
++import dlt
++from dlt.hub import data_quality as dq
+ 
+-# prepare a query to execute all checks
+-check_plan = dq.prepare_checks(dataset["orders"], checks=checks)
+-# execute checks and get results in-memory
+-check_plan.df()
++@dlt.resource
++def orders():
++    yield data
++
++# later; this mutates the resource object and sets checks
++dq.with_checks(
++    orders,
++    dq.checks.is_in("payment_methods", ["card", "cash", "voucher"]),
++)
+ ```
+ 
++### Available checks
+ 
+-### Check level
+-The **check level** indicates the granularity of the **check result**. For instance:
+-- **Row-level** checks produce a result per record. It's possible to inspect which specific records pass / failed the check.
++Here's the list of built-in checks:
+ 
+-- **Table-level** checks produce a result per table (e.g., result is "the number of unique values" and decision is "is this greater than 5?"). 
++```py
++from dlt.hub import data_quality as dq
+ 
+-    These checks can often be rewritten as row-level checks (e.g., "is this value unique?")
++dq.checks.is_unique("col")
++dq.checks.is_not_null("col")
++dq.checks.is_primary_key("col")  # valid primary key
++dq.checks.is_in("foo", ["bar", "baz"])  # valid values
++dq.checks.case("col < 0")  # row-wise check
++```
+ 
+-- **Dataset-level** checks produce a result per dataset. This typically involves multiple tables, temporal comparisons, or pipeline information (e.g., "the number of rows in 'orders' is higher than the number of rows in 'customers')
++### Compute checks
+ 
+-:::important
+-Notice that the **check level** relates to the result and not the **input data** of the check. For instance, a row-level check can involve multiple tables as input.
+-:::
++Pass the pipeline to `dq.enable_data_quality()` to enable checks. This will set a flag on the pipeline state to compute checks and write results to destination after each `pipeline.run()` call.
+ 
++```python
++pipeline = dlt.pipeline("my_pipeline", destination="duckdb")
+ 
+-### Built-in checks
+-The library `dlthub` includes many built-in checks: `is_in()`, `is_unique()`, `is_primary_key()`, and more. The built-in `case()` and `where()` simplify custom row and table-level checks respectively.
++dq.enable_data_quality(pipeline)
+ 
+-For example, the following are equivalent:
++pipeline.run(customers)
++```
+ 
+-```py
+-from dlt.hub import data_quality as dq
++Since the flag is stored on the pipeline state, instantiating this pipeline from another script or notebook will remember that metrics are enabled and compute checks when `pipeline.run()` is called.
+ 
+-dq.checks.is_unique("foo")
+-dq.checks.case("COUNT(*) OVER (PARTITION BY foo) > 1")
++```python
++# another_file.py
++pipeline = dlt.attach("my_pipeline")
++
++# this will compute checks too
++pipeline.run(customers)
+ ```
+ 
++### Read checks
+ 
+-### Custom checks (WIP)
+-Can be implemented as a `dlt.hub.transformation` that matches a specific schema or as subclass of `_BaseCheck` for full control. This allows to use any language supported by transformations, allowing eager/lazy and in-memory/on-backend execution.
++The convenience function `dq.read_check()` allows you to retrieve stored checks with some metadata. This makes it easy to build reporting, dashboard, or analytics over this data.
+ 
+-Notes:
+-- Should have utilities to statically validate check definitions (especially lazy)
+-- Should have testing utilities that makes it easy to unit test checks (same utilities as transformations)
++The function produces a `dlt.Relation` which can be converted to a list, pandas dataframe, arrow table, etc.
+ 
++```python
++dataset = pipeline.dataset()
++dq.read_check(
++    dataset,
++    table="orders",
++    column="payment_method", 
++).df()
++```
+ 
+-### Lifecycle
+-Data quality checks can be executed at different stages of the pipeline lifecycle. This choice has several impacts, including:
+-- the **input data** available for the check
+-- the compute resources used
+-- the **actions** available (e.g., drop invalid load)
++## Lifecycle
++Data quality (both metrics and checks) can be executed at different stages of the pipeline lifecycle. This impacts several aspects including:
++- available **input data**
++- compute resources used
++- **actions** available after a failed check (e.g., prevent invalid data load)
+ 
+ <!--How does this affect transactions? How do we handle errors in the data quality part-->
+ 
+-#### Post-load
++### Post-load
+ The post-load execution is the simplest option. The pipeline goes through `Extract -> Normalize -> Load` as usual. Then, the checks are executed on the destination.
+ 
+ Properties:
+@@ -111,7 +304,12 @@ sequenceDiagram
+     Dataset->>Dataset: Run Checks
+ ```
+ 
+-#### Pre-load (staging)
++### Pre-load (staging)
++:::warning
++Work in progress. Currently unavailable.
++:::
++
++
+ The pre-load execution via staging dataset allows to execute checks on the destination and trigger actions before data is loaded into the dataset. This is effectively using **post-load** checks before a 2nd load phase.
+ 
+ :::info
+@@ -143,7 +341,10 @@ sequenceDiagram
+ ```
+ 
+ 
+-#### Pre-load (in-memory)
++### Pre-load (in-memory)
++:::warning
++Work in progress. Currently unavailable.
++:::
+ 
+ The pre-load execution in-memory will execute checks using `duckdb` against the load packages (i.e., temporary files) stored on the machine that runs `dlt`. This allows to trigger actions before data is loaded into the destination.
+ 
+@@ -169,27 +370,9 @@ sequenceDiagram
+     Pipeline->>Dataset: Load
+ ```
+ 
+-## Migration and versioning (WIP)
+-
+-As the real-world change, their can be addition, removal, or modification of data quality checks for your pipeline / dataset. This is require for proper auditing.
+-
+-For example, the check `is_in("division", ["europe", "america"])` defined in 2024 could evolve to `is_in("division", ["europe", "america", "asia"])` in 2026.
+-
+-Notes:
+-- checks need to be serialized and hashed (trivial for lazy checks)
+-- checks can be stored on schema (consequently on the destination too)
+-- this is the same challenge as versioning transformations
+-
+-## Action (WIP)
+-After running checks, **actions** can be triggered based on the **check result** or **check outcome**. 
+-
+-Notes:
+-- actions can be configured globally or per-check
+-- planned actions: drop data, quarantine data (move to a special dataset), resolve (e.g., fill value, set default, apply transformation), fail (prevents load), raise/alert (sends notification)
+-- This needs to be configurable from outside the source code (e.g., via `config.toml`). The same checks would require different action during development vs. prod
+-
+-
+-## Metrics
+-
+-
+-
++## Roadmap
++- Define checks that depend on metrics (this should reduce verbosity)
++- Support user-defined group-by metrics
++- Support completely custom checks via `@dlt.hub.transformation` (e.g., SQL, SQLGlot, Ibis, Narwhals, Polars)
++- Trigger actions based on check result or outcome (e.g., send Slack notification)
++- Track metrics and checks changes via `dlt.Schema` versioning
+
+
+===== COMMIT aeb5b659 =====
+
+
+commit aeb5b659f
+Author: Anuun Chinbat
+Date: 2026-02-20
+
+    fix(schema): `.to_mermaid()` handles missing `data_type` field (#3659)
+
+diff --git a/dlt/helpers/mermaid.py b/dlt/helpers/mermaid.py
+index 5849a4084..8452bd0ed 100644
+--- a/dlt/helpers/mermaid.py
++++ b/dlt/helpers/mermaid.py
+@@ -62,7 +62,10 @@ def _to_mermaid_table(
+ 
+ # TODO add scale & precision to `data_type`
+ def _to_mermaid_column(column: TColumnSchema, hide_descriptions: bool = False) -> str:
+-    mermaid_col = column["data_type"] + " " + column["name"]
++    # NOTE: incomplete columns (no data_type) currently arise from "seen-null-first" propagation
++    # (columns whose first observed values were all null). if that propagation is removed so that
++    # incomplete columns no longer reach the schema, this fallback should be revisited.
++    mermaid_col = column.get("data_type", "no_data_seen") + " " + column["name"]
+     keys = []
+     if column.get("primary_key"):
+         keys.append("PK")
+diff --git a/tests/helpers/test_mermaid.py b/tests/helpers/test_mermaid.py
+index a19f365a9..f534e1c63 100644
+--- a/tests/helpers/test_mermaid.py
++++ b/tests/helpers/test_mermaid.py
+@@ -311,6 +311,10 @@ EXPECTED_MERMAID_STR = """
+             {"name": "description_col", "data_type": "text", "description": "foo"},
+             'text description_col "foo"\n',
+         ),
++        (
++            {"name": "incomplete_col"},  # no data_type set yet
++            "no_data_seen incomplete_col\n",
++        ),
+     ],
+ )
+ def test_to_mermaid_column(hints: TColumnSchema, expected_mermaid_col: str) -> None:
+
+
+===== COMMIT dcb90029 =====
+
+
+commit dcb90029b
+Author: djudjuu
+Date: 2026-02-20
+
+    adjust scaffold api and vibe source tests to not expect source.md file (#3649)
+
+diff --git a/tests/workspace/cli/test_init_command.py b/tests/workspace/cli/test_init_command.py
+index 2af61e7b3..42f5a728a 100644
+--- a/tests/workspace/cli/test_init_command.py
++++ b/tests/workspace/cli/test_init_command.py
+@@ -719,11 +719,7 @@ def test_init_vibe_source_editor_choice_ux(ide_choice: str, workspace_files: Fil
+ 
+     assert "dlt will generate useful project rules tailored to your assistant/IDE." in _out
+     assert f"adding {ide_choice} rules, code snippets and docs" in _out
+-    assert (
+-        "file(s) supporting github were copied:" in _out
+-        and "github.md" in _out
+-        and "github-docs.yaml" in _out
+-    )
++    assert "file(s) supporting github were copied:" in _out and "github-docs.yaml" in _out
+ 
+ 
+ def test_init_all_vibe_sources_together(workspace_files: FileStorage) -> None:
+diff --git a/tests/workspace/cli/test_scaffold_api_client.py b/tests/workspace/cli/test_scaffold_api_client.py
+index 85c54466e..1eab16a46 100644
+--- a/tests/workspace/cli/test_scaffold_api_client.py
++++ b/tests/workspace/cli/test_scaffold_api_client.py
+@@ -29,7 +29,6 @@ def test_get_scaffold_files_storage_success(requests_mock: rm.Mocker) -> None:
+ 
+     source_name = "github"
+     mock_files = {
+-        "github.md": "# GitHub Source\nDocumentation content",
+         "github-docs.yaml": "some more docs",
+     }
+     # Match URL without query params and verify Accept header
+@@ -44,11 +43,8 @@ def test_get_scaffold_files_storage_success(requests_mock: rm.Mocker) -> None:
+     )
+ 
+     assert isinstance(storage, FileStorage)
+-    # Verify files exist using has_file
+-    assert storage.has_file("github.md")
+     assert storage.has_file("github-docs.yaml")
+     # Verify file content using load
+-    assert storage.load("github.md") == "# GitHub Source\nDocumentation content"
+     assert storage.load("github-docs.yaml") == "some more docs"
+ 
+     # Verify that Accept header was sent
+
+
+===== COMMIT 69e9c471 =====
+
+
+commit 69e9c4712
+Author: rudolfix
+Date: 2026-02-20
+
+    (fix) clickhouse: makes reads sequential by default (#3651)
+
+diff --git a/dlt/destinations/impl/clickhouse/configuration.py b/dlt/destinations/impl/clickhouse/configuration.py
+index 83c87818d..4a7a08d1d 100644
+--- a/dlt/destinations/impl/clickhouse/configuration.py
++++ b/dlt/destinations/impl/clickhouse/configuration.py
+@@ -88,6 +88,8 @@ class ClickHouseClientConfiguration(DestinationClientDwhWithStagingConfiguration
+     """Special table to mark dataset as existing"""
+     staging_use_https: bool = True
+     """Connect to the staging buckets via https"""
++    select_sequential_consistency: int = 1
++    """Ensures read-after-write consistency on ClickHouse Cloud and clusters"""
+ 
+     __config_gen_annotations__: ClassVar[List[str]] = [
+         "dataset_table_separator",
+diff --git a/dlt/destinations/impl/clickhouse/factory.py b/dlt/destinations/impl/clickhouse/factory.py
+index b71b90233..b72c11462 100644
+--- a/dlt/destinations/impl/clickhouse/factory.py
++++ b/dlt/destinations/impl/clickhouse/factory.py
+@@ -226,6 +226,7 @@ class clickhouse(Destination[ClickHouseClientConfiguration, "ClickHouseClient"])
+         credentials: Union[ClickHouseCredentials, str, Dict[str, Any], Type[Connection]] = None,
+         destination_name: str = None,
+         environment: str = None,
++        select_sequential_consistency: int = None,
+         **kwargs: Any,
+     ) -> None:
+         """Configure the ClickHouse destination to use in a pipeline.
+@@ -238,12 +239,14 @@ class clickhouse(Destination[ClickHouseClientConfiguration, "ClickHouseClient"])
+                 a connection string in the format `clickhouse://user:password@host:port/database`
+             destination_name (str, optional): Name of the destination, can be used in config section to differentiate between multiple of the same type
+             environment (str, optional): Environment of the destination
++            select_sequential_consistency (int, optional): Ensures read-after-write consistency on ClickHouse Cloud and clusters. Defaults to 1.
+             **kwargs (Any): Additional arguments passed to the destination config
+         """
+         super().__init__(
+             credentials=credentials,
+             destination_name=destination_name,
+             environment=environment,
++            select_sequential_consistency=select_sequential_consistency,
+             **kwargs,
+         )
+ 
+diff --git a/dlt/destinations/impl/clickhouse/sql_client.py b/dlt/destinations/impl/clickhouse/sql_client.py
+index b859c2656..f3d7de410 100644
+--- a/dlt/destinations/impl/clickhouse/sql_client.py
++++ b/dlt/destinations/impl/clickhouse/sql_client.py
+@@ -100,6 +100,11 @@ class ClickHouseSqlClient(
+             return sentinel_table in all_ds_tables
+ 
+     def open_connection(self) -> clickhouse_driver.dbapi.connection.Connection:
++        if self.credentials.query is None:
++            self.credentials.query = {}
++        self.credentials.query["select_sequential_consistency"] = (
++            self.config.select_sequential_consistency
++        )
+         self._conn = clickhouse_driver.connect(dsn=self.credentials.to_native_representation())
+         return self._conn
+ 
+@@ -216,6 +221,7 @@ class ClickHouseSqlClient(
+                     "allow_experimental_lightweight_delete": 1,
+                     "enable_http_compression": 1,
+                     "date_time_input_format": "best_effort",
++                    "select_sequential_consistency": self.config.select_sequential_consistency,
+                 },
+                 compression=compression,
+             )
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+index 1ef9877a9..1ba708a9b 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/clickhouse.md
+@@ -105,6 +105,7 @@ dataset_table_separator = "___"                         # The default separator
+ table_engine_type = "merge_tree"                        # The default table engine to use.
+ dataset_sentinel_table_name = "dlt_sentinel_table"      # The default name for sentinel tables.
+ staging_use_https = true                                # Wether to connecto to the staging bucket via https (defaults to True)
++select_sequential_consistency = 1                       # Ensures read-after-write consistency on ClickHouse Cloud (defaults to 1)
+ ```
+ 
+ ## Write disposition
+@@ -118,6 +119,19 @@ Data is loaded into ClickHouse using the most efficient method depending on the
+ - For local files, the `clickhouse-connect` library is used to directly load files into ClickHouse tables using the `INSERT` command.
+ - For files in remote storage like S3, Google Cloud Storage, or Azure Blob Storage, ClickHouse table functions like `s3`, `gcs`, and `azureBlobStorage` are used to read the files and insert the data into tables.
+ 
++### Read-after-write consistency
++
++By default, dlt sets `select_sequential_consistency=1` on all ClickHouse connections. This ensures
++that `SELECT` queries always see the results of preceding writes, even on ClickHouse Cloud
++(SharedMergeTree) or self-hosted clusters where queries may be routed to different nodes. If you are
++running read-only workloads and want to avoid the small metadata check overhead, set it to `0` in
++your configuration:
++
++```toml
++[destination.clickhouse]
++select_sequential_consistency = 0
++```
++
+ ## Datasets
+ 
+ ClickHouse does not support multiple datasets in one database; dlt relies on datasets to exist for multiple reasons.
+diff --git a/tests/common/storages/test_local_filesystem.py b/tests/common/storages/test_local_filesystem.py
+index c8a346cfb..6f84762d7 100644
+--- a/tests/common/storages/test_local_filesystem.py
++++ b/tests/common/storages/test_local_filesystem.py
+@@ -1,6 +1,7 @@
+ import os
+ import pytest
+ import pathlib
++import time
+ from urllib.parse import quote
+ from typing import Tuple
+ 
+@@ -45,7 +46,21 @@ UNC_WSL_PATH = r"\\wsl.localhost\Ubuntu-18.04\home\rudolfix\ .dlt"
+ )
+ def test_local_path_win_configuration(bucket_url: str, file_url: str) -> None:
+     assert FilesystemConfiguration.is_local_path(bucket_url) is True
+-    assert FilesystemConfiguration.make_file_url(bucket_url) == file_url
++    # UNC paths (e.g. \\wsl.localhost\...) resolve via network and the WSL host
++    # on GitHub Actions Windows runners is occasionally slow to respond, causing
++    # transient OSError (WinError 64). Retry a few times before giving up.
++    is_unc = bucket_url.startswith("\\\\") or bucket_url.startswith("//")
++    last_err: Exception = None
++    for attempt in range(3 if is_unc else 1):
++        try:
++            assert FilesystemConfiguration.make_file_url(bucket_url) == file_url
++            break
++        except OSError as e:
++            last_err = e
++            if attempt < 2:
++                time.sleep(1)
++    else:
++        raise last_err
+ 
+     c = resolve_configuration(FilesystemConfiguration(bucket_url))
+     assert c.protocol == "file"
+diff --git a/tests/load/clickhouse/test_clickhouse_configuration.py b/tests/load/clickhouse/test_clickhouse_configuration.py
+index 0b5a223a9..ee6b3562f 100644
+--- a/tests/load/clickhouse/test_clickhouse_configuration.py
++++ b/tests/load/clickhouse/test_clickhouse_configuration.py
+@@ -5,6 +5,7 @@ import pytest
+ from dlt.common.configuration.resolve import resolve_configuration
+ from dlt.common.libs.sql_alchemy_compat import make_url
+ from dlt.common.utils import custom_environ, digest128
++from dlt.destinations import clickhouse
+ from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseClient
+ from dlt.destinations.impl.clickhouse.configuration import (
+     ClickHouseCredentials,
+@@ -67,6 +68,14 @@ def test_clickhouse_credentials_resolved() -> None:
+         assert config.s3_extra_credentials["role_arn"] == "my_arn"
+ 
+ 
++def test_clickhouse_factory_select_sequential_consistency() -> None:
++    dest = clickhouse(select_sequential_consistency=0)
++    assert dest.config_params["select_sequential_consistency"] == 0
++
++    dest = clickhouse()
++    assert "select_sequential_consistency" not in dest.config_params
++
++
+ def test_clickhouse_configuration() -> None:
+     # def empty fingerprint
+     assert ClickHouseClientConfiguration().fingerprint() == ""
+@@ -94,6 +103,7 @@ def test_clickhouse_connection_settings(client: ClickHouseClient) -> None:
+         assert ("allow_experimental_lightweight_delete", "1") in res
+         assert ("enable_http_compression", "1") in res
+         assert ("date_time_input_format", "best_effort") in res
++        assert ("select_sequential_consistency", "1") in res
+ 
+ 
+ def test_client_has_dataset(client: ClickHouseClient) -> None:
+
+
+===== COMMIT 4caedcad =====
+
+
+commit 4caedcad4
+Author: Alberto
+Date: 2026-02-19
+
+    fix(ci): use OS-specific method to remove file (#3648)
+
+diff --git a/dlt/common/storages/file_storage.py b/dlt/common/storages/file_storage.py
+index 4917ba5c9..e1f502bd9 100644
+--- a/dlt/common/storages/file_storage.py
++++ b/dlt/common/storages/file_storage.py
+@@ -320,12 +320,9 @@ class FileStorage:
+ 
+     @staticmethod
+     def rmtree_del_ro(action: AnyFun, name: str, exc: Any) -> Any:
+-        if action is os.unlink or action is os.remove or action is os.rmdir:
++        if action in (os.unlink, os.remove, os.rmdir):
+             os.chmod(name, stat.S_IWRITE)
+-            if os.path.isdir(name):
+-                os.rmdir(name)
+-            else:
+-                os.remove(name)
++            action(name)
+ 
+     @staticmethod
+     def open_zipsafe_ro(path: str, mode: str = "r", **kwargs: Any) -> IO[Any]:
+
+
+===== COMMIT e22fc97e =====
+
+
+commit e22fc97e1
+Author: Alberto
+Date: 2026-02-18
+
+    feat/Add install command for make test-load-local-p (#3645)
+
+diff --git a/Makefile b/Makefile
+index 698e6a0c7..117e3c7ee 100644
+--- a/Makefile
++++ b/Makefile
+@@ -163,12 +163,20 @@ test-common-p: ## Tests common components in parallel
+ # Local load tests
+ # ----------------------------------------------------------------------
+ 
++install-load-local: dev
++	uv run pip install sqlalchemy==2.0.18
++
+ TEST_LOAD_PATHS = tests/load
+ 
+ test-load-local: ## Tests load with local destinations (duckdb + filesystem)
+ 	ACTIVE_DESTINATIONS='["duckdb", "filesystem"]' \
+ 	ALL_FILESYSTEM_DRIVERS='["memory", "file"]' \
+-	$(call RUN_XDIST_SAFE_SPLIT,$(TEST_LOAD_PATHS))
++	$(call RUN_XDIST_SAFE_SPLIT, \
++		$(TEST_LOAD_PATHS) \
++		--ignore tests/load/sources \
++		--ignore tests/load/filesystem_sftp \
++	)
++
+ 
+ test-load-local-p: ## Tests load with local destinations in parallel
+ 	$(MAKE) test-load-local PYTEST_XDIST_N=auto
+
+
+===== COMMIT 7a77d840 =====
+
+
+commit 7a77d8403
+Author: rudolfix
+Date: 2026-02-18
+
+    (chore) removes license autofixture, adds selective license application (#3646)
+
+diff --git a/.github/workflows/test_hub.yml b/.github/workflows/test_hub.yml
+index 4b3bb611d..6f951e008 100644
+--- a/.github/workflows/test_hub.yml
++++ b/.github/workflows/test_hub.yml
+@@ -56,11 +56,8 @@ jobs:
+           activate-environment: true
+           enable-cache: true
+ 
+-      - name: Install min dependencies
+-        run: uv sync
+-
+-      - name: run import tests
+-        run: uv run pytest tests/hub/test_plugin_import.py
++      - name: Install hub minimal dependencies
++        run: make install-hub-minimal
+ 
+       # NOTE: needed for mssql source tests in plus
+       - name: Install ODBC driver for SQL Server
+@@ -69,31 +66,22 @@ jobs:
+           sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18
+         if: matrix.os == 'ubuntu-latest'
+ 
+-      # still does not work in mac
+-      # - name: Install ODBC driver for SQL Server (macOS)
+-      #   if: matrix.os == 'macos-latest'
+-      #   env:
+-      #     HOMEBREW_NONINTERACTIVE: 1
+-      #     HOMEBREW_NO_AUTO_UPDATE: 1
+-      #     HOMEBREW_NO_ANALYTICS: 1
+-      #     HOMEBREW_NO_INSTALL_CLEANUP: 1
+-      #   run: |
+-      #     brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release
+-      #     printf "YES\n" | brew install msodbcsql18
+-      #     # quick diagnostics (do not fail the build if unavailable)
+-      #     odbcinst -j || true
+-      #     odbcinst -q -d || true
+-
+-      - name: Install all dependencies
++      - name: Install dlthub
++        if: matrix.dlthub_dep != ''
++        run: uv run pip install --upgrade --force-reinstall --pre --no-cache-dir ${{ matrix.dlthub_dep }}
++
++      - name: Run hub minimal tests
++        run: make test-hub-minimal
++
++      - name: Install hub all dependencies
+         run: make dev-hub
+ 
+-      - name: Install dlthub
++      - name: Install dlthub (after full install)
+         if: matrix.dlthub_dep != ''
+         run: uv run pip install --upgrade --force-reinstall --pre --no-cache-dir ${{ matrix.dlthub_dep }}
+ 
+-      - name: Run tests
+-        run: uv run pytest tests/hub
+-        # if: matrix.os != 'macos-latest'
++      - name: Run all hub tests
++        run: make test-hub
+ 
+       - name: Test runtime client
+         run: |
+diff --git a/Makefile b/Makefile
+index a8960b9ec..698e6a0c7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,5 @@
+ .DEFAULT_GOAL := help
+-.PHONY: install-uv has-uv dev lint test test-common test-common-p reset-test-storage recreate-compiled-deps build-library-prerelease build-library publish-library test-load-local test-load-local-p test-load-local-postgres test-load-local-postgres-p install-snowflake-extras test-remote-snowflake test-remote-snowflake-p install-common-core test-common-core install-common-core-source test-common-core-source install-common-source install-pipeline-min test-pipeline-min install-pipeline-arrow test-pipeline-arrow install-pipeline-min-arrow test-pipeline-min-arrow install-workspace test-workspace test-workspace-dashboard install-pipeline-full test-pipeline-full install-pipeline-full-sql test-pipeline-full-sql install-sqlalchemy2 test-with-sqlalchemy-2 test-dest-load test-dest-remote-essential test-dest-remote-nonessential test-dbt-no-venv test-dbt-runner-venv test-sources-load test-sources-sql-database
++.PHONY: install-uv has-uv dev lint test test-common test-common-p reset-test-storage recreate-compiled-deps build-library-prerelease build-library publish-library test-load-local test-load-local-p test-load-local-postgres test-load-local-postgres-p install-snowflake-extras test-remote-snowflake test-remote-snowflake-p install-common-core test-common-core install-common-core-source test-common-core-source install-common-source install-pipeline-min test-pipeline-min install-pipeline-arrow test-pipeline-arrow install-pipeline-min-arrow test-pipeline-min-arrow install-workspace test-workspace test-workspace-dashboard install-hub-minimal test-hub-minimal test-hub install-pipeline-full test-pipeline-full install-pipeline-full-sql test-pipeline-full-sql install-sqlalchemy2 test-with-sqlalchemy-2 test-dest-load test-dest-remote-essential test-dest-remote-nonessential test-dbt-no-venv test-dbt-runner-venv test-sources-load test-sources-sql-database
+ 
+ PYV=$(shell python3 -c "import sys;t='{v[0]}.{v[1]}'.format(v=list(sys.version_info[:2]));sys.stdout.write(t)")
+ .SILENT:has-uv
+@@ -269,6 +269,19 @@ TEST_WORKSPACE_PATHS = tests/workspace
+ test-workspace:
+ 	$(call RUN_XDIST_SAFE_SPLIT,$(TEST_WORKSPACE_PATHS))
+ 
++# ----------------------------------------------------------------------
++# CI: hub minimal (no ibis)
++# ----------------------------------------------------------------------
++
++install-hub-minimal:
++	uv sync $(UV_SYNC_ARGS) --extra hub --group ibis-bare
++
++test-hub-minimal:
++	$(PYTEST_BASE) tests/hub --ignore=tests/hub/test_data_quality.py --ignore=tests/hub/test_destinations.py
++
++test-hub:
++	$(PYTEST_BASE) tests/hub
++
+ # ----------------------------------------------------------------------
+ # CI: full pipeline + sources + destinations
+ # ----------------------------------------------------------------------
+diff --git a/deploy/dlt/Dockerfile.minimal b/deploy/dlt/Dockerfile.minimal
+index 2f0e4c443..64431d5f7 100644
+--- a/deploy/dlt/Dockerfile.minimal
++++ b/deploy/dlt/Dockerfile.minimal
+@@ -57,5 +57,6 @@ RUN uv run dlt pipeline fruit_pipeline info
+ # install hub
+ RUN uv pip install /tmp/pydlt/dlt-${IMAGE_VERSION}.tar.gz[hub] --resolution lowest-direct && uv pip install typing-extensions==4.8.0
+ RUN uv run python minimal_pipeline.py
+-RUN uv run dlt --non-interactive license issue dlthub.transformation
+-RUN uv run dlt runtime --help
+\ No newline at end of file
++# TODO: enable when dlthub fixed
++# RUN uv run dlt --non-interactive license issue dlthub.transformation
++# RUN uv run dlt runtime --help
+\ No newline at end of file
+diff --git a/dlt/common/configuration/plugins.py b/dlt/common/configuration/plugins.py
+index b4c577265..4a1120e4f 100644
+--- a/dlt/common/configuration/plugins.py
++++ b/dlt/common/configuration/plugins.py
+@@ -1,4 +1,5 @@
+ import os
++import warnings
+ from typing import Any, ClassVar, Dict, List, Optional, Protocol
+ import pluggy
+ import argparse
+@@ -69,7 +70,14 @@ def load_setuptools_entrypoints(m: pluggy.PluginManager) -> List[str]:
+                 or m.is_blocked(ep.name)
+             ):
+                 continue
+-            plugin = ep.load()
++            try:
++                plugin = ep.load()
++            except Exception as e:
++                warnings.warn(
++                    f"Plugin {ep.name} from {package_name} failed to load: {e}",
++                    stacklevel=1,
++                )
++                continue
+             m.register(plugin, name=ep.name)
+             m._plugin_distinfo.append((plugin, pluggy._manager.DistFacade(dist)))
+             top_module = ep.module.split(".")[0]
+diff --git a/dlt/hub/__init__.py b/dlt/hub/__init__.py
+index 447bd6ada..3b7086ffa 100644
+--- a/dlt/hub/__init__.py
++++ b/dlt/hub/__init__.py
+@@ -9,10 +9,9 @@ __exception__ = None
+ try:
+     from dlthub import transformation, runner
+     from . import current
+-    from . import data_quality
+ 
+     __found__ = True
+-    __all__ = ("transformation", "current", "runner", "data_quality")
++    __all__ = ("transformation", "current", "runner")
+ except ImportError as import_exc:
+     __exception__ = import_exc
+ 
+diff --git a/docs/uv.lock b/docs/uv.lock
+index 4134fd77e..d72c75bad 100644
+--- a/docs/uv.lock
++++ b/docs/uv.lock
+@@ -834,7 +834,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.21.1a0"
++version = "1.22.0"
+ source = { editable = "../" }
+ dependencies = [
+     { name = "click" },
+@@ -929,8 +929,8 @@ requires-dist = [
+     { name = "db-dtypes", marker = "extra == 'bigquery'", specifier = ">=1.2.0" },
+     { name = "db-dtypes", marker = "extra == 'gcp'", specifier = ">=1.2.0" },
+     { name = "deltalake", marker = "extra == 'deltalake'", specifier = ">=0.25.1" },
+-    { name = "dlt-runtime", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.22" },
+-    { name = "dlthub", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.22" },
++    { name = "dlt-runtime", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.23" },
++    { name = "dlthub", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.21.0,<0.23" },
+     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=0.9" },
+     { name = "duckdb", marker = "extra == 'ducklake'", specifier = ">=1.2.0" },
+     { name = "duckdb", marker = "extra == 'lancedb'", specifier = ">=1.4.3" },
+@@ -1048,6 +1048,7 @@ dev = [
+     { name = "flake8-print", specifier = ">=5.0.0,<6" },
+     { name = "flake8-tidy-imports", specifier = ">=4.8.0" },
+     { name = "graphviz", specifier = ">=0.21" },
++    { name = "griffe", specifier = ">=1.10.0" },
+     { name = "isort", specifier = ">=5.12.0,<6" },
+     { name = "mypy", specifier = ">=1.11.0,<1.13.0" },
+     { name = "pip", specifier = ">=24.0.0" },
+@@ -1084,6 +1085,7 @@ ibis = [
+     { name = "ibis-framework", extras = ["duckdb", "postgres", "bigquery", "snowflake", "clickhouse", "databricks"], marker = "python_full_version >= '3.13'", specifier = ">=12.0.0" },
+     { name = "ibis-framework", extras = ["duckdb", "postgres", "bigquery", "snowflake", "mssql", "clickhouse", "databricks"], marker = "python_full_version >= '3.10' and python_full_version < '3.13'", specifier = ">=12.0.0" },
+ ]
++ibis-bare = [{ name = "ibis-framework", marker = "python_full_version >= '3.10'", specifier = ">=12.0.0" }]
+ pipeline = [
+     { name = "alive-progress", specifier = ">=3.1.1,<4" },
+     { name = "cffi", specifier = ">=1.16" },
+@@ -1213,15 +1215,16 @@ wheels = [
+ 
+ [[package]]
+ name = "dlthub"
+-version = "0.20.1"
++version = "0.22.0"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "python-jose" },
+     { name = "ruamel-yaml" },
++    { name = "sqlglot" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/77/1b/2c079f22243462e914026172094411ed7ef1fc96c8089e0ca66d1a14038a/dlthub-0.20.1.tar.gz", hash = "sha256:7b3a188abc28601fd4bdf8f17e7925ef729d4f91fb67a6b4eb5c5dc5a04ac3a2", size = 158432, upload-time = "2025-12-09T15:18:10.813Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/d5/af/fe84689f8742a7a3dc3e538faf5bc001a70168a34c6375e17eb15d2ce3e1/dlthub-0.22.0.tar.gz", hash = "sha256:cede29e2d0340b48e6ec3d287b9573340707273509f4f697b23d7f4981d86b9d", size = 169355, upload-time = "2026-02-17T15:15:56.941Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/21/94/b2a87853102c6aa08606b2708d8f678b1e39855e8227fe111e37c32631b6/dlthub-0.20.1-py3-none-any.whl", hash = "sha256:c4d4e0c4515cd68f316ccd02c9ecc007332c861ae6f92a488f7e961935e7f1a0", size = 209767, upload-time = "2025-12-09T15:18:09.067Z" },
++    { url = "https://files.pythonhosted.org/packages/a2/33/0cb13a6a0ac6d416efe69265131b625ad08754824dbbbac5accc1c5c12f6/dlthub-0.22.0-py3-none-any.whl", hash = "sha256:7b57ce78613607f49c169152f3d544aed90aed6783a0bb82d2dfe0f92b2a4713", size = 225911, upload-time = "2026-02-17T15:15:55.011Z" },
+ ]
+ 
+ [[package]]
+diff --git a/docs/website/docs/hub/features/transformations/transformation-snippets.py b/docs/website/docs/hub/features/transformations/transformation-snippets.py
+index bc4b39c6f..b78987627 100644
+--- a/docs/website/docs/hub/features/transformations/transformation-snippets.py
++++ b/docs/website/docs/hub/features/transformations/transformation-snippets.py
+@@ -1,13 +1,18 @@
+ import pytest
+-from typing import Any
++from typing import Any, Iterator
+ 
+ import dlt
+ from tests.pipeline.utils import load_table_counts
+-from tests.hub.conftest import auto_issue_license as auto_issue_license
++from tests.hub.utils import issue_ephemeral_license
+ 
+ pytest.importorskip("dlthub")
+ 
+ 
++@pytest.fixture(scope="session", autouse=True)
++def auto_issue_license() -> Iterator[Any]:
++    yield from issue_ephemeral_license()
++
++
+ @pytest.fixture(scope="function")
+ def fruitshop_pipeline() -> dlt.Pipeline:
+     """Set up a fruitshop fixture dataset for transformations examples"""
+diff --git a/pyproject.toml b/pyproject.toml
+index 3957519d9..793e8ecb8 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -63,7 +63,7 @@ dependencies = [
+ 
+ [project.optional-dependencies]
+ hub = [
+-    "dlthub>=0.20.0,<0.23 ; python_version >= '3.10'",
++    "dlthub>=0.21.0,<0.23 ; python_version >= '3.10'",
+     "dlt-runtime>=0.20.0,<0.23 ; python_version >= '3.10'",
+ ]
+ gcp = [
+@@ -293,6 +293,7 @@ ibis = [
+     "ibis-framework[duckdb, postgres, bigquery, snowflake, mssql, clickhouse, databricks]>=12.0.0 ; python_version >= '3.10' and python_version < '3.13'",
+     "ibis-framework[duckdb, postgres, bigquery, snowflake, clickhouse, databricks]>=12.0.0 ; python_version >= '3.13'"
+ ]
++ibis-bare = ["ibis-framework>=12.0.0 ; python_version >= '3.10'"]
+ streamlit = ["streamlit>=1.40.0,<2 ; python_version >= '3.9' and python_version != '3.9.7' and python_version < '3.14'"]
+ dashboard-tests = [
+     "playwright>=1.52.0,<2",
+diff --git a/tests/hub/conftest.py b/tests/hub/conftest.py
+deleted file mode 100644
+index 3d11432fa..000000000
+--- a/tests/hub/conftest.py
++++ /dev/null
+@@ -1,14 +0,0 @@
+-from typing import Iterator, Any
+-import pytest
+-
+-
+-@pytest.fixture(scope="session", autouse=True)
+-def auto_issue_license() -> Iterator[Any]:
+-    # skip tests if module not installed
+-    pytest.importorskip("dlthub")
+-
+-    from dlthub.common.license import LicenseContext
+-
+-    from tests.hub.utils import issue_ephemeral_license
+-
+-    yield from issue_ephemeral_license()
+diff --git a/tests/hub/test_data_quality.py b/tests/hub/test_data_quality.py
+index 8ef689ae4..e0b6f2f14 100644
+--- a/tests/hub/test_data_quality.py
++++ b/tests/hub/test_data_quality.py
+@@ -1,4 +1,5 @@
+ import dlt
++from dlt.extract import DltResource
+ 
+ 
+ def test_direct_module_import():
+@@ -10,15 +11,28 @@ def test_direct_module_import():
+ 
+ def test_from_module_import():
+     """Can import the registered `dlthub` submodule from `dlt.hub`."""
+-    from dlt.hub import data_quality
++    from dlt.hub import data_quality as dq_hub
++    from dlthub import data_quality as dq_dlthub
+ 
+ 
+ def test_data_quality_entrypoints():
+-    import dlthub.data_quality as dq
++    from dlt.hub import data_quality as dq
+ 
+     # access a single check
+-    assert dlt.hub.data_quality is not dq
+-    assert dlt.hub.data_quality.checks is dq.checks  # type: ignore[attr-defined,unused-ignore]
+-    assert dlt.hub.data_quality.checks.is_not_null is dq.checks.is_not_null  # type: ignore[attr-defined,unused-ignore]
+-    assert dlt.hub.data_quality.CheckSuite is dq.CheckSuite  # type: ignore[attr-defined,unused-ignore]
+-    assert dlt.hub.data_quality.prepare_checks is dq.prepare_checks  # type: ignore[attr-defined,unused-ignore]
++    assert dq.checks.is_not_null is not None  # type: ignore[attr-defined,unused-ignore]
++    assert dq.CheckSuite is not None  # type: ignore[attr-defined,unused-ignore]
++    assert dq.prepare_checks is not None  # type: ignore[attr-defined,unused-ignore]
++
++    from dlt.hub.data_quality import with_checks  # type: ignore[attr-defined,unused-ignore]
++    from dlt.hub.data_quality import with_metrics  # type: ignore[attr-defined,unused-ignore]
++
++    @with_checks(
++        dq.checks.is_not_null("foo"),  # type: ignore[attr-defined,unused-ignore]
++        dq.checks.is_unique("value"),  # type: ignore[attr-defined,unused-ignore]
++    )
++    @with_metrics(dq.metrics.table.row_count())  # type: ignore[attr-defined,unused-ignore]
++    @dlt.resource
++    def checked_resource():
++        pass
++
++    assert type(checked_resource()) is DltResource
+diff --git a/tests/hub/test_project.py b/tests/hub/test_project.py
+index 96ca92415..d18caff3c 100644
+--- a/tests/hub/test_project.py
++++ b/tests/hub/test_project.py
+@@ -1,4 +1,5 @@
+ import dlt
++from tests.hub.utils import ephemeral_license
+ 
+ 
+ def test_imports() -> None:
+@@ -6,7 +7,8 @@ def test_imports() -> None:
+ 
+ 
+ def test_project_context() -> None:
+-    context = dlt.hub.current.project.context()  # type: ignore[attr-defined,unused-ignore]
++    with ephemeral_license():
++        context = dlt.hub.current.project.context()  # type: ignore[attr-defined,unused-ignore]
+     assert context.name == "hub"
+     assert dlt.hub.current.project.catalog() is not None  # type: ignore[attr-defined,unused-ignore]
+     assert dlt.hub.current.project.config().name == "hub"  # type: ignore[attr-defined,unused-ignore]
+@@ -15,11 +17,12 @@ def test_project_context() -> None:
+ def test_switch_profile() -> None:
+     from dlt.hub.current import project  # type: ignore[attr-defined,unused-ignore]
+ 
+-    ctx = project.context()
+-    try:
+-        profile = ctx.profile
+-        project.context().switch_profile("tests")
+-        assert project.context().profile == "tests"
+-        print(project.config().current_profile)
+-    finally:
+-        assert project.context().switch_profile(profile).profile == profile
++    with ephemeral_license():
++        ctx = project.context()
++        try:
++            profile = ctx.profile
++            project.context().switch_profile("tests")
++            assert project.context().profile == "tests"
++            print(project.config().current_profile)
++        finally:
++            assert project.context().switch_profile(profile).profile == profile
+diff --git a/tests/hub/test_runner.py b/tests/hub/test_runner.py
+index b454652e7..c30486806 100644
+--- a/tests/hub/test_runner.py
++++ b/tests/hub/test_runner.py
+@@ -1,12 +1,17 @@
+ import dlt
+ 
++from tests.hub.utils import ephemeral_license
++
+ 
+ def test_runner_instance() -> None:
+-    pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
++    pipeline = dlt.pipeline(
++        pipeline_name="my_pipeline", destination=dlt.destinations.filesystem("_data")
++    )
+ 
+     @dlt.resource(table_name="my_table")
+     def my_resource():
+         return [1, 2, 3]
+ 
+-    load_info = dlt.hub.runner(pipeline).run(my_resource())
++    with ephemeral_license():
++        load_info = dlt.hub.runner(pipeline).run(my_resource())
+     print(load_info)
+diff --git a/tests/hub/test_transformations.py b/tests/hub/test_transformations.py
+index dd25d5b43..04b8f3414 100644
+--- a/tests/hub/test_transformations.py
++++ b/tests/hub/test_transformations.py
+@@ -4,7 +4,6 @@ import dlt
+ def test_transformation_decorator() -> None:
+     assert dlt.hub.transformation is not None
+ 
+-    # current version blocks declarations with licenses
+     @dlt.hub.transformation
+     def get_even_rows(dataset: dlt.Dataset):
+         return dataset.table("items").filter("id % 2 = 0")
+diff --git a/tests/hub/utils.py b/tests/hub/utils.py
+index bbf192bf6..50aa70fad 100644
+--- a/tests/hub/utils.py
++++ b/tests/hub/utils.py
+@@ -11,6 +11,11 @@ from dlthub.common.license import (
+ )
+ 
+ 
++@contextlib.contextmanager
++def ephemeral_license():
++    yield from issue_ephemeral_license()
++
++
+ def issue_ephemeral_license() -> Iterator[LicenseContext]:
+     license_ = create_self_signed_license("dlthub.transformation dlthub.project dlthub.runner")
+     try:
+diff --git a/uv.lock b/uv.lock
+index c03fadbf8..d39fd4788 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2065,7 +2065,8 @@ dependencies = [
+     { name = "semver" },
+     { name = "setuptools" },
+     { name = "simplejson" },
+-    { name = "sqlglot" },
++    { name = "sqlglot", version = "28.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
++    { name = "sqlglot", version = "28.10.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+     { name = "tenacity" },
+     { name = "tomlkit" },
+     { name = "typing-extensions" },
+@@ -2294,6 +2295,9 @@ ibis = [
+     { name = "ibis-framework", extra = ["bigquery", "clickhouse", "databricks", "duckdb", "postgres", "snowflake"], marker = "python_full_version >= '3.10'" },
+     { name = "ibis-framework", extra = ["mssql"], marker = "python_full_version >= '3.10' and python_full_version < '3.13'" },
+ ]
++ibis-bare = [
++    { name = "ibis-framework", marker = "python_full_version >= '3.10'" },
++]
+ pipeline = [
+     { name = "alive-progress" },
+     { name = "cffi" },
+@@ -2349,7 +2353,7 @@ requires-dist = [
+     { name = "db-dtypes", marker = "extra == 'gcp'", specifier = ">=1.2.0" },
+     { name = "deltalake", marker = "extra == 'deltalake'", specifier = ">=0.25.1" },
+     { name = "dlt-runtime", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.23" },
+-    { name = "dlthub", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.23" },
++    { name = "dlthub", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.21.0,<0.23" },
+     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=0.9" },
+     { name = "duckdb", marker = "extra == 'ducklake'", specifier = ">=1.2.0" },
+     { name = "duckdb", marker = "extra == 'lancedb'", specifier = ">=1.4.3" },
+@@ -2504,6 +2508,7 @@ ibis = [
+     { name = "ibis-framework", extras = ["duckdb", "postgres", "bigquery", "snowflake", "clickhouse", "databricks"], marker = "python_full_version >= '3.13'", specifier = ">=12.0.0" },
+     { name = "ibis-framework", extras = ["duckdb", "postgres", "bigquery", "snowflake", "mssql", "clickhouse", "databricks"], marker = "python_full_version >= '3.10' and python_full_version < '3.13'", specifier = ">=12.0.0" },
+ ]
++ibis-bare = [{ name = "ibis-framework", marker = "python_full_version >= '3.10'", specifier = ">=12.0.0" }]
+ pipeline = [
+     { name = "alive-progress", specifier = ">=3.1.1,<4" },
+     { name = "cffi", specifier = ">=1.16" },
+@@ -2532,7 +2537,7 @@ streamlit = [{ name = "streamlit", marker = "python_full_version >= '3.9' and py
+ 
+ [[package]]
+ name = "dlt-runtime"
+-version = "0.20.0"
++version = "0.21.1"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "attrs", version = "25.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+@@ -2542,22 +2547,23 @@ dependencies = [
+     { name = "python-jose", marker = "python_full_version >= '3.10'" },
+     { name = "tabulate", marker = "python_full_version >= '3.10'" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/d0/86/d7f057d8bdf2f3ada28bf1277b7f24a7abbb221d72788bd682176126a75c/dlt_runtime-0.20.0.tar.gz", hash = "sha256:753c7522bc01c92a453459640e482f87b647b14cc5734d754133a91968acc79f", size = 49532, upload-time = "2025-12-09T14:32:33.708Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/4a/1e/a35c27c184a72f14af404838cd98906a6838a20054b8c191c47e0e00cd2f/dlt_runtime-0.21.1.tar.gz", hash = "sha256:5fe3d470542dd109ccd44c3b4d0ec1eaefedb8f5b300a3e0f1a07e44d4003a50", size = 64188, upload-time = "2026-02-13T13:11:34.233Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/4c/b0/02a6c846d89e3c27a592a929d95526036be1d607e48fca214dcbf3b7bf58/dlt_runtime-0.20.0-py3-none-any.whl", hash = "sha256:0969165672b2b3938a618ddd263e0cf8ec356d289253f58134e325e222753056", size = 119573, upload-time = "2025-12-09T14:32:32.119Z" },
++    { url = "https://files.pythonhosted.org/packages/19/04/1673c5c68be6c27c1ce01614f9dc2b742d8305be6c5743e5c18ee34dd0a1/dlt_runtime-0.21.1-py3-none-any.whl", hash = "sha256:3650129becffbe8e00dabe7cc0a7ee7347b61a8d49e9a32d7be1c0bb1f3ceddd", size = 167654, upload-time = "2026-02-13T13:11:32.627Z" },
+ ]
+ 
+ [[package]]
+ name = "dlthub"
+-version = "0.20.1"
++version = "0.22.0"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "python-jose", marker = "python_full_version >= '3.10'" },
+     { name = "ruamel-yaml", marker = "python_full_version >= '3.10'" },
++    { name = "sqlglot", version = "28.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/77/1b/2c079f22243462e914026172094411ed7ef1fc96c8089e0ca66d1a14038a/dlthub-0.20.1.tar.gz", hash = "sha256:7b3a188abc28601fd4bdf8f17e7925ef729d4f91fb67a6b4eb5c5dc5a04ac3a2", size = 158432, upload-time = "2025-12-09T15:18:10.813Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/d5/af/fe84689f8742a7a3dc3e538faf5bc001a70168a34c6375e17eb15d2ce3e1/dlthub-0.22.0.tar.gz", hash = "sha256:cede29e2d0340b48e6ec3d287b9573340707273509f4f697b23d7f4981d86b9d", size = 169355, upload-time = "2026-02-17T15:15:56.941Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/21/94/b2a87853102c6aa08606b2708d8f678b1e39855e8227fe111e37c32631b6/dlthub-0.20.1-py3-none-any.whl", hash = "sha256:c4d4e0c4515cd68f316ccd02c9ecc007332c861ae6f92a488f7e961935e7f1a0", size = 209767, upload-time = "2025-12-09T15:18:09.067Z" },
++    { url = "https://files.pythonhosted.org/packages/a2/33/0cb13a6a0ac6d416efe69265131b625ad08754824dbbbac5accc1c5c12f6/dlthub-0.22.0-py3-none-any.whl", hash = "sha256:7b57ce78613607f49c169152f3d544aed90aed6783a0bb82d2dfe0f92b2a4713", size = 225911, upload-time = "2026-02-17T15:15:55.011Z" },
+ ]
+ 
+ [[package]]
+@@ -3885,7 +3891,7 @@ dependencies = [
+     { name = "atpublic", marker = "python_full_version >= '3.10'" },
+     { name = "parsy", marker = "python_full_version >= '3.10'" },
+     { name = "python-dateutil", marker = "python_full_version >= '3.10'" },
+-    { name = "sqlglot", marker = "python_full_version >= '3.10'" },
++    { name = "sqlglot", version = "28.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+     { name = "toolz", marker = "python_full_version >= '3.10'" },
+     { name = "typing-extensions", marker = "python_full_version >= '3.10'" },
+     { name = "tzdata", marker = "python_full_version >= '3.10'" },
+@@ -8839,10 +8845,59 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/88/1e/3177e774a4237d8bd9fd9c741ba2f626fba1785ce1c0683eacbfba3cec2f/sqlfluff-2.3.5-py3-none-any.whl", hash = "sha256:2ca095a2f2cced5573a83fc8a6d2aceb36edd21a8c4c5d8099b6544e386d86a1", size = 724960, upload-time = "2023-10-27T19:32:07.128Z" },
+ ]
+ 
++[[package]]
++name = "sqlglot"
++version = "28.0.0"
++source = { registry = "https://pypi.org/simple" }
++resolution-markers = [
++    "python_full_version >= '3.14' and os_name == 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version >= '3.14' and os_name != 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version >= '3.14' and os_name == 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version >= '3.14' and os_name != 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version >= '3.14' and os_name == 'nt' and sys_platform == 'emscripten'",
++    "python_full_version >= '3.14' and os_name != 'nt' and sys_platform == 'emscripten'",
++    "python_full_version == '3.13.*' and os_name == 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.13.*' and os_name != 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.12.*' and os_name == 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.11.*' and os_name == 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.10.*' and os_name == 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.12.*' and os_name != 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.11.*' and os_name != 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.10.*' and os_name != 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.13.*' and os_name == 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.13.*' and os_name != 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.12.*' and os_name == 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.11.*' and os_name == 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.10.*' and os_name == 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.12.*' and os_name != 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.11.*' and os_name != 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.10.*' and os_name != 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version == '3.13.*' and os_name == 'nt' and sys_platform == 'emscripten'",
++    "python_full_version == '3.13.*' and os_name != 'nt' and sys_platform == 'emscripten'",
++    "python_full_version == '3.12.*' and os_name == 'nt' and sys_platform == 'emscripten'",
++    "python_full_version == '3.11.*' and os_name == 'nt' and sys_platform == 'emscripten'",
++    "python_full_version == '3.10.*' and os_name == 'nt' and sys_platform == 'emscripten'",
++    "python_full_version == '3.12.*' and os_name != 'nt' and sys_platform == 'emscripten'",
++    "python_full_version == '3.11.*' and os_name != 'nt' and sys_platform == 'emscripten'",
++    "python_full_version == '3.10.*' and os_name != 'nt' and sys_platform == 'emscripten'",
++]
++sdist = { url = "https://files.pythonhosted.org/packages/52/8d/9ce5904aca760b81adf821c77a1dcf07c98f9caaa7e3b5c991c541ff89d2/sqlglot-28.0.0.tar.gz", hash = "sha256:cc9a651ef4182e61dac58aa955e5fb21845a5865c6a4d7d7b5a7857450285ad4", size = 5520798, upload-time = "2025-11-17T10:34:57.016Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/56/6d/86de134f40199105d2fee1b066741aa870b3ce75ee74018d9c8508bbb182/sqlglot-28.0.0-py3-none-any.whl", hash = "sha256:ac1778e7fa4812f4f7e5881b260632fc167b00ca4c1226868891fb15467122e4", size = 536127, upload-time = "2025-11-17T10:34:55.192Z" },
++]
++
+ [[package]]
+ name = "sqlglot"
+ version = "28.10.0"
+ source = { registry = "https://pypi.org/simple" }
++resolution-markers = [
++    "python_full_version < '3.10' and os_name == 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version < '3.10' and os_name != 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version < '3.10' and os_name == 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version < '3.10' and os_name != 'nt' and platform_python_implementation == 'PyPy' and sys_platform != 'emscripten'",
++    "python_full_version < '3.10' and os_name == 'nt' and sys_platform == 'emscripten'",
++    "python_full_version < '3.10' and os_name != 'nt' and sys_platform == 'emscripten'",
++]
+ sdist = { url = "https://files.pythonhosted.org/packages/69/7d/1479ac3543caada917c3781893d3f846c810aec6355eb7b2f58df68f999b/sqlglot-28.10.0.tar.gz", hash = "sha256:f3d4759164ad854176980b3a47eb0c7ef699118dfa80beeb93e010885637b211", size = 5739594, upload-time = "2026-02-04T14:22:18.26Z" }
+ wheels = [
+     { url = "https://files.pythonhosted.org/packages/a7/34/c5de8f3c110bd066ebfa31b2d948dd33b691c7ccea39065e37f97f3f30a1/sqlglot-28.10.0-py3-none-any.whl", hash = "sha256:d442473bfd2340776dfc88382de3df456b9c5b66974623e554c6ad6426ba365e", size = 597042, upload-time = "2026-02-04T14:22:16.534Z" },
+
+
+===== COMMIT 700aa872 =====
+
+
+commit 700aa8726
+Author: rudolfix
+Date: 2026-02-18
+
+    sets default mcp transport to http-stream (#3624)
+
+diff --git a/dlt/_workspace/cli/_pipeline_command.py b/dlt/_workspace/cli/_pipeline_command.py
+index 41ce6e4bb..78c2f5882 100644
+--- a/dlt/_workspace/cli/_pipeline_command.py
++++ b/dlt/_workspace/cli/_pipeline_command.py
+@@ -153,9 +153,13 @@ def pipeline_command(
+     if operation == "mcp":
+         from dlt._workspace.mcp import PipelineMCP
+ 
+-        transport = "stdio" if command_kwargs["stdio"] else "sse"
+-        if transport:
+-            # write to stderr. stdin is the comm channel
++        if command_kwargs["stdio"]:
++            transport = "stdio"
++        elif command_kwargs.get("sse"):
++            transport = "sse"
++        else:
++            transport = "streamable-http"
++        if transport != "stdio":
+             fmt.echo("Starting dlt MCP server", err=True)
+         mcp = PipelineMCP(p, command_kwargs["port"])
+         mcp.run(transport=transport)
+diff --git a/dlt/_workspace/cli/_workspace_command.py b/dlt/_workspace/cli/_workspace_command.py
+index 46569d266..c90c28f93 100644
+--- a/dlt/_workspace/cli/_workspace_command.py
++++ b/dlt/_workspace/cli/_workspace_command.py
+@@ -71,15 +71,19 @@ def clean_workspace(run_context: RunContextBase, args: argparse.Namespace) -> No
+ 
+ 
+ @utils.track_command("workspace", track_before=True, operation="mcp")
+-def start_mcp(run_context: WorkspaceRunContext, port: int, stdio: bool) -> None:
++def start_mcp(run_context: WorkspaceRunContext, port: int, stdio: bool, sse: bool) -> None:
+     from dlt._workspace.mcp import WorkspaceMCP
+ 
+-    transport = "stdio" if stdio else "sse"
+-    if transport:
+-        # write to stderr. stdin is the comm channel
++    if stdio:
++        transport = "stdio"
++    elif sse:
++        transport = "sse"
++    else:
++        transport = "streamable-http"
++    if transport != "stdio":
+         fmt.echo("Starting dlt MCP server", err=True)
+     mcp_server = WorkspaceMCP(f"dlt: {run_context.name}@{run_context.profile}", port=port)
+-    mcp_server.run(transport)
++    mcp_server.run(transport=transport)
+ 
+ 
+ @utils.track_command("dashboard", True)
+diff --git a/dlt/_workspace/cli/commands.py b/dlt/_workspace/cli/commands.py
+index 795f7623b..ae0544efe 100644
+--- a/dlt/_workspace/cli/commands.py
++++ b/dlt/_workspace/cli/commands.py
+@@ -424,7 +424,7 @@ list of all tables and columns created at the destination during the loading of
+             pipeline_subparsers,
+             "This MCP facilitates schema and data exploration for the dataset created with this"
+             " pipeline",
+-            "Launch MCP server attached to this pipeline in SSE transport mode",
++            "Launch MCP server attached to this pipeline",
+             DEFAULT_PIPELINE_MCP_PORT,
+         )
+ 
+@@ -829,8 +829,7 @@ workspace info.
+             subparsers,
+             "This MCP allows to attach to any pipeline that was previously ran in this workspace"
+             " and then facilitates schema and data exploration in the pipeline's dataset.",
+-            "Launch dlt MCP server in current Python environment and Workspace in SSE transport"
+-            " mode by default.",
++            "Launch dlt MCP server in current Python environment and Workspace",
+             DEFAULT_DLT_MCP_PORT,
+         )
+ 
+@@ -864,7 +863,7 @@ workspace info.
+         elif args.workspace_command == "show":
+             show_workspace(workspace_context, args.edit)
+         elif args.workspace_command == "mcp":
+-            start_mcp(workspace_context, port=args.port, stdio=args.stdio)
++            start_mcp(workspace_context, port=args.port, stdio=args.stdio, sse=args.sse)
+         else:
+             self.parser.print_usage()
+ 
+diff --git a/dlt/_workspace/cli/utils.py b/dlt/_workspace/cli/utils.py
+index 6f2895b99..a93e21c0f 100644
+--- a/dlt/_workspace/cli/utils.py
++++ b/dlt/_workspace/cli/utils.py
+@@ -102,20 +102,23 @@ def display_run_context_info() -> None:
+             )
+ 
+ 
+-def add_mcp_arg_parser(
+-    subparsers: Any, description: str, help_str: str, default_sse_port: int
+-) -> None:
++def add_mcp_arg_parser(subparsers: Any, description: str, help_str: str, default_port: int) -> None:
+     command_parser = subparsers.add_parser(
+         "mcp",
+         description=description,
+         help=help_str,
+     )
+     command_parser.add_argument("--stdio", action="store_true", help="Use stdio transport mode")
++    command_parser.add_argument(
++        "--sse",
++        action="store_true",
++        help="Use legacy SSE transport instead of streamable-http",
++    )
+     command_parser.add_argument(
+         "--port",
+         type=int,
+-        default=default_sse_port,
+-        help=f"SSE port to use (default: {default_sse_port})",
++        default=default_port,
++        help=f"Port for the MCP server (default: {default_port})",
+     )
+ 
+ 
+diff --git a/dlt/_workspace/mcp/server.py b/dlt/_workspace/mcp/server.py
+index 946971433..acdb43e76 100644
+--- a/dlt/_workspace/mcp/server.py
++++ b/dlt/_workspace/mcp/server.py
+@@ -1,14 +1,10 @@
+ from abc import ABC, abstractmethod
+-import os
+-import pathlib
+-from typing import List, Optional
+ 
+ from mcp.server.fastmcp import FastMCP
+ from mcp.server.fastmcp.prompts.base import Prompt
+ from mcp.server.fastmcp.utilities.logging import get_logger
+ 
+ from dlt._workspace.mcp.tools.mcp_tools import PipelineMCPTools
+-from dlt.common.configuration.specs.pluggable_run_context import RunContextBase
+ 
+ from dlt._workspace.mcp import tools
+ from dlt._workspace.mcp import prompts
+@@ -16,26 +12,16 @@ from dlt.pipeline.pipeline import Pipeline
+ 
+ 
+ class DltMCP(FastMCP, ABC):
+-    def __init__(
+-        self, name: str, dependencies: List[str], port: int = 8000, sse_path: str = "/"
+-    ) -> None:
++    def __init__(self, name: str, port: int = 8000, path: str = "/mcp") -> None:
+         super().__init__(
+             name=name,
+-            dependencies=dependencies,
+-            # log_level="WARNING",  # do not send INFO logs because some clients HANG
+             port=port,
+-            sse_path=sse_path,
++            sse_path=path,
++            streamable_http_path=path,
+         )
+-        self._cwd_at_init: pathlib.Path = pathlib.Path.cwd()
+-        self._run_context: Optional[RunContextBase] = None
+         self.logger = get_logger(__name__)
+-
+         self._register_features()
+ 
+-    # override `run` to allow to pass `transport` in configuration
+-    # def run(self, transport = "stdio", mount_path = None):
+-    #     return super().run(transport, mount_path)
+-
+     @abstractmethod
+     def _register_features(self) -> None:
+         pass
+@@ -46,12 +32,11 @@ class WorkspaceMCP(DltMCP):
+ 
+     # TODO: allow to  configure in a standard way
+     # @with_config(WorkspaceMCPConfiguration)
+-    def __init__(self, name: str = "dlt", port: int = 8000, sse_path: str = "/") -> None:
++    def __init__(self, name: str = "dlt", port: int = 8000, path: str = "/mcp") -> None:
+         super().__init__(
+             name=name,
+-            dependencies=["dlt[workspace]"],
+             port=port,
+-            sse_path=sse_path,
++            path=path,
+         )
+ 
+     def _register_features(self) -> None:
+@@ -75,13 +60,12 @@ class PipelineMCP(DltMCP):
+ 
+     # TODO: allow to  configure in a standard way
+     # @with_config(PipelineMCPConfiguration)
+-    def __init__(self, pipeline: Pipeline, port: int = 8000, sse_path: str = "/") -> None:
++    def __init__(self, pipeline: Pipeline, port: int = 8000, path: str = "/mcp") -> None:
+         self.pipeline = pipeline
+         super().__init__(
+             name=f"dlt pipeline: {pipeline.pipeline_name}",
+-            dependencies=["dlt[workspace]"],
+             port=port,
+-            sse_path=sse_path,
++            path=path,
+         )
+ 
+     def _register_features(self) -> None:
+diff --git a/dlt/_workspace/mcp/tools/mcp_tools.py b/dlt/_workspace/mcp/tools/mcp_tools.py
+index d34e5f28e..84e4d1632 100644
+--- a/dlt/_workspace/mcp/tools/mcp_tools.py
++++ b/dlt/_workspace/mcp/tools/mcp_tools.py
+@@ -5,7 +5,7 @@ import sqlglot
+ 
+ import pyarrow as pa
+ from mcp.server.fastmcp import FastMCP
+-from mcp.server.fastmcp.server import AnyUrl
++from pydantic.networks import AnyUrl
+ from mcp.server.fastmcp.resources import FunctionResource
+ 
+ from dlt import Pipeline
+@@ -59,6 +59,7 @@ class BaseMCPTools(ABC):
+         description: str,
+         mime_type: str,
+     ) -> None:
++        # NOTE: no public API for adding resource templates yet in mcp SDK
+         mcp_server._resource_manager.add_template(fn, uri_template, name, description, mime_type)
+ 
+     def recent_result_resource(self) -> str:
+@@ -130,24 +131,6 @@ class BaseMCPTools(ABC):
+         else:
+             return format_csv(table, info)
+ 
+-    # def _return_df(self, table: pa.Table, info: str = "") -> str:
+-    #     # just copy metadata
+-    #     df = table.to_pandas().copy(deep=False)
+-
+-    #     # Remove non ascii characters from the columns. Those hang claude desktop - server
+-    #     # at least on Windows
+-    #     for col in df.select_dtypes(include=["object"]).columns:
+-    #         df[col] = df[col].apply(
+-    #             lambda x: unicodedata.normalize("NFKD", str(x))
+-    #             .encode("ascii", "ignore")
+-    #             .decode("ascii")
+-    #             .replace("\n", " ")
+-    #             .replace("\r", " ")
+-    #         )
+-    #     if info:
+-    #         info += "csv delimited with | containing header starts in next line:\n"
+-    #     return str(info + df.to_csv(index=False, sep="|"))
+-
+     def _cache_arrow(
+         self,
+         table: pa.Table,
+@@ -155,7 +138,6 @@ class BaseMCPTools(ABC):
+         save_bookmark: Optional[str] = None,
+         input_bookmark: Optional[str] = None,
+     ) -> str:
+-        # info = ""
+         if not is_valid_schema_name(save_bookmark):
+             raise ValueError(
+                 f"Invalid bookmark name: {save_bookmark}. Only strings that are valid Python "
+diff --git a/dlt/_workspace/mcp/tools/pipeline.py b/dlt/_workspace/mcp/tools/pipeline.py
+index 06935e37d..335a28435 100644
+--- a/dlt/_workspace/mcp/tools/pipeline.py
++++ b/dlt/_workspace/mcp/tools/pipeline.py
+@@ -1,6 +1,8 @@
+ # mypy: disable-error-code="return-value, no-any-return"
++from typing import Any, Dict, List
++
++import sqlglot
+ from mcp.server.fastmcp.exceptions import ToolError
+-from typing import Any
+ 
+ import dlt
+ from dlt.common.pipeline import get_dlt_pipelines_dir
+@@ -9,7 +11,7 @@ from dlt.common.storages.file_storage import FileStorage
+ from dlt._workspace.mcp.tools import helpers
+ 
+ 
+-def available_pipelines() -> list[str]:
++def available_pipelines() -> List[str]:
+     """List all available dlt pipelines. Each pipeline has several tables."""
+     pipelines_dir = get_dlt_pipelines_dir()
+     storage = FileStorage(pipelines_dir)
+@@ -17,7 +19,7 @@ def available_pipelines() -> list[str]:
+     return dirs
+ 
+ 
+-def available_tables(pipeline_name: str) -> dict[str, Any]:
++def available_tables(pipeline_name: str) -> Dict[str, Any]:
+     """List all available tables in the specified pipeline."""
+     pipeline = dlt.attach(pipeline_name)
+     return {
+@@ -28,14 +30,14 @@ def available_tables(pipeline_name: str) -> dict[str, Any]:
+     }
+ 
+ 
+-def table_preview(pipeline_name: str, table_name: str) -> dict[str, Any]:
++def table_preview(pipeline_name: str, table_name: str) -> str:
+     """Get the first row from the specified table."""
+     pipeline = dlt.attach(pipeline_name)
+ 
+-    # TODO refactor try/except to specific line or at the tool manager level
++    # TODO: refactor try/except to specific line or at the tool manager level
+     # the inconsistent errors are probably due to database locking
+     try:
+-        return pipeline.dataset()[table_name].limit(1).df().to_dict()
++        return helpers.format_csv(pipeline.dataset()[table_name].limit(1).arrow())
+     except Exception as e:
+         raise ToolError(
+             "Tool `table_preview()` failed. Verify the `pipeline_name` and the `table_name`. "
+@@ -43,11 +45,11 @@ def table_preview(pipeline_name: str, table_name: str) -> dict[str, Any]:
+         ) from e
+ 
+ 
+-def table_schema(pipeline_name: str, table_name: str) -> dict[str, Any]:
++def table_schema(pipeline_name: str, table_name: str) -> Dict[str, Any]:
+     """Get the schema of the specified table."""
+     from dlt.destinations.impl.duckdb.sql_client import DuckDbSqlClient
+ 
+-    # TODO refactor try/except to specific line or at the tool manager level
++    # TODO: refactor try/except to specific line or at the tool manager level
+     # the inconsistent errors are probably due to database locking
+     try:
+         pipeline = dlt.attach(pipeline_name)
+@@ -55,7 +57,7 @@ def table_schema(pipeline_name: str, table_name: str) -> dict[str, Any]:
+ 
+         # get schema and clone the table
+         schema = dataset.schema
+-        table_schema: dict[str, Any] = schema.get_table(table_name)  # type: ignore[assignment]
++        table_schema: Dict[str, Any] = schema.get_table(table_name)  # type: ignore[assignment]
+         # add sql dialect which is destination type
+         if isinstance(dataset.sql_client, DuckDbSqlClient):
+             dialect = "duckdb"
+@@ -83,8 +85,16 @@ def table_schema(pipeline_name: str, table_name: str) -> dict[str, Any]:
+ def execute_sql_query(pipeline_name: str, sql_select_query: str) -> str:
+     """Executes SELECT SQL statement for simple data analysis.
+ 
+-    Use the `table_schema()` tool to get the available columns and use their fully qualified name in the SQL query.
++    Use the `table_schema()` tool to get the available columns and use their fully qualified
++    name in the SQL query.
+     """
++    parsed = sqlglot.parse(sql_select_query)
++    if any(
++        isinstance(expr, (sqlglot.exp.Insert, sqlglot.exp.Update, sqlglot.exp.Delete))
++        for expr in parsed
++    ):
++        raise ToolError("Data modification statements are not allowed")
++
+     pipeline = dlt.attach(pipeline_name)
+     dataset = pipeline.dataset()
+     result = dataset(sql_select_query).arrow()
+diff --git a/docs/website/docs/hub/features/mcp-server.md b/docs/website/docs/hub/features/mcp-server.md
+index 85a936ea4..abb03af3a 100644
+--- a/docs/website/docs/hub/features/mcp-server.md
++++ b/docs/website/docs/hub/features/mcp-server.md
+@@ -22,10 +22,9 @@ Users can start as many MCP servers as necessary. The default configurations and
+ 
+ ## Launch MCP server
+ 
+-Since all MCP clients work with `sse` transport now, it is the default when running the server. The MCP will attach to the workspace context
++The default transport is `streamable-http` (MCP spec 2025-03-26). The MCP will attach to the workspace context
+ and pipelines in it. It must be able to start in the same Python environment and see the same workspace as `dlt` when running pipelines.
+-There were also issues with `stdio` pollution from `print` statements—one misbehaving dependency could break the transport channel.
+-TL;DR: We still support `stdio` transport, but it is not recommended.
++We still support `stdio` and legacy `sse` transports via `--stdio` and `--sse` flags, but `streamable-http` is recommended.
+ 
+ To launch the server in **workspace context**:
+ ```sh
+@@ -36,7 +35,7 @@ INFO:     Waiting for application startup.
+ INFO:     Application startup complete.
+ INFO:     Uvicorn running on http://127.0.0.1:43654 (Press CTRL+C to quit)
+ ```
+-The workspace MCP server has **43654** as the default port and is configured without any path (i.e., `/sse`), so users can just copy the link above into the appropriate client.
++The workspace MCP server has **43654** as the default port and serves on `/mcp`. Use `--sse` flag to use legacy SSE transport instead.
+ 
+ To launch the server in **pipeline context**:
+ ```sh
+@@ -59,10 +58,10 @@ The pipeline MCP server has **43656** as the default port. The pipeline is alrea
+ {
+   "mcpServers": {
+     "dlt-workspace": {
+-      "url": "http://127.0.0.1:43654/"
++      "url": "http://127.0.0.1:43654/mcp"
+     },
+     "dlt-pipeline-mcp": {
+-      "url": "http://127.0.0.1:43656/"
++      "url": "http://127.0.0.1:43656/mcp"
+     }
+   }
+ }
+@@ -76,8 +75,7 @@ version: 0.0.1
+ schema: v1
+ mcpServers:
+   - name: dlt-workspace
+-    type: sse
+-    url: "http://localhost:43654"
++    url: "http://localhost:43654/mcp"
+ ```
+ 
+ ### Continue Hub
+@@ -87,14 +85,14 @@ With Continue, you can use [Continue Hub](https://docs.continue.dev/hub/introduc
+ See the [dltHub page](https://hub.continue.dev/dlthub) and select the `dlt` or `dltHub` Assistant. This bundles the MCP with additional Continue-specific features. 
+ 
+ ## Configure MCP server
+-The server can still be started with `stdio` transport and a different port using the command line.
++The server can be started with `stdio` or legacy `sse` transport and a different port using the command line.
+ 
+ 🚧 The feature below is in development and not yet available:
+ The plan is to allow full configuration of MCP via the dlt configuration system.
+ 
+ ```toml
+ [workspace.mcp]
+-path="/sse"
++path="/mcp"
+ port=888
+ ```
+ 
+diff --git a/docs/website/docs/reference/command-line-interface.md b/docs/website/docs/reference/command-line-interface.md
+index 6083fe958..07a55c5a8 100644
+--- a/docs/website/docs/reference/command-line-interface.md
++++ b/docs/website/docs/reference/command-line-interface.md
+@@ -153,7 +153,7 @@ Inherits arguments from [`dlt`](#dlt).
+ * [`schema`](#dlt-pipeline-schema) - Displays default schema
+ * [`drop`](#dlt-pipeline-drop) - Selectively drop tables and reset state
+ * [`load-package`](#dlt-pipeline-load-package) - Displays information on load package, use -v or -vv for more info
+-* [`mcp`](#dlt-pipeline-mcp) - Launch mcp server attached to this pipeline in sse transport mode
++* [`mcp`](#dlt-pipeline-mcp) - Launch mcp server attached to this pipeline
+ 
+ </details>
+ 
+@@ -494,11 +494,11 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
+ 
+ ### `dlt pipeline mcp`
+ 
+-Launch MCP server attached to this pipeline in SSE transport mode.
++Launch MCP server attached to this pipeline.
+ 
+ **Usage**
+ ```sh
+-dlt pipeline [pipeline_name] mcp [-h] [--stdio] [--port PORT]
++dlt pipeline [pipeline_name] mcp [-h] [--stdio] [--sse] [--port PORT]
+ ```
+ 
+ **Description**
+@@ -514,7 +514,8 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
+ **Options**
+ * `-h, --help` - Show this help message and exit
+ * `--stdio` - Use stdio transport mode
+-* `--port PORT` - Sse port to use (default: 43656)
++* `--sse` - Use legacy sse transport instead of streamable-http
++* `--port PORT` - Port for the mcp server (default: 43656)
+ 
+ </details>
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index d084cfb00..3957519d9 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -199,7 +199,7 @@ workspace = [
+     "ibis-framework>=12.0.0 ; python_version >= '3.10'",
+     "pyarrow>=16.0.0",
+     "marimo>=0.14.5",
+-    "mcp>=1.2.1 ; python_version >= '3.10'",
++    "mcp>=1.13.0 ; python_version >= '3.10'",
+     "pathspec>=0.11.2",
+ ]
+ dbml = [
+diff --git a/tests/pipeline/cases/contracts/trace.schema.yaml b/tests/pipeline/cases/contracts/trace.schema.yaml
+index 4477a5405..ee7d73b13 100644
+--- a/tests/pipeline/cases/contracts/trace.schema.yaml
++++ b/tests/pipeline/cases/contracts/trace.schema.yaml
+@@ -47,14 +47,17 @@ tables:
+     description: Created by DLT. Tracks completed loads
+     resource: _dlt_loads
+   trace:
++    description: Top-level pipeline run trace with execution context, timing and environment info
+     columns:
+       transaction_id:
++        description: Unique identifier for this pipeline run
+         data_type: text
+         nullable: true
+       pipeline_name:
+         data_type: text
+         nullable: true
+       execution_context__ci_run:
++        description: Whether the pipeline is running in a CI environment
+         data_type: bool
+         nullable: true
+       execution_context__python:
+@@ -70,18 +73,23 @@ tables:
+         data_type: text
+         nullable: true
+       execution_context__library__name:
++        description: "dlt library name"
+         data_type: text
+         nullable: true
+       execution_context__library__version:
++        description: "dlt library version"
+         data_type: text
+         nullable: true
+       execution_context__plus__name:
++        description: "dlthub plus library name (if installed)"
+         data_type: text
+         nullable: true
+       execution_context__plus__version:
++        description: "dlthub plus library version (if installed)"
+         data_type: text
+         nullable: true
+       execution_context__run_context:
++        description: "Run context class name (e.g. PluggableRunContext)"
+         data_type: text
+         nullable: true
+       started_at:
+@@ -91,6 +99,7 @@ tables:
+         data_type: timestamp
+         nullable: true
+       engine_version:
++        description: Trace format version (TRACE_ENGINE_VERSION)
+         data_type: bigint
+         nullable: true
+       _dlt_load_id:
+@@ -104,6 +113,7 @@ tables:
+     write_disposition: append
+     resource: trace
+   trace__execution_context__exec_info:
++    description: Python exception info (sys.exc_info) captured at trace creation time
+     columns:
+       value:
+         data_type: text
+@@ -122,11 +132,14 @@ tables:
+         nullable: false
+     parent: trace
+   trace__steps:
++    description: Individual pipeline steps (extract, normalize, load) with timing and outcome info
+     columns:
+       span_id:
++        description: Unique span identifier for this step
+         data_type: text
+         nullable: true
+       step:
++        description: "Step type: extract, normalize, or load"
+         data_type: text
+         nullable: true
+       started_at:
+@@ -139,6 +152,7 @@ tables:
+         data_type: text
+         nullable: true
+       step_info__first_run:
++        description: Whether this is the first run of the pipeline (no prior state)
+         data_type: bool
+         nullable: true
+       step_info__started_at:
+@@ -163,6 +177,7 @@ tables:
+         data_type: text
+         nullable: true
+       load_info__destination_displayable_credentials:
++        description: Sanitized destination credentials safe for display
+         data_type: text
+         nullable: true
+       load_info__destination_name:
+@@ -175,18 +190,23 @@ tables:
+         data_type: text
+         nullable: true
+       load_info__staging_displayable_credentials:
++        description: Sanitized staging credentials safe for display
+         data_type: text
+         nullable: true
+       load_info__destination_fingerprint:
++        description: Unique identifier for the destination instance
+         data_type: text
+         nullable: true
+       step_exception:
++        description: Exception string for failed steps
+         data_type: text
+         nullable: true
+       exception_traces:
++        description: JSON-serialized exception chain (compact form, see child table for structured)
+         data_type: text
+         nullable: true
+       load_info__environment:
++        description: dlt deployment environment name
+         data_type: text
+         nullable: true
+       load_info__dataset_name:
+@@ -194,6 +214,7 @@ tables:
+         nullable: true
+     parent: trace
+   trace__steps__extract_info__job_metrics:
++    description: Per-job file metrics from the extract step (file path, item count, size)
+     columns:
+       file_path:
+         data_type: text
+@@ -205,15 +226,18 @@ tables:
+         data_type: bigint
+         nullable: true
+       created:
++        description: File creation time as unix timestamp
+         data_type: double
+         nullable: true
+       last_modified:
++        description: File last modification time as unix timestamp
+         data_type: double
+         nullable: true
+       load_id:
+         data_type: text
+         nullable: true
+       extract_idx:
++        description: Index of the extract run within the same load_id (multiple sources)
+         data_type: bigint
+         nullable: true
+       job_id:
+@@ -236,6 +260,7 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__extract_info__table_metrics:
++    description: Extract job metrics aggregated by destination table name
+     columns:
+       file_path:
+         data_type: text
+@@ -247,15 +272,18 @@ tables:
+         data_type: bigint
+         nullable: true
+       created:
++        description: File creation time as unix timestamp
+         data_type: double
+         nullable: true
+       last_modified:
++        description: File last modification time as unix timestamp
+         data_type: double
+         nullable: true
+       load_id:
+         data_type: text
+         nullable: true
+       extract_idx:
++        description: Index of the extract run within the same load_id
+         data_type: bigint
+         nullable: true
+       table_name:
+@@ -275,6 +303,7 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__extract_info__resource_metrics:
++    description: Extract job metrics aggregated by resource name, including custom resource metrics
+     columns:
+       file_path:
+         data_type: text
+@@ -286,21 +315,25 @@ tables:
+         data_type: bigint
+         nullable: true
+       created:
++        description: File creation time as unix timestamp
+         data_type: double
+         nullable: true
+       last_modified:
++        description: File last modification time as unix timestamp
+         data_type: double
+         nullable: true
+       load_id:
+         data_type: text
+         nullable: true
+       extract_idx:
++        description: Index of the extract run within the same load_id
+         data_type: bigint
+         nullable: true
+       resource_name:
+         data_type: text
+         nullable: true
+       custom_metrics__good_old_github:
++        description: Test-specific custom metric from github resource
+         data_type: bool
+         nullable: true
+       _dlt_parent_id:
+@@ -317,17 +350,21 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__extract_info__dag:
++    description: Resource dependency graph edges (parent_name -> resource_name) from extract step
+     columns:
+       load_id:
+         data_type: text
+         nullable: true
+       extract_idx:
++        description: Index of the extract run within the same load_id
+         data_type: bigint
+         nullable: true
+       parent_name:
++        description: Parent resource in the dependency edge
+         data_type: text
+         nullable: true
+       resource_name:
++        description: Child resource in the dependency edge
+         data_type: text
+         nullable: true
+       _dlt_parent_id:
+@@ -344,17 +381,20 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__extract_info__hints:
++    description: Resource hints applied during extract (write_disposition, schema_contract, columns, etc.)
+     columns:
+       load_id:
+         data_type: text
+         nullable: true
+       extract_idx:
++        description: Index of the extract run within the same load_id
+         data_type: bigint
+         nullable: true
+       resource_name:
+         data_type: text
+         nullable: true
+       columns:
++        description: JSON-serialized column hints applied to the resource
+         data_type: text
+         nullable: true
+       write_disposition:
+@@ -370,6 +410,7 @@ tables:
+         data_type: text
+         nullable: true
+       original_columns:
++        description: JSON-serialized column hints before normalization
+         data_type: text
+         nullable: true
+       primary_key:
+@@ -389,6 +430,7 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__step_info__loads_ids:
++    description: List of load package IDs processed in a pipeline step
+     columns:
+       value:
+         data_type: text
+@@ -407,14 +449,17 @@ tables:
+         nullable: false
+     parent: trace__steps
+   trace__steps__step_info__load_packages:
++    description: Load package metadata (state, schema, completion time) for each processed package
+     columns:
+       load_id:
+         data_type: text
+         nullable: true
+       package_path:
++        description: Filesystem path to the load package directory
+         data_type: text
+         nullable: true
+       state:
++        description: "Package state: new, extracted, normalized, loaded"
+         data_type: text
+         nullable: true
+       schema_hash:
+@@ -440,8 +485,10 @@ tables:
+         nullable: true
+     parent: trace__steps
+   trace__steps__step_info__load_packages__jobs:
++    description: Individual load jobs within a package (file path, state, size, retry count, errors)
+     columns:
+       state:
++        description: "Job state: new_jobs, started_jobs, failed_jobs, completed_jobs"
+         data_type: text
+         nullable: true
+       file_path:
+@@ -454,12 +501,14 @@ tables:
+         data_type: timestamp
+         nullable: true
+       elapsed:
++        description: Time in seconds since job file was created
+         data_type: double
+         nullable: true
+       table_name:
+         data_type: text
+         nullable: true
+       file_id:
++        description: Random 5-byte string making the job file name unique
+         data_type: text
+         nullable: true
+       retry_count:
+@@ -491,6 +540,7 @@ tables:
+         nullable: true
+     parent: trace__steps__step_info__load_packages
+   trace__steps__normalize_info__job_metrics:
++    description: Per-job file metrics from the normalize step (file path, item count, size)
+     columns:
+       file_path:
+         data_type: text
+@@ -502,15 +552,18 @@ tables:
+         data_type: bigint
+         nullable: true
+       created:
++        description: File creation time as unix timestamp
+         data_type: double
+         nullable: true
+       last_modified:
++        description: File last modification time as unix timestamp
+         data_type: double
+         nullable: true
+       load_id:
+         data_type: text
+         nullable: true
+       extract_idx:
++        description: Index of the extract run within the same load_id
+         data_type: bigint
+         nullable: true
+       job_id:
+@@ -533,6 +586,7 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__normalize_info__table_metrics:
++    description: Normalize job metrics aggregated by destination table name
+     columns:
+       file_path:
+         data_type: text
+@@ -544,15 +598,18 @@ tables:
+         data_type: bigint
+         nullable: true
+       created:
++        description: File creation time as unix timestamp
+         data_type: double
+         nullable: true
+       last_modified:
++        description: File last modification time as unix timestamp
+         data_type: double
+         nullable: true
+       load_id:
+         data_type: text
+         nullable: true
+       extract_idx:
++        description: Index of the extract run within the same load_id
+         data_type: bigint
+         nullable: true
+       table_name:
+@@ -572,6 +629,7 @@ tables:
+         row_key: true
+     parent: trace__steps
+   trace__steps__load_info__job_metrics:
++    description: Per-job metrics from the load step (timing, state, remote URL, retry count)
+     columns:
+       load_id:
+         data_type: text
+@@ -607,6 +665,7 @@ tables:
+         data_type: timestamp
+         nullable: true
+       remote_url:
++        description: Destination URL where the data was loaded
+         data_type: text
+         nullable: true
+       retry_count:
+@@ -614,6 +673,7 @@ tables:
+         nullable: true
+     parent: trace__steps
+   trace__steps__step_info__load_packages__tables:
++    description: Schema update tables within a load package (write disposition, format, contract)
+     columns:
+       write_disposition:
+         data_type: text
+@@ -652,13 +712,16 @@ tables:
+         unique: true
+         row_key: true
+       parent:
++        description: Parent table name for nested/child tables
+         data_type: text
+         nullable: true
+       x_normalizer__seen_data:
++        description: Whether the normalizer has seen actual data for this table
+         data_type: bool
+         nullable: true
+     parent: trace__steps__step_info__load_packages
+   trace__steps__step_info__load_packages__tables__columns:
++    description: Column definitions from schema update tables (data type, constraints, hints)
+     columns:
+       name:
+         data_type: text
+@@ -679,6 +742,7 @@ tables:
+         data_type: bool
+         nullable: true
+       variant:
++        description: Whether this column holds variant (mixed-type) data
+         data_type: bool
+         nullable: true
+       primary_key:
+@@ -730,21 +794,26 @@ tables:
+         data_type: bool
+         nullable: true
+       x_normalizer__seen_null_first:
++        description: Whether the normalizer first saw a null value for this column
+         data_type: bool
+         nullable: true
+     parent: trace__steps__step_info__load_packages__tables
+   trace__resolved_config_values:
++    description: Config and secret values resolved during the pipeline run (key, provider, type)
+     columns:
+       key:
+         data_type: text
+         nullable: true
+       is_secret_hint:
++        description: Whether the config key is marked as a secret
+         data_type: bool
+         nullable: true
+       provider_name:
++        description: Config provider that resolved the value (e.g. toml, env, vault)
+         data_type: text
+         nullable: true
+       config_type_name:
++        description: Configuration spec class name that requested the value
+         data_type: text
+         nullable: true
+       _dlt_parent_id:
+@@ -761,6 +830,7 @@ tables:
+         row_key: true
+     parent: trace
+   trace__resolved_config_values__sections:
++    description: Config section path components for each resolved config value
+     columns:
+       value:
+         data_type: text
+@@ -779,6 +849,7 @@ tables:
+         nullable: false
+     parent: trace__resolved_config_values
+   trace__steps__exception_traces:
++    description: Structured exception chain for failed steps (type, message, terminality, source)
+     columns:
+       message:
+         data_type: text
+@@ -787,9 +858,11 @@ tables:
+         data_type: text
+         nullable: true
+       is_terminal:
++        description: Whether the exception is non-retryable (terminal)
+         data_type: bool
+         nullable: true
+       docstring:
++        description: Docstring of the exception class
+         data_type: text
+         nullable: true
+       load_id:
+@@ -799,6 +872,7 @@ tables:
+         data_type: text
+         nullable: true
+       exception_attrs:
++        description: JSON-serialized public attributes of DltException subclasses
+         data_type: text
+         nullable: true
+       _dlt_parent_id:
+@@ -821,6 +895,7 @@ tables:
+         nullable: true
+     parent: trace__steps
+   trace__steps__exception_traces__stack_trace:
++    description: Stack trace frames for each exception in the chain
+     columns:
+       value:
+         data_type: text
+diff --git a/tests/workspace/cli/test_mcp_commands.py b/tests/workspace/cli/test_mcp_commands.py
+index ba56cbf79..5e57a2d6f 100644
+--- a/tests/workspace/cli/test_mcp_commands.py
++++ b/tests/workspace/cli/test_mcp_commands.py
+@@ -17,26 +17,42 @@ from tests.workspace.utils import fruitshop_pipeline_context as fruitshop_pipeli
+ def test_pipeline_mcp_command(
+     fruitshop_pipeline_context: RunContext, script_runner: ScriptRunner, mocker: MockerFixture
+ ) -> None:
+-    # patch mcp server
+-    # NOTE: patch works because we call in-process
+     mock = mocker.patch.object(FastMCP, "run")
+-    # mcp server will be able attach to pokemon pipeline
+     result = script_runner.run(["dlt", "--debug", "pipeline", "fruitshop", "mcp"])
+     assert mock.called
++    mock.assert_called_with(transport="streamable-http")
++    assert result.returncode == 0
++    assert result.stdout == ""
++
++
++def test_pipeline_mcp_command_sse(
++    fruitshop_pipeline_context: RunContext, script_runner: ScriptRunner, mocker: MockerFixture
++) -> None:
++    mock = mocker.patch.object(FastMCP, "run")
++    result = script_runner.run(["dlt", "--debug", "pipeline", "fruitshop", "mcp", "--sse"])
++    assert mock.called
++    mock.assert_called_with(transport="sse")
+     assert result.returncode == 0
+-    # can't have any stdout!
+     assert result.stdout == ""
+ 
+ 
+ def test_workspace_mcp_command(
+     fruitshop_pipeline_context: RunContext, script_runner: ScriptRunner, mocker: MockerFixture
+ ) -> None:
+-    # patch mcp server
+-    # NOTE: patch works because we call in-process
+     mock = mocker.patch.object(FastMCP, "run")
+-    # mcp server will be able attach to pokemon pipeline
+     result = script_runner.run(["dlt", "--debug", "workspace", "mcp"])
+     assert mock.called
++    mock.assert_called_with(transport="streamable-http")
++    assert result.returncode == 0
++    assert result.stdout == ""
++
++
++def test_workspace_mcp_command_sse(
++    fruitshop_pipeline_context: RunContext, script_runner: ScriptRunner, mocker: MockerFixture
++) -> None:
++    mock = mocker.patch.object(FastMCP, "run")
++    result = script_runner.run(["dlt", "--debug", "workspace", "mcp", "--sse"])
++    assert mock.called
++    mock.assert_called_with(transport="sse")
+     assert result.returncode == 0
+-    # can't have any stdout!
+     assert result.stdout == ""
+diff --git a/uv.lock b/uv.lock
+index b939ce5c8..c03fadbf8 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2372,7 +2372,7 @@ requires-dist = [
+     { name = "jsonpath-ng", specifier = ">=1.5.3" },
+     { name = "lancedb", marker = "extra == 'lancedb'", specifier = ">=0.22.0" },
+     { name = "marimo", marker = "extra == 'workspace'", specifier = ">=0.14.5" },
+-    { name = "mcp", marker = "python_full_version >= '3.10' and extra == 'workspace'", specifier = ">=1.2.1" },
++    { name = "mcp", marker = "python_full_version >= '3.10' and extra == 'workspace'", specifier = ">=1.13.0" },
+     { name = "oracledb", marker = "extra == 'oracle'", specifier = ">=3.4.1" },
+     { name = "orjson", marker = "python_full_version >= '3.14'", specifier = ">=3.11.0" },
+     { name = "orjson", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'", specifier = ">=3.6.7,!=3.9.11,!=3.9.12,!=3.9.13,!=3.9.14,!=3.10.1,<4" },
+
+
+===== COMMIT 6db3c0f1 =====
+
+
+commit 6db3c0f17
+Author: Thierry Jean
+Date: 2026-02-18
+
+    fix imported constant; use dq.read_check() (#3647)
+
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index 36882f773..14f9c3837 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -615,25 +615,20 @@ def section_data_quality_raw_table(
+     ):
+         try:
+             # Import constants from data_quality module (using private names to avoid conflicts)
++            from dlthub import data_quality as dq
+             from dlthub.data_quality.storage import (
+-                DLT_CHECKS_RESULTS_TABLE_NAME as _DLT_CHECKS_RESULTS_TABLE_NAME,
++                DLT_CHECKS_TABLE_NAME as _DLT_CHECKS_RESULTS_TABLE_NAME,
+                 DLT_DATA_QUALITY_SCHEMA_NAME as _DLT_DATA_QUALITY_SCHEMA_NAME,
+             )
+ 
+             _error_message: str = None
+             with mo.status.spinner(title="Loading raw data quality checks table..."):
+                 try:
+-                    # Build query to select all columns including _dlt_load_id
+-                    _raw_dataset = dlt_pipeline.dataset(schema=_DLT_DATA_QUALITY_SCHEMA_NAME)
+-                    _raw_sql_query = (
+-                        _raw_dataset.table(_DLT_CHECKS_RESULTS_TABLE_NAME)
+-                        .limit(1000)
+-                        .to_sql(pretty=True, _raw_query=True)
+-                    )
++                    _raw_sql_query = dq.read_check(dlt_pipeline.dataset())
+ 
+                     # Execute query
+                     _raw_query_result, _error_message, _traceback_string = utils.get_query_result(
+-                        dlt_pipeline, _raw_sql_query
++                        dlt_pipeline, _raw_sql_query.to_sql()
+                     )
+                     dlt_set_last_query_result(_raw_query_result)
+                 except Exception as exc:
+
+
+===== COMMIT cfdc8f2d =====
+
+
+commit cfdc8f2d2
+Author: rudolfix
+Date: 2026-02-17
+
+    bumps to version 1.22.0 (#3639)
+
+diff --git a/dlt/_workspace/cli/_init_command.py b/dlt/_workspace/cli/_init_command.py
+index 0710f075f..b693ed42a 100644
+--- a/dlt/_workspace/cli/_init_command.py
++++ b/dlt/_workspace/cli/_init_command.py
+@@ -185,15 +185,6 @@ def init_pipeline_at_destination(
+             % (fmt.bold(display_source_name), InvalidSchemaName.MAXIMUM_SCHEMA_NAME_LENGTH)
+         )
+         raise CliCommandException()
+-    if destination_type and not is_valid_schema_name(destination_type):
+-        fmt.error(
+-            "Destination name %s is not a valid Python identifier. Use snake_case"
+-            " names containing only lowercase letters, numbers and underscores (max"
+-            " %d characters)."
+-            % (fmt.bold(destination_type), InvalidSchemaName.MAXIMUM_SCHEMA_NAME_LENGTH)
+-        )
+-        raise CliCommandException()
+-
+     # try to import the destination and get config spec
+     if destination_type:
+         destination_reference = Destination.from_reference(destination_type)
+diff --git a/pyproject.toml b/pyproject.toml
+index 1cf50e785..a66a1ffcf 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "dlt"
+-version = "1.21.1a0"
++version = "1.22.0"
+ description = "dlt is an open-source python-first scalable data loading library that does not require any backend to run."
+ authors = [{ name = "dltHub Inc.", email = "services@dlthub.com" }]
+ requires-python = ">=3.9.2, <3.15"
+@@ -63,8 +63,8 @@ dependencies = [
+ 
+ [project.optional-dependencies]
+ hub = [
+-    "dlthub>=0.20.0,<0.22 ; python_version >= '3.10'",
+-    "dlt-runtime>=0.20.0,<0.22 ; python_version >= '3.10'",
++    "dlthub>=0.20.0,<0.23 ; python_version >= '3.10'",
++    "dlt-runtime>=0.20.0,<0.23 ; python_version >= '3.10'",
+ ]
+ gcp = [
+     "grpcio>=1.50.0",
+diff --git a/tests/workspace/cli/test_init_command.py b/tests/workspace/cli/test_init_command.py
+index 4e46b97dc..2af61e7b3 100644
+--- a/tests/workspace/cli/test_init_command.py
++++ b/tests/workspace/cli/test_init_command.py
+@@ -133,9 +133,8 @@ def test_init_command_pipeline_default_template(
+         ("dlthub:robin-ai", "bigquery"),  # dlthub prefix with hyphen
+         ("123source", "bigquery"),  # starts with digit
+         ("my source", "bigquery"),  # space
+-        ("valid_source", "big-query"),  # invalid destination
+     ],
+-    ids=["hyphen", "dlthub_hyphen", "digit_start", "space", "invalid_dest"],
++    ids=["hyphen", "dlthub_hyphen", "digit_start", "space"],
+ )
+ def test_init_command_invalid_identifiers(
+     repo_dir: str, workspace_files: FileStorage, source_name: str, destination: str
+@@ -146,6 +145,20 @@ def test_init_command_invalid_identifiers(
+         _init_command.init_command(source_name, destination, repo_dir)
+ 
+ 
++def test_init_command_dotted_destination_accepted(
++    repo_dir: str, workspace_files: FileStorage
++) -> None:
++    """Dotted destination references like dlt.destinations.dremio must not be
++    rejected by the source name identifier validation."""
++    from dlt._workspace.cli.exceptions import CliCommandException
++
++    # must not raise CliCommandException for invalid identifier
++    try:
++        _init_command.init_command("debug", "dlt.destinations.duckdb", repo_dir)
++    except CliCommandException:
++        pytest.fail("Dotted destination name was incorrectly rejected as invalid identifier")
++
++
+ def test_default_source_file_selection() -> None:
+     templates_storage = files_ops.get_single_file_templates_storage()
+ 
+diff --git a/uv.lock b/uv.lock
+index dc0e5cf89..edae6e126 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2041,7 +2041,7 @@ wheels = [
+ 
+ [[package]]
+ name = "dlt"
+-version = "1.21.1a0"
++version = "1.22.0"
+ source = { editable = "." }
+ dependencies = [
+     { name = "click" },
+@@ -2346,8 +2346,8 @@ requires-dist = [
+     { name = "db-dtypes", marker = "extra == 'bigquery'", specifier = ">=1.2.0" },
+     { name = "db-dtypes", marker = "extra == 'gcp'", specifier = ">=1.2.0" },
+     { name = "deltalake", marker = "extra == 'deltalake'", specifier = ">=0.25.1" },
+-    { name = "dlt-runtime", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.22" },
+-    { name = "dlthub", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.22" },
++    { name = "dlt-runtime", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.23" },
++    { name = "dlthub", marker = "python_full_version >= '3.10' and extra == 'hub'", specifier = ">=0.20.0,<0.23" },
+     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=0.9" },
+     { name = "duckdb", marker = "extra == 'ducklake'", specifier = ">=1.2.0" },
+     { name = "duckdb", marker = "extra == 'lancedb'", specifier = ">=1.4.3" },
+
+
+===== COMMIT d763f5d6 =====
+
+
+commit d763f5d6f
+Author: rudolfix
+Date: 2026-02-16
+
+    (fix) 3604 fixes column order mismatch in `sql_database` (#3638)
+

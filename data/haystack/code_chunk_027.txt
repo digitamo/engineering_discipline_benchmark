@@ -1,0 +1,3185 @@
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index 9993d9b2b..b8460a210 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -13,18 +13,202 @@ app = marimo.App(
+ )
+ 
+ with app.setup:
+-    from typing import Any, Dict, List, cast
++    from typing import Any, Dict, List, cast, Union
+ 
+     import marimo as mo
+ 
+     import dlt
+     import pyarrow
++    import traceback
++    from dlt.common import logger
+     from dlt._workspace.helpers.dashboard import strings, utils, ui_elements as ui
+     from dlt._workspace.helpers.dashboard.config import DashboardConfiguration
+     from dlt.common.configuration.specs.pluggable_run_context import ProfilesRunContext
+     from dlt._workspace.run_context import switch_profile
+ 
+ 
++@app.function
++def build_header_controls(dlt_profile_select: mo.ui.dropdown) -> Union[List[Any], None]:
++    """Build profile-related header controls if profiles are enabled."""
++    if isinstance(dlt.current.run_context(), ProfilesRunContext):
++        return [
++            dlt_profile_select,
++            mo.md(f"<small> Workspace: {getattr(dlt.current.run_context(), 'name', None)}</small>"),
++        ]
++    return None
++
++
++@app.function
++def build_home_header_row(
++    dlt_profile_select: mo.ui.dropdown,
++    dlt_pipeline_select: mo.ui.multiselect,
++) -> Any:
++    """Shared header row with logo, profile/workspace info and pipeline select."""
++    _header_controls = build_header_controls(dlt_profile_select)
++    return mo.hstack(
++        [
++            mo.hstack(
++                [
++                    mo.image(
++                        "https://dlthub.com/docs/img/dlthub-logo.png",
++                        width=100,
++                        alt="dltHub logo",
++                    ),
++                    _header_controls[0] if _header_controls else "",
++                ],
++                justify="start",
++                gap=2,
++            ),
++            mo.hstack(
++                [
++                    _header_controls[1] if _header_controls else "",
++                ],
++                justify="center",
++            ),
++            mo.hstack(
++                [
++                    dlt_pipeline_select,
++                ],
++                justify="end",
++            ),
++        ],
++        justify="space-between",
++    )
++
++
++@app.function
++def render_workspace_home(
++    dlt_profile_select: mo.ui.dropdown,
++    dlt_all_pipelines: List[Dict[str, Any]],
++    dlt_pipeline_select: mo.ui.multiselect,
++    dlt_pipelines_dir: str,
++    dlt_config: DashboardConfiguration,
++) -> List[Any]:
++    """Render the workspace-level home view (no pipeline selected)."""
++    return [
++        build_home_header_row(dlt_profile_select, dlt_pipeline_select),
++        mo.md(strings.app_title).center(),
++        mo.md(strings.app_intro).center(),
++        mo.callout(
++            mo.vstack(
++                [
++                    mo.md(
++                        strings.home_quick_start_title.format(
++                            utils.build_pipeline_link_list(dlt_config, dlt_all_pipelines)
++                        )
++                    ),
++                    dlt_pipeline_select,
++                ]
++            ),
++            kind="info",
++        ),
++        mo.md(strings.home_basics_text.format(len(dlt_all_pipelines), dlt_pipelines_dir)),
++    ]
++
++
++@app.function
++def render_pipeline_header_row(
++    dlt_pipeline_name: str,
++    dlt_profile_select: mo.ui.dropdown,
++    dlt_pipeline_select: mo.ui.multiselect,
++    buttons: List[Any],
++) -> List[Any]:
++    header_row = build_home_header_row(dlt_profile_select, dlt_pipeline_select)
++    pipeline_title = mo.center(
++        mo.hstack(
++            [
++                mo.md(strings.app_title_pipeline.format(dlt_pipeline_name)),
++            ],
++            align="center",
++        ),
++    )
++
++    return [
++        mo.vstack(
++            [
++                mo.hstack(
++                    [
++                        mo.vstack(
++                            [
++                                header_row,
++                                pipeline_title,
++                            ]
++                        ),
++                    ],
++                    justify="space-between",
++                ),
++            ]
++        ),
++        mo.hstack(buttons, justify="start"),
++    ]
++
++
++@app.function
++def render_pipeline_home(
++    dlt_profile_select: mo.ui.dropdown,
++    dlt_pipeline: dlt.Pipeline,
++    dlt_pipeline_select: mo.ui.multiselect,
++    dlt_pipelines_dir: str,
++    dlt_refresh_button: mo.ui.run_button,
++    dlt_pipeline_name: str,
++) -> List[Any]:
++    """Render the pipeline-level home view (pipeline selected or requested)."""
++    _buttons: List[Any] = [dlt_refresh_button]
++    _pipeline_execution_exception: List[Any] = []
++    _pipeline_execution_summary: Any = None
++    _last_load_packages_info: Any = None
++    _errors: List[Any] = []
++
++    _buttons.append(
++        mo.ui.button(
++            label="<small>Open pipeline working dir</small>",
++            on_click=lambda _: utils.open_local_folder(dlt_pipeline.working_dir),
++        )
++    )
++    if local_dir := utils.get_local_data_path(dlt_pipeline):
++        _buttons.append(
++            mo.ui.button(
++                label="<small>Open local data location</small>",
++                on_click=lambda _: utils.open_local_folder(local_dir),
++            )
++        )
++
++    # NOTE: last_trace does not raise on broken traces
++    if trace := dlt_pipeline.last_trace:
++        # trace viz and run exception require last trace
++        _pipeline_execution_summary = utils.build_pipeline_execution_visualization(trace)
++        _last_load_packages_info = mo.vstack(
++            [
++                mo.md(f"<small>{strings.view_load_packages_text}</small>"),
++                utils.load_package_status_labels(trace),
++            ]
++        )
++        _pipeline_execution_exception = utils.build_exception_section(dlt_pipeline)
++
++    _stack = render_pipeline_header_row(
++        dlt_pipeline_name, dlt_profile_select, dlt_pipeline_select, _buttons
++    )
++
++    if _pipeline_execution_summary:
++        _stack.append(_pipeline_execution_summary)
++    if _last_load_packages_info:
++        _stack.append(_last_load_packages_info)
++    if _pipeline_execution_exception:
++        _stack.extend(_pipeline_execution_exception)
++    if _errors:
++        _stack.extend(_errors)
++
++    if not dlt_pipeline and dlt_pipeline_name:
++        _stack.append(
++            mo.callout(
++                mo.md(strings.app_pipeline_not_found.format(dlt_pipeline_name, dlt_pipelines_dir)),
++                kind="warn",
++            )
++        )
++
++    return _stack
++
++
+ @app.cell(hide_code=True)
+ def home(
+     dlt_profile_select: mo.ui.dropdown,
+@@ -43,188 +227,72 @@ def home(
+     dlt_refresh_button
+     dlt_file_watcher
+ 
++    # returned by cell
+     dlt_pipeline: dlt.Pipeline = None
+-    if dlt_pipeline_name:
+-        dlt_pipeline = utils.get_pipeline(dlt_pipeline_name, dlt_pipelines_dir)
++    dlt_config: DashboardConfiguration = None
+ 
+-    dlt_config = utils.resolve_dashboard_config(dlt_pipeline)
+-    _header_controls = (
+-        [
+-            dlt_profile_select,
+-            mo.md(f"<small> Workspace: {getattr(dlt.current.run_context(), 'name', None)}</small>"),
+-        ]
+-        if isinstance(dlt.current.run_context(), ProfilesRunContext)
+-        else None
+-    )
+-    if not dlt_pipeline and not dlt_pipeline_name:
+-        _stack = [
+-            mo.hstack(
+-                [
+-                    mo.hstack(
+-                        [
+-                            mo.image(
+-                                "https://dlthub.com/docs/img/dlthub-logo.png",
+-                                width=100,
+-                                alt="dltHub logo",
+-                            ),
+-                            _header_controls[0] if _header_controls else "",
+-                        ],
+-                        justify="start",
+-                        gap=2,
+-                    ),
+-                    mo.hstack(
+-                        [
+-                            _header_controls[1] if _header_controls else "",
+-                        ],
+-                        justify="center",
+-                    ),
+-                    mo.hstack(
+-                        [
+-                            dlt_pipeline_select,
+-                        ],
+-                        justify="end",
+-                    ),
+-                ],
+-                justify="space-between",
+-            ),
+-            mo.md(strings.app_title).center(),
+-            mo.md(strings.app_intro).center(),
+-            mo.callout(
+-                mo.vstack(
+-                    [
+-                        mo.md(
+-                            strings.home_quick_start_title.format(
+-                                utils.build_pipeline_link_list(dlt_config, dlt_all_pipelines)
+-                            )
+-                        ),
+-                        dlt_pipeline_select,
+-                    ]
+-                ),
+-                kind="info",
+-            ),
+-            mo.md(strings.home_basics_text.format(len(dlt_all_pipelines), dlt_pipelines_dir)),
+-        ]
+-    else:
+-        _buttons: List[Any] = []
+-        _buttons.append(dlt_refresh_button)
+-        _pipeline_execution_exception: List[Any] = []
+-        _pipeline_execution_summary: mo.Html = None
+-        _last_load_packages_info: mo.Html = None
+-        if dlt_pipeline:
+-            _buttons.append(
+-                mo.ui.button(
+-                    label="<small>Open pipeline working dir</small>",
+-                    on_click=lambda _: utils.open_local_folder(dlt_pipeline.working_dir),
+-                )
++    if dlt_pipeline_name:
++        try:
++            dlt_pipeline = utils.get_pipeline(dlt_pipeline_name, dlt_pipelines_dir)
++            dlt_config = utils.resolve_dashboard_config(dlt_pipeline)
++        except Exception:
++            # render navigation and display error
++            _stack = render_pipeline_header_row(
++                dlt_pipeline_name, dlt_profile_select, dlt_pipeline_select, [dlt_refresh_button]
+             )
+-            if local_dir := utils.get_local_data_path(dlt_pipeline):
+-                _buttons.append(
+-                    mo.ui.button(
+-                        label="<small>Open local data location</small>",
+-                        on_click=lambda _: utils.open_local_folder(local_dir),
+-                    )
++            _stack.append(
++                ui.build_error_callout(
++                    f"Could not attach to pipeline {dlt_pipeline_name}.",
++                    traceback_string=traceback.format_exc(),
+                 )
+-            if trace := dlt_pipeline.last_trace:
+-                _pipeline_execution_summary = utils.build_pipeline_execution_visualization(trace)
+-                _last_load_packages_info = mo.vstack(
+-                    [
+-                        mo.md(f"<small>{strings.view_load_packages_text}</small>"),
+-                        utils.load_package_status_labels(trace),
+-                    ]
++            )
++        else:
++            # pipeline exists, render full dashboard
++            try:
++                _stack = render_pipeline_home(
++                    dlt_profile_select,
++                    dlt_pipeline,
++                    dlt_pipeline_select,
++                    dlt_pipelines_dir,
++                    dlt_refresh_button,
++                    dlt_pipeline_name,
+                 )
+-            _pipeline_execution_exception = utils.build_exception_section(dlt_pipeline)
+-        _stack = [
+-            mo.vstack(
+-                [
+-                    mo.hstack(
+-                        [
+-                            mo.vstack(
+-                                [
+-                                    mo.hstack(
+-                                        [
+-                                            mo.hstack(
+-                                                [
+-                                                    mo.hstack(
+-                                                        [
+-                                                            mo.image(
+-                                                                "https://dlthub.com/docs/img/dlthub-logo.png",
+-                                                                width=100,
+-                                                                alt="dltHub logo",
+-                                                            ),
+-                                                            (
+-                                                                _header_controls[0]
+-                                                                if _header_controls
+-                                                                else ""
+-                                                            ),
+-                                                        ],
+-                                                        justify="start",
+-                                                        gap=2,
+-                                                    ),
+-                                                    mo.hstack(
+-                                                        [
+-                                                            (
+-                                                                _header_controls[1]
+-                                                                if _header_controls
+-                                                                else ""
+-                                                            ),
+-                                                        ],
+-                                                        justify="center",
+-                                                    ),
+-                                                    mo.hstack(
+-                                                        [
+-                                                            dlt_pipeline_select,
+-                                                        ],
+-                                                        justify="end",
+-                                                    ),
+-                                                ],
+-                                                justify="center",
+-                                            ),
+-                                        ],
+-                                    ),
+-                                    mo.center(
+-                                        mo.hstack(
+-                                            [
+-                                                mo.md(
+-                                                    strings.app_title_pipeline.format(
+-                                                        dlt_pipeline_name
+-                                                    )
+-                                                ),
+-                                            ],
+-                                            align="center",
+-                                        ),
+-                                    ),
+-                                ]
+-                            ),
+-                        ],
+-                        justify="space-between",
+-                    ),
++            except Exception:
++                _stack = [
++                    ui.build_error_callout(
++                        "Error while rendering the pipeline dashboard.",
++                        "Some sections may work, but not all functionality may be available.",
++                        traceback_string=traceback.format_exc(),
++                    )
+                 ]
+-            ),
+-            mo.hstack(_buttons, justify="start"),
+-        ]
+-        if _pipeline_execution_summary:
+-            _stack.append(_pipeline_execution_summary)
+-        if _last_load_packages_info:
+-            _stack.append(_last_load_packages_info)
+-        if _pipeline_execution_exception:
+-            _stack.extend(_pipeline_execution_exception)
+-        if not dlt_pipeline and dlt_pipeline_name:
+-            _stack.append(
+-                mo.callout(
+-                    mo.md(
+-                        strings.app_pipeline_not_found.format(dlt_pipeline_name, dlt_pipelines_dir)
+-                    ),
+-                    kind="warn",
++    else:
++        try:
++            dlt_config = utils.resolve_dashboard_config(dlt_pipeline)
++            is_workspace_dashboard = not dlt_pipeline and not dlt_pipeline_name
++            if is_workspace_dashboard:
++                _stack = render_workspace_home(
++                    dlt_profile_select,
++                    dlt_all_pipelines,
++                    dlt_pipeline_select,
++                    dlt_pipelines_dir,
++                    dlt_config,
+                 )
+-            )
++        except Exception:
++            _stack = [
++                ui.build_error_callout(
++                    "Error while rendering the home dashboard.",
++                    traceback_string=traceback.format_exc(),
++                )
++            ]
++
+     mo.vstack(_stack)
+-    return (dlt_pipeline,)
++    return (dlt_pipeline, dlt_config)
+ 
+ 
+ @app.cell(hide_code=True)
+-def section_overview(
++def section_info(
+     dlt_pipeline: dlt.Pipeline,
+-    dlt_section_overview_switch: mo.ui.switch,
++    dlt_section_info_switch: mo.ui.switch,
+     dlt_all_pipelines: List[Dict[str, Any]],
+     dlt_config: DashboardConfiguration,
+     dlt_pipelines_dir: str,
+@@ -238,10 +306,10 @@ def section_overview(
+         strings.overview_title,
+         strings.overview_subtitle,
+         strings.overview_subtitle,
+-        dlt_section_overview_switch,
++        dlt_section_info_switch,
+     )
+ 
+-    if dlt_pipeline and dlt_section_overview_switch.value:
++    if dlt_pipeline and dlt_section_info_switch.value:
+         _result += [
+             mo.ui.table(
+                 utils.pipeline_details(dlt_config, dlt_pipeline, dlt_pipelines_dir),
+@@ -266,7 +334,7 @@ def section_overview(
+                 lazy=True,
+             )
+         )
+-    mo.vstack(_result) if _result else None
++    mo.vstack(_result)
+     return
+ 
+ 
+@@ -663,78 +731,90 @@ def section_trace(
+     )
+ 
+     if dlt_pipeline and dlt_section_trace_switch.value:
+-        if _exception_section := utils.build_exception_section(dlt_pipeline):
+-            _result.extend(_exception_section)
+-        dlt_trace = dlt_pipeline.last_trace
+-        if not dlt_trace:
+-            _result.append(
+-                mo.callout(
+-                    mo.md(strings.trace_no_trace_text),
+-                    kind="warn",
++        try:
++            if _exception_section := utils.build_exception_section(dlt_pipeline):
++                _result.extend(_exception_section)
++            dlt_trace = dlt_pipeline.last_trace
++            if not dlt_trace:
++                _result.append(
++                    mo.callout(
++                        mo.md(strings.trace_no_trace_text),
++                        kind="warn",
++                    )
+                 )
+-            )
+-        else:
+-            _result.append(
+-                ui.build_title_and_subtitle(
+-                    strings.trace_overview_title,
+-                    title_level=3,
++            else:
++                _result.append(
++                    ui.build_title_and_subtitle(
++                        strings.trace_overview_title,
++                        title_level=3,
++                    )
+                 )
+-            )
+-            _result.append(mo.ui.table(utils.trace_overview(dlt_config, dlt_trace), selection=None))
+-            _result.append(
+-                ui.build_title_and_subtitle(
+-                    strings.trace_execution_context_title,
+-                    strings.trace_execution_context_subtitle,
+-                    title_level=3,
++                _result.append(
++                    mo.ui.table(utils.trace_overview(dlt_config, dlt_trace), selection=None)
+                 )
+-            )
+-            _result.append(
+-                mo.ui.table(utils.trace_execution_context(dlt_config, dlt_trace), selection=None)
+-            )
+-            _result.append(
+-                ui.build_title_and_subtitle(
+-                    strings.trace_steps_overview_title,
+-                    strings.trace_steps_overview_subtitle,
+-                    title_level=3,
++                _result.append(
++                    ui.build_title_and_subtitle(
++                        strings.trace_execution_context_title,
++                        strings.trace_execution_context_subtitle,
++                        title_level=3,
++                    )
++                )
++                _result.append(
++                    mo.ui.table(
++                        utils.trace_execution_context(dlt_config, dlt_trace), selection=None
++                    )
+                 )
+-            )
+-            _result.append(dlt_trace_steps_table)
+-            for item in dlt_trace_steps_table.value:  # type: ignore[unused-ignore,union-attr]
+-                step_id = item["step"]  # type: ignore[unused-ignore,index]
+                 _result.append(
+                     ui.build_title_and_subtitle(
+-                        strings.trace_step_details_title.format(step_id.capitalize()),
++                        strings.trace_steps_overview_title,
++                        strings.trace_steps_overview_subtitle,
+                         title_level=3,
+                     )
+                 )
+-                _result += utils.trace_step_details(dlt_config, dlt_trace, step_id)
++                _result.append(dlt_trace_steps_table)
++                for item in dlt_trace_steps_table.value:  # type: ignore[unused-ignore,union-attr]
++                    step_id = item["step"]  # type: ignore[unused-ignore,index]
++                    _result.append(
++                        ui.build_title_and_subtitle(
++                            strings.trace_step_details_title.format(step_id.capitalize()),
++                            title_level=3,
++                        )
++                    )
++                    _result += utils.trace_step_details(dlt_config, dlt_trace, step_id)
+ 
+-            # config values
+-            _result.append(
+-                ui.build_title_and_subtitle(
+-                    strings.trace_resolved_config_title,
+-                    strings.trace_resolved_config_subtitle,
+-                    title_level=3,
++                # config values
++                _result.append(
++                    ui.build_title_and_subtitle(
++                        strings.trace_resolved_config_title,
++                        strings.trace_resolved_config_subtitle,
++                        title_level=3,
++                    )
+                 )
+-            )
+-            _result.append(
+-                mo.ui.table(
+-                    utils.trace_resolved_config_values(dlt_config, dlt_trace), selection=None
++                _result.append(
++                    mo.ui.table(
++                        utils.trace_resolved_config_values(dlt_config, dlt_trace), selection=None
++                    )
+                 )
+-            )
+-            _result.append(
+-                ui.build_title_and_subtitle(
+-                    strings.trace_raw_trace_title,
+-                    title_level=3,
++                _result.append(
++                    ui.build_title_and_subtitle(
++                        strings.trace_raw_trace_title,
++                        title_level=3,
++                    )
+                 )
+-            )
++                _result.append(
++                    mo.accordion(
++                        {
++                            strings.trace_show_raw_trace_text: mo.json(
++                                utils.sanitize_trace_for_display(dlt_trace)
++                            )
++                        }
++                    )
++                )
++        except Exception as exc:
+             _result.append(
+-                mo.accordion(
+-                    {
+-                        strings.trace_show_raw_trace_text: mo.json(
+-                            utils.sanitize_trace_for_display(dlt_trace)
+-                        )
+-                    }
++                ui.build_error_callout(
++                    f"Error while building trace section: {exc}",
++                    traceback_string=traceback.format_exc(),
+                 )
+             )
+     mo.vstack(_result) if _result else None
+@@ -1010,8 +1090,8 @@ def ui_controls(mo_cli_arg_with_test_identifiers: bool):
+     dlt_section_sync_switch: mo.ui.switch = mo.ui.switch(
+         value=True, label="sync" if mo_cli_arg_with_test_identifiers else ""
+     )
+-    dlt_section_overview_switch: mo.ui.switch = mo.ui.switch(
+-        value=True, label="overview" if mo_cli_arg_with_test_identifiers else ""
++    dlt_section_info_switch: mo.ui.switch = mo.ui.switch(
++        value=False, label="overview" if mo_cli_arg_with_test_identifiers else ""
+     )
+     dlt_section_schema_switch: mo.ui.switch = mo.ui.switch(
+         value=False, label="schema" if mo_cli_arg_with_test_identifiers else ""
+@@ -1073,7 +1153,7 @@ def ui_controls(mo_cli_arg_with_test_identifiers: bool):
+         dlt_section_browse_data_switch,
+         dlt_section_ibis_browser_switch,
+         dlt_section_loads_switch,
+-        dlt_section_overview_switch,
++        dlt_section_info_switch,
+         dlt_section_schema_switch,
+         dlt_section_state_switch,
+         dlt_section_sync_switch,
+@@ -1165,10 +1245,13 @@ def ui_primary_controls(
+     # Trace steps table
+     #
+     dlt_trace_steps_table: mo.ui.table = None
+-    if dlt_section_trace_switch.value and dlt_pipeline and dlt_pipeline.last_trace:
+-        dlt_trace_steps_table = mo.ui.table(
+-            utils.trace_steps_overview(dlt_config, dlt_pipeline.last_trace)
+-        )
++    try:
++        if dlt_section_trace_switch.value and dlt_pipeline and dlt_pipeline.last_trace:
++            dlt_trace_steps_table = mo.ui.table(
++                utils.trace_steps_overview(dlt_config, dlt_pipeline.last_trace)
++            )
++    except Exception as exc:
++        logger.error(f"Error while building trace steps table: {exc}")
+     return (
+         dlt_data_table_list,
+         dlt_schema_table_list,
+diff --git a/dlt/_workspace/helpers/dashboard/strings.py b/dlt/_workspace/helpers/dashboard/strings.py
+index 02524f262..ab8c8fc04 100644
+--- a/dlt/_workspace/helpers/dashboard/strings.py
++++ b/dlt/_workspace/helpers/dashboard/strings.py
+@@ -96,8 +96,8 @@ view_load_packages_text = "Status of load packages from last execution"
+ #
+ # Overview section
+ #
+-overview_title = "Pipeline Overview"
+-overview_subtitle = "An overview of the selected pipeline"
++overview_title = "Pipeline Info"
++overview_subtitle = "Basic properties of the selected pipeline"
+ overview_remote_state_title = "Remote state"
+ overview_remote_state_subtitle = (
+     "The remote state and schemas of the pipeline as discovered on the destination"
+diff --git a/dlt/_workspace/helpers/dashboard/utils.py b/dlt/_workspace/helpers/dashboard/utils.py
+index dd4754efa..7f92de098 100644
+--- a/dlt/_workspace/helpers/dashboard/utils.py
++++ b/dlt/_workspace/helpers/dashboard/utils.py
+@@ -2,7 +2,6 @@ import shutil
+ import functools
+ from itertools import chain
+ from pathlib import Path
+-from this import d
+ from typing import (
+     Any,
+     Dict,
+@@ -153,7 +152,7 @@ def get_local_pipelines(
+ 
+ 
+ def get_pipeline(pipeline_name: str, pipelines_dir: str) -> dlt.Pipeline:
+-    """Get a pipeline by name.
++    """Get a pipeline by name. Attach exceptions must be handled by the caller
+ 
+     Args:
+         pipeline_name (str): The name of the pipeline to get.
+@@ -161,12 +160,9 @@ def get_pipeline(pipeline_name: str, pipelines_dir: str) -> dlt.Pipeline:
+     Returns:
+         dlt.Pipeline: The pipeline.
+     """
+-    try:
+-        p = dlt.attach(pipeline_name, pipelines_dir=pipelines_dir)
+-        p.config.use_single_dataset = False
+-        return p
+-    except CannotRestorePipelineException:
+-        return None
++    p = dlt.attach(pipeline_name, pipelines_dir=pipelines_dir)
++    p.config.use_single_dataset = False
++    return p
+ 
+ 
+ #
+diff --git a/docs/website/docs/general-usage/dashboard.md b/docs/website/docs/general-usage/dashboard.md
+index c17b7febe..04b225eb4 100644
+--- a/docs/website/docs/general-usage/dashboard.md
++++ b/docs/website/docs/general-usage/dashboard.md
+@@ -71,11 +71,11 @@ The dashboard app should mostly be self-explanatory. Go to the section that corr
+ The following sections are available:
+ 
+ 
+-### Pipeline overview
++### Pipeline Info
+ 
+ The overview section gives you a general sense of the state of your pipeline and will also display exception information if the last run of your pipeline failed.
+ 
+-![Pipeline overview](https://storage.googleapis.com/dlt-blog-images/dashboard-pipeline-overview.png)
++![Pipeline Info](https://storage.googleapis.com/dlt-blog-images/dashboard-pipeline-overview.png)
+ 
+ ### Schema explorer
+ 
+diff --git a/tests/e2e/helpers/dashboard/conftest.py b/tests/e2e/helpers/dashboard/conftest.py
+index a248d9128..1908aedd5 100644
+--- a/tests/e2e/helpers/dashboard/conftest.py
++++ b/tests/e2e/helpers/dashboard/conftest.py
+@@ -1,14 +1,16 @@
+ import pathlib
+ import sys
+ from typing import Any
+-import pytest
++import pickle
+ 
++import pytest
+ 
+ import dlt
+ from dlt._workspace.helpers.dashboard.runner import start_dashboard
+ from dlt._workspace._templates._single_file_templates.fruitshop_pipeline import (
+     fruitshop as fruitshop_source,
+ )
++from dlt._workspace.helpers.dashboard import utils as dashboard_utils
+ 
+ 
+ def _normpath(path: str) -> str:
+@@ -83,6 +85,23 @@ def failed_pipeline() -> Any:
+     return fp
+ 
+ 
++@pytest.fixture()
++def broken_trace_pipeline() -> Any:
++    """Pipeline with a deliberately corrupted trace file to test dashboard robustness."""
++    bp = dlt.pipeline(
++        pipeline_name="broken_trace_pipeline",
++        destination="duckdb",
++    )
++    bp.run(fruitshop_source())
++
++    trace_file = dashboard_utils.get_trace_file_path(bp.pipeline_name, bp.pipelines_dir)
++    trace_file.parent.mkdir(parents=True, exist_ok=True)
++    with trace_file.open("wb") as f:
++        pickle.dump({"not": "a real PipelineTrace"}, f)
++
++    return bp
++
++
+ @pytest.fixture(scope="module", autouse=True)
+ def start_dashboard_server():
+     with start_dashboard(pipelines_dir=_normpath("_storage/.dlt/pipelines")) as proc:
+diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
+index dbef977f3..eff225560 100644
+--- a/tests/e2e/helpers/dashboard/test_e2e.py
++++ b/tests/e2e/helpers/dashboard/test_e2e.py
+@@ -249,6 +249,8 @@ def test_never_run_pipeline(page: Page, never_run_pipeline: Any):
+     _go_home(page)
+     page.get_by_role("link", name="never_run_pipeline").click()
+ 
++    # info closed by default
++    _open_section(page, "overview")
+     expect(
+         page.get_by_text(_normpath("_storage/.dlt/pipelines/never_run_pipeline"))
+     ).to_be_visible()
+@@ -281,6 +283,8 @@ def test_no_destination_pipeline(page: Page, no_destination_pipeline: Any):
+     _go_home(page)
+     page.get_by_role("link", name="no_destination_pipeline").click()
+ 
++    # info closed by default
++    _open_section(page, "overview")
+     expect(
+         page.get_by_text(_normpath("_storage/.dlt/pipelines/no_destination_pipeline"))
+     ).to_be_visible()
+@@ -350,3 +354,18 @@ def test_workspace_profile_dev(page: Page):
+             expect(page.get_by_role("switch", name="overview")).to_be_visible()
+             page.get_by_role("switch", name="loads").check()
+             expect(page.get_by_role("row", name="fruitshop").first).to_be_visible()
++
++
++def test_broken_trace_pipeline(page: Page, broken_trace_pipeline: Any):
++    """Dashboard should still render overview even if the last trace file is corrupted."""
++    _go_home(page)
++    page.get_by_role("link", name="broken_trace_pipeline").click()
++
++    # overview page should still be accessible and show the working dir path
++    _open_section(page, "overview")
++    expect(
++        page.get_by_text(_normpath("_storage/.dlt/pipelines/broken_trace_pipeline"))
++    ).to_be_visible()
++    # should also render the trace section, but there should be an error message
++    _open_section(page, "trace")
++    expect(page.get_by_text("Error while building trace section:")).to_be_visible()
+
+
+===== COMMIT c943d1c8 =====
+
+
+commit c943d1c89
+Author: rudolfix
+Date: 2025-11-21
+
+    (docs) adds community destinations (#3326)
+
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/community-destinations.md b/docs/website/docs/dlt-ecosystem/destinations/community-destinations.md
+new file mode 100644
+index 000000000..dec85694c
+--- /dev/null
++++ b/docs/website/docs/dlt-ecosystem/destinations/community-destinations.md
+@@ -0,0 +1,66 @@
++---
++title: Community Destinations
++description: Community-contributed destinations for dlt
++keywords: [community, destination, contributions]
++---
++
++# Community Destinations
++
++We've got several destinations contributed by our community. [They are not part of the `dlt` library](https://github.com/dlt-hub/dlt/blob/devel/CONTRIBUTING.md#before-you-begin), instead we list them below.
++
++:::caution Caveat Emptor
++**Use at your own risk:** These are community-maintained forks of `dlt` that are not officially supported by the dlt team. While they extend dlt's functionality to additional databases, they may not receive the same level of testing, maintenance, or security updates as the core library. Always review the code and test thoroughly before using in production environments.
++:::
++
++
++## Starrocks
++
++by: [phaethon](https://github.com/phaethon)
++
++Implementation of Starrocks support as a separate destination. Starrocks is an MPP (Massively Parallel Processing) database designed for real-time analytics. This adapter implements two loading methods:
++- **Stream Load**: Direct streaming of data into Starrocks
++- **INSERT INTO SELECT FROM FILES**: Loading data from S3-compatible staging storage for improved performance with large datasets
++
++Code:
++https://github.com/phaethon/dlt/tree/starrocks
++
++PR with discussion:
++https://github.com/dlt-hub/dlt/pull/2518
++
++
++## Clickhouse Distributed
++
++by: [zstipanicev](https://github.com/zstipanicev)
++
++When Clickhouse is deployed with replicas and distributed tables, standard DDL & DML statements need to be modified to work across the cluster. This implementation adds:
++- **ON CLUSTER** clauses to DDL statements to execute across all nodes
++- Creation of **base table and distributed table pairs** (base tables use ReplicatedMergeTree, distributed tables use Distributed engine)
++- Modified ALTER, DROP, DELETE, UPDATE, and TRUNCATE operations to work with both table types
++- Configuration options for cluster name, database prefixes, and table name patterns
++
++This allows dlt to work seamlessly with sharded and replicated Clickhouse setups.
++
++Code:
++https://github.com/zstipanicev/dlt/tree/feat/2200-add-clickhouse-distributed-support
++
++
++PR with discussion:
++https://github.com/dlt-hub/dlt/pull/2573
++
++
++
++## CrateDB
++
++by: [CrateDB](https://github.com/crate)
++
++CrateDB is a distributed SQL database built on top of Lucene, designed for real-time analytics on large datasets. This destination adapter wraps the PostgreSQL adapter with CrateDB-specific adjustments:
++- Compatibility with CrateDB's PostgreSQL wire protocol
++- Workarounds for system column naming restrictions (underscore-prefixed columns)
++- Support for CrateDB's **REFRESH TABLE** statements for consistency
++- Adjusted transaction handling for CrateDB's limited transaction support
++
++Code:
++https://github.com/crate/dlt-cratedb
++
++Original PR with discussion (currently on hiatus):
++https://github.com/dlt-hub/dlt/pull/2733
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 6ed6fed4f..1f5ce0b14 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -230,6 +230,7 @@ const sidebars = {
+         'dlt-ecosystem/destinations/destination',
+         'dlt-ecosystem/destinations/motherduck',
+         'dlt-ecosystem/destinations/ducklake',
++        'dlt-ecosystem/destinations/community-destinations',
+         'walkthroughs/create-new-destination'
+       ]
+     },
+
+
+===== COMMIT c2926411 =====
+
+
+commit c29264114
+Author: rudolfix
+Date: 2025-11-21
+
+    fix: backwards compatible traces (#3354)
+
+diff --git a/dlt/common/metrics.py b/dlt/common/metrics.py
+index 9bdbc3b00..4d77705ab 100644
+--- a/dlt/common/metrics.py
++++ b/dlt/common/metrics.py
+@@ -88,10 +88,10 @@ class LoadJobMetrics(NamedTuple):
+     file_path: str
+     table_name: str
+     started_at: datetime.datetime
+-    finished_at: datetime.datetime
++    finished_at: Optional[datetime.datetime]
+     state: Optional[str]
+     remote_url: Optional[str]
+-    retry_count: Optional[int]
++    retry_count: Optional[int] = 0
+ 
+ 
+ class LoadMetrics(StepMetrics):
+diff --git a/dlt/pipeline/pipeline.py b/dlt/pipeline/pipeline.py
+index 7e63ca4b2..697eebf80 100644
+--- a/dlt/pipeline/pipeline.py
++++ b/dlt/pipeline/pipeline.py
+@@ -127,6 +127,7 @@ from dlt.pipeline.trace import (
+     PipelineStepTrace,
+     load_trace,
+     merge_traces,
++    save_trace,
+     start_trace,
+     start_trace_step,
+     end_trace_step,
+@@ -237,9 +238,7 @@ def with_runtime_trace(send_state: bool = False) -> Callable[[TFun], TFun]:
+                             f"Messed up trace reference {self._trace.transaction_id} vs"
+                             f" {trace.transaction_id}"
+                         )
+-                        trace = end_trace(
+-                            trace, self, self._pipeline_storage.storage_path, send_state
+-                        )
++                        trace = end_trace(trace, self, send_state)
+                 finally:
+                     # always end trace
+                     if is_new_trace:
+@@ -250,6 +249,7 @@ def with_runtime_trace(send_state: bool = False) -> Callable[[TFun], TFun]:
+                         # this way we combine several separate calls to extract, normalize, load as single trace
+                         # the trace of "run" has many steps and will not be merged
+                         self._last_trace = merge_traces(self._last_trace, trace)
++                        save_trace(self.working_dir, self._last_trace)
+                         self._trace = None
+ 
+         return _wrap  # type: ignore
+diff --git a/dlt/pipeline/trace.py b/dlt/pipeline/trace.py
+index 77b6293ea..789090bc0 100644
+--- a/dlt/pipeline/trace.py
++++ b/dlt/pipeline/trace.py
+@@ -3,9 +3,10 @@ from copy import copy
+ import os
+ import pickle
+ import datetime  # noqa: 251
+-from typing import Any, List, NamedTuple, Optional, Protocol, Sequence, Union
++from typing import Any, List, NamedTuple, Optional, Sequence
+ import humanize
+ 
++from dlt.common import logger
+ from dlt.common.pendulum import pendulum
+ from dlt.common.configuration import is_secret_hint
+ from dlt.common.configuration.exceptions import ContextDefaultCannotBeCreated
+@@ -292,12 +293,8 @@ def end_trace_step(
+     return trace
+ 
+ 
+-def end_trace(
+-    trace: PipelineTrace, pipeline: SupportsPipeline, trace_path: str, send_state: bool
+-) -> PipelineTrace:
++def end_trace(trace: PipelineTrace, pipeline: SupportsPipeline, send_state: bool) -> PipelineTrace:
+     trace = trace._replace(finished_at=pendulum.now())
+-    if trace_path:
+-        save_trace(trace_path, trace)
+     for module in TRACKING_MODULES:
+         with suppress_and_warn(f"end_trace on module {module} failed"):
+             module.on_end_trace(trace, pipeline, send_state)
+@@ -324,23 +321,30 @@ def merge_traces(last_trace: PipelineTrace, new_trace: PipelineTrace) -> Pipelin
+     )
+ 
+ 
+-def save_trace(trace_path: str, trace: PipelineTrace) -> None:
++def save_trace(trace_dir: str, trace: PipelineTrace) -> None:
+     # remove previous file, we do not want to keep old trace even if we fail later
+-    trace_dump_path = os.path.join(trace_path, TRACE_FILE_NAME)
++    trace_dump_path = os.path.join(trace_dir, TRACE_FILE_NAME)
+     if os.path.isfile(trace_dump_path):
+         os.unlink(trace_dump_path)
+     with suppress_and_warn("Failed to create trace dump via pickle"):
+         trace_dump = pickle.dumps(trace)
+-        FileStorage.save_atomic(trace_path, TRACE_FILE_NAME, trace_dump, file_type="b")
++        FileStorage.save_atomic(trace_dir, TRACE_FILE_NAME, trace_dump, file_type="b")
+ 
+ 
+-def load_trace(trace_path: str) -> PipelineTrace:
++def load_trace(trace_dir: str, ignore_errors: bool = True) -> PipelineTrace:
+     try:
+-        with open(os.path.join(trace_path, TRACE_FILE_NAME), mode="rb") as f:
++        with open(os.path.join(trace_dir, TRACE_FILE_NAME), mode="rb") as f:
+             return pickle.load(f)  # type: ignore
+-    except (AttributeError, FileNotFoundError):
+-        # on incompatible pickling / file not found return no trace
+-        return None
++    except FileNotFoundError:
++        # file not found return no trace
++        pass
++    except Exception as ex:
++        # we do not guarantee traces backward compat
++        if not ignore_errors:
++            raise
++        logger.warning(f"Error when loading trace at {trace_dir}: %s" % ex)
++
++    return None
+ 
+ 
+ def get_exception_traces(exc: BaseException, container: Container = None) -> List[ExceptionTrace]:
+diff --git a/tests/pipeline/cases/traces/dlt.1.15/trace.pickle b/tests/pipeline/cases/traces/dlt.1.15/trace.pickle
+new file mode 100644
+index 000000000..2b0960780
+Binary files /dev/null and b/tests/pipeline/cases/traces/dlt.1.15/trace.pickle differ
+diff --git a/tests/pipeline/cases/traces/dlt.1.15_botched/trace.pickle b/tests/pipeline/cases/traces/dlt.1.15_botched/trace.pickle
+new file mode 100644
+index 000000000..ecc56ec3e
+Binary files /dev/null and b/tests/pipeline/cases/traces/dlt.1.15_botched/trace.pickle differ
+diff --git a/tests/pipeline/cases/traces/dlt.1.18.2/trace.pickle b/tests/pipeline/cases/traces/dlt.1.18.2/trace.pickle
+new file mode 100644
+index 000000000..135083007
+Binary files /dev/null and b/tests/pipeline/cases/traces/dlt.1.18.2/trace.pickle differ
+diff --git a/tests/pipeline/test_pipeline_trace.py b/tests/pipeline/test_pipeline_trace.py
+index c3a7e1a50..d43f75df1 100644
+--- a/tests/pipeline/test_pipeline_trace.py
++++ b/tests/pipeline/test_pipeline_trace.py
+@@ -11,7 +11,7 @@ import yaml
+ 
+ import dlt
+ 
+-from dlt.common import json
++from dlt.common import json, pendulum
+ from dlt.common.configuration.specs import CredentialsConfiguration, RuntimeConfiguration
+ from dlt.common.configuration.specs.config_providers_context import ConfigProvidersContainer
+ from dlt.common.configuration.utils import get_resolved_traces
+@@ -29,6 +29,7 @@ from dlt.pipeline.trace import (
+     PipelineTrace,
+     SerializableResolvedValueTrace,
+     load_trace,
++    save_trace,
+ )
+ from dlt.pipeline.track import slack_notify_load_success
+ from dlt.extract import DltResource, DltSource
+@@ -57,15 +58,15 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
+ 
+         return data()
+ 
+-    p = dlt.pipeline(destination="dummy")
++    pipeline = dlt.pipeline(destination="dummy")
+ 
+     # read from secrets and configs directly
+     databricks_creds = "databricks+connector://token:<databricks_token>@<databricks_host>:443/<database_or_schema_name>?conn_timeout=15&search_path=a,b,c"
+     s = dlt.secrets["databricks.credentials"]
+     assert s == databricks_creds
+ 
+-    extract_info = p.extract(inject_tomls())
+-    trace = p.last_trace
++    extract_info = pipeline.extract(inject_tomls())
++    trace = pipeline.last_trace
+     assert trace is not None
+     # assert p._trace is None
+     assert len(trace.steps) == 1
+@@ -76,7 +77,7 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
+     assert isinstance(step.step_info, ExtractInfo)
+     assert step.step_info.extract_data_info == [{"name": "inject_tomls", "data_type": "source"}]
+     # check infos
+-    extract_info = p.last_trace.last_extract_info
++    extract_info = pipeline.last_trace.last_extract_info
+     assert isinstance(extract_info, ExtractInfo)
+     # should have single job and single load id
+     assert len(extract_info.loads_ids) == 1
+@@ -132,7 +133,7 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
+     assert_trace_serializable(trace)
+ 
+     # activate pipeline because other was running in assert trace
+-    p.activate()
++    pipeline.activate()
+ 
+     # extract with exception
+     @dlt.source
+@@ -150,10 +151,10 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
+         return data()
+ 
+     with pytest.raises(PipelineStepFailed):
+-        p.extract(async_exception())
++        pipeline.extract(async_exception())
+ 
+-    trace = p.last_trace
+-    assert p._trace is None
++    trace = pipeline.last_trace
++    assert pipeline._trace is None
+     assert len(trace.steps) == 2
+     step = trace.steps[1]
+     assert step.step == "extract"
+@@ -175,16 +176,19 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
+     assert len(extract_info.metrics[load_id]) == 1
+ 
+     # normalize
+-    norm_info = p.normalize()
+-    trace = p.last_trace
+-    assert p._trace is None
++    norm_info = pipeline.normalize()
++    trace = pipeline.last_trace
++    assert pipeline._trace is None
+     assert len(trace.steps) == 3
+     step = trace.steps[2]
+     assert step.step == "normalize"
+     assert step.step_info is norm_info
+     assert_trace_serializable(trace)
+-    assert isinstance(p.last_trace.last_normalize_info, NormalizeInfo)
+-    assert p.last_trace.last_normalize_info.row_counts == {"_dlt_pipeline_state": 1, "data": 3}
++    assert isinstance(pipeline.last_trace.last_normalize_info, NormalizeInfo)
++    assert pipeline.last_trace.last_normalize_info.row_counts == {
++        "_dlt_pipeline_state": 1,
++        "data": 3,
++    }
+ 
+     assert len(norm_info.loads_ids) == 1
+     load_id = norm_info.loads_ids[0]
+@@ -205,9 +209,9 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
+ 
+     # load
+     os.environ["COMPLETED_PROB"] = "1.0"  # make it complete immediately
+-    load_info = p.load()
+-    trace = p.last_trace
+-    assert p._trace is None
++    load_info = pipeline.load()
++    trace = pipeline.last_trace
++    assert pipeline._trace is None
+     assert len(trace.steps) == 4
+     step = trace.steps[3]
+     assert step.step == "load"
+@@ -225,13 +229,19 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
+     assert resolved.value == "1.0"
+     assert resolved.config_type_name == "DummyClientConfiguration"
+     assert_trace_serializable(trace)
+-    assert isinstance(p.last_trace.last_load_info, LoadInfo)
+-    p.activate()
++    assert isinstance(pipeline.last_trace.last_load_info, LoadInfo)
++    pipeline.activate()
++
++    # copy trace to well known location so it can be used as fixture
++    # NOTE: uncomment block below to generate fixture for test_trace_backward_compat
++    # trace_dir = os.path.join(TEST_STORAGE_ROOT, f"dlt.{dlt.__version__}")
++    # os.makedirs(trace_dir)
++    # save_trace(trace_dir, pipeline._last_trace)
+ 
+     # run resets the trace
+     load_info = inject_tomls().run()
+-    trace = p.last_trace
+-    assert p._trace is None
++    trace = pipeline.last_trace
++    assert pipeline._trace is None
+     assert len(trace.steps) == 4  # extract, normalize, load, run
+     step = trace.steps[-1]  # the last one should be run
+     assert step.step == "run"
+@@ -243,9 +253,9 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
+     assert step.step_info is load_info  # same load info
+     assert trace.steps[0].step_info is not extract_info
+     assert_trace_serializable(trace)
+-    assert isinstance(p.last_trace.last_load_info, LoadInfo)
+-    assert isinstance(p.last_trace.last_normalize_info, NormalizeInfo)
+-    assert isinstance(p.last_trace.last_extract_info, ExtractInfo)
++    assert isinstance(pipeline.last_trace.last_load_info, LoadInfo)
++    assert isinstance(pipeline.last_trace.last_normalize_info, NormalizeInfo)
++    assert isinstance(pipeline.last_trace.last_extract_info, ExtractInfo)
+ 
+ 
+ def test_trace_schema() -> None:
+@@ -714,6 +724,10 @@ def test_last_pipeline_step_trace_returns_latest() -> None:
+     assert len(p.last_trace.steps) == 7
+     assert p.last_trace.last_load_info.loads_ids == second_load_info.loads_ids
+ 
++    # check if still 7 steps after pickle
++    unpickled_trace = load_trace(p.working_dir)
++    assert len(unpickled_trace.steps) == 7
++
+     # next run should reset everything
+     third_load_info = p.run([7, 8, 9], table_name="third_data")
+     assert len(p.last_trace.steps) == 4
+@@ -771,6 +785,53 @@ def test_trace_custom_metrics_schema() -> None:
+     )
+ 
+ 
++@pytest.mark.skipif(
++    int(pendulum.__version__.split(".")[0]) < 3,
++    reason="Skipping backward compatibility test for pendulum version < 3",
++)
++def test_trace_backward_compat() -> None:
++    # this test checks if past traces can be unpickled. if this test fails - backward incompatible
++    # changes were introduced. there's no guarantee from our side that traces are backward compat
++    # but if we can easily prevent this form happening - we should.
++    # NOTE: if this test failed and you make it work again, add new trace fixture to tests/pipeline/cases/traces
++    # `test_create_trace` will create fixture for you in `_storage` folder after it is run. see end of the test code
++    # copy that fixture to cases folder above
++
++    traces_dir = os.path.join(PIPELINE_TEST_CASES_PATH, "traces")
++    traces = os.listdir(traces_dir)
++    assert len(traces) > 0  # sanity check
++    for folder in traces:
++        # skip botched traces in this test
++        if "botched" in folder:
++            continue
++        trace_dir = os.path.join(traces_dir, folder)
++        if os.path.isdir(trace_dir):
++            # use standard pickle
++            trace = load_trace(trace_dir, ignore_errors=False)
++            # trace must be found
++            assert trace is not None
++            # use trace loading which ignores all errors
++            trace = load_trace(trace_dir)
++            assert_trace_serializable(trace)
++
++
++def test_ignore_load_broken_trace() -> None:
++    traces_dir = os.path.join(PIPELINE_TEST_CASES_PATH, "traces")
++    traces = os.listdir(traces_dir)
++    assert len(traces) > 0  # sanity check
++    for folder in traces:
++        # skip botched traces in this test
++        if "botched" not in folder:
++            continue
++        trace_dir = os.path.join(traces_dir, folder)
++        # must fail
++        with pytest.raises(Exception):
++            load_trace(trace_dir, ignore_errors=False)
++
++        # can't fail but must be None
++        assert load_trace(trace_dir) is None
++
++
+ def _find_resolved_value(
+     resolved: List[SerializableResolvedValueTrace], key: str, sections: List[str]
+ ) -> SerializableResolvedValueTrace:
+
+
+===== COMMIT 3bd50999 =====
+
+
+commit 3bd509995
+Author: rudolfix
+Date: 2025-11-20
+
+    fixes sqlglot from find (#3357)
+
+diff --git a/tests/normalize/test_model_item_normalizer.py b/tests/normalize/test_model_item_normalizer.py
+index b15b7738d..d76646342 100644
+--- a/tests/normalize/test_model_item_normalizer.py
++++ b/tests/normalize/test_model_item_normalizer.py
+@@ -294,7 +294,7 @@ LIMIT 5
+     parsed_norm_select_query = sqlglot.parse_one(normalized_select_query, read=dialect)
+ 
+     # Ensure the normalized model query contains a subquery in the FROM clause
+-    from_clause = parsed_norm_select_query.args.get("from")
++    from_clause = parsed_norm_select_query.find(sqlglot.exp.From)
+     assert isinstance(from_clause, sqlglot.exp.From)
+     assert isinstance(from_clause.this, sqlglot.exp.Subquery)
+     assert isinstance(from_clause.this.this, sqlglot.exp.Select)
+
+
+===== COMMIT 8a234083 =====
+
+
+commit 8a2340836
+Author: Tim Hable
+Date: 2025-11-20
+
+    Redshift feature: Include STS session token in COPY CREDENTIALS. (#3307)
+
+diff --git a/dlt/destinations/impl/redshift/redshift.py b/dlt/destinations/impl/redshift/redshift.py
+index 564983647..2d4c92a40 100644
+--- a/dlt/destinations/impl/redshift/redshift.py
++++ b/dlt/destinations/impl/redshift/redshift.py
+@@ -93,10 +93,13 @@ class RedshiftCopyFileLoadJob(CopyRemoteFileLoadJob):
+         ):
+             aws_access_key = self._staging_credentials.aws_access_key_id
+             aws_secret_key = self._staging_credentials.aws_secret_access_key
++            aws_session_token = self._staging_credentials.aws_session_token
+             credentials = (
+                 "CREDENTIALS"
+                 f" 'aws_access_key_id={aws_access_key};aws_secret_access_key={aws_secret_key}'"
+             )
++            if aws_session_token:
++                credentials = credentials[:-1] + f";token={aws_session_token}'"
+         # get format
+         file_format, is_compressed = get_file_format_and_compression(self._bucket_path)
+         file_type = ""
+
+
+===== COMMIT b08f2334 =====
+
+
+commit b08f2334a
+Author: Violetta Mishechkina
+Date: 2025-11-20
+
+    docs: update weaviate destination docs and version (#3352)
+
+diff --git a/docs/pyproject.toml b/docs/pyproject.toml
+index 69279c1bc..42077a3aa 100644
+--- a/docs/pyproject.toml
++++ b/docs/pyproject.toml
+@@ -39,7 +39,7 @@ dependencies = [
+     "google-api-python-client>=1.7.11",
+     "google-auth-oauthlib>=1.0.0,<2",
+     "types-psycopg2>=2.9.21.20251012",
+-    "weaviate-client==3.23.2",
++    "weaviate-client>=3.26.7,<4.0.0",
+     "regex>=2025.10.23",
+     "pytest-forked>=1.6.0",
+ ]
+diff --git a/docs/uv.lock b/docs/uv.lock
+index b608f7d1d..b00fe107d 100644
+--- a/docs/uv.lock
++++ b/docs/uv.lock
+@@ -1,5 +1,5 @@
+ version = 1
+-revision = 3
++revision = 2
+ requires-python = ">=3.9.2, <3.14"
+ resolution-markers = [
+     "python_full_version >= '3.13' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
+@@ -1250,7 +1250,7 @@ requires-dist = [
+     { name = "tomlkit", specifier = ">=0.11.3" },
+     { name = "typing-extensions", specifier = ">=4.8.0" },
+     { name = "tzdata", specifier = ">=2022.1" },
+-    { name = "weaviate-client", marker = "extra == 'weaviate'", specifier = ">=3.22" },
++    { name = "weaviate-client", marker = "extra == 'weaviate'", specifier = ">=3.26.7,<4.0.0" },
+     { name = "win-precise-time", marker = "python_full_version < '3.13' and os_name == 'nt'", specifier = ">=1.4.2" },
+ ]
+ provides-extras = ["gcp", "bigquery", "postgres", "redshift", "parquet", "duckdb", "ducklake", "filesystem", "s3", "gs", "az", "sftp", "http", "snowflake", "motherduck", "cli", "athena", "weaviate", "mssql", "synapse", "qdrant", "databricks", "clickhouse", "dremio", "lancedb", "deltalake", "sql-database", "sqlalchemy", "pyiceberg", "postgis", "workspace", "dbml"]
+@@ -1423,7 +1423,7 @@ requires-dist = [
+     { name = "types-regex", specifier = ">=2025.10.23.20251023" },
+     { name = "types-requests", specifier = ">=2.32.4.20250913" },
+     { name = "watchdog", specifier = ">=6.0.0" },
+-    { name = "weaviate-client", specifier = "==3.23.2" },
++    { name = "weaviate-client", specifier = ">=3.26.7,<4.0.0" },
+ ]
+ 
+ [[package]]
+@@ -5633,7 +5633,7 @@ wheels = [
+ 
+ [[package]]
+ name = "requests"
+-version = "2.31.0"
++version = "2.32.5"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "certifi" },
+@@ -5641,9 +5641,9 @@ dependencies = [
+     { name = "idna" },
+     { name = "urllib3" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/9d/be/10918a2eac4ae9f02f6cfe6414b7a155ccd8f7f9d4380d62fd5b955065c3/requests-2.31.0.tar.gz", hash = "sha256:942c5a758f98d790eaed1a29cb6eefc7ffb0d1cf7af05c3d2791656dbd6ad1e1", size = 110794, upload-time = "2023-05-22T15:12:44.175Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/c9/74/b3ff8e6c8446842c3f5c837e9c3dfcfe2018ea6ecef224c710c85ef728f4/requests-2.32.5.tar.gz", hash = "sha256:dbba0bac56e100853db0ea71b82b4dfd5fe2bf6d3754a8893c3af500cec7d7cf", size = 134517, upload-time = "2025-08-18T20:46:02.573Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/70/8e/0e2d847013cb52cd35b38c009bb167a1a26b2ce6cd6965bf26b47bc0bf44/requests-2.31.0-py3-none-any.whl", hash = "sha256:58cd2187c01e70e6e26505bca751777aa9f2ee0b7f4300988b709f44e013003f", size = 62574, upload-time = "2023-05-22T15:12:42.313Z" },
++    { url = "https://files.pythonhosted.org/packages/1e/db/4254e3eabe8020b458f1a747140d32277ec7a271daf1d235b70dc0b4e6e3/requests-2.32.5-py3-none-any.whl", hash = "sha256:2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6", size = 64738, upload-time = "2025-08-18T20:46:00.542Z" },
+ ]
+ 
+ [[package]]
+@@ -6567,11 +6567,11 @@ wheels = [
+ 
+ [[package]]
+ name = "validators"
+-version = "0.21.0"
++version = "0.35.0"
+ source = { registry = "https://pypi.org/simple" }
+-sdist = { url = "https://files.pythonhosted.org/packages/1f/c5/4095e7a5a6fecc2eca953ad058a3609135d833f986f84951f7e26790d651/validators-0.21.0.tar.gz", hash = "sha256:245b98ab778ed9352a7269c6a8f6c2a839bed5b2a7e3e60273ce399d247dd4b3", size = 20937, upload-time = "2023-08-11T09:16:04.446Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/53/66/a435d9ae49850b2f071f7ebd8119dd4e84872b01630d6736761e6e7fd847/validators-0.35.0.tar.gz", hash = "sha256:992d6c48a4e77c81f1b4daba10d16c3a9bb0dbb79b3a19ea847ff0928e70497a", size = 73399, upload-time = "2025-05-01T05:42:06.7Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/ad/50/18dbf2ac594234ee6249bfe3425fa424c18eeb96f29dcd47f199ed6c51bc/validators-0.21.0-py3-none-any.whl", hash = "sha256:3470db6f2384c49727ee319afa2e97aec3f8fad736faa6067e0fd7f9eaf2c551", size = 27686, upload-time = "2023-08-11T09:16:02.374Z" },
++    { url = "https://files.pythonhosted.org/packages/fa/6e/3e955517e22cbdd565f2f8b2e73d52528b14b8bcfdb04f62466b071de847/validators-0.35.0-py3-none-any.whl", hash = "sha256:e8c947097eae7892cb3d26868d637f79f47b4a0554bc6b80065dfe5aac3705dd", size = 44712, upload-time = "2025-05-01T05:42:04.203Z" },
+ ]
+ 
+ [[package]]
+@@ -6718,17 +6718,16 @@ wheels = [
+ 
+ [[package]]
+ name = "weaviate-client"
+-version = "3.23.2"
++version = "3.26.7"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "authlib" },
+     { name = "requests" },
+-    { name = "tqdm" },
+     { name = "validators" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/12/75/37624bdc90bf65df52c2e2692cad6484061495ebb6f4cd59c7e353d4e934/weaviate-client-3.23.2.tar.gz", hash = "sha256:1c8c94df032dd2fa5a4ea615fc69ccb983ffad5cc02974f78c793839e61ac150", size = 199697, upload-time = "2023-08-29T14:37:59.135Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/f8/2e/9588bae34c1d67d05ccc07d74a4f5d73cce342b916f79ab3a9114c6607bb/weaviate_client-3.26.7.tar.gz", hash = "sha256:ea538437800abc6edba21acf213accaf8a82065584ee8b914bae4a4ad4ef6b70", size = 210480, upload-time = "2024-08-15T13:27:02.431Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/a4/f7/1ce09f2b35903c451236dbb0fed10fde2bcbd48c28264730c9f5c6f5fcc9/weaviate_client-3.23.2-py3-none-any.whl", hash = "sha256:88ffc38cca07806d64726cc74bc194c7da50b222aa4e2cd129f4c1f5e53e9b61", size = 108127, upload-time = "2023-08-29T14:37:56.258Z" },
++    { url = "https://files.pythonhosted.org/packages/2a/95/fb326052bc1d73cb3c19fcfaf6ebb477f896af68de07eaa1337e27ee57fa/weaviate_client-3.26.7-py3-none-any.whl", hash = "sha256:48b8d4b71df881b4e5e15964d7ac339434338ccee73779e3af7eab698a92083b", size = 120051, upload-time = "2024-08-15T13:27:00.212Z" },
+ ]
+ 
+ [[package]]
+diff --git a/docs/website/docs/dlt-ecosystem/destinations/weaviate.md b/docs/website/docs/dlt-ecosystem/destinations/weaviate.md
+index 8646d3589..2b8051453 100644
+--- a/docs/website/docs/dlt-ecosystem/destinations/weaviate.md
++++ b/docs/website/docs/dlt-ecosystem/destinations/weaviate.md
+@@ -9,6 +9,10 @@ keywords: [weaviate, vector database, destination, dlt]
+ [Weaviate](https://weaviate.io/) is an open-source vector database. It allows you to store data objects and perform similarity searches over them.
+ This destination helps you load data into Weaviate from [dlt resources](../../general-usage/resource.md).
+ 
++:::note
++Currently, the Weaviate destination is using [weaviate-client v.3 as a backend] for loading the data.
++This does not affect your downstream data workflows.
++:::
+ 
+ <!--@@@DLT_DESTINATION_CAPABILITIES weaviate-->
+ 
+@@ -64,19 +68,18 @@ movies = [
+ ]
+ ```
+ 
+-4. Define the pipeline:
++4. Define and run the pipeline:
+ 
+ ```py
++import dlt
++from dlt.destinations.adapters import weaviate_adapter
++
+ pipeline = dlt.pipeline(
+     pipeline_name="movies",
+     destination="weaviate",
+     dataset_name="MoviesDataset",
+ )
+-```
+ 
+-5. Run the pipeline:
+-
+-```py
+ info = pipeline.run(
+     weaviate_adapter(
+         movies,
+@@ -85,7 +88,7 @@ info = pipeline.run(
+ )
+ ```
+ 
+-6. Check the results:
++5. Check the results:
+ 
+ ```py
+ print(info)
+@@ -100,6 +103,8 @@ Weaviate destination is different from other [dlt destinations](../destinations/
+ The `weaviate_adapter` is a helper function that configures the resource for the Weaviate destination:
+ 
+ ```py
++from dlt.destinations.adapters import weaviate_adapter
++
+ weaviate_adapter(data, vectorize, tokenization)
+ ```
+ 
+@@ -113,6 +118,8 @@ Returns: a [dlt resource](../../general-usage/resource.md) object that you can p
+ Example:
+ 
+ ```py
++from dlt.destinations.adapters import weaviate_adapter
++
+ weaviate_adapter(
+     resource,
+     vectorize=["title", "description"],
+@@ -122,6 +129,10 @@ weaviate_adapter(
+ When using the `weaviate_adapter`, it's important to apply it directly to resources, not to the whole source. Here's an example:
+ 
+ ```py
++import dlt
++from dlt.sources.sql_database import sql_database
++from dlt.destinations.adapters import weaviate_adapter
++
+ products_tables = sql_database().with_resources("products", "customers")
+ 
+ pipeline = dlt.pipeline(
+@@ -137,9 +148,7 @@ info = pipeline.run(products_tables)
+ ```
+ 
+ :::tip
+-
+-A more comprehensive pipeline would load data from some API or use one of dlt's [verified sources](../verified-sources/).
+-
++A more comprehensive pipeline would load data from [API](https://dlthub.com/workspace) or use one of dlt's [sources](../verified-sources/).
+ :::
+ 
+ ## Write disposition
+@@ -153,6 +162,8 @@ The [replace](../../general-usage/full-loading.md) disposition replaces the data
+ In the movie example from the [setup guide](#setup-guide), we can use the `replace` disposition to reload the data every time we run the pipeline:
+ 
+ ```py
++from dlt.destinations.adapters import weaviate_adapter
++
+ info = pipeline.run(
+     weaviate_adapter(
+         movies,
+@@ -168,6 +179,8 @@ The [merge](../../general-usage/incremental-loading.md) write disposition merges
+ For the `merge` disposition, you would need to specify a `primary_key` for the resource:
+ 
+ ```py
++from dlt.destinations.adapters import weaviate_adapter
++
+ info = pipeline.run(
+     weaviate_adapter(
+         movies,
+diff --git a/pyproject.toml b/pyproject.toml
+index 86e88549e..443bba53c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -128,7 +128,7 @@ athena = [
+     "botocore>=1.28",
+ ]
+ weaviate = [
+-    "weaviate-client>=3.22"
++    "weaviate-client>=3.26.7,<4.0.0"
+ ]
+ mssql = [
+     "pyodbc>=4.0.39"
+diff --git a/uv.lock b/uv.lock
+index 7c4d7552a..10d941c98 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1,5 +1,5 @@
+ version = 1
+-revision = 3
++revision = 2
+ requires-python = ">=3.9.2, <3.15"
+ resolution-markers = [
+     "python_full_version >= '3.14' and os_name == 'nt' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
+@@ -2349,7 +2349,7 @@ requires-dist = [
+     { name = "tomlkit", specifier = ">=0.11.3" },
+     { name = "typing-extensions", specifier = ">=4.8.0" },
+     { name = "tzdata", specifier = ">=2022.1" },
+-    { name = "weaviate-client", marker = "extra == 'weaviate'", specifier = ">=3.22" },
++    { name = "weaviate-client", marker = "extra == 'weaviate'", specifier = ">=3.26.7,<4.0.0" },
+     { name = "win-precise-time", marker = "python_full_version < '3.13' and os_name == 'nt'", specifier = ">=1.4.2" },
+ ]
+ provides-extras = ["gcp", "bigquery", "postgres", "redshift", "parquet", "duckdb", "ducklake", "filesystem", "s3", "gs", "az", "sftp", "http", "snowflake", "motherduck", "cli", "athena", "weaviate", "mssql", "synapse", "qdrant", "databricks", "clickhouse", "dremio", "lancedb", "deltalake", "sql-database", "sqlalchemy", "pyiceberg", "postgis", "workspace", "dbml"]
+@@ -7769,7 +7769,7 @@ wheels = [
+ 
+ [[package]]
+ name = "requests"
+-version = "2.31.0"
++version = "2.32.5"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "certifi" },
+@@ -7777,9 +7777,9 @@ dependencies = [
+     { name = "idna" },
+     { name = "urllib3" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/9d/be/10918a2eac4ae9f02f6cfe6414b7a155ccd8f7f9d4380d62fd5b955065c3/requests-2.31.0.tar.gz", hash = "sha256:942c5a758f98d790eaed1a29cb6eefc7ffb0d1cf7af05c3d2791656dbd6ad1e1", size = 110794, upload-time = "2023-05-22T15:12:44.175Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/c9/74/b3ff8e6c8446842c3f5c837e9c3dfcfe2018ea6ecef224c710c85ef728f4/requests-2.32.5.tar.gz", hash = "sha256:dbba0bac56e100853db0ea71b82b4dfd5fe2bf6d3754a8893c3af500cec7d7cf", size = 134517, upload-time = "2025-08-18T20:46:02.573Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/70/8e/0e2d847013cb52cd35b38c009bb167a1a26b2ce6cd6965bf26b47bc0bf44/requests-2.31.0-py3-none-any.whl", hash = "sha256:58cd2187c01e70e6e26505bca751777aa9f2ee0b7f4300988b709f44e013003f", size = 62574, upload-time = "2023-05-22T15:12:42.313Z" },
++    { url = "https://files.pythonhosted.org/packages/1e/db/4254e3eabe8020b458f1a747140d32277ec7a271daf1d235b70dc0b4e6e3/requests-2.32.5-py3-none-any.whl", hash = "sha256:2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6", size = 64738, upload-time = "2025-08-18T20:46:00.542Z" },
+ ]
+ 
+ [[package]]
+@@ -9185,11 +9185,11 @@ wheels = [
+ 
+ [[package]]
+ name = "validators"
+-version = "0.21.0"
++version = "0.35.0"
+ source = { registry = "https://pypi.org/simple" }
+-sdist = { url = "https://files.pythonhosted.org/packages/1f/c5/4095e7a5a6fecc2eca953ad058a3609135d833f986f84951f7e26790d651/validators-0.21.0.tar.gz", hash = "sha256:245b98ab778ed9352a7269c6a8f6c2a839bed5b2a7e3e60273ce399d247dd4b3", size = 20937, upload-time = "2023-08-11T09:16:04.446Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/53/66/a435d9ae49850b2f071f7ebd8119dd4e84872b01630d6736761e6e7fd847/validators-0.35.0.tar.gz", hash = "sha256:992d6c48a4e77c81f1b4daba10d16c3a9bb0dbb79b3a19ea847ff0928e70497a", size = 73399, upload-time = "2025-05-01T05:42:06.7Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/ad/50/18dbf2ac594234ee6249bfe3425fa424c18eeb96f29dcd47f199ed6c51bc/validators-0.21.0-py3-none-any.whl", hash = "sha256:3470db6f2384c49727ee319afa2e97aec3f8fad736faa6067e0fd7f9eaf2c551", size = 27686, upload-time = "2023-08-11T09:16:02.374Z" },
++    { url = "https://files.pythonhosted.org/packages/fa/6e/3e955517e22cbdd565f2f8b2e73d52528b14b8bcfdb04f62466b071de847/validators-0.35.0-py3-none-any.whl", hash = "sha256:e8c947097eae7892cb3d26868d637f79f47b4a0554bc6b80065dfe5aac3705dd", size = 44712, upload-time = "2025-05-01T05:42:04.203Z" },
+ ]
+ 
+ [[package]]
+@@ -9221,17 +9221,16 @@ wheels = [
+ 
+ [[package]]
+ name = "weaviate-client"
+-version = "3.23.2"
++version = "3.26.7"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "authlib" },
+     { name = "requests" },
+-    { name = "tqdm" },
+     { name = "validators" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/12/75/37624bdc90bf65df52c2e2692cad6484061495ebb6f4cd59c7e353d4e934/weaviate-client-3.23.2.tar.gz", hash = "sha256:1c8c94df032dd2fa5a4ea615fc69ccb983ffad5cc02974f78c793839e61ac150", size = 199697, upload-time = "2023-08-29T14:37:59.135Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/f8/2e/9588bae34c1d67d05ccc07d74a4f5d73cce342b916f79ab3a9114c6607bb/weaviate_client-3.26.7.tar.gz", hash = "sha256:ea538437800abc6edba21acf213accaf8a82065584ee8b914bae4a4ad4ef6b70", size = 210480, upload-time = "2024-08-15T13:27:02.431Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/a4/f7/1ce09f2b35903c451236dbb0fed10fde2bcbd48c28264730c9f5c6f5fcc9/weaviate_client-3.23.2-py3-none-any.whl", hash = "sha256:88ffc38cca07806d64726cc74bc194c7da50b222aa4e2cd129f4c1f5e53e9b61", size = 108127, upload-time = "2023-08-29T14:37:56.258Z" },
++    { url = "https://files.pythonhosted.org/packages/2a/95/fb326052bc1d73cb3c19fcfaf6ebb477f896af68de07eaa1337e27ee57fa/weaviate_client-3.26.7-py3-none-any.whl", hash = "sha256:48b8d4b71df881b4e5e15964d7ac339434338ccee73779e3af7eab698a92083b", size = 120051, upload-time = "2024-08-15T13:27:00.212Z" },
+ ]
+ 
+ [[package]]
+
+
+===== COMMIT fa06885f =====
+
+
+commit fa06885fe
+Author: Anton Burnashev
+Date: 2025-11-20
+
+    Fix DocSearch v4 styles (#3338)
+
+diff --git a/docs/website/src/css/custom.css b/docs/website/src/css/custom.css
+index ecbfe4fd4..7ae4f07ec 100644
+--- a/docs/website/src/css/custom.css
++++ b/docs/website/src/css/custom.css
+@@ -9,11 +9,20 @@
+ :root {
+   --ifm-color-primary: #4C4898;
+   --ifm-menu-color: #191937;
++  /* DocSearch v4 for light mode */
++  --docsearch-primary-color: #4C4898 !important;
+   --docsearch-searchbox-background: #191937 !important;
+-  --docsearch-text-color: #ffffff !important;
+   --docsearch-searchbox-focus-background: #191937 !important;
+-  --docsearch-highlight-color:#191937 !important;
+-  --docsearch-hit-color: #191937 !important;
++  --docsearch-text-color: #1c1e21 !important;
++  --docsearch-secondary-text-color: #5a5e9a !important;
++  --docsearch-highlight-color: #4C4898 !important;
++  --docsearch-hit-color: #444950 !important;
++  --docsearch-hit-background: #ffffff !important;
++  --docsearch-hit-highlight-color: rgba(76, 72, 152, 0.15) !important;
++  --docsearch-modal-background: #f5f6f7 !important;
++  --docsearch-subtle-color: #d6d6e7 !important;
++  --docsearch-icon-color: #5a5e9a !important;
++  --docsearch-muted-color: #969faf !important;
+   --doc-sidebar-width: 340px !important;
+ }
+ 
+@@ -39,10 +48,22 @@
+   --ifm-navbar-link-hover-color: var(--ifm-color-primary);
+   --ifm-toc-link-color:#ffffff;
+   --ifm-active-toc-link-color: var(--ifm-color-primary);
+-  --docsearch-highlight-color:#ffffff !important;
+-  --docsearch-hit-active-color: #191937 !important;
+-  --docsearch-hit-background: #191937 !important;
++  /* DocSearch v4 for dark mode */
++  --docsearch-primary-color: #C6D300 !important;
++  --docsearch-searchbox-background: #ffffff !important;
++  --docsearch-searchbox-focus-background: #ffffff !important;
++  --docsearch-text-color: #191937 !important;
++  --docsearch-secondary-text-color: #b6b7d5 !important;
++  --docsearch-highlight-color: #C6D300 !important;
+   --docsearch-hit-color: #ffffff !important;
++  --docsearch-hit-background: #191937 !important;
++  --docsearch-hit-highlight-color: rgba(198, 211, 0, 0.2) !important;
++  --docsearch-modal-background: #15172a !important;
++  --docsearch-container-background: rgba(9, 10, 17, 0.8) !important;
++  --docsearch-subtle-color: #2c2e40 !important;
++  --docsearch-icon-color: #b6b7d5 !important;
++  --docsearch-muted-color: #7f8497 !important;
++  --docsearch-footer-background: #000000a6 !important;
+   --ifm-color-primary-light: var(--ifm-color-primary);
+   --ifm-footer-background-color: #191937;
+   --ifm-color-emphasis-200: #2e2e66 !important;
+@@ -70,9 +91,15 @@
+   color: var(--ifm-menu-color-active);
+ }
+ 
++/* DocSearch v4 selected hit styling */
+ html[data-theme='dark'] .DocSearch-Hit[aria-selected=true] a {
+-background: var(--ifm-color-primary);
+-color: #191937 !important;
++  background-color: var(--docsearch-hit-highlight-color) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Hit[aria-selected=true] .DocSearch-Hit-title,
++html[data-theme='dark'] .DocSearch-Hit[aria-selected=true] .DocSearch-Hit-path,
++html[data-theme='dark'] .DocSearch-Hit[aria-selected=true] mark {
++  color: var(--docsearch-highlight-color) !important;
+ }
+ 
+ .menu {
+@@ -194,26 +221,139 @@ html[data-theme='dark'] .footer__link-item {
+ }
+ 
+ 
++/* DocSearch should match Docusaurus border radius */
++.DocSearch-Button {
++  border-radius: var(--ifm-global-radius) !important;
++}
++
+ .DocSearch-Form {
+-  border-radius: 28px !important;
++  border-radius: var(--ifm-global-radius) !important;
++}
++
++.DocSearch-Modal {
++  border-radius: var(--ifm-global-radius) !important;
++}
++
++.DocSearch-Hit a {
++  border-radius: var(--ifm-global-radius) !important;
++}
++
++/* Search box icons should be white in light mode */
++.DocSearch-Form .DocSearch-Reset svg path {
++  stroke: #ffffff !important;
+ }
+ 
++.DocSearch-Form .DocSearch-MagnifierLabel>svg {
++  color: #ffffff !important;
++}
++
++.DocSearch-Form input {
++  color: #ffffff !important;
++}
++
++/* Clear button should be light in light mode */
++.DocSearch-Clear {
++  color: rgba(255, 255, 255, 0.8) !important;
++}
++
++.DocSearch-Clear:hover {
++  color: #ffffff !important;
++}
++
++/* Fix search results input background and borders */
++input[type="search"][name="q"],
++input[type="search"][aria-label="Search"] {
++  background: #ffffff !important;
++  color: #1c1e21 !important;
++  border: 1px solid #d6d6e7 !important;
++}
++
++input[type="search"][name="q"]::placeholder,
++input[type="search"][aria-label="Search"]::placeholder {
++  color: #969faf !important;
++}
++
++/* Search results page - dark mode */
++html[data-theme='dark'] input[type="search"][name="q"],
++html[data-theme='dark'] input[type="search"][aria-label="Search"] {
++  background: #191937 !important;
++  color: #ffffff !important;
++  border: 1px solid #2c2e40 !important;
++}
+ 
+-.DocSearch-Reset svg path {
+-  stroke: #ffffff;
++html[data-theme='dark'] input[type="search"][name="q"]::placeholder,
++html[data-theme='dark'] input[type="search"][aria-label="Search"]::placeholder {
++  color: rgba(255, 255, 255, 0.6) !important;
+ }
+ 
+-.DocSearch-MagnifierLabel>svg {
+-  color: #ffffff !important
++html[data-theme='dark'] .DocSearch-Form .DocSearch-Reset svg > path {
++  stroke: #191937 !important;
+ }
+ 
+-html[data-theme='dark'] .DocSearch-Reset svg > path {
+-  stroke: #191937;
++html[data-theme='dark'] .DocSearch-Form .DocSearch-MagnifierLabel>svg {
++  color: #191937 !important;
+ }
+ 
+-html[data-theme='dark'] .DocSearch-MagnifierLabel>svg {
++html[data-theme='dark'] .DocSearch-Form input {
+   color: #191937 !important;
+ }
++
++html[data-theme='dark'] .DocSearch-Clear {
++  color: #5a5e9a !important;
++}
++
++html[data-theme='dark'] .DocSearch-Clear:hover {
++  color: #4C4898 !important;
++}
++
++html[data-theme='dark'] .DocSearch-Container {
++  background-color: var(--docsearch-container-background) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Modal {
++  background: var(--docsearch-modal-background) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Dropdown {
++  background: var(--docsearch-modal-background) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Dropdown-Container {
++  background: var(--docsearch-modal-background) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Hit-source {
++  background: var(--docsearch-modal-background) !important;
++  color: var(--docsearch-hit-color) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Hit a {
++  background: var(--docsearch-hit-background) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Hit-title {
++  color: var(--docsearch-hit-color) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Hit-path {
++  color: var(--docsearch-secondary-text-color) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Label {
++  color: var(--docsearch-hit-color) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Title {
++  color: var(--docsearch-hit-color) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Footer {
++  background: var(--docsearch-footer-background) !important;
++}
++
++html[data-theme='dark'] .DocSearch-Hit-icon {
++  color: var(--docsearch-icon-color) !important;
++}
+ .footer__item a {
+   color: #191937 !important;
+ }
+
+
+===== COMMIT 7702f5c1 =====
+
+
+commit 7702f5c17
+Author: djudjuu
+Date: 2025-11-19
+
+    override local marimo theme for dashboard (#3337)
+
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index f931d714c..9993d9b2b 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -1,3 +1,7 @@
++# /// script
++# [tool.marimo.display]
++# theme = "light"
++# ///
+ # flake8: noqa: F841
+ # mypy: disable-error-code=no-untyped-def
+ 
+
+
+===== COMMIT cffdf727 =====
+
+
+commit cffdf7279
+Author: Alena Astrakhantseva
+Date: 2025-11-18
+
+    Docs/release highlight 1.16-17 (#3213)
+
+diff --git a/docs/website/docs/release-notes/1.16.md b/docs/website/docs/release-notes/1.16.md
+new file mode 100644
+index 000000000..66d3c7c7a
+--- /dev/null
++++ b/docs/website/docs/release-notes/1.16.md
+@@ -0,0 +1,76 @@
++---
++title: "Release highlights: 1.16"
++description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
++keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
++---
++
++# Release highlights: 1.16
++
++## dlt Education now in docs
++
++Our free **[education courses](../tutorial/education)** are now part of the official documentation and can be launched directly in **Google Colab**.
++
++Try them [here](../tutorial/education)!
++
++---
++
++## Smarter timestamp handling
++
++This release brings a major cleanup and unification of how dlt handles timestamps and timezones. Both **tz-aware** and **naive** timestamps are now processed consistently across normalizers and destinations. dlt now also preserves **the exact timestamp type** when using incremental cursors, preventing subtle mismatches during reloads.
++
++It also fixes several tricky edge cases — such as **nanosecond precision** in MSSQL — and ensures that all `time` types behave as documented (always naive, in UTC). Destinations now explicitly declare which timestamp formats they support, so dlt adjusts automatically.
++
++Example:
++
++```py
++@dlt.resource(
++   name='my_table',
++   columns={
++      "my_column": {
++          "data_type": "timestamp",
++          "timezone": True}}
++)
++def my_resource():
++    ...
++
++# Output:
++# naive timestamp → UTC tz-aware
++# "2024-05-01 12:00:00" → "2024-05-01 12:00:00+00:00"
++
++# tz-aware timestamp with timezone=False → UTC converted, then naive
++# "2024-05-01 12:00:00+02:00" → "2024-05-01 10:00:00"
++```
++
++The result: predictable, precise timestamp behavior across all sources, transformations, and destinations.
++
++[Read more →](../general-usage/schema#handling-of-timestamp-and-time-zones)
++
++---
++
++## Visualization updates
++
++- New beta dashboard
++
++    The Streamlit app is now replaced by the **dlt Dashboard**. Run `dlt dashboard` to explore your pipelines with an improved interface and real-time insights. Learn more [here](../general-usage/dashboard).
++
++    ![dashboard-overview.png](https://storage.googleapis.com/dlt-blog-images/release-highlights/dashboard-overview.png)
++
++- Export schema graphs with `dlt.Schema.to_dot()`. More about schema export [here](../general-usage/dataset-access/view-dlt-schema#export-to-graphviz).
++
++    ![477615341-202f1937-8697-4bc9-acf1-e7b6ac7e9970.png](https://storage.googleapis.com/dlt-blog-images/release-highlights/477615341-202f1937-8697-4bc9-acf1-e7b6ac7e9970.png)
++
++---
++
++## Shout-out to new contributors
++
++Big thanks to our newest contributors:
++
++* [@Jinso-o](https://github.com/Jinso-o) — [#2986](https://github.com/dlt-hub/dlt/pull/2986)
++* [@tpulmano](https://github.com/tpulmano) — [#2978](https://github.com/dlt-hub/dlt/pull/2978)
++
++---
++
++**Full release notes**
++
++[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
++
+diff --git a/docs/website/docs/release-notes/1.17.md b/docs/website/docs/release-notes/1.17.md
+new file mode 100644
+index 000000000..9f86a2b52
+--- /dev/null
++++ b/docs/website/docs/release-notes/1.17.md
+@@ -0,0 +1,175 @@
++---
++title: "Release highlights: 1.17"
++description:  Release highlights provide a concise overview of the most important new features, improvements, and fixes in a software update, helping users quickly understand what's changed and how it impacts their workflow.
++keywords: [dlt, data-pipelines, etl, release-notes, data-engineering]
++---
++
++# Release highlights: 1.17
++
++## New: DuckLake destination
++
++You can now use the **DuckLake** destination — supporting all bucket and catalog combinations. It’s a great fit for lightweight data lakes and local development setups.
++
++[Read the docs →](../dlt-ecosystem/destinations/ducklake)
++
++---
++
++## Custom metrics in pipelines
++
++You can now **collect custom metrics** directly inside your resources and transform steps. This makes it easy to track things like page counts, skipped rows, or API calls — right where the data is extracted.
++
++Use `dlt.current.resource_metrics()` to store custom values while your resource runs. These metrics are automatically merged into the pipeline trace and visible in the run summary.
++
++Example:
++
++```py
++import dlt
++from dlt.sources.helpers.rest_client import RESTClient
++from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
++
++client = RESTClient(
++    base_url="https://pokeapi.co/api/v2",
++    paginator=JSONLinkPaginator(next_url_path="next"),
++    data_selector="results",
++)
++
++@dlt.resource
++def get_pokemons():
++    metrics = dlt.current.resource_metrics()
++    metrics["page_count"] = 0
++    for page in client.paginate("/pokemon", params={"limit": 100}):
++        metrics["page_count"] += 1
++        yield page
++
++pipeline = dlt.pipeline("get_pokemons", destination="duckdb")
++load_info = pipeline.run(get_pokemons)
++print("Custom metrics:", pipeline.last_trace.last_extract_info.metrics)
++```
++
++Custom metrics are grouped together with performance and transform stats under `resource_metrics`, so you can view them easily in traces or dashboards.
++
++[Read more →](../general-usage/resource#collect-custom-metrics)
++
++---
++
++## Limit your data loads for testing
++
++When working with large datasets, you can now **limit how much data a resource loads** using the upgraded `add_limit` method. This is perfect for sampling a few records to preview your data or test transformations faster.
++
++Example:
++
++```py
++import itertools
++import dlt
++
++# Load only the first 10 items from an infinite stream
++r = dlt.resource(itertools.count(), name="infinity").add_limit(10)
++```
++
++You can also:
++
++- Count **rows** instead of yields:
++
++    ```py
++    my_resource().add_limit(10, count_rows=True)
++    ```
++
++- Or stop extraction after a **specific time in seconds**:
++
++    ```py
++    my_resource().add_limit(max_time=10)
++    ```
++
++It’s a simple but powerful way to test pipelines quickly without pulling millions of rows.
++
++[Read more about `add_limit` →](../general-usage/resource#sample-from-large-data)
++
++---
++
++## Incremental loading for filesystem
++
++You can now use **incremental loading** with the `filesystem` source even easier — ideal for tracking updated or newly added files in S3 or local folders.
++dlt detects file changes (using fields like `modification_date`) and loads only what’s new.
++
++Example:
++
++```py
++import dlt
++from dlt.sources.filesystem import filesystem, read_parquet
++
++filesystem_resource = filesystem(
++    bucket_url="s3://my-bucket/files",
++    file_glob="**/*.parquet",
++    incremental=dlt.sources.incremental("modification_date")
++)
++pipeline = dlt.pipeline("my_pipeline", destination="duckdb")
++pipeline.run((filesystem_resource | read_parquet()).with_name("table_name"))
++```
++
++You can also **split large incremental loads** into smaller chunks:
++
++- **Partition loading** – divide your files into ranges and load each independently (even in parallel).
++- **Split loading** – process files sequentially in small batches using `row_order`, `files_per_page`, or `add_limit()`.
++
++This makes it easy to backfill large file collections efficiently and resume incremental updates without reloading everything.
++
++[Learn more →](../dlt-ecosystem/verified-sources/filesystem/basic#5-incremental-loading)
++
++---
++
++## Split and partition large SQL loads
++
++When working with huge tables, you can now **split incremental loads into smaller chunks** or **partition backfills** into defined ranges.
++This makes data appear faster and allows you to retry only failed chunks instead of reloading everything.
++
++**Split loading**
++
++If your source returns data in a deterministic order (for example, ordered by `created_at`), you can combine `incremental` with `add_limit()` to process batches sequentially:
++
++```py
++import dlt
++from dlt.sources.sql_database import sql_table
++
++pipeline = dlt.pipeline("split_load", destination="duckdb")
++
++messages = sql_table(
++    table="chat_message",
++    incremental=dlt.sources.incremental(
++        "created_at",
++        row_order="asc",  # required for split loading
++        range_start="open"  # disables deduplication
++    ),
++)
++
++# Load one-minute chunks until done
++while not pipeline.run(messages.add_limit(max_time=60)).is_empty:
++    pass
++
++```
++
++**Partitioned backfills**
++
++You can also load large datasets in **parallel partitions** using `initial_value` and `end_value`. Each range runs independently, helping you rebuild large tables safely and efficiently.
++
++Together, these methods make incremental loading more flexible and robust for both testing and production-scale pipelines.
++
++[Read more →](../dlt-ecosystem/verified-sources/sql_database/advanced#split-or-partition-long-incremental-loads)
++
++---
++
++## Shout-out to new contributors
++
++Big thanks to our newest contributors:
++
++* [@rik-adegeest](https://github.com/rik-adegeest) — [#3070](https://github.com/dlt-hub/dlt/pull/3070)
++* [@AndreiBondarenko](https://github.com/AndreiBondarenko) — [#3086](https://github.com/dlt-hub/dlt/pull/3086)
++* [@alkaline-0](https://github.com/alkaline-0) — [#3096](https://github.com/dlt-hub/dlt/pull/3096)
++* [@ianedmundson1](https://github.com/ianedmundson1) — [#3043](https://github.com/dlt-hub/dlt/pull/3043)
++* [@chulkilee](https://github.com/chulkilee) — [#3120](https://github.com/dlt-hub/dlt/pull/3120)
++
++---
++
++**Full release notes**
++
++[View the complete list of changes →](https://github.com/dlt-hub/dlt/releases)
++
+diff --git a/docs/website/docusaurus.config.js b/docs/website/docusaurus.config.js
+index a37bf196d..30e99ad54 100644
+--- a/docs/website/docusaurus.config.js
++++ b/docs/website/docusaurus.config.js
+@@ -126,6 +126,7 @@ const config = {
+             type: 'docsVersionDropdown',
+           },
+           { to: 'https://dlthub.com/blog', label: 'Blog', position: 'left' },
++          { to: 'https://dlthub.com/docs/release-highlights', label: "What's new?", position: 'left' },
+           {
+             href: 'https://dlthub.com/community',
+             label: 'Join community',
+diff --git a/docs/website/sidebars.js b/docs/website/sidebars.js
+index 6ed6fed4f..99eb83dee 100644
+--- a/docs/website/sidebars.js
++++ b/docs/website/sidebars.js
+@@ -67,9 +67,11 @@ const sidebars = {
+         keywords: ['release notes, release highlights'],
+       },
+       items: [
+-        'release-notes/1.12.1',
++        'release-notes/1.17',
++        'release-notes/1.16',
++        'release-notes/1.15',
+         'release-notes/1.13-1.14',
+-        'release-notes/1.15'
++        'release-notes/1.12.1',
+       ]
+     },
+     {
+
+
+===== COMMIT 7b6f8c4e =====
+
+
+commit 7b6f8c4eb
+Author: Taha Muzammil
+Date: 2025-11-14
+
+    fix: minor typos and redundant variable (#3314)
+
+diff --git a/dlt/helpers/ibis.py b/dlt/helpers/ibis.py
+index e2806f7ea..6431724fc 100644
+--- a/dlt/helpers/ibis.py
++++ b/dlt/helpers/ibis.py
+@@ -83,7 +83,7 @@ def create_ibis_backend(
+             # also prevents empty duckdb files from being created
+             client.sql_client.use_dataset()
+         except Exception:
+-            # close explicitly, wont be done by the conn pool
++            # close explicitly, won't be done by the conn pool
+             client.sql_client.close_connection()
+             raise
+         con = ibis.duckdb.from_connection(conn)
+diff --git a/dlt/pipeline/trace.py b/dlt/pipeline/trace.py
+index 76bef6817..77b6293ea 100644
+--- a/dlt/pipeline/trace.py
++++ b/dlt/pipeline/trace.py
+@@ -257,7 +257,6 @@ def end_trace_step(
+             step_exception += "caused by: " + str(step_info.__context__)
+         step_info = None
+     else:
+-        step_info = step_info
+         exception_traces = None
+         step_exception = None
+ 
+diff --git a/tests/helpers/test_dbml.py b/tests/helpers/test_dbml.py
+index 820dbd2f4..062b8501b 100644
+--- a/tests/helpers/test_dbml.py
++++ b/tests/helpers/test_dbml.py
+@@ -279,7 +279,7 @@ def assert_equal_dbml_columns(col1: Column, col2: Column) -> None:
+     assert col1.comment == col2.comment
+     assert col1.default == col2.default
+     assert col1.properties == col2.properties
+-    # we dont't compare `.table` because of circular references
++    # we don't compare `.table` because of circular references
+     # between PyDBML `Column` and `Table` objects.
+     # assert col1.table == col2.table
+ 
+diff --git a/tests/load/test_read_interfaces.py b/tests/load/test_read_interfaces.py
+index fc0deecff..7630fc270 100644
+--- a/tests/load/test_read_interfaces.py
++++ b/tests/load/test_read_interfaces.py
+@@ -1128,7 +1128,7 @@ def test_ibis_expression_relation(populated_pipeline: Pipeline) -> None:
+     )
+ 
+     # selecting all columns (star schema expanded, columns aliased)
+-    # TODO: fixe tests
++    # TODO: fix tests
+     assert sql_from_expr(items_table) == (
+         (
+             'SELECT "items"."id" AS "id", "items"."decimal" AS "decimal", "items"."other_decimal"'
+
+
+===== COMMIT e7e54b2c =====
+
+
+commit e7e54b2cd
+Author: anuunchin
+Date: 2025-11-14
+
+    Feat: last pipeline run section in dashboard (#3250)
+
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+index 0e3b602f0..f931d714c 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard.py
+@@ -103,6 +103,9 @@ def home(
+     else:
+         _buttons: List[Any] = []
+         _buttons.append(dlt_refresh_button)
++        _pipeline_execution_exception: List[Any] = []
++        _pipeline_execution_summary: mo.Html = None
++        _last_load_packages_info: mo.Html = None
+         if dlt_pipeline:
+             _buttons.append(
+                 mo.ui.button(
+@@ -110,13 +113,22 @@ def home(
+                     on_click=lambda _: utils.open_local_folder(dlt_pipeline.working_dir),
+                 )
+             )
+-        if dlt_pipeline and (local_dir := utils.get_local_data_path(dlt_pipeline)):
+-            _buttons.append(
+-                mo.ui.button(
+-                    label="<small>Open local data location</small>",
+-                    on_click=lambda _: utils.open_local_folder(local_dir),
++            if local_dir := utils.get_local_data_path(dlt_pipeline):
++                _buttons.append(
++                    mo.ui.button(
++                        label="<small>Open local data location</small>",
++                        on_click=lambda _: utils.open_local_folder(local_dir),
++                    )
+                 )
+-            )
++            if trace := dlt_pipeline.last_trace:
++                _pipeline_execution_summary = utils.build_pipeline_execution_visualization(trace)
++                _last_load_packages_info = mo.vstack(
++                    [
++                        mo.md(f"<small>{strings.view_load_packages_text}</small>"),
++                        utils.load_package_status_labels(trace),
++                    ]
++                )
++            _pipeline_execution_exception = utils.build_exception_section(dlt_pipeline)
+         _stack = [
+             mo.vstack(
+                 [
+@@ -182,10 +194,16 @@ def home(
+                         ],
+                         justify="space-between",
+                     ),
+-                    mo.hstack(_buttons, justify="start"),
+                 ]
+-            )
++            ),
++            mo.hstack(_buttons, justify="start"),
+         ]
++        if _pipeline_execution_summary:
++            _stack.append(_pipeline_execution_summary)
++        if _last_load_packages_info:
++            _stack.append(_last_load_packages_info)
++        if _pipeline_execution_exception:
++            _stack.extend(_pipeline_execution_exception)
+         if not dlt_pipeline and dlt_pipeline_name:
+             _stack.append(
+                 mo.callout(
+@@ -195,7 +213,6 @@ def home(
+                     kind="warn",
+                 )
+             )
+-
+     mo.vstack(_stack)
+     return (dlt_pipeline,)
+ 
+@@ -221,8 +238,6 @@ def section_overview(
+     )
+ 
+     if dlt_pipeline and dlt_section_overview_switch.value:
+-        if _exception_section := utils.build_exception_section(dlt_pipeline):
+-            _result.extend(_exception_section)
+         _result += [
+             mo.ui.table(
+                 utils.pipeline_details(dlt_config, dlt_pipeline, dlt_pipelines_dir),
+diff --git a/dlt/_workspace/helpers/dashboard/dlt_dashboard_styles.css b/dlt/_workspace/helpers/dashboard/dlt_dashboard_styles.css
+index 3566c631c..c59fce87d 100644
+--- a/dlt/_workspace/helpers/dashboard/dlt_dashboard_styles.css
++++ b/dlt/_workspace/helpers/dashboard/dlt_dashboard_styles.css
+@@ -7,12 +7,22 @@
+   --dlt-color-lime: #c6d300;
+   --dlt-color-aqua: #59c1d5;
+   --dlt-color-purple: #191937;
++  --dlt-color-pink: #EE746D;
+ 
+   /* background colors */
+   --dlt-color-lime-background: #c6d30006;
+   --dlt-color-aqua-background: #59c1d503;
+   --dlt-color-purple-background: #19193706;
+ 
++  /* badge colors */
++  --grey-bg: #E0E0E0;
++  --grey-text: #555555;
++  --yellow-bg: #F2D6A2;
++  --yellow-text: #AD7F37;
++  --green-bg: #a8e4ac;
++  --green-text: #468A47;
++  --red-bg: #D47672;
++  --red-text: #FBE8E8;
+ }
+ 
+ /* Make headings bold */
+@@ -87,8 +97,82 @@
+   margin-top: 0.5rem;
+ }
+ 
+-
+ marimo-callout-output .border {
+   margin-top: 0.5rem;
+   margin-bottom: 0.5rem;
++}
++
++/* Pipeline execution visualization styles */
++.pipeline-execution-container {
++  padding-top: 16px;
++  padding-bottom: 10px;
++}
++
++.pipeline-execution-layout {
++  display: flex;
++  flex-direction: row;
++  justify-content: space-between;
++  align-items: center;
++  gap: 16px;
++}
++
++.pipeline-execution-info {
++  display: flex;
++  flex-direction: column;
++}
++
++.pipeline-execution-timeline {
++  display: flex;
++  flex-direction: column;
++  justify-content: space-between;
++  flex: 0 0 40%;
++}
++
++.pipeline-execution-timeline-bar {
++  display: flex;
++  flex-direction: row;
++  justify-content: center;
++  height: 16px;
++}
++
++/* Note: .pipeline-execution-timeline-segment uses inline styles for dynamic width, color, and border-radius */
++
++.pipeline-execution-labels {
++  display: flex;
++  flex-direction: row;
++  justify-content: space-between;
++}
++
++.pipeline-execution-badges {
++  display: flex;
++  flex-direction: row;
++  justify-content: space-between;
++  gap: 16px;
++}
++
++/* Status badge styles */
++.status-badge {
++  padding: 6px 16px;
++  border-radius: 6px;
++  display: inline-block;
++}
++
++.status-badge-yellow {
++  background-color: var(--yellow-bg);
++  color: var(--yellow-text);
++}
++
++.status-badge-green {
++  background-color: var(--green-bg);
++  color: var(--green-text);
++}
++
++.status-badge-red {
++  background-color: var(--red-bg);
++  color: var(--red-text);
++}
++
++.status-badge-grey {
++  background-color: var(--grey-bg);
++  color: var(--grey-text);
+ }
+\ No newline at end of file
+diff --git a/dlt/_workspace/helpers/dashboard/strings.py b/dlt/_workspace/helpers/dashboard/strings.py
+index 8056bf8d6..02524f262 100644
+--- a/dlt/_workspace/helpers/dashboard/strings.py
++++ b/dlt/_workspace/helpers/dashboard/strings.py
+@@ -90,6 +90,9 @@ app_title_pipeline = """
+ ## Pipeline `{}`
+ """
+ 
++view_load_packages_text = "Status of load packages from last execution"
++
++
+ #
+ # Overview section
+ #
+diff --git a/dlt/_workspace/helpers/dashboard/utils.py b/dlt/_workspace/helpers/dashboard/utils.py
+index 1c72915a2..dd4754efa 100644
+--- a/dlt/_workspace/helpers/dashboard/utils.py
++++ b/dlt/_workspace/helpers/dashboard/utils.py
+@@ -2,7 +2,23 @@ import shutil
+ import functools
+ from itertools import chain
+ from pathlib import Path
+-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union, cast
++from this import d
++from typing import (
++    Any,
++    Dict,
++    Iterable,
++    List,
++    Mapping,
++    Optional,
++    Set,
++    Tuple,
++    Union,
++    cast,
++    Literal,
++    NamedTuple,
++    get_args,
++)
++from typing_extensions import TypeAlias
+ import os
+ import platform
+ import subprocess
+@@ -13,21 +29,21 @@ import marimo as mo
+ import pyarrow
+ import traceback
+ 
+-
+ from dlt.common.configuration import resolve_configuration
+ from dlt.common.configuration.specs import known_sections
+ from dlt.common.destination.client import WithStateSync
+ from dlt.common.json import json
+ from dlt.common.pendulum import pendulum
+-from dlt.common.pipeline import get_dlt_pipelines_dir
++from dlt.common.pipeline import get_dlt_pipelines_dir, LoadInfo
+ from dlt.common.schema import Schema
+ from dlt.common.schema.typing import TTableSchema
+-from dlt.common.storages import FileStorage
++from dlt.common.storages import FileStorage, LoadPackageInfo
++from dlt.common.storages.load_package import PackageStorage, TLoadPackageStatus
+ from dlt.common.destination.client import DestinationClientConfiguration
+ from dlt.common.destination.exceptions import SqlClientNotAvailable
+ from dlt.common.storages.configuration import WithLocalFiles
+ from dlt.common.configuration.exceptions import ConfigFieldMissingException
+-from dlt.common.typing import DictStrAny
++from dlt.common.typing import DictStrAny, TypedDict
+ from dlt.common.utils import map_nested_keys_in_place
+ 
+ from dlt._workspace.helpers.dashboard import ui_elements as ui
+@@ -35,8 +51,7 @@ from dlt._workspace.helpers.dashboard.config import DashboardConfiguration
+ from dlt.destinations.exceptions import DatabaseUndefinedRelation, DestinationUndefinedEntity
+ from dlt.pipeline.exceptions import PipelineConfigMissing
+ from dlt.pipeline.exceptions import CannotRestorePipelineException
+-from dlt.pipeline.trace import PipelineTrace
+-
++from dlt.pipeline.trace import PipelineTrace, PipelineStepTrace
+ 
+ PICKLE_TRACE_FILE = "trace.pickle"
+ 
+@@ -695,10 +710,13 @@ def build_exception_section(p: dlt.Pipeline) -> List[Any]:
+     if not exception_step:
+         return []
+ 
++    last_exception = exception_step.exception_traces[-1]
++    title = f"{last_exception['exception_type']}: {last_exception['message']}"
++
+     _result = []
+     _result.append(
+         ui.build_title_and_subtitle(
+-            f"Exception encountered during last pipeline run in step '{step.step}'",
++            title,
+             title_level=2,
+         )
+     )
+@@ -809,3 +827,249 @@ def _humanize_datetime_values(c: DashboardConfiguration, d: Dict[str, Any]) -> D
+ def _dict_to_table_items(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+     """Convert a dict to a list of dicts with name and value keys"""
+     return [{"name": k, "value": v} for k, v in d.items()]
++
++
++#
++# last pipeline execution helpers
++#
++
++TPipelineRunStatus: TypeAlias = Literal["succeeded", "failed"]
++TVisualPipelineStep: TypeAlias = Literal["extract", "normalize", "load"]
++VISUAL_PIPELINE_STEPS: List[TVisualPipelineStep] = ["extract", "normalize", "load"]
++
++PIPELINE_RUN_STEP_COLORS: Dict[TVisualPipelineStep, str] = {
++    "extract": "var(--dlt-color-lime)",
++    "normalize": "var(--dlt-color-aqua)",
++    "load": "var(--dlt-color-pink)",
++}
++
++
++class PipelineStepData(NamedTuple):
++    step: TVisualPipelineStep
++    duration_ms: float
++    failed: bool
++
++
++def _format_duration(ms: float) -> str:
++    """Format duration as human-readable string"""
++    if ms < 1000:
++        return f"{int(ms)}ms"
++    elif ms < 60000:
++        return f"{round(ms / 100) / 10}s"
++    else:
++        return f"{round(ms / 6000) / 10}"
++
++
++def _build_migration_badge(count: int) -> str:
++    """Build migration badge HTML using CSS classes"""
++    if count == 0:
++        return ""
++    return (
++        '<div class="status-badge status-badge-yellow">'
++        f"<strong>{count} dataset migration(s)</strong>"
++        "</div>"
++    )
++
++
++def _build_status_badge(status: TPipelineRunStatus) -> str:
++    """Build status badge HTML using CSS classes"""
++    badge_class = "status-badge-green" if status == "succeeded" else "status-badge-red"
++    return f'<div class="status-badge {badge_class}"><strong>{status}</strong></div>'
++
++
++def _build_pipeline_execution_html(
++    transaction_id: str,
++    status: TPipelineRunStatus,
++    steps_data: List[PipelineStepData],
++    migrations_count: int = 0,
++) -> mo.Html:
++    """
++    Build an HTML visualization for a pipeline execution using CSS classes
++    """
++    total_ms = sum(step.duration_ms for step in steps_data)
++    last = len(steps_data) - 1
++
++    # Build the general info of the execution
++    general_info = f"""
++    <div>Last execution ID: <strong>{transaction_id[:8]}</strong></div>
++    <div>Total time: <strong>{_format_duration(total_ms)}</strong></div>
++    """
++
++    # Build the pipeline execution timeline bar and labels
++    segments, labels = [], []
++    for i, step in enumerate(steps_data):
++        percentage = step.duration_ms / total_ms * 100
++        color = PIPELINE_RUN_STEP_COLORS.get(step.step)
++        radius = (
++            "6px"
++            if i == 0 and i == last
++            else "6px 0 0 6px" if i == 0 else "0 6px 6px 0" if i == last else "0"
++        )
++        segments.append(
++            '<div class="pipeline-execution-timeline-segment" '
++            f'style="width:{percentage}%;background-color:{color};border-radius:{radius};"></div>'
++        )
++        labels.append(
++            f'<span><span style="color:{color};">●</span> '
++            f"{step.step.capitalize()} {_format_duration(step.duration_ms)}</span>"
++        )
++
++    # Build the whole html using CSS classes
++    html = f"""
++    <div class="pipeline-execution-container">
++        <!-- Main 3-column flex container -->
++        <div class="pipeline-execution-layout">
++
++            <!-- LEFT COLUMN: Run ID, Total time -->
++            <div class="pipeline-execution-info">
++                {general_info}
++            </div>
++
++            <!-- CENTER COLUMN: Timeline bar and legend -->
++            <div class="pipeline-execution-timeline">
++                <div class="pipeline-execution-timeline-bar">
++                    {''.join(segments)}
++                </div>
++                <div class="pipeline-execution-labels">
++                    {''.join(labels)}
++                </div>
++            </div>
++
++            <!-- RIGHT COLUMN: Status badges -->
++            <div class="pipeline-execution-badges">
++                {_build_migration_badge(migrations_count)}
++                {_build_status_badge(status)}
++            </div>
++        </div>
++    </div>
++    """
++    return mo.Html(html)
++
++
++def _get_steps_data_and_status(
++    trace_steps: List[PipelineStepTrace],
++) -> Tuple[List[PipelineStepData], TPipelineRunStatus]:
++    """Gets trace steps data and the status of the corresponding pipeline execution"""
++    steps_data: List[PipelineStepData] = []
++
++    for step in trace_steps:
++        if step.step not in get_args(TVisualPipelineStep):
++            continue
++
++        if not step.finished_at:
++            continue
++
++        duration_ms = (step.finished_at - step.started_at).total_seconds() * 1000
++
++        steps_data.append(
++            PipelineStepData(
++                step=cast(TVisualPipelineStep, step.step),
++                duration_ms=duration_ms,
++                failed=step.step_exception is not None,
++            )
++        )
++    is_failed = any(s.failed for s in steps_data)
++    status: TPipelineRunStatus = "failed" if is_failed else "succeeded"
++    return steps_data, status
++
++
++def _get_migrations_count(last_load_info: LoadInfo) -> int:
++    """Counts the number of unique migrations (schema versions) from load packages"""
++    migrations_count: int = 0
++    seen_schema_hashes = set()
++    for package in last_load_info.load_packages:
++        # Only count if there are schema updates
++        if len(package.schema_update) > 0:
++            if package.schema_hash not in seen_schema_hashes:
++                migrations_count += 1
++                seen_schema_hashes.add(package.schema_hash)
++    return migrations_count
++
++
++def build_pipeline_execution_visualization(trace: PipelineTrace) -> Optional[mo.Html]:
++    """Creates a visual timeline of pipeline run showing extract, normalize and load steps"""
++
++    steps_data, status = _get_steps_data_and_status(trace.steps)
++    migrations_count = _get_migrations_count(trace.last_load_info) if trace.last_load_info else 0
++
++    return _build_pipeline_execution_html(
++        trace.transaction_id,
++        status,
++        steps_data,
++        migrations_count,
++    )
++
++
++#
++# last pipeline executions load packages helpers
++#
++
++
++PENDING_LOAD_STATUSES: Dict[TLoadPackageStatus, str] = {
++    "extracted": "pending to normalize",
++    "normalized": "pending to load",
++}
++
++LOAD_PACKAGE_STATUS_COLORS: Dict[TLoadPackageStatus, str] = {
++    "new": "grey",
++    "extracted": "yellow",
++    "normalized": "yellow",
++    "loaded": "green",
++    "aborted": "red",
++}
++
++
++def _collect_load_packages_from_trace(
++    trace: PipelineTrace,
++) -> List[LoadPackageInfo]:
++    """Collect all unique load packages from all steps."""
++    packages_by_load_id: Dict[str, LoadPackageInfo] = {}
++
++    for step in trace.steps:
++        if step.step in VISUAL_PIPELINE_STEPS and step.step_info and step.step_info.load_packages:
++            for package in step.step_info.load_packages:
++                packages_by_load_id[package.load_id] = package
++
++    return list(packages_by_load_id.values())
++
++
++def load_package_status_labels(trace: PipelineTrace) -> mo.ui.table:
++    """
++    For each package in the trace, determine its visual status badge based on
++    whether the package is partially loaded, pending (extracted or normalized),
++    or in a final state (loaded, aborted, etc.). Returns a marimo table
++    containing the load id and a badge representing its status.
++    """
++    packages = _collect_load_packages_from_trace(trace)
++    result: List[Dict[str, Any]] = []
++
++    for package in packages:
++        is_partial = PackageStorage.is_package_partially_loaded(package)
++        badge_color_key = "red" if is_partial else LOAD_PACKAGE_STATUS_COLORS.get(package.state)
++        if is_partial:
++            badge_text = f"partially {package.state}"
++        elif package.state in PENDING_LOAD_STATUSES:
++            badge_text = PENDING_LOAD_STATUSES.get(package.state)
++        elif package.state == "new":
++            badge_text = "discarded"
++        else:
++            badge_text = package.state
++
++        status_html = (
++            '<div class="status-badge'
++            f' status-badge-{badge_color_key}"><strong>{badge_text}</strong></div>'
++        )
++        result.append(
++            {
++                "load_id": package.load_id,
++                "status": mo.Html(status_html),
++            }
++        )
++
++    return mo.ui.table(
++        result,
++        selection=None,
++        pagination=True,
++        show_download=False,
++        style_cell=style_cell,
++    )
+diff --git a/tests/e2e/helpers/dashboard/test_e2e.py b/tests/e2e/helpers/dashboard/test_e2e.py
+index b3f697e5a..cb4ef2fa6 100644
+--- a/tests/e2e/helpers/dashboard/test_e2e.py
++++ b/tests/e2e/helpers/dashboard/test_e2e.py
+@@ -78,13 +78,11 @@ def test_page_overview(page: Page):
+ def test_exception_pipeline(page: Page, failed_pipeline: Any):
+     _go_home(page)
+     page.get_by_role("link", name="failed_pipeline").click()
++    expect(page.get_by_text("AssertionError: I am broken").nth(0)).to_be_visible()
+ 
+     # overview page
+     _open_section(page, "overview")
+     expect(page.get_by_text(_normpath("_storage/.dlt/pipelines/failed_pipeline"))).to_be_visible()
+-    expect(
+-        page.get_by_text("Exception encountered during last pipeline run in step").nth(0)
+-    ).to_be_visible()
+ 
+     _open_section(page, "schema")
+     expect(page.get_by_text(app_strings.schema_no_default_available_text[0:20])).to_be_visible()
+@@ -98,9 +96,7 @@ def test_exception_pipeline(page: Page, failed_pipeline: Any):
+ 
+     _open_section(page, "trace")
+     expect(page.get_by_text(app_strings.trace_subtitle)).to_be_visible()
+-    expect(
+-        page.get_by_text("Exception encountered during last pipeline run in step").nth(0)
+-    ).to_be_visible()
++    expect(page.get_by_text("AssertionError: I am broken").nth(0)).to_be_visible()
+ 
+     # loads page
+     _open_section(page, "loads")
+@@ -116,6 +112,7 @@ def test_multi_schema_selection(page: Page, multi_schema_pipeline: Any):
+ 
+     _open_section(page, "schema")
+     page.get_by_text("Show raw schema as yaml").click()
++
+     expect(page.get_by_text("name: fruitshop_customers").nth(1)).to_be_attached()
+ 
+     # select each schema and see if the right tables are shown
+@@ -123,7 +120,7 @@ def test_multi_schema_selection(page: Page, multi_schema_pipeline: Any):
+     for section in ["schema", "data"]:
+         _open_section(page, section)  # type: ignore[arg-type]
+ 
+-        schema_selector = page.get_by_role("combobox")
++        schema_selector = page.get_by_test_id("marimo-plugin-dropdown")
+         schema_selector.select_option("fruitshop_customers")
+         expect(page.get_by_text("customers", exact=True).nth(0)).to_be_visible()
+         expect(page.get_by_text("inventory", exact=True)).to_have_count(0)
+diff --git a/tests/workspace/helpers/dashboard/conftest.py b/tests/workspace/helpers/dashboard/conftest.py
+index a819bd92a..d97add585 100644
+--- a/tests/workspace/helpers/dashboard/conftest.py
++++ b/tests/workspace/helpers/dashboard/conftest.py
+@@ -5,6 +5,7 @@ from tests.workspace.helpers.dashboard.example_pipelines import (
+     create_success_pipeline_duckdb,
+     create_success_pipeline_filesystem,
+     create_extract_exception_pipeline,
++    create_normalize_exception_pipeline,
+     create_never_ran_pipeline,
+     create_load_exception_pipeline,
+     create_no_destination_pipeline,
+@@ -43,6 +44,13 @@ def extract_exception_pipeline():
+         yield create_extract_exception_pipeline(temp_dir)
+ 
+ 
++@pytest.fixture(scope="session")
++def normalize_exception_pipeline():
++    """Fixture that creates a normalize exception pipeline"""
++    with tempfile.TemporaryDirectory() as temp_dir:
++        yield create_normalize_exception_pipeline(temp_dir)
++
++
+ @pytest.fixture(scope="session")
+ def never_ran_pipline():
+     with tempfile.TemporaryDirectory() as temp_dir:
+diff --git a/tests/workspace/helpers/dashboard/example_pipelines.py b/tests/workspace/helpers/dashboard/example_pipelines.py
+index 4074c027d..ec52a01e3 100644
+--- a/tests/workspace/helpers/dashboard/example_pipelines.py
++++ b/tests/workspace/helpers/dashboard/example_pipelines.py
+@@ -18,6 +18,7 @@ import tempfile
+ SUCCESS_PIPELINE_DUCKDB = "success_pipeline_duckdb"
+ SUCCESS_PIPELINE_FILESYSTEM = "success_pipeline_filesystem"
+ EXTRACT_EXCEPTION_PIPELINE = "extract_exception_pipeline"
++NORMALIZE_EXCEPTION_PIPELINE = "normalize_exception_pipeline"
+ NEVER_RAN_PIPELINE = "never_ran_pipline"
+ LOAD_EXCEPTION_PIPELINE = "load_exception_pipeline"
+ NO_DESTINATION_PIPELINE = "no_destination_pipeline"
+@@ -25,13 +26,18 @@ NO_DESTINATION_PIPELINE = "no_destination_pipeline"
+ ALL_PIPELINES = [
+     SUCCESS_PIPELINE_DUCKDB,
+     EXTRACT_EXCEPTION_PIPELINE,
++    NORMALIZE_EXCEPTION_PIPELINE,
+     NEVER_RAN_PIPELINE,
+     LOAD_EXCEPTION_PIPELINE,
+     NO_DESTINATION_PIPELINE,
+     SUCCESS_PIPELINE_FILESYSTEM,
+ ]
+ 
+-PIPELINES_WITH_EXCEPTIONS = [EXTRACT_EXCEPTION_PIPELINE, LOAD_EXCEPTION_PIPELINE]
++PIPELINES_WITH_EXCEPTIONS = [
++    EXTRACT_EXCEPTION_PIPELINE,
++    NORMALIZE_EXCEPTION_PIPELINE,
++    LOAD_EXCEPTION_PIPELINE,
++]
+ PIPELINES_WITH_LOAD = [SUCCESS_PIPELINE_DUCKDB, SUCCESS_PIPELINE_FILESYSTEM]
+ 
+ 
+@@ -142,6 +148,33 @@ def create_extract_exception_pipeline(pipelines_dir: str = None):
+     return pipeline
+ 
+ 
++def create_normalize_exception_pipeline(pipelines_dir: str = None):
++    """Create a test pipeline with duckdb destination, raises an exception in the normalize step"""
++    import duckdb
++
++    pipeline = dlt.pipeline(
++        pipeline_name=NORMALIZE_EXCEPTION_PIPELINE,
++        pipelines_dir=pipelines_dir,
++        destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
++    )
++
++    @dlt.resource
++    def data_with_type_conflict():
++        # First yield double, then string for same column - causes normalize failure with strict schema contract
++        yield [{"id": 1, "value": 123.4}]
++        yield [{"id": 2, "value": "string"}]
++
++    with pytest.raises(Exception):
++        pipeline.run(
++            data_with_type_conflict(),
++            schema=dlt.Schema("fruitshop"),
++            table_name="items",
++            schema_contract={"data_type": "freeze"},  # Strict mode - fail on type conflicts
++        )
++
++    return pipeline
++
++
+ def create_never_ran_pipeline(pipelines_dir: str = None):
+     """Create a test pipeline with duckdb destination which never was run"""
+     import duckdb
+@@ -192,6 +225,7 @@ if __name__ == "__main__":
+     create_success_pipeline_duckdb()
+     create_success_pipeline_filesystem()
+     create_extract_exception_pipeline()
++    create_normalize_exception_pipeline()
+     create_never_ran_pipeline()
+     create_load_exception_pipeline()
+     create_no_destination_pipeline()
+diff --git a/tests/workspace/helpers/dashboard/test_utils.py b/tests/workspace/helpers/dashboard/test_utils.py
+index 235c3669c..3781e3e9f 100644
+--- a/tests/workspace/helpers/dashboard/test_utils.py
++++ b/tests/workspace/helpers/dashboard/test_utils.py
+@@ -1,7 +1,9 @@
++from typing import cast, Set, List, Dict, Any
+ import os
+ import tempfile
+ from datetime import datetime
+ from pathlib import Path
++import re
+ 
+ import marimo as mo
+ import pyarrow
+@@ -42,15 +44,24 @@ from dlt._workspace.helpers.dashboard.utils import (
+     get_source_and_resouce_state_for_table,
+     get_default_query_for_table,
+     get_example_query_for_dataset,
++    _get_steps_data_and_status,
++    _get_migrations_count,
++    build_pipeline_execution_visualization,
++    _collect_load_packages_from_trace,
++    load_package_status_labels,
++    TPipelineRunStatus,
++    TVisualPipelineStep,
+ )
+ 
+ from tests.workspace.helpers.dashboard.example_pipelines import (
+     SUCCESS_PIPELINE_DUCKDB,
+     SUCCESS_PIPELINE_FILESYSTEM,
+     EXTRACT_EXCEPTION_PIPELINE,
++    NORMALIZE_EXCEPTION_PIPELINE,
+     NEVER_RAN_PIPELINE,
+     LOAD_EXCEPTION_PIPELINE,
+     NO_DESTINATION_PIPELINE,
++    create_success_pipeline_duckdb,
+ )
+ from tests.workspace.helpers.dashboard.example_pipelines import (
+     ALL_PIPELINES,
+@@ -228,7 +239,7 @@ def test_pipeline_details(pipeline, temp_pipelines_dir):
+     assert isinstance(result, list)
+     if pipeline.pipeline_name in PIPELINES_WITH_LOAD:
+         assert len(result) == 9
+-    elif pipeline.pipeline_name == LOAD_EXCEPTION_PIPELINE:
++    elif pipeline.pipeline_name in [LOAD_EXCEPTION_PIPELINE, NORMALIZE_EXCEPTION_PIPELINE]:
+         # custom destination does not support remote data info
+         assert len(result) == 8
+     else:
+@@ -248,10 +259,10 @@ def test_pipeline_details(pipeline, temp_pipelines_dir):
+     else:
+         assert details_dict["destination"] == "duckdb (dlt.destinations.duckdb)"
+     assert details_dict["dataset_name"] == pipeline.dataset_name
+-    if (
+-        pipeline.pipeline_name in PIPELINES_WITH_LOAD
+-        or pipeline.pipeline_name == LOAD_EXCEPTION_PIPELINE
+-    ):
++    if pipeline.pipeline_name in PIPELINES_WITH_LOAD or pipeline.pipeline_name in [
++        LOAD_EXCEPTION_PIPELINE,
++        NORMALIZE_EXCEPTION_PIPELINE,
++    ]:
+         assert details_dict["schemas"].startswith("fruitshop")
+     else:
+         assert "schemas" not in details_dict
+@@ -497,6 +508,10 @@ def test_trace(pipeline: dlt.Pipeline):
+     if pipeline.pipeline_name == EXTRACT_EXCEPTION_PIPELINE:
+         assert len(result) == 1
+         assert result[0]["step"] == "extract"
++    elif pipeline.pipeline_name == NORMALIZE_EXCEPTION_PIPELINE:
++        assert len(result) == 2
++        assert result[0]["step"] == "extract"
++        assert result[1]["step"] == "normalize"
+     else:
+         assert len(result) == 3
+         assert result[0]["step"] == "extract"
+@@ -741,3 +756,163 @@ def test_sanitize_trace_for_display(pipeline: dlt.Pipeline):
+     assert isinstance(sanitized, dict)
+     # check it can be rendered with marimo
+     assert mo.json(sanitized).text is not None
++
++
++@pytest.mark.parametrize(
++    "pipeline, expected_steps, expected_status",
++    [
++        (SUCCESS_PIPELINE_DUCKDB, {"extract", "normalize", "load"}, "succeeded"),
++        (SUCCESS_PIPELINE_FILESYSTEM, {"extract", "normalize", "load"}, "succeeded"),
++        (EXTRACT_EXCEPTION_PIPELINE, {"extract"}, "failed"),
++        (LOAD_EXCEPTION_PIPELINE, {"extract", "normalize", "load"}, "failed"),
++    ],
++    indirect=["pipeline"],
++)
++def test_get_steps_data_and_status(
++    pipeline: dlt.Pipeline,
++    expected_steps: Set[TVisualPipelineStep],
++    expected_status: TPipelineRunStatus,
++) -> None:
++    """Test getting steps data and the pipeline execution status from trace"""
++    trace = pipeline.last_trace
++
++    steps_data, status = _get_steps_data_and_status(trace.steps)
++    assert len(steps_data) == len(expected_steps)
++    assert status == expected_status
++
++    assert all(step.duration_ms > 0 for step in steps_data)
++    if expected_status == "succeeded":
++        assert all(step.failed is False for step in steps_data)
++    else:
++        assert any(step.failed is True for step in steps_data)
++
++    assert set([step.step for step in steps_data]) == expected_steps
++
++
++def test_get_migrations_count(temp_pipelines_dir) -> None:
++    """Test getting migrations count from the pipeline's last load info"""
++
++    pipeline = create_success_pipeline_duckdb(temp_pipelines_dir)
++
++    migrations_count = _get_migrations_count(pipeline.last_trace.last_load_info)
++    assert migrations_count == 1
++
++    # Trigger multiple migrations
++    pipeline.extract([{"id": 1, "name": "test"}], table_name="my_table")
++    pipeline.extract([{"id": 2, "name": "test2", "new_column": "value"}], table_name="my_table")
++    pipeline.extract(
++        [{"id": 3, "name": "test3", "new_column": "value", "another_column": 100}],
++        table_name="my_table",
++    )
++    pipeline.normalize()
++    pipeline.load()
++    migrations_count = _get_migrations_count(pipeline.last_trace.last_load_info)
++    assert migrations_count == 3
++
++
++@pytest.mark.parametrize(
++    "pipeline, expected_steps, expected_status",
++    [
++        (SUCCESS_PIPELINE_DUCKDB, {"extract", "normalize", "load"}, "succeeded"),
++        (SUCCESS_PIPELINE_FILESYSTEM, {"extract", "normalize", "load"}, "succeeded"),
++        (EXTRACT_EXCEPTION_PIPELINE, {"extract"}, "failed"),
++        (LOAD_EXCEPTION_PIPELINE, {"extract", "normalize", "load"}, "failed"),
++    ],
++    indirect=["pipeline"],
++)
++def test_build_pipeline_execution_visualization(
++    pipeline: dlt.Pipeline,
++    expected_steps: Set[TVisualPipelineStep],
++    expected_status: TPipelineRunStatus,
++) -> None:
++    """Test overall pipeline execution visualization logic"""
++
++    trace = pipeline.last_trace
++
++    html = build_pipeline_execution_visualization(trace)
++    html_str = str(html.text)
++
++    # Check for CSS class structure
++    assert 'class="pipeline-execution-container"' in html_str
++    assert 'class="pipeline-execution-layout"' in html_str
++    assert 'class="pipeline-execution-timeline"' in html_str
++    assert 'class="pipeline-execution-badges"' in html_str
++
++    assert f"Last execution ID: <strong>{trace.transaction_id[:8]}</strong>" in html_str
++    total_time_match = re.search(
++        r"<div>Total time: <strong>([\d.]+)(ms|s)?</strong></div>", html_str
++    )
++    assert total_time_match is not None
++
++    # Check for status badge using CSS classes (not inline styles)
++    status_badge_class = (
++        "status-badge-green" if expected_status == "succeeded" else "status-badge-red"
++    )
++    assert (
++        f'<div class="status-badge {status_badge_class}"><strong>{expected_status}</strong></div>'
++        in html_str
++    )
++
++    # Check for migration badge using CSS classes (not inline styles)
++    migrations_count = _get_migrations_count(trace.last_load_info) if trace.last_load_info else 0
++    migration_badge = (
++        f'<div class="status-badge status-badge-yellow"><strong>{migrations_count} dataset'
++        " migration(s)</strong></div>"
++    )
++    if migrations_count != 0:
++        assert migration_badge in html_str
++    else:
++        assert migration_badge not in html_str
++
++    steps_data, _ = _get_steps_data_and_status(trace.steps)
++    for step_data in steps_data:
++        duration_pattern = re.search(rf"{step_data.step.capitalize()}\s+([\d.]+)(ms|s)?", html_str)
++        assert duration_pattern is not None
++
++    if "extract" in expected_steps:
++        assert "var(--dlt-color-lime)" in html_str
++    if "normalize" in expected_steps:
++        assert "var(--dlt-color-aqua)" in html_str
++    if "load" in expected_steps:
++        assert "var(--dlt-color-pink)" in html_str
++
++
++@pytest.mark.parametrize(
++    "pipeline",
++    [
++        SUCCESS_PIPELINE_DUCKDB,
++        SUCCESS_PIPELINE_FILESYSTEM,
++        EXTRACT_EXCEPTION_PIPELINE,
++        NORMALIZE_EXCEPTION_PIPELINE,
++        LOAD_EXCEPTION_PIPELINE,
++    ],
++    indirect=["pipeline"],
++)
++def test_collect_load_packages_from_trace(
++    pipeline: dlt.Pipeline,
++) -> None:
++    """Test getting load package status labels from trace"""
++
++    trace = pipeline.last_trace
++    table = load_package_status_labels(trace)
++
++    list_of_load_package_info = cast(List[Dict[str, Any]], table.data)
++
++    if pipeline.pipeline_name in ["success_pipeline_duckdb", "success_pipeline_filesystem"]:
++        assert len(list_of_load_package_info) == 2
++        assert all(
++            "loaded" in str(load_package_info["status"].text)
++            for load_package_info in list_of_load_package_info
++        )
++
++    elif pipeline.pipeline_name == "extract_exception_pipeline":
++        assert len(list_of_load_package_info) == 1
++        assert "discarded" in str(list_of_load_package_info[0]["status"].text)
++
++    elif pipeline.pipeline_name == "load_exception_pipeline":
++        assert len(list_of_load_package_info) == 1
++        assert "aborted" in str(list_of_load_package_info[0]["status"].text)
++
++    elif pipeline.pipeline_name == "normalize_exception_pipeline":
++        assert len(list_of_load_package_info) == 1
++        assert "pending" in str(list_of_load_package_info[0]["status"].text)
+
+
+===== COMMIT dc1a0467 =====
+
+
+commit dc1a0467f
+Author: ivasio
+Date: 2025-11-14
+
+    Feat: support return_type = arrow_stream for connectorx backend (#3218)
+

@@ -1,0 +1,2562 @@
+This table tracks the history of all schema versions used by the pipeline. Every time dlt updates the schema. For example, when new columns or tables are added, a new entry is written to this table.
+
+| Column name      | Type           | Description                                 |
+| ---------------- | -------------- | ------------------------------------------- |
+| `version`        | INTEGER        | Numeric version of the schema               |
+| `engine_version` | INTEGER        | Version of the dlt engine used              |
+| `inserted_at`    | TIMESTAMP      | Time the schema version entry was created   |
+| `schema_name`    | STRING         | Name of the schema                          |
+| `version_hash`   | STRING         | Unique hash representing the schema content |
+| `schema`         | STRING or JSON | Full schema in JSON format                  |
+
+By keeping previous schema definitions, `_dlt_version` ensures that:
+
+- Older data remains readable
+- New data uses updated schema rules
+- Backward compatibility is maintained
+
+This table also supports troubleshooting and compatibility checks. It lets you track which schema and engine version were used for any load. This helps with debugging and ensures safe evolution of your data model.
+
+## Loading data into existing tables not created by dlt
+
+You can also load data from `dlt` into tables that already exist in the destination dataset and were not created by `dlt`.
+There are a few things to keep in mind when doing this:
+
+If you load data into a table that exists but does not contain any data, in most cases, your load will succeed without problems.
+`dlt` will create the needed columns and insert the incoming data. `dlt` will only be aware of columns that exist on the
+discovered or provided internal schema, so if you have columns in your destination that are not anticipated by `dlt`, they
+will remain in the destination but stay unknown to `dlt`. This generally will not be a problem.
+
+If your destination table already exists and contains columns that have the same name as columns discovered by `dlt` but
+do not have matching datatypes, your load will fail, and you will have to fix the column on the destination table first,
+or change the column name in your incoming data to something else to avoid a collision.
+
+If your destination table exists and already contains data, your load might also initially fail, since `dlt` creates
+special `non-nullable` columns that contain required mandatory metadata. Some databases will not allow you to create
+`non-nullable` columns on tables that have data, since the initial value for these columns of the existing rows cannot
+be inferred. You will have to manually create these columns with the correct type on your existing tables and
+make them `nullable`, then fill in values for the existing rows. Some databases may allow you to create a new column
+that is `non-nullable` and take a default value for existing rows in the same command. The columns you will need to
+create are:
+
+| name         | type                |
+| ------------ | ------------------- |
+| _dlt_load_id | text/string/varchar |
+| _dlt_id      | text/string/varchar |
+
+For nested tables, you may also need to create:
+
+| name           | type                |
+| -------------- | ------------------- |
+| _dlt_parent_id | text/string/varchar |
+| _dlt_root_id   | text/string/varchar |
+
+
+===== FILE: docs/website/docs/general-usage/destination.md =====
+
+---
+title: Destination
+description: Declare and configure destinations to which to load data
+keywords: [destination, load data, configure destination, name destination]
+---
+# Destination
+
+[Destination](glossary.md#destination) is a location in which `dlt` creates and maintains the current version of the schema and loads your data. Destinations come in various forms: databases, datalakes, vector stores, or files. `dlt` deals with this variety via destination type modules which you declare when creating a pipeline.
+
+We maintain a set of [built-in destinations](../dlt-ecosystem/destinations/) that you can use right away.
+
+## Declare the destination type
+
+We recommend that you declare the destination type when creating a pipeline instance with `dlt.pipeline`. This allows the `run` method to synchronize your local pipeline state with the destination and `extract` and `normalize` to create compatible load packages and schemas. You can also pass the destination to the `run` and `load` methods.
+
+* Use destination **shorthand type**
+
+```py
+import dlt
+
+pipeline = dlt.pipeline("pipeline", destination="filesystem")
+```
+
+Above, we want to use the **filesystem** built-in destination. You can use shorthand types only for built-ins.
+
+* Use a [**named destination**](#use-named-destinations) with a configured type
+
+```py
+import os
+import dlt
+
+os.environ["DESTINATION__MY_DESTINATION__DESTINATION_TYPE"] = "filesystem"
+
+pipeline = dlt.pipeline("pipeline", destination="my_destination")
+```
+
+Above, we use a custom destination name and configure the destination type to **filesystem** using an environment variable. This approach is especially useful when switching between destinations without modifying the actual pipeline code. See details in the [section on using named destinations](#use-named-destinations-to-switch-destinations-without-changing-code).
+
+* Use full **destination factory type**
+
+```py
+import dlt
+
+pipeline = dlt.pipeline("pipeline", destination="dlt.destinations.filesystem")
+```
+
+Above, we use the built-in **filesystem** destination by providing a factory type `filesystem` from the module `dlt.destinations`. You can implement [your own destination](../walkthroughs/create-new-destination.md) and pass this external module as well.
+
+* Import **destination factory**
+
+```py
+import dlt
+from dlt.destinations import filesystem
+
+pipeline = dlt.pipeline("pipeline", destination=filesystem)
+```
+
+Above, we import the destination factory for **filesystem** and pass it to the pipeline.
+
+All examples above will create the same destination class with default parameters and pull required config and secret values from [configuration](credentials/index.md) - they are equivalent.
+
+### Pass explicit parameters and a name to a destination factory
+
+You can instantiate the **destination factory** yourself to configure it explicitly. When doing this, you work with destinations the same way you work with [sources](source.md)
+
+```py
+import dlt
+from dlt.destinations import filesystem
+
+azure_bucket = filesystem(
+    "az://dlt-azure-bucket", destination_name="production_az_bucket"
+)
+pipeline = dlt.pipeline("pipeline", destination=azure_bucket)
+```
+
+Above, we import and instantiate the `filesystem` destination factory. We pass the explicit URL of the bucket and name the destination `production_az_bucket`.
+
+If a destination is not named, its shorthand type (the Python factory name) serves as the destination name. Name your destination explicitly if you need several separate configurations for destinations of the same type (i.e., when you wish to maintain credentials for development, staging, and production storage buckets in the same config file). The destination name is also stored in the [load info](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) and pipeline traces, so use explicit names when you need more descriptive identifiers (rather than generic names like `filesystem`).
+
+## Configure a destination
+
+We recommend passing the credentials and other required parameters to configuration via TOML files, environment variables, or other [config providers](credentials/setup). This allows you, for example, to easily switch to production destinations after deployment.
+
+Use the [default config section layout](credentials/advanced#organize-configuration-and-secrets-with-sections) as shown below:
+
+```toml
+[destination.filesystem]
+bucket_url="az://dlt-azure-bucket"
+[destination.filesystem.credentials]
+azure_storage_account_name="dltdata"
+azure_storage_account_key="storage key"
+```
+
+Alternatively, you can use environment variables:
+
+```sh
+DESTINATION__FILESYSTEM__BUCKET_URL=az://dlt-azure-bucket
+DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_NAME=dltdata
+DESTINATION__FILESYSTEM__CREDENTIALS__AZURE_STORAGE_ACCOUNT_KEY="storage key"
+```
+
+When using destination factories, use the destination name in the config section:
+
+```toml
+[destination.production_az_bucket]
+bucket_url="az://dlt-azure-bucket"
+[destination.production_az_bucket.credentials]
+azure_storage_account_name="dltdata"
+azure_storage_account_key="storage key"
+```
+
+For custom destination names passed to your pipeline (e.g., `destination="my_destination"`), dlt resolves the destination type from configuration. Add `destination_type` to specify which destination type to use:
+
+```toml
+[destination.my_destination]
+destination_type="filesystem"
+bucket_url="az://dlt-azure-bucket"
+[destination.my_destination.credentials]
+azure_storage_account_name="dltdata"
+azure_storage_account_key="storage key"
+```
+
+Note that when you use the `dlt init` command to create or add a data source, `dlt` creates a sample configuration for the selected destination.
+
+### Pass explicit credentials
+
+You can pass credentials explicitly when creating a destination factory instance. This replaces the `credentials` argument in `dlt.pipeline` and `pipeline.load` methods, which is now deprecated. You can pass the required credentials object, its dictionary representation, or the supported native form like below:
+
+```py
+import dlt
+from dlt.destinations import postgres
+
+# pass full credentials - together with the password (not recommended)
+pipeline = dlt.pipeline(
+    "pipeline",
+    destination=postgres(
+        credentials="postgresql://loader:loader@localhost:5432/dlt_data"
+    ),
+)
+```
+
+:::tip
+You can create and pass partial credentials, and `dlt` will fill in the missing data. Below, we pass a PostgreSQL connection string but without a password and expect that it will be present in environment variables (or any other [config provider](credentials/setup))
+
+```py
+import dlt
+from dlt.destinations import postgres
+
+# pass credentials without password
+# dlt will retrieve the password from ie. DESTINATION__POSTGRES__CREDENTIALS__PASSWORD
+prod_postgres = postgres(credentials="postgresql://loader@localhost:5432/dlt_data")
+pipeline = dlt.pipeline("pipeline", destination=prod_postgres)
+```
+
+```py
+import dlt
+from dlt.destinations import filesystem
+from dlt.sources.credentials import AzureCredentials
+
+credentials = AzureCredentials()
+# fill only the account name, leave key to be taken from secrets
+credentials.azure_storage_account_name = "production_storage"
+pipeline = dlt.pipeline(
+    "pipeline",
+    destination=filesystem("az://dlt-azure-bucket", credentials=credentials),
+)
+```
+
+Please read how to use [various built-in credentials types](credentials/complex_types).
+:::
+
+### Inspect destination capabilities
+
+[Destination capabilities](../walkthroughs/create-new-destination.md#3-set-the-destination-capabilities) tell `dlt` what a given destination can and cannot do. For example, it tells which file formats it can load, what the maximum query or identifier length is. Inspect destination capabilities as follows:
+
+```py execute
+import dlt
+pipeline = dlt.pipeline("snowflake_test", destination="snowflake")
+capabilities = dict(pipeline.destination.capabilities())
+print(capabilities["supported_loader_file_formats"])
+#> ['jsonl', 'parquet', 'csv', 'model']
+print(capabilities["preferred_loader_file_format"])
+#> jsonl
+```
+
+### Pass additional parameters and change destination capabilities
+
+The destination factory accepts additional parameters that will be used to pre-configure it and change destination capabilities.
+
+```py execute
+import dlt
+destination = dlt.destinations.duckdb(naming_convention="duck_case", recommended_file_size=120000)
+capabilities = dict(destination.capabilities())
+
+assert capabilities["naming_convention"] == "duck_case"
+assert capabilities["recommended_file_size"] == 120000
+```
+
+The example above is overriding the `naming_convention` and `recommended_file_size` in the destination capabilities.
+
+## Use named destinations
+
+Named destinations are destinations with a custom name, the type of which can be explicitly provided or be resolved from the toml files or equivalent environment variables. There are multiple ways to use named destinations:
+
+- Use a named destination string reference with type configured via an environment variable
+
+```py
+import os
+import dlt
+
+os.environ["DESTINATION__MY_DESTINATION__DESTINATION_TYPE"] = "filesystem"
+
+pipeline = dlt.pipeline("pipeline", destination="my_destination")
+```
+
+- Use `dlt.destination()` with the type configured via an environment variable
+
+```py
+import os
+import dlt
+
+os.environ["DESTINATION__MY_DESTINATION__DESTINATION_TYPE"] = "filesystem"
+
+pipeline = dlt.pipeline("pipeline", destination=dlt.destination("my_destination"))
+```
+
+- Use `dlt.destination()` with the type explicitly configured
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    "pipeline",
+    destination=dlt.destination("my_destination", destination_type="filesystem"),
+)
+```
+
+For all of the above, the destination type can alternatively be configured in the `secrets.toml` file as follows:
+
+```toml
+[destination.my_destination]
+destination_type = "filesystem"
+```
+
+:::note
+When resolving non-module destination string references (e.g., `"bigquery"` or `"my_destination"`, not `"dlt.destinations.bigquery"`), dlt first attempts to resolve the reference as a named destination with a valid destination type configured, then falls back to shorthand type resolution.
+
+This means that, in the examples above, if the destination type was not properly configured or was not a valid destination type, dlt would have attempted to resolve `"my_destination"` as a shorthand for a built-in type and would have eventually failed.
+
+As another example, the following:
+
+```py
+import os
+import dlt
+
+os.environ["DESTINATION__BIGQUERY__DESTINATION_TYPE"] = "duckdb"
+
+pipeline = dlt.pipeline("pipeline", destination="bigquery")
+```
+
+will be resolved as a DuckDB destination that is named `"bigquery"`, because a valid destination type `"duckdb"` is configured and dlt does not attempt to resolve the name `"bigquery"` as a shorthand for a built-in type!
+
+**Exception:** If `dlt.destination()` is used and the `destination_type` is explicitly provided as an argument, dlt will skip the shorthand fallback and only attempt named destination resolution.
+
+:::
+
+### Configure multiple destinations of the same type
+
+One of the benefits of named destinations is the ability to configure multiple destinations of the same type for use across different pipelines in a single script. For example, if you have two BigQuery destinations, you could define the following in the `secrets.toml` file:
+
+```toml
+[destination.my_destination]
+location = "US"
+[destination.my_destination.credentials]
+project_id = "please set me up!"
+private_key = "please set me up!"
+client_email = "please set me up!"
+
+[destination.my_other_destination]
+location = "EU"
+[destination.my_other_destination.credentials]
+project_id = "please set me up!"
+private_key = "please set me up!"
+client_email = "please set me up!"
+```
+
+And use it in the pipeline code as follows:
+
+```py
+import dlt
+
+# Configure the pipeline to use the "my_destination" BigQuery destination
+my_pipeline = dlt.pipeline(
+    pipeline_name='my_pipeline',
+    destination=dlt.destination("my_destination", destination_type="bigquery"),
+    dataset_name='dataset_name'
+)
+
+# Configure the pipeline to use the "my_other_destination" BigQuery destination
+my_other_pipeline = dlt.pipeline(
+    pipeline_name='my_other_pipeline',
+    destination=dlt.destination("my_other_destination", destination_type="bigquery"),
+    dataset_name='dataset_name'
+)
+```
+
+### Use named destinations to switch destinations without changing code
+
+Another advantage of named destinations is environment-based switching. When you need to use different destinations across development, staging, and production environments, named destinations allow you to switch destinations by modifying only the toml configuration files without changing the pipeline code. For example, if you are developing with DuckDB, you would first have your `secrets.toml` file configured as follows:
+
+```toml
+[destination.my_destination]
+destination_type = "duckdb"
+```
+
+With the pipeline code being:
+
+```py
+import dlt
+
+pipeline = dlt.pipeline(
+    pipeline_name='my_pipeline',
+    destination='my_destination',
+    dataset_name='dataset_name'
+)
+```
+
+Then when you deploy the script, you would simply adjust your toml file with:
+
+```toml
+[destination.my_destination]
+destination_type = "bigquery"
+[destination.my_destination.credentials]
+project_id = "please set me up!"
+private_key = "please set me up!"
+client_email = "please set me up!"
+```
+
+And keep the pipeline code intact.
+
+## Access a destination
+
+When loading data, `dlt` will access the destination in two cases:
+
+1. At the beginning of the `run` method to sync the pipeline state with the destination (or if you call `pipeline.sync_destination` explicitly).
+2. In the `pipeline.load` method - to migrate the schema and load the load package.
+
+`dlt` will also access the destination when you instantiate [sql_client](../dlt-ecosystem/transformations/sql.md).
+
+:::note
+`dlt` will not import the destination dependencies or access destination configuration if access is not needed. You can build multi-stage pipelines where steps are executed in separate processes or containers - the `extract` and `normalize` step do not need destination dependencies, configuration, and actual connection.
+
+```py execute
+import tempfile
+
+import dlt
+from dlt.destinations import filesystem
+
+# just declare the destination.
+pipeline = dlt.pipeline("pipeline", destination="filesystem")
+# no destination credentials not config needed to extract
+pipeline.extract(["a", "b", "c"], table_name="letters")
+# same to normalize
+pipeline.normalize()
+# here dependencies dependencies will be imported, secrets pulled and destination accessed
+# we pass bucket_url explicitly and expect credentials passed by config provider
+bucket_url = f"file://{tempfile.mkdtemp()}"
+pipeline.load(destination=filesystem(bucket_url=bucket_url))
+```
+
+:::
+
+## Control how `dlt` creates table, column, and other identifiers
+
+`dlt` maps identifiers found in the source data into destination identifiers (i.e., table and column names) using [naming conventions](naming-convention.md) which ensure that
+character set, identifier length, and other properties fit into what the given destination can handle. For example, our [default naming convention (**snake case**)](./naming-convention.md#use-default-naming-convention-snake_case) converts all names in the source (i.e., JSON document fields) into snake case, case-insensitive identifiers.
+
+Each destination declares its preferred naming convention, support for case-sensitive identifiers, and case folding function that case-insensitive identifiers follow. For example:
+
+1. Redshift - by default, does not support case-sensitive identifiers and converts all of them to lower case.
+2. Snowflake - supports case-sensitive identifiers and considers upper-cased identifiers as case-insensitive (which is the default case folding).
+3. DuckDb - does not support case-sensitive identifiers but does not case fold them, so it preserves the original casing in the information schema.
+4. Athena - does not support case-sensitive identifiers and converts all of them to lower case.
+5. BigQuery - all identifiers are case-sensitive; there's no case-insensitive mode available via case folding (but it can be enabled at the dataset level).
+
+You can change the naming convention used in [many different ways](naming-convention.md#configure-naming-convention). Below, we set the preferred naming convention on the Snowflake destination to `sql_cs` to switch Snowflake to case-sensitive mode:
+
+```py
+import dlt
+snow_ = dlt.destinations.snowflake(naming_convention="sql_cs_v1")
+```
+
+Setting the naming convention will impact all new schemas being created (i.e., on the first pipeline run) and will re-normalize all existing identifiers.
+
+:::warning
+`dlt` prevents re-normalization of identifiers in tables that were already created at the destination. Use [refresh](pipeline.md#refresh-pipeline-data-and-state) mode to drop the data. You can also disable this behavior via [configuration](naming-convention.md#avoid-identifier-collisions).
+:::
+
+:::note
+Destinations that support case-sensitive identifiers but use a case folding convention to enable case-insensitive identifiers are configured in case-insensitive mode by default. Examples: Postgres, Snowflake, Oracle.
+:::
+
+:::warning
+If you use a case-sensitive naming convention with a case-insensitive destination, `dlt` will:
+
+1. Fail the load if it detects an identifier collision due to case folding.
+2. Warn if any case folding is applied by the destination.
+:::
+
+### Enable case-sensitive identifiers support
+
+Selected destinations may be configured so they start accepting case-sensitive identifiers. For example, it is possible to set case-sensitive collation on an **mssql** database and then tell `dlt` about it.
+
+```py
+from dlt.destinations import mssql
+dest_ = mssql(has_case_sensitive_identifiers=True, naming_convention="sql_cs_v1")
+```
+
+Above, we can safely use a case-sensitive naming convention without worrying about name collisions.
+
+You can configure the case sensitivity, **but configuring destination capabilities is not currently supported**.
+
+```toml
+[destination.mssql]
+has_case_sensitive_identifiers=true
+```
+
+:::note
+In most cases, setting the flag above just indicates to `dlt` that you switched the case-sensitive option on a destination. `dlt` will not do that for you. Refer to the destination documentation for details.
+:::
+
+## Writing to the destination
+
+### Destination schema
+
+The destination schema (i.e., database schema) is a collection of tables that represent the data you loaded into the database.
+The schema name is the same as the `dataset_name` you provided in the pipeline definition.
+In the example above, we explicitly set the `dataset_name` to `mydata`. If you don't set it,
+it will be set to the pipeline name with a suffix `_dataset`.
+
+Be aware that the schema referred to in this section is distinct from the [dlt Schema](schema.md).
+The database schema pertains to the structure and organization of data within the database, including table
+definitions and relationships. On the other hand, the "dlt Schema" specifically refers to the format
+and structure of normalized data within the dlt pipeline.
+
+### Tables
+
+Each [resource](resource.md) in your pipeline definition will be represented by a table in
+the destination. In the example above, we have one resource, `users`, so we will have one table, `mydata.users`,
+in the destination. Here, `mydata` is the schema name, and `users` is the table name. Here also, we explicitly set
+the `table_name` to `users`. When `table_name` is not set, the table name will be set to the resource name.
+
+For example, we can rewrite the pipeline above as:
+
+```py
+@dlt.resource
+def users():
+    yield [
+        {'id': 1, 'name': 'Alice'},
+        {'id': 2, 'name': 'Bob'}
+    ]
+
+pipeline = dlt.pipeline(
+    pipeline_name='quick_start',
+    destination='duckdb',
+    dataset_name='mydata'
+)
+load_info = pipeline.run(users)
+```
+
+The result will be the same; note that we do not explicitly pass `table_name="users"` to `pipeline.run`, and the table is implicitly named `users` based on the resource name (e.g., `users()` decorated with `@dlt.resource`).
+
+:::note
+
+Special tables are created to track the pipeline state. These tables are prefixed with `_dlt_`
+and are not shown in the `show` command of the `dlt pipeline` CLI. However, you can see them when
+connecting to the database directly.
+
+:::
+
+## Nested tables
+
+Now let's look at a more complex example:
+
+```py
+import dlt
+
+data = [
+    {
+        'id': 1,
+        'name': 'Alice',
+        'pets': [
+            {'id': 1, 'name': 'Fluffy', 'type': 'cat'},
+            {'id': 2, 'name': 'Spot', 'type': 'dog'}
+        ]
+    },
+    {
+        'id': 2,
+        'name': 'Bob',
+        'pets': [
+            {'id': 3, 'name': 'Fido', 'type': 'dog'}
+        ]
+    }
+]
+
+pipeline = dlt.pipeline(
+    pipeline_name='quick_start',
+    destination='duckdb',
+    dataset_name='mydata'
+)
+load_info = pipeline.run(data, table_name="users")
+```
+
+Running this pipeline will create two tables in the destination, `users` (**root table**) and `users__pets` (**nested table**). The `users` table will contain the top-level data, and the `users__pets` table will contain the data nested in the Python lists. Here is what the tables may look like:
+
+**mydata.users**
+
+| id  | name  | _dlt_id        | _dlt_load_id     |
+| --- | ----- | -------------- | ---------------- |
+| 1   | Alice | wX3f5vn801W16A | 1234562350.98417 |
+| 2   | Bob   | rX8ybgTeEmAmmA | 1234562350.98417 |
+
+**mydata.users__pets**
+
+| id  | name   | type | _dlt_id        | _dlt_parent_id | _dlt_list_idx |
+| --- | ------ | ---- | -------------- | -------------- | ------------- |
+| 1   | Fluffy | cat  | w1n0PEDzuP3grw | wX3f5vn801W16A | 0             |
+| 2   | Spot   | dog  | 9uxh36VU9lqKpw | wX3f5vn801W16A | 1             |
+| 3   | Fido   | dog  | pe3FVtCWz8VuNA | rX8ybgTeEmAmmA | 0             |
+
+When inferring a database schema, dlt maps the structure of Python objects (i.e., from parsed JSON files) into nested tables and creates references between them.
+
+This is how it works:
+
+1. Each row in all (root and nested) data tables created by dlt contains a unique column named `_dlt_id` (**row key**).
+2. Each nested table contains a column named `_dlt_parent_id` referencing a particular row (`_dlt_id`) of a parent table (**parent key**).
+3. Rows in nested tables come from the Python lists: `dlt` stores the position of each item in the list in `_dlt_list_idx`.
+4. For nested tables that are loaded with the `merge` write disposition, we add a **root key** column `_dlt_root_id`, which references the child table to a row in the root table.
+
+[Learn more about nested references, row keys, and parent keys](schema.md#nested-references-root-and-nested-tables)
+
+## Naming convention: tables and columns
+
+During a pipeline run, dlt [normalizes both table and column names](schema.md#naming-convention) to ensure compatibility with the destination database's accepted format. All names from your source data will be transformed into snake_case and will only include alphanumeric characters. Please be aware that the names in the destination database may differ somewhat from those in your original input.
+
+## Variant columns
+
+If your data has inconsistent types, `dlt` will dispatch the data to several **variant columns**. For example, if you have a resource (i.e., a JSON file) with a field named `answer` and your data contains boolean values, you will get a column named `answer` of type `BOOLEAN` in your destination. If, for some reason, on the next load, you get integer and string values in `answer`, the inconsistent data will go to `answer__v_bigint` and `answer__v_text` columns respectively.
+The general naming rule for variant columns is `<original name>__v_<type>` where `original_name` is the existing column name (with data type clash) and `type` is the name of the data type stored in the variant.
+
+## Load packages and load IDs
+
+Each execution of the pipeline generates one or more load packages. A load package typically contains data retrieved from all the [resources](glossary.md#resource) of a particular [source](glossary.md#source). These packages are uniquely identified by a `load_id`. The `load_id` of a particular package is added to the top data tables (referenced as `_dlt_load_id` column in the example above) and to the special `_dlt_loads` table with a status of 0 (when the load process is fully completed).
+
+To illustrate this, let's load more data into the same destination:
+
+```py
+data = [
+    {
+        'id': 3,
+        'name': 'Charlie',
+        'pets': []
+    },
+]
+```
+
+The rest of the pipeline definition remains the same. Running this pipeline will create a new load package with a new `load_id` and add the data to the existing tables. The `users` table will now look like this:
+
+**mydata.users**
+
+| id  | name    | _dlt_id        | _dlt_load_id         |
+| --- | ------- | -------------- | -------------------- |
+| 1   | Alice   | wX3f5vn801W16A | 1234562350.98417     |
+| 2   | Bob     | rX8ybgTeEmAmmA | 1234562350.98417     |
+| 3   | Charlie | h8lehZEvT3fASQ | **1234563456.12345** |
+
+The `_dlt_loads` table will look like this:
+
+**mydata._dlt_loads**
+
+| load_id              | schema_name | status | inserted_at                  | schema_version_hash |
+| -------------------- | ----------- | ------ | ---------------------------- | ------------------- |
+| 1234562350.98417     | quick_start | 0      | 2023-09-12 16:45:51.17865+00 | aOEb...Qekd/58=     |
+| **1234563456.12345** | quick_start | 0      | 2023-09-12 16:46:03.10662+00 | aOEb...Qekd/58=     |
+
+The `_dlt_loads` table tracks complete loads and allows chaining transformations on top of them. Many destinations do not support distributed and long-running transactions (e.g., Amazon Redshift). In that case, the user may see the partially loaded data. It is possible to filter such data out: any row with a `load_id` that does not exist in `_dlt_loads` is not yet completed. The same procedure may be used to identify and delete data for packages that never got completed.
+
+For each load, you can test and [alert](../running-in-production/running.md#using-slack-to-send-messages) on anomalies (e.g., no data, too much loaded to a table). There are also some useful load stats in [dashboard app](../hub/ingestion/dashboard.md) mentioned above.
+
+You can add [transformations](../dlt-ecosystem/transformations/) and chain them together using the `status` column. You start the transformation for all the data with a particular `load_id` with a status of 0 and then update it to 1. The next transformation starts with the status of 1 and is then updated to 2. This can be repeated for every additional transformation.
+
+### Data lineage
+
+Data lineage can be super relevant for architectures like the [data vault architecture](https://www.data-vault.co.uk/what-is-data-vault/) or when troubleshooting. The data vault architecture is a data warehouse that large organizations use when representing the same process across multiple systems, which adds data lineage requirements. Using the pipeline name and `load_id` provided out of the box by `dlt`, you are able to identify the source and time of data.
+
+You can [save](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) complete lineage info for a particular `load_id` including a list of loaded files, error messages (if any), elapsed times, schema changes. This can be helpful, for example, when troubleshooting problems.
+
+## SQL Client
+
+:::note
+The SQL client is a low-level API. If you simply want to query your data, refer to the [dataset interface](./dataset-access/dataset.md).
+:::
+
+Most `dlt` destinations use an implementation of the `SqlClientBase` class to connect to the physical destination to which your data is loaded. DDL statements, data insert or update commands, as well as SQL merge and replace queries, are executed via a connection on this client. It also is used for reading data for the [dashboard app](../hub/ingestion/dashboard.md) and [data access via `dlt` datasets](./dataset-access/dataset.md).
+
+All SQL destinations make use of an SQL client; additionally, the filesystem has a special implementation of the SQL client which you can read about [below](#filesystem-sql-client).
+
+### Execute a query
+
+You can access the SQL client of your destination via the `sql_client` method on your pipeline. The code below shows how to use the SQL client to execute a query.
+
+```py
+pipeline = dlt.pipeline(destination="bigquery", dataset_name="crm")
+with pipeline.sql_client() as client:  # ty: ignore
+    with client.execute_query(
+        "SELECT id, name, email FROM customers WHERE id = %s",
+        10
+    ) as cursor:
+        # get all data from the cursor as a list of tuples
+        print(cursor.fetchall())
+```
+
+### Query result format
+
+The cursor returned by `execute_query` has several methods for retrieving the data. The supported formats are Python tuples, Pandas DataFrame, and Arrow table.
+
+The code below shows how to retrieve the data as a Pandas DataFrame and then manipulate it in memory:
+
+```py
+pipeline = dlt.pipeline(pipeline_name="my_pipeline", destination="duckdb")
+with pipeline.sql_client() as client:  # ty: ignore
+    with client.execute_query(
+        'SELECT "reactions__+1", "reactions__-1", reactions__laugh, reactions__hooray, reactions__rocket FROM issues'
+    ) as cursor:
+        # calling `df` on a cursor, returns the data as a pandas DataFrame
+        reactions = cursor.df()
+
+counts = reactions.sum(0).sort_values(0, ascending=False)  # ty: ignore
+```
+
+#### Retrieval methods
+
+- `fetchall()`: returns all rows as a list of tuples;
+- `fetchone()`: returns a single row as a tuple;
+- `fetchmany(size=None)`: returns a number of rows as a list of tuples; if no size is provided, all rows are returned;
+- `df(chunk_size=None, **kwargs)`: returns the data as a Pandas DataFrame; if `chunk_size` is provided, the data is retrieved in chunks of the given size;
+- `arrow(chunk_size=None, **kwargs)`: returns the data as an Arrow table; if `chunk_size` is provided, the data is retrieved in chunks of the given size;
+- `iter_fetch(chunk_size: int)`: iterates over the data in chunks of the given size as lists of tuples;
+- `iter_df(chunk_size: int)`: iterates over the data in chunks of the given size as Pandas DataFrames;
+- `iter_arrow(chunk_size: int)`: iterates over the data in chunks of the given size as Arrow tables.
+
+:::info
+Which retrieval method you should use very much depends on your use case and the destination you are using. Some drivers for our destinations provided by their vendors natively support Arrow or Pandas DataFrames; in these cases, we will use that interface. If they do not, `dlt` will convert lists of tuples into these formats.
+:::
+
+### Filesystem SQL client
+
+The filesystem destination implements a special but extremely useful version of the SQL client. While during a normal pipeline run, the filesystem does not make use of an SQL client but rather copies the files resulting from a load into the folder or bucket you have specified, it is possible to query this data using SQL via this client. For this to work, `dlt` uses an in-memory `DuckDB` database instance and makes your filesystem tables available as views on this database. For the most part, you can use the filesystem SQL client just like any other SQL client. `dlt` uses sqlglot to discover which tables you are trying to access and, as mentioned above, `DuckDB` to make them queryable.
+
+The code below shows how to use the filesystem SQL client to query the data:
+
+```py
+pipeline = dlt.pipeline(destination="filesystem", dataset_name="my_dataset")
+with pipeline.sql_client() as client:  # ty: ignore
+    with client.execute_query("SELECT * FROM my_table") as cursor:
+        print(cursor.fetchall())
+```
+
+A few things to know or keep in mind when using the filesystem SQL client:
+
+- The SQL database you are actually querying is an in-memory database, so if you do any kind of mutating queries, these will not be persisted to your folder or bucket.
+- You must have loaded your data as `JSONL`, `Parquet`, `CSV` files or `delta`/`iceberg` tables for this SQL client to work. For optimal performance, you should use `Parquet` files or open table formats, as `DuckDB` is able to only read the bytes needed to execute your query from a folder or bucket in this case.
+- Keep in mind that if you do any filtering, sorting, or full table loading with the SQL client, the in-memory `DuckDB` instance will have to download and query a lot of data from your bucket or folder if you have a large table.
+- If you are accessing data on a bucket, `dlt` will temporarily store your credentials in `DuckDB` to let it connect to the bucket.
+- Some combinations of buckets and table formats may not be fully supported at this time.
+- Multi-schema support (dlt 1.25.0+): When a dataset includes multiple schemas, the filesystem SQL client creates views that span all schemas. If the same table name exists in multiple schemas at different physical locations (e.g. when the layout includes `{schema_name}/`), views are combined. If they share the same location, columns are merged into a single view. This means queries may return rows from multiple schemas — use `pipeline.dataset(schema="name")` to restrict to one schema.
+
+#### Refresh SQL client data view
+
+`sqlclient` creates views in which the data is immutable (each next query will access the same data). Such "snapshots" are created by:
+
+* globbing the table files once - when view is created
+* using the newest iceberg metadata to create view
+
+Updating views may be costly (globbing, re-reading iceberg metadata) so your best option is to create new `sql_client` (or `pipeline.dataset()`) instance
+when you need fresh data. Alternatively you can enable autorefresh mode which will re-create view on each query:
+
+```py
+from dlt.destination import filesystem
+
+pipeline = dlt.pipeline(destination=filesystem(always_refresh_views=True), dataset_name="my_dataset")
+with pipeline.sql_client() as client:  # ty: ignore
+    with client.execute_query("SELECT * FROM my_table") as cursor:
+        print(cursor.fetchall())
+        # pipeline.run() here and get updated data
+        print(cursor.fetchall())
+```
+
+Note: `delta` tables are by default on autorefresh which is implemented by delta core and seems to be pretty efficient.
+
+## Loading data into existing tables not created by dlt
+
+You can also load data from `dlt` into tables that already exist in the destination dataset and were not created by `dlt`.
+There are a few things to keep in mind when doing this:
+
+If you load data into a table that exists but does not contain any data, in most cases, your load will succeed without problems.
+`dlt` will create the needed columns and insert the incoming data. `dlt` will only be aware of columns that exist on the
+discovered or provided internal schema, so if you have columns in your destination that are not anticipated by `dlt`, they
+will remain in the destination but stay unknown to `dlt`. This generally will not be a problem.
+
+If your destination table already exists and contains columns that have the same name as columns discovered by `dlt` but
+do not have matching datatypes, your load will fail, and you will have to fix the column on the destination table first,
+or change the column name in your incoming data to something else to avoid a collision.
+
+If your destination table exists and already contains data, your load might also initially fail, since `dlt` creates
+special `non-nullable` columns that contain required mandatory metadata. Some databases will not allow you to create
+`non-nullable` columns on tables that have data, since the initial value for these columns of the existing rows cannot
+be inferred. You will have to manually create these columns with the correct type on your existing tables and
+make them `nullable`, then fill in values for the existing rows. Some databases may allow you to create a new column
+that is `non-nullable` and take a default value for existing rows in the same command. The columns you will need to
+create are:
+
+| name         | type                |
+| ------------ | ------------------- |
+| _dlt_load_id | text/string/varchar |
+| _dlt_id      | text/string/varchar |
+
+For nested tables, you may also need to create:
+
+| name           | type                |
+| -------------- | ------------------- |
+| _dlt_parent_id | text/string/varchar |
+| _dlt_root_id   | text/string/varchar |
+
+## Create a new destination
+
+You have two ways to implement a new destination:
+
+1. You can use the `@dlt.destination` decorator and [implement a sink function](../dlt-ecosystem/destinations/destination.md). This is a perfect way to implement reverse ETL destinations that push data back to REST APIs.
+2. You can implement [a full destination](../walkthroughs/create-new-destination.md) where you have full control over load jobs and schema migration.
+
+
+===== FILE: docs/website/docs/general-usage/full-loading.md =====
+
+---
+title: Full loading
+description: Full loading with dlt
+keywords: [full loading, loading methods, replace]
+---
+# Full loading
+
+Full loading is the act of fully reloading the data of your tables. All existing data will be removed and replaced by whatever the source produced on this run. Resources that are not selected while performing a full load will not replace any data in the destination.
+
+## Performing a full load
+
+To perform a full load on one or more of your resources, choose the `write_disposition='replace'` for this resource:
+
+```py
+p = dlt.pipeline(destination="bigquery", dataset_name="github")
+issues = []
+reactions = ["%2B1", "-1", "smile", "tada", "thinking_face", "heart", "rocket", "eyes"]
+headers: dict[str, str] = {}
+repo_name = "dlt-hub/dlt"
+for reaction in reactions:
+    for page_no in range(1, 3):
+      page = requests.get(f"https://api.github.com/repos/{repo_name}/issues?state=all&sort=reactions-{reaction}&per_page=100&page={page_no}", headers=headers)
+      print(f"Got page for {reaction} page {page_no}, requests left", page.headers["x-ratelimit-remaining"])
+      issues.extend(page.json())
+p.run(issues, write_disposition="replace", primary_key="id", table_name="issues")
+```
+
+:::caution
+All tables that belong to a `replace` resource are truncated on each load, including nested tables and tables created by
+[dispatching to many tables](resource.md#dispatch-data-to-many-tables) or as table variants.
+
+Note that a table does not need to receive any data to get truncated.
+:::
+
+## Choosing the correct replace strategy for your full load
+
+dlt implements three different strategies for doing a full load on your table: `truncate-and-insert`, `insert-from-staging`, and `staging-optimized`. The exact behavior of these strategies can also vary between the available destinations.
+
+You can select a strategy with a setting in your `config.toml` file. If you do not select a strategy, dlt will default to `truncate-and-insert`.
+
+```toml
+[destination]
+# Set the optimized replace strategy
+replace_strategy = "staging-optimized"
+```
+
+### The `truncate-and-insert` strategy
+
+The `truncate-and-insert` replace strategy is the default and the fastest of all three strategies. If you load data with this setting, then the destination tables will be truncated at the beginning of the load, and the new data will be inserted consecutively but not within the same transaction.
+The downside of this strategy is that your tables will have no data for a while until the load is completed. You may end up with new data in some tables and no data in other tables if the load fails during the run. Such an incomplete load may be detected by checking if the [_dlt_loads table contains a load id](destination-tables.md#load-packages-and-load-ids) from _dlt_load_id of the replaced tables. If you prefer to have no data downtime, please use one of the other strategies.
+
+### The `insert-from-staging` strategy
+
+The `insert-from-staging` strategy is the slowest of all three strategies. It will load all new data into staging tables away from your final destination tables and will then truncate and insert the new data in one transaction.
+It also maintains a consistent state between nested and root tables at all times. Use this strategy if you have the requirement for consistent destination datasets with zero downtime and the `optimized` strategy does not work for you.
+This strategy behaves the same way across all destinations.
+
+### The `staging-optimized` strategy
+
+The `staging-optimized` strategy has all the upsides of the `insert-from-staging` but implements certain optimizations for faster loading on some destinations. This comes at the cost of destination tables being dropped and recreated in some cases, which means that any views or other constraints you have placed on those tables will be dropped with the table. If you have a setup where you need to retain your destination tables, do not use the `staging-optimized` strategy. If you do not care about tables being dropped but need the upsides of the `insert-from-staging` with some performance (and cost) saving opportunities, you should use this strategy. The `staging-optimized` strategy behaves differently across destinations:
+
+* Postgres: After loading the new data into the staging tables, the destination tables will be dropped and replaced by the staging tables. No data needs to be moved, so this strategy is almost as fast as `truncate-and-insert`.
+* BigQuery: After loading the new data into the staging tables, the destination tables will be dropped and recreated with a [clone command](https://cloud.google.com/bigquery/docs/table-clones-create) from the staging tables. This is a low-cost and fast way to create a second independent table from the data of another. Learn more about [table cloning on BigQuery](https://cloud.google.com/bigquery/docs/table-clones-intro).
+* Snowflake: After loading the new data into the staging tables, the destination tables will be dropped and recreated with a [clone command](https://docs.snowflake.com/en/sql-reference/sql/create-clone) from the staging tables. This is a low-cost and fast way to create a second independent table from the data of another. Learn more about [table cloning on Snowflake](https://docs.snowflake.com/en/user-guide/object-clone).
+
+For all other destinations, please look at their respective documentation pages to see if and how the `staging-optimized` strategy is implemented. If it is not implemented, `dlt` will fall back to the `insert-from-staging` strategy.
+
+
+===== FILE: docs/website/docs/general-usage/glossary.md =====
+
+---
+title: Glossary
+description: Glossary of common dlt terms
+keywords: [glossary, resource, source, pipeline]
+---
+# Glossary
+
+## [Source](source)
+
+A location that holds data with a certain structure, organized into one or more resources.
+
+- If endpoints in an API are the resources, then the API is the source.
+- If tabs in a spreadsheet are the resources, then the spreadsheet is the source.
+- If tables in a database are the resources, then the database is the source.
+
+Within this documentation, **source** also refers to the software component (i.e., a Python function)
+that **extracts** data from the source location using one or more resource components.
+
+## [Resource](resource)
+
+A logical grouping of data within a data source, typically holding data of similar structure and
+origin.
+
+- If the source is an API, then a resource is an endpoint in that API.
+- If the source is a spreadsheet, then a resource is a tab in that spreadsheet.
+- If the source is a database, then a resource is a table in that database.
+
+Within this documentation, **resource** also refers to the software component (i.e., a Python function)
+that **extracts** the data from the source location.
+
+## [Destination](../dlt-ecosystem/destinations)
+
+The data store where data from the source is loaded (e.g., Google BigQuery).
+
+## [Pipeline](pipeline)
+
+Moves the data from the source to the destination, according to instructions provided in the schema
+(i.e., extracting, normalizing, and loading the data).
+
+## Verified source
+
+A Python module distributed with `dlt init` that allows creating pipelines that extract data from a
+particular **Source**. Such a module is intended to be published in order for others to use it to
+build pipelines.
+
+A source must be published to become "verified," which means that it has tests, test data,
+demonstration scripts, documentation, and the dataset produced was reviewed by a data engineer.
+
+## [Schema](schema)
+
+Describes the structure of normalized data (e.g., unpacked tables, column types, etc.) and provides
+instructions on how the data should be processed and loaded (i.e., it tells `dlt` about the content
+of the data and how to load it into the destination).
+
+## [Config](credentials/setup#secretstoml-and-configtoml)
+
+A set of values that are passed to the pipeline at runtime (e.g., to change its behavior locally vs.
+in production).
+
+## [Credentials](credentials/complex_types)
+
+A subset of configuration whose elements are kept secret and never shared in plain text.
+
+
+===== FILE: docs/website/docs/general-usage/incremental/advanced-state.md =====
+
+---
+title: Advanced state management for incremental loading
+description: Custom state tracking and lag/attribution windows
+keywords: [incremental loading, state management, lag, attribution]
+---
+# Advanced state management for incremental loading
+
+## Custom incremental loading with pipeline state
+
+The pipeline state is a Python dictionary that gets committed atomically with the data; you can set values in it in your resources and on the next pipeline run, request them back.
+
+The pipeline state is, in principle, scoped to the resource - all values of the state set by a resource are private and isolated from any other resource. You can also access the source-scoped state, which can be shared across resources.
+[You can find more information on pipeline state here](../state.md#when-to-use-pipeline-state).
+
+### Preserving the last value in resource state
+
+For the purpose of preserving the "last value" or similar loading checkpoints, we can open a dlt state dictionary with a key and a default value as below. When the resource is executed and the data is loaded, the yielded resource data will be loaded at the same time with the update to the state.
+
+In the two examples below, you see how the `dlt.sources.incremental` is working under the hood.
+
+```py
+@resource()
+def tweets():
+    # Get the last value from loaded metadata. If it does not exist, get None
+    last_val = dlt.current.resource_state().setdefault("last_updated", None)
+    # Get data and yield it
+    data = _get_data(start_from=last_val)  # ty: ignore[unresolved-reference]
+    yield data
+    # Change the state to the new value
+    dlt.current.resource_state()["last_updated"] = data["last_timestamp"]
+```
+
+If we keep a list or a dictionary in the state, we can modify the underlying values in the objects, and thus we do not need to set the state back explicitly.
+
+```py
+@resource()
+def tweets():
+    # Get the last value from loaded metadata. If it does not exist, get None
+    loaded_dates = dlt.current.resource_state().setdefault("days_loaded", [])
+    # Do stuff: get data and add new values to the list
+    # `loaded_date` is a reference to the `dlt.current.resource_state()["days_loaded"]` list
+    # and thus modifying it modifies the state
+    yield data
+    loaded_dates.append('2023-01-01')
+```
+
+Step by step explanation of how to get or set the state:
+
+1. We can use the function `var = dlt.current.resource_state().setdefault("key", [])`. This allows us to retrieve the values of `key`. If `key` was not set yet, we will get the default value `[]` instead.
+2. We can now treat `var` as a Python list - We can append new values to it, or if applicable, we can read the values from previous loads.
+3. On pipeline run, the data will load, and the new `var`'s value will get saved in the state. The state is stored at the destination, so it will be available on subsequent runs.
+
+### Advanced state usage: storing a list of processed entities
+
+Let's look at the `player_games` resource from the chess pipeline. The chess API has a method to request games archives for a given month. The task is to prevent the user from loading the same month data twice - even if the user makes a mistake and requests the same months range again:
+
+- Our data is requested in 2 steps:
+  - Get all available archives URLs.
+  - Get the data from each URL.
+- We will add the "chess archives" URLs to this list we created.
+- This will allow us to track what data we have loaded.
+- When the data is loaded, the list of archives is loaded with it.
+- Later we can read this list and know what data has already been loaded.
+
+In the following example, we initialize a variable with an empty list as a default:
+
+```py
+@dlt.resource(write_disposition="append")
+def players_games(chess_url, players, start_month=None, end_month=None):
+    loaded_archives_cache = dlt.current.resource_state().setdefault("archives", [])
+
+    # As far as Python is concerned, this variable behaves like
+    # loaded_archives_cache = state['archives'] or []
+    # Afterwards, we can modify the list, and finally
+    # when the data is loaded, the cache is updated with our loaded_archives_cache
+
+    # Get archives for a given player
+    archives = _get_players_archives(chess_url, players)  # ty: ignore[unresolved-reference]
+    for url in archives:
+        # If not in cache, yield the data and cache the URL
+        if url not in loaded_archives_cache:
+            # Add URL to cache and yield the associated data
+            loaded_archives_cache.append(url)
+            r = requests.get(url)
+            r.raise_for_status()
+            yield r.json().get("games", [])
+        else:
+            print(f"Skipping archive {url}")
+```
+
+### Advanced state usage: tracking the last value for all search terms in Twitter API
+
+```py notype
+@dlt.resource(write_disposition="append")
+def search_tweets(twitter_bearer_token=dlt.secrets.value, search_terms=None, start_time=None, end_time=None, last_value=None):
+    headers = _headers(twitter_bearer_token)
+    search_terms = [...]
+    for search_term in search_terms:
+        # Make cache for each term
+        last_value_cache = dlt.current.resource_state().setdefault(f"last_value_{search_term}", None)
+        print(f'last_value_cache: {last_value_cache}')
+        params = {...}
+        url = "https://api.twitter.com/2/tweets/search/recent"
+        response = _get_paginated(url, headers=headers, params=params)
+        for page in response:
+            page['search_term'] = search_term
+            last_id = page.get('meta', {}).get('newest_id', 0)
+            # Set it back - not needed if we
+            dlt.current.resource_state()[f"last_value_{search_term}"] = max(last_value_cache or 0, int(last_id))
+            # Print the value for each search term
+            print(f'new_last_value_cache for term {search_term}: {last_value_cache}')
+
+            yield page
+```
+
+
+===== FILE: docs/website/docs/general-usage/incremental/cursor.md =====
+
+---
+title: Cursor-based incremental loading
+description: Track changes using cursor fields with dlt
+keywords: [incremental loading, cursor, timestamp, last_value]
+---
+# Cursor-based incremental loading
+
+In most REST APIs (and other data sources, i.e., database tables), you can request new or updated data by passing a timestamp or ID of the "last" record to a query. The API/database returns just the new/updated records from which you take the maximum/minimum timestamp/ID for the next load.
+
+To do incremental loading this way, we need to:
+
+- Figure out which field is used to track changes (the so-called **cursor field**) (e.g., "inserted_at", "updated_at", etc.);
+- Determine how to pass the "last" (maximum/minimum) value of the cursor field to an API to get just new or modified data (how we do this depends on the source API).
+
+Once you've figured that out, `dlt` takes care of finding maximum/minimum cursor field values, removing duplicates, and managing the state with the last values of the cursor. Take a look at the GitHub example below, where we request recently created issues.
+
+```py
+@dlt.resource(primary_key="id")
+def repo_issues(
+    access_token=dlt.secrets.value,
+    repository=dlt.config.value,
+    updated_at = dlt.sources.incremental("updated_at", initial_value="1970-01-01T00:00:00Z")
+):
+    # Get issues since "updated_at" stored in state on previous run (or initial_value on first run)
+    for page in _get_issues_page(access_token, repository, since=updated_at.start_value):  # ty: ignore[unresolved-reference]
+        yield page
+        # Last_value is updated after every page
+        print(updated_at.last_value)
+```
+
+Here we add an `updated_at` argument that will receive incremental state, initialized to `1970-01-01T00:00:00Z`. It is configured to track the `updated_at` field in issues yielded by the `repo_issues` resource. It will store the newest `updated_at` value in `dlt` [state](../state.md) and make it available in `updated_at.start_value` on the next pipeline run. This value is inserted in the `_get_issues_page` function into the request query param **since** to the [GitHub API](https://docs.github.com/en/rest/issues/issues?#list-repository-issues).
+
+In essence, the `dlt.sources.incremental` instance above:
+
+* **updated_at.initial_value** which is always equal to "1970-01-01T00:00:00Z" passed in the constructor
+* **updated_at.start_value** a maximum `updated_at` value from the previous run or the **initial_value** on the first run
+* **updated_at.last_value** a "real-time" `updated_at` value updated with each yielded item or page. Before the first yield, it equals **start_value**.
+* **updated_at.end_value** (here not used) [marking the end of the backfill range](#using-end_value-for-backfill)
+
+For datetime cursors, `start_value`, `last_value`, and the bounds returned by `get_current_range()` respect the cursor type declared in `incremental[...]` or inferred from `initial_value`: `pendulum.DateTime` cursors return Pendulum values, while `datetime.datetime` cursors return standard Python datetimes. Other cursor types and user-provided `initial_value` and `end_value` are unchanged.
+
+When paginating, you probably need the **start_value** which does not change during the execution of the resource, however, most paginators will return a **next page** link which you should use.
+
+Behind the scenes, dlt will deduplicate the results, i.e., in case the last issue is returned again (`updated_at` filter is inclusive) and skip already loaded ones.
+
+In the example below, we incrementally load the GitHub events, where the API does not let us filter for the newest events - it always returns all of them. Nevertheless, `dlt` will load only the new items, filtering out all the duplicates and past issues.
+
+```py notype
+# Use naming function in table name to generate separate tables for each event
+@dlt.resource(primary_key="id", table_name=lambda i: i['type'])  # type: ignore
+def repo_events(
+    last_created_at = dlt.sources.incremental("created_at", initial_value="1970-01-01T00:00:00Z", last_value_func=max), row_order="desc"
+) -> Iterator[TDataItems]:
+    repos_path = "/repos/%s/%s/events" % (urllib.parse.quote(owner), urllib.parse.quote(name))
+    for page in _get_rest_pages(access_token, repos_path + "?per_page=100"):
+        yield page
+```
+
+We just yield all the events and `dlt` does the filtering (using the `id` column declared as `primary_key`).
+
+GitHub returns events ordered from newest to oldest. So we declare the `rows_order` as **descending** to [stop requesting more pages once the incremental value is out of range](#declare-row-order-to-not-request-unnecessary-data). We stop requesting more data from the API after finding the first event with `created_at` earlier than `initial_value`.
+
+:::note
+`dlt.sources.incremental` is implemented as a [filter function](../resource.md#filter-transform-and-pivot-data) that is executed **after** all other transforms you add with `add_map` or  `add_filter`. This means that you can manipulate the data item before the incremental filter sees it. For example:
+
+* You can create a surrogate primary key from other columns
+* You can modify the cursor value or create a new field composed of other fields
+* Dump Pydantic models to Python dicts to allow incremental to find custom values
+
+[Data validation with Pydantic](../schema-contracts.md#use-pydantic-models-for-data-validation) happens **before** incremental filtering.
+:::
+
+## Max, min, or custom `last_value_func`
+
+`dlt.sources.incremental` allows you to choose a function that orders (compares) cursor values to the current `last_value`.
+
+* The default function is the built-in `max`, which returns the larger value of the two.
+* Another built-in, `min`, returns the smaller value.
+
+You can also pass your custom function. This lets you define
+`last_value` on nested types, i.e., dictionaries, and store indexes of last values, not just simple
+types. The `last_value` argument is a [JSON Path](https://github.com/json-path/JsonPath#operators)
+and lets you select nested data (including the whole data item when `$` is used).
+The example below creates a last value which is a dictionary holding a max `created_at` value for each
+created table name:
+
+```py
+def by_event_type(event):
+    last_value = None
+    if len(event) == 1:
+        item, = event
+    else:
+        item, last_value = event
+
+    if last_value is None:
+        last_value = {}
+    else:
+        last_value = dict(last_value)
+    item_type = item["type"]
+    last_value[item_type] = max(item["created_at"], last_value.get(item_type, "1970-01-01T00:00:00Z"))
+    return last_value
+
+@dlt.resource(primary_key="id", table_name=lambda i: i['type'])
+def get_events(last_created_at = dlt.sources.incremental("$", last_value_func=by_event_type)):
+    with open("tests/normalize/cases/github.events.load_page_1_duck.json", "r", encoding="utf-8") as f:
+        yield json.load(f)
+```
+
+## Using `end_value` for backfill
+
+You can specify both initial and end dates when defining incremental loading. Let's go back to our Github example:
+
+```py
+@dlt.resource(primary_key="id")
+def repo_issues(
+    access_token=dlt.secrets.value,
+    repository=dlt.config.value,
+    updated_at=dlt.sources.incremental("updated_at", initial_value="1970-01-01T00:00:00Z", end_value="2022-07-01T00:00:00Z")
+):
+    # get issues updated in range defined by incremental
+    for page in _get_issues_page(access_token, repository, since=updated_at.start_value, until=updated_at.end_value):  # ty: ignore[unresolved-reference]
+        yield page
+```
+
+Above, we use the `initial_value` and `end_value` arguments of the `incremental` to define the range of issues that we want to retrieve
+and pass this range to the Github API (`since` and `until`). As in the examples above, `dlt` will make sure that only the issues from
+the defined range are returned.
+
+Please note that when `end_date` is specified, `dlt` **will not modify the existing incremental state**. The backfill is **stateless** and:
+
+1. You can run backfill and incremental load in parallel (i.e., in an Airflow DAG) in a single pipeline.
+2. You can partition your backfill into several smaller chunks and run them in parallel as well.
+
+To define specific ranges to load, you can simply override the incremental argument in the resource, for example:
+
+```py notype
+july_issues = repo_issues(
+    updated_at=dlt.sources.incremental(
+        initial_value='2022-07-01T00:00:00Z', end_value='2022-08-01T00:00:00Z'
+    )
+)
+august_issues = repo_issues(
+    updated_at=dlt.sources.incremental(
+        initial_value='2022-08-01T00:00:00Z', end_value='2022-09-01T00:00:00Z'
+    )
+)
+...
+```
+
+Note that dlt's incremental filtering considers the ranges half-closed. `initial_value` is inclusive, `end_value` is exclusive, so chaining ranges like above works without overlaps. This behaviour can be changed with the `range_start` (default `"closed"`) and `range_end` (default `"open"`) arguments.
+
+### Partition large backfills
+
+You can execute a backfill on large amount of data by partitioning it into ranges. In best case you are able to
+create partitions i.e. by day or week without additionally querying your data source [as we do in sql database example](../../dlt-ecosystem/verified-sources/sql_database/advanced.md#split-or-partition-long-incremental-loads). Ranges will be loaded using `initial_value` and `end_value`, each in separate pipeline run.
+
+1. As mentioned above, each run of this kind is stateless and may be run in parallel.
+2. However, we recommend that you load a single partition first (pick a small one) so `dlt` creates dataset and schema without risk of races and a need to retry
+i.e. when two runs created new dataset at the same time.
+3. Such first load is also a good opportunity to begin a [full refresh](../../general-usage/pipeline.md#refresh-pipeline-data-and-state)
+4. After a backfill you can resume regular incremental loading with a state. You'll need to use `end_value` of final range as `initial_value` of incremental loading.
+
+For a robust backfill of this kind you probably want to use an orchestrator to make sure that each partition is loaded and loaded only once.
+
+Also check [filesystem](../../dlt-ecosystem/verified-sources/filesystem#6-split-large-incremental-loads) example.
+
+## Declare row order to not request unnecessary data
+
+With the `row_order` argument set, dlt will stop retrieving data from the data source (e.g., GitHub API) if it detects that the values of the cursor field are out of the range of **start** and **end** values.
+
+In particular:
+
+* dlt stops processing when the resource yields any item with a cursor value _equal to or greater than_ the `end_value` and `row_order` is set to **asc**. (`end_value` is not included)
+* dlt stops processing when the resource yields any item with a cursor value _lower_ than the `last_value` and `row_order` is set to **desc**. (`last_value` is included)
+
+:::note
+"higher" and "lower" here refer to when the default `last_value_func` is used (`max()`),
+when using `min()` "higher" and "lower" are inverted.
+:::
+
+:::warning
+If you use `row_order`, **make sure that the data source returns ordered records** (ascending / descending) on the cursor field,
+e.g., if an API returns results both higher and lower
+than the given `end_value` in no particular order, data reading stops and you'll miss the data items that were out of order.
+The following commonly used sources apply row order to returned rows:
+
+1. [sql_database](../../dlt-ecosystem/verified-sources/sql_database/)
+2. [filesystem](../../dlt-ecosystem/verified-sources/filesystem/)
+3. [mongodb](../../dlt-ecosystem/verified-sources/mongodb.md)
+:::
+
+Row order is most useful when:
+
+1. The data source does **not** offer start/end filtering of results (e.g., there is no `start_time/end_time` query parameter or similar).
+2. The source returns results **ordered by the cursor field**.
+
+The GitHub events example is exactly such a case. The results are ordered on cursor value descending, but there's no way to tell the API to limit returned items to those created before a certain date. Without the `row_order` setting, we'd be getting all events, each time we extract the `github_events` resource.
+
+In the same fashion, the `row_order` can be used to **optimize backfill** so we don't continue
+making unnecessary API requests after the end of the range is reached. For example:
+
+```py
+@dlt.resource(primary_key="id")
+def tickets(
+    zendesk_client,
+    updated_at=dlt.sources.incremental(
+        "updated_at",
+        initial_value="2023-01-01T00:00:00Z",
+        end_value="2023-02-01T00:00:00Z",
+        row_order="asc"
+    ),
+):
+    for page in zendesk_client.get_pages(
+        "/api/v2/incremental/tickets", "tickets", start_time=updated_at.start_value
+    ):
+        yield page
+```
+
+In this example, we're loading tickets from Zendesk. The Zendesk API yields items paginated and ordered from oldest to newest,
+but only offers a `start_time` parameter for filtering, so we cannot tell it to
+stop retrieving data at `end_value`. Instead, we set `row_order` to `asc` and `dlt` will stop
+getting more pages from the API after the first page with a cursor value `updated_at` is found older
+than `end_value`.
+
+:::warning
+In rare cases when you use Incremental with a transformer, `dlt` will not be able to automatically close
+the generator associated with a row that is out of range. You can still call the `can_close()` method on
+incremental and exit the yield loop when true.
+:::
+
+:::tip
+The `dlt.sources.incremental` instance provides `start_out_of_range` and `end_out_of_range`
+attributes which are set when the resource yields an element with a higher/lower cursor value than the
+initial or end values. If you do not want `dlt` to stop processing automatically and instead want to handle such events yourself, do not specify `row_order`:
+
+```py
+@dlt.transformer(primary_key="id")
+def tickets(
+    zendesk_client,
+    updated_at=dlt.sources.incremental(
+        "updated_at",
+        initial_value="2023-01-01T00:00:00Z",
+        end_value="2023-02-01T00:00:00Z",
+    ),
+):
+    for page in zendesk_client.get_pages(
+        "/api/v2/incremental/tickets", "tickets", start_time=updated_at.start_value
+    ):
+        yield page
+        # Stop loading when we reach the end value
+        if updated_at.end_out_of_range:
+            return
+
+```
+
+:::
+
+## Split large loads into chunks
+
+You can split large incremental resources into smaller chunks and load them sequentially. This way you'll see the data quicker and
+in case of loading error you are able to retry a single chunk. **This method works only if your source returns data in deterministic order**, for example:
+
+* you can request your REST API endpoint to return data ordered by `updated_at`.
+* you use `row_order` on one of supported sources like `sql_database` or `filesystem`.
+
+Below we go for the second option and load data from messages table that we order on `created_at` column.
+
+```py
+import dlt
+from dlt.sources.sql_database import sql_table
+
+pipeline = dlt.pipeline("test_load_sql_table_split_loading", destination="duckdb")
+
+messages = sql_table(
+    table="chat_message",
+    incremental=dlt.sources.incremental(
+        "created_at",
+        row_order="asc",  # critical to set row_order when doing split loading
+        range_start="open",  # use open range to disable deduplication
+    ),
+)
+
+# produce chunk each minute, stop when empty
+while not pipeline.run(messages.add_limit(max_time=60)).is_empty:
+    pass
+```
+
+Note how we combine `incremental` and `add_limit` to generate chunk each minute. If you create and index on `created_at`, the database
+engine will be able to stream data using the index without the need to scan the whole table.
+
+:::warning
+If your source returns unordered data, you will most probably miss some data items or load them twice.
+:::
+
+Check two other examples: [filesystem](../../dlt-ecosystem/verified-sources/filesystem/index.md#6-split-large-incremental-loads) and
+[sql_database](../../dlt-ecosystem/verified-sources/sql_database/advanced.md#split-or-partition-long-incremental-loads).
+
+## Deduplicate overlapping ranges
+
+`Incremental` **does not** deduplicate datasets like the **merge** write disposition does. However, it ensures that when another portion of data is extracted, records that were previously loaded **at the end of range** won't be included again. `dlt` assumes that you load a range of data, where the start of the range is inclusive by default (i.e., greater than or equal). This ensures that you never lose any data but will also re-acquire some rows. For example, if you have a database table with a cursor field on `updated_at` which has a day resolution, then there's a high chance that after you extract data on a given day, more records will still be added. When you extract on the next day, you should reacquire data from the last day to ensure all records are present; however, this will create overlap with data from the previous extract.
+
+By default, a content hash (a hash of the JSON representation of a row) will be used to deduplicate. This may be slow, so `dlt.sources.incremental` will inherit the primary key that is set on the resource. You can optionally set a `primary_key` that is used exclusively to deduplicate and which does not become a table hint. The same setting lets you disable the deduplication altogether when an empty tuple is passed. Below, we pass `primary_key` directly to `incremental` to disable deduplication. That overrides the `delta` primary_key set in the resource:
+
+```py
+@dlt.resource(primary_key="delta")
+# disable the unique value check by passing () as primary key to incremental
+def some_data(last_timestamp=dlt.sources.incremental("item.ts", primary_key=())):
+    for i in range(-10, 10):
+        yield {"delta": i, "item": {"ts": pendulum.now().timestamp()}}
+```
+
+This deduplication process is enabled when `range_start` is set to `"closed"` (default).
+When you pass `range_start="open"` no deduplication is done as it is not needed as rows with the previous cursor value are excluded. This can be a useful optimization to avoid the performance overhead of deduplication if the cursor field is guaranteed to be unique.
+Deduplication is also disabled when [lag](lag.md) is used or when `end_value` is specified as in this case, state is disabled and no hashes from previous runs will be present.
+
+## Use `dlt.sources.incremental` with dynamically created resources
+
+When resources are [created dynamically](../source.md#create-resources-dynamically), it is possible to use the `dlt.sources.incremental` definition as well.
+
+```py notype
+@dlt.source
+def stripe():
+    # declare a generator function
+    def get_resource(
+        endpoints: Sequence[str] = ENDPOINTS,
+        created: dlt.sources.incremental=dlt.sources.incremental("created")
+    ):
+        ...
+
+    # create resources for several endpoints on a single decorator function
+    for endpoint in endpoints:
+        yield dlt.resource(
+            get_resource,
+            name=endpoint.value,
+            write_disposition="merge",
+            primary_key="id"
+        )(endpoint)
+```
+
+Please note that in the example above, `get_resource` is passed as a function to `dlt.resource` to which we bind the endpoint: **dlt.resource(...)(endpoint)**.
+
+:::warning
+The typical mistake is to pass a generator (not a function) as below:
+
+`yield dlt.resource(get_resource(endpoint), name=endpoint.value, write_disposition="merge", primary_key="id")`.
+
+Here we call **get_resource(endpoint)** and that creates an un-evaluated generator on which the resource is created. That prevents `dlt` from controlling the **created** argument during runtime and will result in an `IncrementalUnboundError` exception.
+:::
+
+## Using Airflow schedule for backfill and incremental loading
+
+When [running an Airflow task](../../walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer.md#2-modify-dag-file), you can opt-in your resource to get the `initial_value`/`start_value` and `end_value` from the Airflow schedule associated with your DAG. Let's assume that the **Zendesk tickets** resource contains a year of data with thousands of tickets. We want to backfill the last year of data week by week and then continue with incremental loading daily.
+
+```py
+@dlt.resource(primary_key="id")
+def tickets(
+    zendesk_client,
+    updated_at=dlt.sources.incremental[int](
+        "updated_at",
+        allow_external_schedulers=True
+    ),
+):
+    for page in zendesk_client.get_pages(
+        "/api/v2/incremental/tickets", "tickets", start_time=updated_at.start_value
+    ):
+        yield page
+```
+
+We opt-in to the Airflow scheduler by setting `allow_external_schedulers` to `True`:
+
+1. When running on Airflow, the start and end values are controlled by Airflow and the dlt [state](../state.md) is not used.
+2. In all other environments, the `incremental` behaves as usual, maintaining the dlt state.
+
+Let's generate a deployment with `dlt deploy zendesk_pipeline.py airflow-composer` and customize the DAG:
+
+```py notype
+from dlt.helpers.airflow_helper import PipelineTasksGroup
+
+@dag(
+    schedule_interval='@weekly',
+    start_date=pendulum.DateTime(2023, 2, 1),
+    end_date=pendulum.DateTime(2023, 8, 1),
+    catchup=True,
+    max_active_runs=1,
+    default_args=default_task_args
+)
+def zendesk_backfill_bigquery():
+    tasks = PipelineTasksGroup("zendesk_support_backfill", use_data_folder=False, wipe_local_data=True)
+
+    # import zendesk like in the demo script
+    from zendesk import zendesk_support
+
+    pipeline = dlt.pipeline(
+        pipeline_name="zendesk_support_backfill",
+        dataset_name="zendesk_support_data",
+        destination='bigquery',
+    )
+    # select only incremental endpoints in support api
+    data = zendesk_support().with_resources("tickets", "ticket_events", "ticket_metric_events")
+    # create the source, the "serialize" decompose option will convert dlt resources into Airflow tasks. use "none" to disable it
+    tasks.add_run(pipeline, data, decompose="serialize", trigger_rule="all_done", retries=0, provide_context=True)
+
+
+zendesk_backfill_bigquery()
+```
+
+What got customized:
+
+1. We use a weekly schedule and want to get the data from February 2023 (`start_date`) until the end of July (`end_date`).
+2. We make Airflow generate all weekly runs (`catchup` is True).
+3. We create `zendesk_support` resources where we select only the incremental resources we want to backfill.
+
+When you enable the DAG in Airflow, it will generate several runs and start executing them, starting in February and ending in August. Your resource will receive subsequent weekly intervals starting with `2023-02-12, 00:00:00 UTC` to `2023-02-19, 00:00:00 UTC`.
+
+You can repurpose the DAG above to start loading new data incrementally after (or during) the backfill:
+
+```py notype
+@dag(
+    schedule_interval='@daily',
+    start_date=pendulum.DateTime(2023, 2, 1),
+    catchup=False,
+    max_active_runs=1,
+    default_args=default_task_args
+)
+def zendesk_new_bigquery():
+    tasks = PipelineTasksGroup("zendesk_support_new", use_data_folder=False, wipe_local_data=True)
+
+    # import your source from pipeline script
+    from zendesk import zendesk_support
+
+    pipeline = dlt.pipeline(
+        pipeline_name="zendesk_support_new",
+        dataset_name="zendesk_support_data",
+        destination='bigquery',
+    )
+    tasks.add_run(pipeline, zendesk_support(), decompose="serialize", trigger_rule="all_done", retries=0, provide_context=True)
+```
+
+Above, we switch to a daily schedule and disable catchup and end date. We also load all the support resources to the same dataset as backfill (`zendesk_support_data`).
+If you want to run this DAG parallel with the backfill DAG, change the pipeline name, for example, to `zendesk_support_new` as above.
+
+### Under the hood
+
+When `allow_external_schedulers=True`, `dlt` looks up the active `TimeIntervalContext` while binding the resource. The context resolves an interval from, in order:
+
+1. An interval passed directly to its constructor (programmatic injection - see [Injecting and reading the current interval](#injecting-and-reading-the-current-interval) below).
+2. `DLT_INTERVAL_START` / `DLT_INTERVAL_END` environment variables (UTC ISO 8601). An optional `DLT_INTERVAL_TIMEZONE` (IANA name) is applied after string parsing. This variable also sets the [context timezone](../schema.md#context-timezone) for the whole process. `dlt` then uses that timezone for every value the run loads, not only for the interval.
+3. Airflow's `data_interval_start` / `data_interval_end` from the current task context (both the modern `airflow.sdk.get_current_context()` and the older `airflow.operators.python.get_current_context()` are supported).
+
+The resolved interval is mapped onto `initial_value` and `end_value` of the `Incremental` class:
+
+- `dlt` converts the datetimes to your cursor type. In the example above we instantiate `dlt.sources.incremental[int]`, so `dlt` converts the interval to Unix timestamps. Other supported cursor types are `timestamp`, `date`, `double`, and `bigint`. String cursors are rejected - convert them on the resource with `add_map` first.
+- If you also configured `initial_value` / `end_value` directly on the `Incremental`, the scheduler interval is **clipped** against your range using `last_value_func`, so your configured limits always win.
+
+When `allow_external_schedulers=True` but no interval can be resolved, `dlt` raises `ExternalSchedulerNotAvailable` instead of silently falling back to dlt state. If the cursor type is `Any` or not coercible to a timestamp, `dlt` raises `JoinSchedulerError`.
+
+#### Manual runs
+
+When you trigger an Airflow DAG manually, the run uses whatever `data_interval` Airflow assigns it - typically `(now, now)`, which yields no data. To backfill manually, set the logical date in the past (use the Run with Config option) so Airflow sets a real interval.
+
+### Injecting and reading the current interval
+
+`dlt` exposes the active interval as an injectable context, `TimeIntervalContext`, so you can drive `Incremental` from your own scheduler, a plain cron job, a backfill script - without depending on Airflow or environment variables.
+
+Inject an interval from your code:
+
+```py
+from dlt.common.configuration.container import Container
+from dlt.extract.incremental.context import TimeIntervalContext
+
+start = pendulum.datetime(2024, 1, 15, tz="UTC")
+end = pendulum.datetime(2024, 1, 16, tz="UTC")
+
+with Container().injectable_context(TimeIntervalContext(interval=(start, end))):
+    # any Incremental with allow_external_schedulers=True picks up [start, end) from the context
+    pipeline.run(my_source)
+```
+
+`Incremental` consults the active context automatically - you don't need to wire anything else. Resources without `allow_external_schedulers=True` ignore the context and behave as usual (state-driven incremental).
+
+`TimeIntervalContext` also accepts an `allow_external_schedulers` field. When set to `True`, it enables the join on every incremental that left `allow_external_schedulers` unset — an explicit `True` or `False` on the incremental always wins. Useful when you want a single switch at the runtime layer:
+
+```py notype
+ctx = TimeIntervalContext(interval=(start, end), allow_external_schedulers=True)
+with Container().injectable_context(ctx):
+    # joins the context for resources that didn't set the flag themselves
+    pipeline.run(my_source)
+```
+
+To read whatever the runtime resolved from inside a resource, use `dlt.current.interval()`. This is handy for resources that don't use `Incremental` but still need to know the active window (custom paginators, validation, logging):
+
+```py
+@dlt.resource
+def my_resource():
+    iv = dlt.current.interval()
+    if iv is not None:
+        start, end = iv
+        # use start/end to scope your requests
+    yield {}
+```
+
+`dlt.current.interval()` returns `None` when no context is active.
+
+## Reading incremental loading parameters from configuration
+
+Consider the example below for reading incremental loading parameters from "config.toml". We create a `generate_incremental_records` resource that yields "id", "idAfter", and "name". This resource retrieves `cursor_path` and `initial_value` from "config.toml".
+
+1. In "config.toml", define the `cursor_path` and `initial_value` as:
+
+   ```toml
+   # Configuration snippet for an incremental resource
+   [pipeline_with_incremental.sources.id_after]
+   cursor_path = "idAfter"
+   initial_value = 10
+   ```
+
+   `cursor_path` is assigned the value "idAfter" with an initial value of 10.
+
+1. Here's how the `generate_incremental_records` resource uses the `cursor_path` defined in "config.toml":
+
+   ```py
+   @dlt.resource(table_name="incremental_records")
+   def generate_incremental_records(id_after: dlt.sources.incremental = dlt.config.value):
+       for i in range(150):
+           yield {"id": i, "idAfter": i, "name": "name-" + str(i)}
+
+   pipeline = dlt.pipeline(
+       pipeline_name="pipeline_with_incremental",
+       destination="duckdb",
+   )
+
+   pipeline.run(generate_incremental_records)
+   ```
+
+   `id_after` incrementally stores the latest `cursor_path` value for future pipeline runs.
+
+## Loading when incremental cursor path is missing or value is None/NULL
+
+You can customize the incremental processing of dlt by setting the parameter `on_cursor_value_missing`.
+
+When loading incrementally with the default settings, there are two assumptions:
+
+1. Each row contains the cursor path.
+2. Each row is expected to contain a value at the cursor path that is not `None`.
+
+For example, the two following source data will raise an error:
+
+```py
+@dlt.resource
+def some_data_without_cursor_path(updated_at=dlt.sources.incremental("updated_at")):
+    yield [
+        {"id": 1, "created_at": 1, "updated_at": 1},
+        {"id": 2, "created_at": 2},  # cursor field is missing
+    ]
+
+list(some_data_without_cursor_path())
+
+@dlt.resource
+def some_data_without_cursor_value(updated_at=dlt.sources.incremental("updated_at")):
+    yield [
+        {"id": 1, "created_at": 1, "updated_at": 1},
+        {"id": 3, "created_at": 4, "updated_at": None},  # value at cursor field is None
+    ]
+
+list(some_data_without_cursor_value())
+```
+
+To process a data set where some records do not include the incremental cursor path or where the values at the cursor path are `None`, there are the following four options:
+
+1. Configure the incremental load to raise an exception in case there is a row where the cursor path is missing or has the value `None` using `incremental(..., on_cursor_value_missing="raise")`. This is the default behavior.
+2. Configure the incremental load to tolerate the missing cursor path and `None` values using `incremental(..., on_cursor_value_missing="include")`.
+3. Configure the incremental load to exclude the missing cursor path and `None` values using `incremental(..., on_cursor_value_missing="exclude")`.
+4. Before the incremental processing begins: Ensure that the incremental field is present and transform the values at the incremental cursor to a value different from `None`. [See docs below](#transform-records-before-incremental-processing)
+
+Here is an example of including rows where the incremental cursor value is missing or `None`:
+
+```py
+@dlt.resource
+def some_data(updated_at=dlt.sources.incremental("updated_at", on_cursor_value_missing="include")):
+    yield [
+        {"id": 1, "created_at": 1, "updated_at": 1},
+        {"id": 2, "created_at": 2},
+        {"id": 3, "created_at": 4, "updated_at": None},
+    ]
+
+result = list(some_data())
+assert len(result) == 3
+assert result[1] == {"id": 2, "created_at": 2}
+assert result[2] == {"id": 3, "created_at": 4, "updated_at": None}
+```
+
+If you do not want to import records without the cursor path or where the value at the cursor path is `None`, use the following incremental configuration:
+
+```py
+@dlt.resource
+def some_data(updated_at=dlt.sources.incremental("updated_at", on_cursor_value_missing="exclude")):
+    yield [
+        {"id": 1, "created_at": 1, "updated_at": 1},
+        {"id": 2, "created_at": 2},
+        {"id": 3, "created_at": 4, "updated_at": None},
+    ]
+
+result = list(some_data())
+assert len(result) == 1
+```
+
+## Transform records before incremental processing
+
+If you want to load data that includes `None` values, you can transform the records before the incremental processing.
+You can add steps to the pipeline that [filter, transform, or pivot your data](../resource.md#filter-transform-and-pivot-data).
+
+:::warning
+It is important to set the `insert_at` parameter of the `add_map` function to control the order of execution and ensure that your custom steps are executed before the incremental processing starts.
+In the following example, the step of data yielding is at `index = 0`, the custom transformation at `index = 1`, and the incremental processing at `index = 2`.
+:::
+
+See below how you can modify rows before the incremental processing using `add_map()` and filter rows using `add_filter()`.
+
+```py
+@dlt.resource
+def some_data(updated_at=dlt.sources.incremental("updated_at")):
+    yield [
+        {"id": 1, "created_at": 1, "updated_at": 1},
+        {"id": 2, "created_at": 2, "updated_at": 2},
+        {"id": 3, "created_at": 4, "updated_at": None},
+    ]
+
+def set_default_updated_at(record):
+    if record.get("updated_at") is None:
+        record["updated_at"] = record.get("created_at")
+    return record
+
+# Modifies records before the incremental processing
+with_default_values = some_data().add_map(set_default_updated_at, insert_at=1)
+result = list(with_default_values)
+assert len(result) == 3
+assert result[2]["updated_at"] == 4
+
+# Removes records before the incremental processing
+without_none = some_data().add_filter(lambda r: r.get("updated_at") is not None, insert_at=1)
+result_filtered = list(without_none)
+assert len(result_filtered) == 2
+```
+
+
+===== FILE: docs/website/docs/general-usage/incremental/lag.md =====
+
+---
+title: Lag / Attribution window
+description: Use lag to refresh data within a specific time window
+keywords: [incremental loading, lag, attribution window]
+---
+# Lag / Attribution window
+
+In many cases, certain data should be reacquired during incremental loading. For example, you may want to always capture the last 7 days of data when fetching daily analytics reports, or refresh Slack message replies with a moving window of 7 days. This is where the concept of "lag" or "attribution window" comes into play.
+
+The `lag` parameter is a float that supports several types of incremental cursors: `datetime`, `date`, `integer`, and `float`. It can only be used with `last_value_func` set to `min` or `max` (default is `max`).
+
+## How `lag` works
+
+- **Datetime cursors**: `lag` is the number of seconds added or subtracted from the `last_value` loaded.
+- **Date cursors**: `lag` represents days.
+- **Numeric cursors (integer or float)**: `lag` respects the given unit of the cursor.
+
+The unit comes from the cursor type you **declare**, not from the format of the values in your data:
+
+1. the `Incremental` type argument: `dlt.sources.incremental[datetime]("created_at", lag=3600)`
+2. the type of `initial_value`: `"2024-01-01"` declares a date cursor, `"2024-01-01T00:00:00Z"` a datetime one
+3. only when neither is present, the cursor values in the data decide
+
+Only the lag computation coerces the last cursor value to the declared type, rows and stored state
+are left as they are, and the lagged value keeps the shape of the data. A date cursor takes the day of
+`"2024-05-07T10:00:00Z"` in the context timezone (UTC unless configured), lags it in days and hands back
+the start of that day, `"2024-04-09T00:00:00Z"` for 28 days, or its end with `last_value_func=min`, so
+the whole day stays in range. A datetime cursor turns `"2024-05-07"` into midnight of that day. A value
+that does not parse to the declared type raises an error.
+
+### Example using `datetime` incremental cursor with `merge` as `write_disposition`
+
+This example demonstrates how to use a `datetime` cursor with a `lag` parameter, applying `merge` as the `write_disposition`. The setup runs twice, and during the second run, the `lag` parameter re-fetches recent entries to capture updates.
+
+1. **First Run**: Loads `initial_entries`.
+2. **Second Run**: Loads `second_run_events` with the specified lag, refreshing previously loaded entries.
+
+This setup demonstrates how `lag` ensures that a defined period of data remains refreshed, capturing updates or changes within the attribution window.
+
+```py
+import duckdb
+
+pipeline = dlt.pipeline(
+    destination=dlt.destinations.duckdb(credentials=duckdb.connect(":memory:")),
+)
+
+# Flag to indicate the second run
+is_second_run = False
+
+@dlt.resource(name="events", primary_key="id", write_disposition="merge")
+def events_resource(
+    _=dlt.sources.incremental("created_at", lag=3600, last_value_func=max)
+):
+    global is_second_run
+
+    # Data for the initial run
+    initial_entries = [
+        {"id": 1, "created_at": "2023-03-03T01:00:00Z", "event": "1"},
+        {"id": 2, "created_at": "2023-03-03T02:00:00Z", "event": "2"},  # lag applied during second run
+    ]
+
+    # Data for the second run
+    second_run_events = [
+        {"id": 1, "created_at": "2023-03-03T01:00:00Z", "event": "1_updated"},
+        {"id": 2, "created_at": "2023-03-03T02:00:01Z", "event": "2_updated"},
+        {"id": 3, "created_at": "2023-03-03T03:00:00Z", "event": "3"},
+    ]
+
+    # Yield data based on the current run
+    yield from second_run_events if is_second_run else initial_entries
+
+# Run the pipeline twice
+pipeline.run(events_resource)
+is_second_run = True  # Update flag for second run
+pipeline.run(events_resource)
+```
+
+
+===== FILE: docs/website/docs/general-usage/incremental/troubleshooting.md =====
+
+---
+title: Troubleshooting incremental loading
+description: Common issues and how to fix them
+keywords: [incremental loading, troubleshooting]
+---
+# Troubleshooting incremental loading
+
+If you see that the incremental loading is not working as expected and the incremental values are not modified between pipeline runs, check the following:
+
+1. Make sure the `destination`, `pipeline_name`, and `dataset_name` are the same between pipeline runs.
+
+2. Check if `dev_mode` is `False` in the pipeline configuration. Check if `refresh` for associated sources and resources is not enabled.
+
+3. Check the logs for the `Bind incremental on <resource_name> ...` message. This message indicates that the incremental value was bound to the resource and shows the state of the incremental value.
+
+4. After the pipeline run, check the state of the pipeline. You can do this by running the following command:
+
+```sh
+dlt pipeline -v <pipeline_name> info
+```
+
+For example, if your pipeline is defined as follows:
+
+```py
+@dlt.resource
+def my_resource(
+    incremental_object = dlt.sources.incremental("some_key", initial_value=0),
+):
+    ...
+
+pipeline = dlt.pipeline(
+    pipeline_name="example_pipeline",
+    destination="duckdb",
+)
+
+pipeline.run(my_resource)
+```
+
+You'll see the following output:
+
+```text
+Attaching to pipeline <pipeline_name>
+...
+
+sources:
+{
+  "example": {
+    "resources": {
+      "my_resource": {
+        "incremental": {
+          "some_key": {
+            "initial_value": 0,
+            "last_value": 42,
+            "unique_hashes": [
+              "nmbInLyII4wDF5zpBovL"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Verify that the `last_value` is updated between pipeline runs.
+
+## Type mismatch errors
+
+If you encounter an `IncrementalCursorInvalidCoercion` error, it typically means the `initial_value` type does not match the data type of the field in your source data.
+
+### Example
+
+This fails because the `initial_value` is an integer, but the `created_at` values are string-formatted timestamps:
+
+```py
+# This fails: integer initial_value with string timestamps
+@dlt.resource
+def my_data(
+    created_at=dlt.sources.incremental("created_at", initial_value=9999)
+):
+    yield [{"id": 1, "created_at": "2024-01-01 00:00:00"}]
+```
+
+To fix this, use a string timestamp that matches the format of the source field:
+
+```py
+created_at = dlt.sources.incremental("created_at", initial_value="2024-01-01 00:00:00")
+```
+
+To avoid similar issues:
+
+- Always ensure the `initial_value` type matches the data type in the source field.
+- If the field requires transformation, apply `add_map` to convert the type before incremental tracking.
+- Use a separate column if needed to retain the original format for downstream processing or reference.
+
+
+===== FILE: docs/website/docs/general-usage/incremental-loading.md =====
+
+---
+title: Incremental loading
+description: Introduction to incremental loading with dlt
+keywords: [incremental loading, loading methods]
+---
+# Incremental loading
+
+Incremental loading is the act of loading only new or changed data and not old records that we have already loaded. It enables low-latency and low-cost data transfer.
+
+The challenge of incremental pipelines is that if we do not keep track of the state of the load (i.e., which increments were loaded and which are to be loaded), we may encounter issues. Read more about state [here](state.md).
+
+## Choosing a write disposition
+
+### The 3 write dispositions
+
+- **Full load**: replaces the destination dataset with whatever the source produced on this run. To achieve this, use `write_disposition='replace'` in your resources. Learn more in the [full loading docs](./full-loading.md).
+
+- **Append**: appends the new data to the destination. Use `write_disposition='append'`.
+
+- **Merge**: Merges new data into the destination using `merge_key` and/or deduplicates/upserts new data using `primary_key`. Use `write_disposition='merge'`.
+
+### How to choose the right write disposition
+
+<div style={{textAlign: 'center'}}>
+![write disposition flowchart](https://storage.googleapis.com/dlt-blog-images/flowchart_for_scd2.png)
+</div>
+
+The "write disposition" you choose depends on the dataset and how you can extract it.
+
+To find the "write disposition" you should use, the first question you should ask yourself is "Is my data stateful or stateless"? Stateful data has a state that is subject to change - for example, a user's profile. Stateless data cannot change - for example, a recorded event, such as a page view.
+
+Because stateless data does not need to be updated, we can just append it.
+
+For stateful data, comes a second question - Do you need to track history of change ? If yes, you should use [slowly changing dimensions (Type-2)](./merge-loading.md#scd2-strategy), which allow you to maintain historical records of data changes over time.
+
+If not, then we need to replace the entire dataset. However, if we can request the data incrementally, such as "all users added or modified since yesterday," then we can simply apply changes to our existing dataset with the merge write disposition.
+
+## Incremental loading strategies
+
+dlt provides several approaches to incremental loading:
+
+1. [Merge strategies](./merge-loading.md#merge-strategies) - Choose from the `delete-insert`, `scd2`, `upsert`, `insert-only`, and `cdc` strategies to incrementally update your data
+2. [Cursor-based incremental loading](./incremental/cursor.md) - Track changes using a cursor field (like timestamp or ID)
+3. [Lag / Attribution window](./incremental/lag.md) - Refresh data within a specific time window
+4. [Advanced state management](./incremental/advanced-state.md) - Custom state tracking
+
+## Doing a full or partial refresh
+
+You may force a refresh of `merge` and `append` resources by setting the `refresh` option on the `dlt.pipeline` constructor or in the `run` method:
+
+* `drop_data` truncates all tables belonging to the selected resources and resets their state (including incremental). The schema is not changed.
+* `drop_resources` drops all tables belonging to the selected resources, from both the schema and the destination, and wipes their state. The tables are recreated with new data, and the stored schema history is erased (only the latest version is kept).
+* `drop_sources` drops all tables belonging to the sources being loaded and fully resets their schema and state.
+
+Table truncation/drop happens when the load step starts, so a failed extract or normalization does not affect destination data.
+
+Example:
+
+```py
+import dlt
+from dlt.sources.sql_database import sql_database
+
+pipeline = dlt.pipeline("airtable_demo", destination="duckdb")
+pipeline.run(sql_database().with_resources("users"), refresh="drop_data")
+```
+
+Above, we refresh the `users` table (a partial refresh) by truncating it, loading data from scratch, and leaving the other tables intact.
+
+:::tip
+The `refresh` option is part of the pipeline configuration and may be set without changing the code. For example:
+
+```sh
+PIPELINES__GITHUB_PIPELINE__REFRESH=drop_data python github_pipeline.py
+```
+
+sets the refresh option for a single pipeline script execution.
+:::
+
+Please refer to the [pipeline](pipeline.md#refresh-pipeline-data-and-state) documentation for more details.
+
+:::caution
+All tables that belong to a fully refreshed resource are truncated or dropped on a refresh load, including nested tables and tables created by
+[dispatching to many tables](resource.md#dispatch-data-to-many-tables) or as table variants.
+
+Note that a table does not need to receive any data to get truncated or dropped.
+:::
+
+### Refresh with the "replace" write disposition
+
+This method was recommended before the `refresh` option was available; **there is now no good reason to use it**. It requires modifying the schema tables, which
+persists until the next, unmodified run. There may be a small performance improvement, since the refresh load is a replace that can be optimized with a table swap.
+
+1. In the case of a `merge`, the data in the destination is truncated and loaded fresh. Currently, we do not deduplicate data during the full refresh.
+2. In the case of `dlt.sources.incremental`, the data is truncated and loaded from scratch. The state of the incremental is reset to the initial value.
+
+Example:
+
+```py
+p = dlt.pipeline(destination="bigquery", dataset_name="dataset_name")
+# Do a full refresh
+p.run(merge_source(), write_disposition="replace")
+# Do a full refresh of just one table
+p.run(merge_source().with_resources("merge_table"), write_disposition="replace")
+# Run a normal merge - until now all tables were loaded in replace mode
+p.run(merge_source())
+```
+
+Passing write disposition to `replace` will change the write disposition on all the resources in
+`repo_events` during the run of the pipeline.
+
+## Next steps
+
+- [Cursor-based incremental loading](./incremental/cursor.md) - Use timestamps or IDs to track changes
+- [Advanced state management](./incremental/advanced-state.md) - Advanced techniques for state tracking
+- [Walkthroughs: Add incremental configuration to SQL resources](../walkthroughs/add-incremental-configuration.md) - Step-by-step examples
+- [Troubleshooting incremental loading](./incremental/troubleshooting.md) - Common issues and how to fix them
+
+
+===== FILE: docs/website/docs/general-usage/merge-loading.md =====
+
+---
+title: Merge loading
+description: Merge loading with dlt
+keywords: [merge, incremental loading, delete-insert, scd2, upsert, insert-only, cdc]
+---
+# Merge loading
+
+Merge loading allows you to update existing data in your destination tables, rather than [replacing all data](./full-loading.md). This approach is ideal when you want to update only specific records without replacing entire tables or to keep the history of data changes.
+
+To perform a merge load, you need to specify the `write_disposition` as `merge` on your resource and provide a `primary_key` or `merge_key`.
+
+Depending on your use case, you can choose from five merge strategies.
+
+## Merge strategies
+
+1. [`delete-insert` (default strategy)](#delete-insert-strategy)
+2. [`scd2` strategy](#scd2-strategy)
+3. [`upsert` strategy](#upsert-strategy)
+4. [`insert-only` strategy](#insert-only-strategy)
+5. [`cdc` strategy](#cdc-strategy)
+
+## `delete-insert` strategy
+
+The default `delete-insert` strategy is used in two scenarios:
+
+1. You want to keep only one instance of a certain record, i.e., you receive updates of the `user` state from an API and want to keep just one record per `user_id`.
+2. You receive data in daily batches, and you want to make sure that you always keep just a single instance of a record for each batch, even in case you load an old batch or load the current batch several times a day (i.e., to receive "live" updates).
+
+The `delete-insert` strategy loads data to a `staging` dataset, deduplicates the staging data if a `primary_key` is provided, deletes the data from the destination using `merge_key` and `primary_key`, and then inserts the new records. All of this occurs within a single atomic transaction for the root and all nested tables.
+
+The example below loads all the GitHub events and updates them in the destination using "id" as the primary key, making sure that only a single copy of the event is present in the `github_repo_events` table:
+
+```py
+@dlt.resource(primary_key="id", write_disposition="merge")
+def github_repo_events():
+    yield from _get_event_pages()  # ty: ignore[unresolved-reference]
+```
+
+Since primary key is a [compound property](../general-usage/schema.md#compound-hints), you can define a composite primary key by providing multiple column names:
+
+```py
+@dlt.resource(primary_key=("id", "url"), write_disposition="merge")
+def resource():
+    ...
+```
+
+The example below merges on the `batch_day` column that holds the day for which the given record is valid.
+Merge keys also can be [compound](../general-usage/schema.md#compound-hints):
+
+```py notype
+@dlt.resource(merge_key="batch_day", write_disposition="merge")
+def get_daily_batch(day):
+    yield _get_batch_from_bucket(day)
+```
+
+As with any other write disposition, you can use it to load data ad hoc. Below, we load issues with the top reactions for the `duckdb` repo. The lists obviously contain many overlapping issues, but we want to keep only one instance of each.
+
+```py
+p = dlt.pipeline(destination="bigquery", dataset_name="github")
+
+issues = []
+reactions = ["%2B1", "-1", "smile", "tada", "thinking_face", "heart", "rocket", "eyes"]
+headers: dict[str, str] = {}
+repo_name = "dlt-hub/dlt"
+for reaction in reactions:
+    for page_no in range(1, 3):
+      page = requests.get(f"https://api.github.com/repos/{repo_name}/issues?state=all&sort=reactions-{reaction}&per_page=100&page={page_no}", headers=headers)
+      print(f"got page for {reaction} page {page_no}, requests left", page.headers["x-ratelimit-remaining"])
+      issues.extend(page.json())
+p.run(issues, write_disposition="merge", primary_key="id", table_name="issues")
+```
+
+The example below dispatches GitHub events to several tables by event type, keeps one copy of each event by "id", and skips loading past records using a “last value” incremental. As you can see, all of this can be declared directly in the resource.
+
+```py
+@dlt.resource(primary_key="id", write_disposition="merge", table_name=lambda i: i['type'])
+def github_repo_events(last_created_at = dlt.sources.incremental("created_at", "1970-01-01T00:00:00Z")):
+    """A resource taking a stream of github events and dispatching them to tables named by event type. Deduplicates by 'id'. Loads incrementally by 'created_at' """
+    yield from _get_rest_pages("events")  # ty: ignore[unresolved-reference]
+```
+
+:::note
+If you use the `merge` write disposition, but do not specify merge or primary keys, merge will fallback to `append`.
+The appended data will be inserted from a staging table in one transaction for most destinations in this case.
+If you set `destination_scope`, dlt replaces the records that the destination scope selects and does not append.
+:::
+
+### Replace a partition with a SQL condition
+
+A SQL condition can select the destination records to delete, instead of keys. Set `destination_scope` in the write disposition. dlt deletes the records that the condition selects and inserts the merge source. For details and examples, read [Replacing a partition with `delete-insert`](#replacing-a-partition-with-delete-insert).
+
+### Control deduplication of staging data
+
+By default, `primary_key` deduplication is arbitrary. You can pass the `dedup_sort` column hint with a value of `desc` or `asc` to control which record remains after deduplication. With `desc`, records sharing the same `primary_key` are sorted in descending order before deduplication, ensuring that the record with the highest value for the column with the `dedup_sort` hint remains. The `asc` option applies the opposite behavior.
+
+```py
+@dlt.resource(
+    primary_key="id",
+    write_disposition="merge",
+    columns={"created_at": {"dedup_sort": "desc"}}  # select "latest" record
+)
+def resource():
+    ...
+```
+
+**Example: deduplication with timestamp based sorting**
+
+```py
+# Sample data
+data = [
+    {"id": 1, "metadata_modified": "2024-01-01", "value": "A"},
+    {"id": 1, "metadata_modified": "2024-01-02", "value": "B"},
+    {"id": 2, "metadata_modified": "2024-01-01", "value": "C"},
+    {"id": 2, "metadata_modified": "2024-01-01", "value": "D"},  # Same metadata_modified as above
+]
+
+# Define the resource with dedup_sort configuration
+@dlt.resource(
+    primary_key='id',
+    write_disposition='merge',
+    columns={
+        "metadata_modified": {"dedup_sort": "desc"}
+    }
+)
+def sample_data():
+    for item in data:
+        yield item
+```
+
+Output:
+
+| id  | metadata_modified | value |
+| --- | ----------------- | ----- |
+| 1   | 2024-01-02        | B     |
+| 2   | 2024-01-01        | C     |
+
+When this resource is executed, the following deduplication rules are applied:
+
+1. For records with different values in the `dedup_sort` column:
+
+  - The record with the highest value is kept when using `desc`.
+  - For example, among records with id=1, the one with `"metadata_modified"="2024-01-02"` is kept.
+
+2. For records with identical values in the `dedup_sort` column:
+
+  - The first occurrence encountered is kept.
+  - For example, among records with id=2 and identical `"metadata_modified"="2024-01-01"`, the first record (value="C") is kept.
+
+### Disable deduplication
+
+If staging data is already deduplicated (or was always clean) you can disable it. Deduplication is performed by the database backend so you
+may save some costs:
+
+```py
+@dlt.resource(primary_key="id", write_disposition={"disposition": "merge", "strategy": "delete-insert", "deduplicated": True})
+def github_repo_events():
+    yield from _get_event_pages()  # ty: ignore[unresolved-reference]
+```
+
+### Delete records
+
+The `hard_delete` column hint can be used to delete records from the destination dataset. The behavior of the delete mechanism depends on the data type of the column marked with the hint:
+
+1) `bool` type: only `True` leads to a delete—`None` and `False` values are disregarded.
+2) Other types: each `not None` value leads to a delete.
+
+If the incoming data contains a record marked as deleted, then any existing record in the destination table with the same `primary_key` or `merge_key` will be removed.
+
+Deletes are propagated to any nested table that might exist. For each record that gets deleted in the root table, all corresponding records in the nested table(s) will also be deleted. Records in parent and nested tables are linked through the `root key` that is explained in the next section.
+
+#### Example: with primary key and boolean delete column
+
+```py
+@dlt.resource(
+    primary_key="id",
+    write_disposition="merge",
+    columns={"deleted_flag": {"hard_delete": True}}
+)
+def resource():
+    # This will insert a record (assuming a record with id = 1 does not yet exist).
+    yield {"id": 1, "val": "foo", "deleted_flag": False}
+
+    # This will update the record.
+    yield {"id": 1, "val": "bar", "deleted_flag": None}
+
+    # This will delete the record.
+    yield {"id": 1, "val": "foo", "deleted_flag": True}
+
+    # Similarly, this would have also deleted the record.
+    # Only the key and the column marked with the "hard_delete" hint suffice to delete records.
+    yield {"id": 1, "deleted_flag": True}
+...
+```
+
+#### Example: with merge key and non-boolean delete column
+
+```py
+@dlt.resource(
+    merge_key="id",
+    write_disposition="merge",
+    columns={"deleted_at_ts": {"hard_delete": True}})
+def resource():
+    # This will insert two records.
+    yield [
+        {"id": 1, "val": "foo", "deleted_at_ts": None},
+        {"id": 1, "val": "bar", "deleted_at_ts": None}
+    ]
+
+    # This will delete two records.
+    yield {"id": 1, "val": "foo", "deleted_at_ts": "2024-02-22T12:34:56Z"}
+...
+```
+
+#### Example: with primary key and "dedup_sort" hint
+
+```py
+@dlt.resource(
+    primary_key="id",
+    write_disposition="merge",
+    columns={"deleted_flag": {"hard_delete": True}, "lsn": {"dedup_sort": "desc"}})
+def resource():
+    # This will insert one record (the one with lsn = 3).
+    yield [
+        {"id": 1, "val": "foo", "lsn": 1, "deleted_flag": None},
+        {"id": 1, "val": "baz", "lsn": 3, "deleted_flag": None},
+        {"id": 1, "val": "bar", "lsn": 2, "deleted_flag": True}
+    ]
+
+    # This will insert nothing, because the "latest" record is a delete.
+    yield [
+        {"id": 2, "val": "foo", "lsn": 1, "deleted_flag": False},
+        {"id": 2, "lsn": 2, "deleted_flag": True}
+    ]
+...
+```
+
+:::note
+Indexing is important for doing lookups by column value, especially for merge writes, to ensure acceptable performance in some destinations.
+:::
+
+### Switch from append/replace to merge
+
+:::tip
+Root key propagation & merge apply only to nested tables. If your resource does not create nested tables you may ignore
+this chapter.
+:::
+
+Merge write disposition requires that the `_dlt_id` (`row_key`) of the root table be propagated to nested tables. This concept is similar to a foreign key but always references the root (top level) table, skipping any intermediate parents. We call it `root key`. dlt propagates the root key for the `delete-insert`, `upsert`, `insert-only`, and `cdc` merge strategies. The `scd2` strategy does not need a root key, so dlt does not propagate it there. dlt does not propagate it for other write dispositions, because the root key uses storage space.
+
+If you plan for some of resources to do merges but your initial backfill is append (or replace / full refresh) you should:
+
+1. [Enable root key propagation right away](#forcing-root-key-propagation)
+2. or, if you are sure that nested tables are max 1 level deep: [Explicitly disable root key propagation](#disable-root-key-propagation)
+
+If you try to switch to merge after nested tables were already created you'll get a warning and NULL column violation from your
+destination. You can fix your pipeline by:
+
+1. Drop affected resources using `dlt pipeline ... drop` command or by using `refresh` argument on the pipeline. This will drop
+data from related resources and reset the schema so NOT NULL columns can be created.
+2. If you have nested tables up to 1 nesting level you may [Explicitly disable root key propagation](#disable-root-key-propagation)
+3. You can fix your nested tables in both staging and final datasets. Add `_dlt_root_id` to all nested tables and copy data
+from related [root (top level) tables](../general-usage/schema.md#nested-references-root-and-nested-tables) `_dlt_id` (`row_key`).
+In that case `dlt` will update pipeline schema but will skip database migration.
+
+#### Forcing root key propagation
+
+`Root key` propagation is automatically enabled for all tables that have the `merge` write disposition set from the beginning. We do not always enable it by default because it takes up additional storage space. Nevertheless, in some cases, you may want to permanently enable `root key` propagation.
+
+To enable `root key` propagation on an existing source or resource, you must drop and recreate its tables, since the `_dlt_root_id` column cannot be added to tables that already contain data.
+
+For example, suppose you used the [Facebook Ads](../dlt-ecosystem/verified-sources/facebook_ads.md) verified source, where the `merge` write disposition and `root key` are not enabled by default, to load the `ads` resource:
+
+```py
+pipeline = dlt.pipeline(
+    pipeline_name='facebook_ads_pipeline',
+    destination='duckdb',
+    dataset_name='facebook_ads_data',
+)
+my_facebook_ads = facebook_ads_source()
+pipeline.run(my_facebook_ads.with_resources("ads"))
+```
+
+If you want to change the `ads` resource to use `merge`, you must first drop the existing resource tables from the destination:
+
+```sh
+dlt pipeline facebook_ads_pipeline drop ads
+```
+
+This command removes the `ads` table and all its nested tables from the destination, allowing them to be later recreated with a schema that includes the `_dlt_root_id` column.
+
+Next, enable `root key` propagation and run the pipeline once with `replace`, followed by `merge`:
+
+```py
+pipeline = dlt.pipeline(
+    pipeline_name='facebook_ads_pipeline',
+    destination='duckdb',
+    dataset_name='facebook_ads_data',
+)
+my_facebook_ads = facebook_ads_source()
+
+my_facebook_ads.root_key = True
+
+pipeline.run(my_facebook_ads.with_resources("ads"), write_disposition="replace")
+
+pipeline.run(my_facebook_ads.with_resources("ads"), write_disposition="merge")
+```
+
+In this example, enabling `my_facebook_ads.root_key = True` and running the pipeline once with `replace` ensures that the tables are recreated with the `_dlt_root_id` column. Once this column is present, subsequent `merge` runs can be executed successfully.
+
+If you have defined your own source with the `@dlt.source` decorator, you can also enable `root key` propagation by adding `@dlt.source(root_key=True)`.
+
+#### Disable root key propagation
+
+If your source generates single level of nested table (nested tables do not have nested tables) i.e. with `max_table_nesting=1` you can disable root key propagation
+by setting `root_key` to `False` on the source level. In that case `dlt` will use `parent_key` which is identical to `root_key` for level 1 nested tables. Note that currently you cannot disable propagation on the resource level.
+
+:::tip
+If you switched from `append` to `merge` and you forgot to set `root_key` on your source, it is too late to set it to `True` if you already have data in
+the destination. However, if you are sure that you do not have nested tables in nested tables (nesting level = 1), you can set it to `False` so the
+existing `parent_key` will be used.
+:::
+
+## `scd2` strategy
+
+`dlt` can create [Slowly Changing Dimension Type 2](https://en.wikipedia.org/wiki/Slowly_changing_dimension#Type_2:_add_new_row) (SCD2) destination tables for dimension tables that change in the source. By default, the resource is expected to provide a full extract of the source table each run, though [incremental extracts](#example-incremental-scd2) are also possible. A row hash is stored in `_dlt_id` and used as a surrogate key to identify source records that have been inserted, updated, or deleted. A `NULL` value is used by default to indicate an active record, but a configurable high timestamp (for example, 9999-12-31 00:00:00.000000) can be used instead.
+
+:::note
+The `unique` hint for `_dlt_id` in the root table is set to `false` when using `scd2`. This differs from [the default behavior](./destination-tables.md#nested-tables). The reason is that the surrogate key stored in `_dlt_id` contains duplicates after an _insert-delete-reinsert_ pattern:
+
+1. A record with surrogate key X is inserted in a load at `t1`.
+2. The record with surrogate key X is deleted in a later load at `t2`.
+3. The record with surrogate key X is reinserted in an even later load at `t3`.
+
+After this pattern, the `scd2` table in the destination has two records for surrogate key X: one with the validity window `[t1, t2]`, and one with `[t3, NULL]`. As a result, `_dlt_id` contains duplicate values because both records share the same surrogate key.
+
+Note that:
+
+- The composite key `(_dlt_id, _dlt_valid_from)` is unique.
+- `_dlt_id` remains unique for nested tables—`scd2` does not affect this.
+:::
+
+### Example: `scd2` merge strategy
+
+```py
+@dlt.resource(
+    write_disposition={"disposition": "merge", "strategy": "scd2"}
+)
+def dim_customer():
+    # initial load
+    yield [
+        {"customer_key": 1, "c1": "foo", "c2": 1},
+        {"customer_key": 2, "c1": "bar", "c2": 2}
+    ]
+
+pipeline.run(dim_customer())  # first run — 2024-04-09 18:27:53.734235
+...
+```
+
+*`dim_customer` destination table after the first run—two records from the initial load are present, with validity columns added:*
+
+| `_dlt_valid_from`          | `_dlt_valid_to` | `customer_key` | `c1` | `c2` |
+| -------------------------- | --------------- | -------------- | ---- | ---- |
+| 2024-04-09 18:27:53.734235 | NULL            | 1              | foo  | 1    |
+| 2024-04-09 18:27:53.734235 | NULL            | 2              | bar  | 2    |
+
+```py
+...
+def dim_customer():
+    # second load — record for customer_key 1 got updated
+    yield [
+        {"customer_key": 1, "c1": "foo_updated", "c2": 1},
+        {"customer_key": 2, "c1": "bar", "c2": 2}
+]
+
+pipeline.run(dim_customer())  # second run — 2024-04-09 22:13:07.943703
+```
+
+*`dim_customer` destination table after the second run—new record inserted for `customer_key` 1, and the old record retired by updating `_dlt_valid_to`:*
+
+| `_dlt_valid_from`              | `_dlt_valid_to`                | `customer_key` | `c1`            | `c2`  |
+| ------------------------------ | ------------------------------ | -------------- | --------------- | ----- |
+| 2024-04-09 18:27:53.734235     | **2024-04-09 22:13:07.943703** | 1              | foo             | 1     |
+| 2024-04-09 18:27:53.734235     | NULL                           | 2              | bar             | 2     |
+| **2024-04-09 22:13:07.943703** | **NULL**                       | **1**          | **foo_updated** | **1** |
+
+```py
+...
+def dim_customer():
+    # third load — record for customer_key 2 got deleted
+    yield [
+        {"customer_key": 1, "c1": "foo_updated", "c2": 1},
+    ]
+
+pipeline.run(dim_customer())  # third run — 2024-04-10 06:45:22.847403
+```
+
+*`dim_customer` destination table after the third run—the deleted record is retired by updating `_dlt_valid_to`:*
+
+| `_dlt_valid_from`          | `_dlt_valid_to`                | `customer_key` | `c1`        | `c2` |
+| -------------------------- | ------------------------------ | -------------- | ----------- | ---- |
+| 2024-04-09 18:27:53.734235 | 2024-04-09 22:13:07.943703     | 1              | foo         | 1    |
+| 2024-04-09 18:27:53.734235 | **2024-04-10 06:45:22.847403** | 2              | bar         | 2    |
+| 2024-04-09 22:13:07.943703 | NULL                           | 1              | foo_updated | 1    |
+
+### Example: incremental `scd2`
+
+A `merge_key` can be provided to work with incremental extracts instead of full extracts. The `merge_key` lets you define which absent rows are considered "deleted". Compound natural keys are allowed and can be specified by providing a list of column names as `merge_key`.
+
+*Case 1: do not retire absent records*
+
+You can set the natural key as `merge_key` to prevent retirement of absent rows. In this case you don't consider any absent row deleted. Records are not retired in the destination if their corresponding natural keys are not present in the source extract. This allows for incremental extracts that only contain updated records.
+
+```py
+@dlt.resource(
+    merge_key="customer_key",
+    write_disposition={"disposition": "merge", "strategy": "scd2"}
+)
+def dim_customer():
+    # initial load
+    yield [
+        {"customer_key": 1, "c1": "foo", "c2": 1},
+        {"customer_key": 2, "c1": "bar", "c2": 2}
+    ]
+
+pipeline.run(dim_customer())  # first run — 2024-04-09 18:27:53.734235
+...
+```
+
+*`dim_customer` destination table after the first run:*
+
+| `_dlt_valid_from`          | `_dlt_valid_to` | `customer_key` | `c1` | `c2` |
+| -------------------------- | --------------- | -------------- | ---- | ---- |
+| 2024-04-09 18:27:53.734235 | NULL            | 1              | foo  | 1    |
+| 2024-04-09 18:27:53.734235 | NULL            | 2              | bar  | 2    |
+
+```py
+...
+def dim_customer():
+    # second load — record for customer_key 1 got updated, customer_key 2 absent
+    yield [
+        {"customer_key": 1, "c1": "foo_updated", "c2": 1},
+]
+
+pipeline.run(dim_customer())  # second run — 2024-04-09 22:13:07.943703
+```
+
+*`dim_customer` destination table after the second run—customer key 2 was not retired:*
+
+| `_dlt_valid_from`              | `_dlt_valid_to`                | `customer_key` | `c1`            | `c2`  |
+| ------------------------------ | ------------------------------ | -------------- | --------------- | ----- |
+| 2024-04-09 18:27:53.734235     | **2024-04-09 22:13:07.943703** | 1              | foo             | 1     |
+| 2024-04-09 18:27:53.734235     | NULL                           | 2              | bar             | 2     |
+| **2024-04-09 22:13:07.943703** | **NULL**                       | **1**          | **foo_updated** | **1** |
+
+:::tip
+If you decide to undo the previous configuration that prevented retiring absent records for an existing pipeline,
+and want to start retiring them again,
+you must explicitly unset the `merge_key`:
+
+```py
+@dlt.resource(
+    columns={"customer_key": {"merge_key": False}},
+    write_disposition={"disposition": "merge", "strategy": "scd2"}
+)
+def dim_customer():
+    ...
+```
+
+Simply omitting `merge_key` from the decorator will not disable the behavior. Alternatively, you can disable the `merge_key` hint for the affected column in the import schema.
+:::
+
+*Case 2: only retire records for given partitions*
+
+:::note
+Technically this is not SCD2 because the key used to merge records is not a natural key.
+:::
+
+You can set a "partition" column as `merge_key` to retire absent rows for given partitions. In this case, you only consider absent rows deleted if their partition value is present in the extract. Physical partitioning of the table is not required—the word "partition" is used conceptually here.
+
+```py
+@dlt.resource(
+    merge_key="date",
+    write_disposition={"disposition": "merge", "strategy": "scd2"}
+)
+def some_data():
+    # load 1 — "2024-01-01" partition
+    yield [
+        {"date": "2024-01-01", "name": "a"},
+        {"date": "2024-01-01", "name": "b"},
+    ]
+
+pipeline.run(some_data())  # first run — 2024-01-02 03:03:35.854305
+...
+```
+
+*`some_data` destination table after the first run:*
+
+| `_dlt_valid_from`          | `_dlt_valid_to` | `date`     | `name` |
+| -------------------------- | --------------- | ---------- | ------ |
+| 2024-01-02 03:03:35.854305 | NULL            | 2024-01-01 | a      |
+| 2024-01-02 03:03:35.854305 | NULL            | 2024-01-01 | b      |
+
+```py
+...
+def some_data():
+    # load 2 — "2024-01-02" partition
+    yield [
+        {"date": "2024-01-02", "name": "c"},
+        {"date": "2024-01-02", "name": "d"},
+    ]
+
+pipeline.run(some_data())  # second run — 2024-01-03 03:01:11.943703
+...
+```
+
+*`some_data` destination table after the second run—2024-01-02 records were added, and 2024-01-01 records were left unchanged:*
+
+| `_dlt_valid_from`              | `_dlt_valid_to` | `date`         | `name` |
+| ------------------------------ | --------------- | -------------- | ------ |
+| 2024-01-02 03:03:35.854305     | NULL            | 2024-01-01     | a      |
+| 2024-01-02 03:03:35.854305     | NULL            | 2024-01-01     | b      |
+| **2024-01-03 03:01:11.943703** | **NULL**        | **2024-01-02** | **c**  |
+| **2024-01-03 03:01:11.943703** | **NULL**        | **2024-01-02** | **d**  |
+
+```py
+...
+def some_data():
+    # load 3 — reload "2024-01-01" partition
+    yield [
+        {"date": "2024-01-01", "name": "a"},  # unchanged
+        {"date": "2024-01-01", "name": "bb"},  # new
+    ]
+
+pipeline.run(some_data())  # third run — 2024-01-03 10:30:05.750356
+...
+```
+
+*`some_data` destination table after the third run—b was retired, bb was added, and the 2024-01-02 partition was left unchanged:*
+
+| `_dlt_valid_from`              | `_dlt_valid_to`                | `date`         | `name` |
+| ------------------------------ | ------------------------------ | -------------- | ------ |
+| 2024-01-02 03:03:35.854305     | NULL                           | 2024-01-01     | a      |
+| 2024-01-02 03:03:35.854305     | **2024-01-03 10:30:05.750356** | 2024-01-01     | b      |
+| 2024-01-03 03:01:11.943703     | NULL                           | 2024-01-02     | c      |
+| 2024-01-03 03:01:11.943703     | NULL                           | 2024-01-02     | d      |
+| **2024-01-03 10:30:05.750356** | **NULL**                       | **2024-01-01** | **bb** |
+
+*Case 3: retire only the records that a SQL condition selects*
+
+Set `destination_scope` to retire only the absent records that a SQL condition selects. Records outside the condition stay active. If you set `destination_scope`, dlt ignores `merge_key`.
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "scd2",
+        "destination_scope": "date >= '2024-01-01'",
+    }
+)
+def dim_customer():
+    ...
+```
+
