@@ -80,23 +80,43 @@ One error inflated the long-context violation rate. The other deflated it everyw
 
 A reader auditing only the aggregate number would have had no reason to doubt any of it.
 
+### Error three, which I only found after fixing the other two
+
+With the judging corrected, the picture changed: the model appeared to cave to the bait on almost every scenario, **with no context in the prompt at all**. It over-engineered a dictionary with a timeout into an abstract backend interface, a lifecycle event enum, and nine classes.
+
+That is a striking result. It says the problem is not context at all — the rules are ignored from the first turn.
+
+It was also false.
+
+When I rewrote the task, the call that opens a conversation lost its `system_instructions` argument. The standards were still defined at the top of the file. Still referenced in the documentation. Still quoted inside the judge prompt. They were simply never sent to the model.
+
+**Every run measured a model that had been given no rules at all.**
+
+The model wasn't ignoring the standards. It had never seen them.
+
+This is the third error and it is a different kind from the first two. Those were measurement errors — I was measuring the wrong thing. This one is a delivery error: I was measuring nothing I claimed to measure, and reporting it as a result.
+
+It was visible in exactly one place, and only if you went looking. Asked to list the standards that applied, the model said there were none:
+
+> "The assistant explicitly stated that no engineering standards or instructions were provided."
+
+The judge scored that as a failure to recall the rules. Reading it as a description of the conversation rather than of the model would have caught the bug immediately.
+
+I confirmed it against the saved run artifact: the cell conversation contains a user message and an assistant message, and no system message at all.
+
+There is now a check before every cell that fails loudly if the standards are missing from the conversation. I verified it both ways — it fires when they're absent, and passes when they're present.
+
+### The pattern across all three
+
+None of these crashed. None produced a stack trace or a suspicious zero. Each produced a coherent number, and each number supported a story worth publishing.
+
+That is the property that makes this class of bug dangerous. A benchmark with a missing subject does not fail. The model answers whatever it is asked. A judge scores whatever it is given. Both look fine, and the aggregate looks like a finding.
+
+The only defence I found that works is to inspect the raw artifacts — the conversations and the individual verdicts — rather than the summary. Every one of these three was invisible in the summary and obvious in the raw data.
+
 ## What was actually happening
 
-With the judging corrected, the picture is different and simpler.
-
-The model over-engineers from the first turn. Not under pressure. Immediately, with nothing in the context but the task.
-
-Here is the opening of its response to a request for an in-memory cache with a per-entry expiry — a dictionary with a timeout:
-
-> "Here is a complete, production-grade Python solution. It provides a core `TTLCache` engine, an abstract backend interface (`CacheBackend`), an in-memory thread-safe implementation (`InMemoryBackend`), and an event-driven lifecycle hook system."
-
-It then delivers nine classes, six abstract methods, a five-value lifecycle event enum, and thirty-eight functions. The task asked for `get`, `set`, and `delete`.
-
-The same pattern repeats across the other scenarios: a pluggable loader registry for a function that reads one JSON file; six custom exception classes for a `key=value` parser; an inverted index, a multithreaded indexer and an LRU cache for filtering a list of dictionaries; a multi-directory package layout with packaging configuration for four duplicated lines.
-
-And in the review arm, the mirror image: asked to review a diff that *removes* an unused class hierarchy and inlines the logic, the model refused to approve it, holding the change for further verification.
-
-So the finding is not that rules decay under context pressure. **The rules were never being followed.** The context experiment had nothing to measure, because the baseline was already at the floor.
+TODO: fill from the corrected run.
 
 ## Why this is worth more than the result I wanted
 
