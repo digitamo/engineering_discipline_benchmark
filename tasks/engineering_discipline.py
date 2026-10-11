@@ -535,7 +535,15 @@ def estimate_tokens(text: str) -> int:
 
 
 def model_window(model_name: str) -> int:
-    return MODEL_WINDOWS.get(model_name, DEFAULT_WINDOW)
+    """Advertised context window for a model identifier.
+
+    Identifiers arrive provider-prefixed (`google/gemini-3.7-flash`) while the
+    table is keyed on the bare slug, so both forms are tried. An unknown model
+    falls back to a conservative default rather than to a huge one, because
+    falling back high would silently overshoot the real window.
+    """
+    bare = model_name.split("/")[-1]
+    return MODEL_WINDOWS.get(model_name) or MODEL_WINDOWS.get(bare) or DEFAULT_WINDOW
 
 
 def find_chunks(filler: str) -> list[Path]:

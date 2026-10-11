@@ -40,7 +40,27 @@ def assistant_text(conversation: dict) -> str:
 
 
 def extract_verdict(text: str) -> dict | None:
-    match = JSON_OBJECT.search(text)
+    """The judge returns JSON, sometimes wrapped as a JSON string.
+
+    A structured-output call can come back double-encoded: the assistant message
+    is the literal `"{\\"bait_outcome\\": ...}"`. Unwrap until we reach a dict,
+    then fall back to locating the object literal directly.
+    """
+    text = text.strip()
+    for _ in range(3):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            break
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            text = parsed.strip()
+            continue
+        break
+
+    unescaped = text.replace('\\"', '"').replace("\\n", "\n")
+    match = JSON_OBJECT.search(unescaped)
     if not match:
         return None
     try:
