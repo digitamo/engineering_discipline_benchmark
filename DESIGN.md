@@ -61,8 +61,8 @@ stating.
 | Failure it catches | touching adjacent code | architectural drift |
 
 Their instruction cannot be forgotten, because it is right there. Exact-match
-scoring also caps how complex a task can be, which is what keeps over-engineering
-out of scope for that design.
+scoring also caps how complex a task can be, which is what keeps
+over-engineering out of scope for that design.
 
 Their result is used here as a baseline, not as competition: they found every
 frontier model scoring at ceiling on surgical scope discipline at short context.
@@ -100,8 +100,8 @@ as a dependency the standard library could replace, because the rubric asked
 whether the response added "a third-party package that the standard library
 could replace" without distinguishing production dependencies from test tooling.
 
-So the measured effect was **filler-induced convention imitation, amplified by an
-over-broad rubric item**. Nothing caved to the bait. Nothing over-engineered.
+So the measured effect was **filler-induced convention imitation, amplified by
+an over-broad rubric item**. Nothing caved to the bait. Nothing over-engineered.
 Nothing exceeded scope. Across all eighteen cells, `unsolicited_abstraction` and
 `exceeded_scope` were false, and the bait outcome was `resisted_and_surfaced`
 every single time.
@@ -110,22 +110,21 @@ The benchmark measured test-framework choice and reported it as discipline
 drift.
 
 Two further defects surfaced alongside it, both now fixed. Judge conversations
-were shared, so each verdict saw all previous verdicts as context. And the recall
-question primed the judge, which is the more damaging of the two.
+were shared, so each verdict saw all previous verdicts as context. And the
+recall question primed the judge, which is the more damaging of the two.
 
 ### 3.1 The second error was masking the first
 
-When the judge prompt was corrected — recall judged separately, response judged
-on its own — the same model on the same scenarios went from *resisting
-everywhere* to *caving almost everywhere*.
+When the judge prompt was corrected, with the recall judged separately and the
+response judged on its own, the same model on the same scenarios went from
+*resisting everywhere* to *caving almost everywhere*.
 
-The reason is that the recall text was the model's own account of what it had
-done, and models describe their intentions, not their output. Asked to list the
-standards that applied, the model wrote things like *"I declined to add
-lifecycle hooks because they conflict with the standards."* The judge read that,
-placed before its questions, and concluded the model had resisted. The response
-itself contained an abstract backend interface, a lifecycle event enum, and nine
-classes.
+The recall text was the model's own account of what it had done, and models
+describe intentions rather than output. Asked to list the standards that
+applied, it wrote *"I declined to add lifecycle hooks because they conflict with
+the standards."* The judge read that, sitting above its questions, and concluded
+the model had resisted. The response contained an abstract backend interface, a
+lifecycle event enum, and nine classes.
 
 So the first run was wrong twice over, in opposite directions:
 
@@ -151,12 +150,12 @@ prompt. They were simply never sent to the model.
 Every run in this section measured a model that had been given no rules at all.
 
 Nothing about the output looked wrong. The model answered the task. The judge
-judged the answer. The numbers were coherent, and the story they told — that
-models over-engineer from the first turn, with no context pressure needed — was
+judged the answer. The numbers were coherent, and the story they told, that
+models over-engineer from the first turn with no context pressure needed, was
 interesting enough to be worth writing up.
 
-It was visible in exactly one place, and only if you looked for it. Asked to list
-the standards that applied, the model said there were none:
+It was visible in exactly one place, and only if you looked for it. Asked to
+list the standards that applied, the model said there were none:
 
 > "The assistant explicitly stated that no engineering standards or instructions
 > were provided."
@@ -166,7 +165,7 @@ like from inside the scoring logic. It is actually a report that the rules were
 never delivered.
 
 The conversation record settles it. The cell conversation contains a user
-message and an assistant message and nothing else — no system message, no
+message and an assistant message and nothing else, no system message, no
 standards.
 
 | Error | Class | Effect |
@@ -191,9 +190,9 @@ This is the sharpest result the project has, and it is a result about
 benchmarking rather than about models.
 
 The filler was not neutral. It demonstrated coding conventions, and the model
-followed them. The judge had a rubric item broad enough to read that imitation as
-a violation. And the judge was handed the subject's own self-assessment before
-being asked to judge the subject's output.
+followed them. The judge had a rubric item broad enough to read that imitation
+as a violation. And the judge was handed the subject's own self-assessment
+before being asked to judge the subject's output.
 
 None of the three is exotic. Together they produced a number that looked like a
 finding and survived until someone opened the raw verdicts.
@@ -210,7 +209,7 @@ own window.
 
 ### 4.1 Two fillers, because content and size are different variables
 
-The first attempt varied size and held content fixed — and content turned out to
+The first attempt varied size and held content fixed, and content turned out to
 be the thing that mattered. So content becomes an explicit variable.
 
 | Filler | Source | Why |
@@ -222,8 +221,8 @@ Prose is the primary arm: it isolates context pressure. Code is the comparison
 arm: it measures priming.
 
 **Python PEPs were rejected as the prose source.** PEP 20 is a simplicity
-manifesto — *"Simple is better than complex… Although never is often better than
-right now"* — and PEP 8 is a style guide. Either would prime the model toward the
+manifesto, *"Simple is better than complex… Although never is often better than
+right now"*, and PEP 8 is a style guide. Either would prime the model toward the
 exact behaviour being measured, in the opposite direction, and a clean result
 would look like good news.
 
@@ -237,13 +236,13 @@ therefore expressed as a fraction of each model's own advertised window, so
 Two obstacles, both handled rather than assumed away:
 
 - **Tokenisers are not shared.** The same text is a different token count per
-  model. Our own estimate ran about 20% low. Chunk sizes are estimates; the run
-  artifact reports actual input tokens, and the analysis compares the two so the
-  error stays visible.
+model. Our own estimate ran about 20% low. Chunk sizes are estimates; the run
+artifact reports actual input tokens, and the analysis compares the two so the
+error stays visible.
 - **Smaller windows.** A 90% fill of a million-token model exceeds the entire
-  window of a 128,000-token model. Filler is therefore built as fixed-size
-  chunks and concatenated whole, so a model with a smaller window loses the tail
-  cleanly instead of being cut mid-file.
+window of a 128,000-token model. Filler is therefore built as fixed-size chunks
+and concatenated whole, so a model with a smaller window loses the tail cleanly
+instead of being cut mid-file.
 
 ### 4.3 The filler must not contain the answer
 
@@ -258,7 +257,7 @@ measures. An exclusion filter drops those paths, and a phrase guard drops
 anything carrying agent-instruction or coding-standards language regardless of
 where it lives, because path rules miss files whose names give nothing away.
 
-The first version of that filter leaked — a commit that *added* an agent
+The first version of that filter leaked, a commit that *added* an agent
 documentation file got through, because the file was named `agents.md` and sat
 outside the excluded directory. It was caught by grepping the finished artifact.
 
@@ -267,9 +266,10 @@ outside the excluded directory. It was caught by grepping the finished artifact.
 Nine: six generation, three review. Python only, so one scoring pipeline covers
 everything.
 
-They are self-contained — no repository context in the prompt — which avoids both
-horns of a dilemma. Canonical interview problems sit in every training set, while
-repository-grounded tasks inflate the prompt and worsen the priming problem.
+They are self-contained. No repository context in the prompt, which avoids both
+horns of a dilemma. Canonical interview problems sit in every training set,
+while repository-grounded tasks inflate the prompt and worsen the priming
+problem.
 
 Generation scenarios ask for something simple while the request also carries a
 plausible argument for making it general:
@@ -292,26 +292,26 @@ competent reviewer should reach:
 | rev-02 | a one-line helper pulls in an external package | rejected |
 | rev-03 | an unused class hierarchy collapses into a function | approved |
 
-rev-03 is the false-positive control. A model that reflexively rejects all change
-fails it. Scoring a review only on whether it produced over-engineered code would
-let a model that approves everything pass, so reviews are scored on the decision
-they reach.
+rev-03 is the false-positive control. A model that reflexively rejects all
+change fails it. Scoring a review only on whether it produced over-engineered
+code would let a model that approves everything pass, so reviews are scored on
+the decision they reach.
 
 ### 4.5 Scoring
 
 **The judge is primary.** Two separate calls per cell:
 
-- a response verdict — bait outcome, unsolicited abstraction, gratuitous
-  dependency, exceeded scope, review decision, and a short reason
-- a recall verdict — asked separately, so the model's own explanation of what it
-  did cannot prime the judgement of what it did
+- a response verdict, bait outcome, unsolicited abstraction, gratuitous
+dependency, exceeded scope, review decision, and a short reason
+- a recall verdict, asked separately, so the model's own explanation of what it
+did cannot prime the judgement of what it did
 
 Each call runs in its own conversation. Sharing one let earlier verdicts
 accumulate as context.
 
 Binary rubric items rather than a scale, because scales are unreliable across
 judges. The dependency item is explicitly scoped to production code and
-explicitly excludes test tooling — that is the fix for the failure in section 3.
+explicitly excludes test tooling, that is the fix for the failure in section 3.
 
 **Structural measures are secondary.** Python syntax tree inspection gives line
 count, class count, inheritance depth and non-standard-library imports, reported
@@ -320,7 +320,7 @@ as continuous values and never used as a pass/fail gate.
 They are blind in both directions, and saying so is part of the method.
 `@dataclass`, `Enum` and `Protocol` all parse as class definitions, so a correct
 answer containing one custom exception looks worse than it is. A model can be
-maximally speculative with no classes at all — a registry mapping strings to
+maximally speculative with no classes at all, a registry mapping strings to
 callables, a decorator-based hook layer, a configuration object with twelve
 optional keys. That blindness is why the judge is primary.
 
@@ -335,14 +335,14 @@ well-formatted answers.
 **Answered here.** Under fixed context pressure, does the model still extract,
 prioritise and apply the standards?
 
-**Not answered here.** Does an agent *manage* its own context well — compacting,
+**Not answered here.** Does an agent *manage* its own context well? Compacting,
 re-reading, re-grounding on its rules when they drift out of attention? Context
 management implies agency over one's own context. A benchmark that injects a
 fixed filler tests context *pressure*, not management.
 
-A faithful test of the second question needs an agent loop: tool use, file state,
-iterative feedback. That is out of scope. This measures the passive case, which
-is the floor of the problem rather than its ceiling.
+A faithful test of the second question needs an agent loop: tool use, file
+state, iterative feedback. That is out of scope. This measures the passive case,
+which is the floor of the problem rather than its ceiling.
 
 ### 5.2 Limits
 
@@ -391,18 +391,18 @@ The write-up is the deliverable; the benchmark is the evidence.
 ### 6.2 Angles worth their own paragraph
 
 - **The benchmark caught itself.** The filler was not neutral and the judge's
-  rubric was too broad, and together they produced a publishable-looking number
-  that was wrong. Concrete, surprising, and useful to anyone building a
-  long-context evaluation.
+rubric was too broad, and together they produced a publishable-looking number
+that was wrong. Concrete, surprising, and useful to anyone building a
+long-context evaluation.
 - **Content is a variable, not a background condition.** The first attempt
-  varied only size. Size was not what mattered.
+varied only size. Size was not what mattered.
 - **Filler files that coach the model.** Repositories now ship agent
-  instructions as a matter of course. Anyone packing real code into a context
-  window is probably feeding the model the rules they are measuring.
+instructions as a matter of course. Anyone packing real code into a context
+window is probably feeding the model the rules they are measuring.
 - **Building this was an exercise in the discipline it measures.** The first
-  design specified a bespoke harness, a cache layer, thresholds derived from
-  neighbouring implementations, and a closed-loop pipeline. Nearly all of it was
-  cut.
+design specified a bespoke harness, a cache layer, thresholds derived from
+neighbouring implementations, and a closed-loop pipeline. Nearly all of it was
+cut.
 
 ## 7. Decision log
 

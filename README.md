@@ -38,7 +38,7 @@ kaggle b t models       # models your token can reach
 ```
 
 > There is no `quota` subcommand. Check quota in the web interface before
-> committing to a run size — a deep fill costs a lot.
+> committing to a run size, a deep fill costs a lot.
 
 ## Layout
 
@@ -89,8 +89,8 @@ edit the markdown by hand.
 Two fillers, because the content of the context turned out to matter more than
 its size:
 
-- `prose` — IETF RFCs, neutral with respect to the standards under test
-- `code` — a pinned clone of the code corpus, which demonstrates coding conventions
+- `prose`, IETF RFCs, neutral with respect to the standards under test
+- `code`, a pinned clone of the code corpus, which demonstrates coding conventions
 
 ```bash
 ./scripts/setup_corpus.sh          # pinned shallow clone, if you do not have one
@@ -132,7 +132,7 @@ python3 scripts/test_scoring.py
 
 The platform proxy reserves quota per request and refuses a request before
 sending it when the reservation exceeds the balance. When that blocks you, run
-locally against a LiteLLM gateway instead — no quota applies.
+locally against a LiteLLM gateway instead, no quota applies.
 
 ```bash
 ./scripts/run_local.sh baseline     # all nine scenarios, no context
@@ -145,7 +145,7 @@ LiteLLM must already be running. The library appends `/openapi` to its base URL
 while LiteLLM serves `/v1`, so `scripts/litellm_bridge.py` starts automatically
 and rewrites the prefix. Neither the library nor the running gateway is changed.
 
-Choose a judge from a different model family where one is available — the
+Choose a judge from a different model family where one is available. The
 platform has been using Gemini to judge Gemini, which is the self-preference
 problem noted in the roadmap.
 
@@ -164,8 +164,8 @@ python3 scripts/analyze.py runs/**/*.run.json
 ```
 
 The task returns the pass rate at the deepest fill, averaged over fillers. That
-single number is what the leaderboard records. Everything else — every cell,
-every judge verdict — is recovered from the run artifact.
+single number is what the leaderboard records. Everything else, every cell,
+every judge verdict, is recovered from the run artifact.
 
 ### What a run costs
 
