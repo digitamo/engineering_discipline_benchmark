@@ -747,12 +747,11 @@ def errored(cells) -> int:
 
 @kbench.task(name="engineering-discipline-2")
 def engineering_discipline_2(llm, judge_llm) -> float:
-    """Do engineering standards survive a nearly full context window, v2?
+    """Do engineering standards survive a nearly full context window? (v2)
 
-    Returns the pass rate at the deepest fill level, averaged over fillers.
-    The subject's pass rate is what the leaderboard records. The prose-versus-
-    code contrast at each depth is the finding, so both fillers always run on
-    the same scenario set.
+    Prose versus code filler at 40% and 70% of the window, scored by a
+    deterministic verifier. Returns the deepest-fill pass rate averaged
+    over fillers.
     """
     window = model_window(llm.name)
     print(f"\nmodel: {llm.name}  |  window: {window:,} tokens")
