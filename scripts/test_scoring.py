@@ -98,7 +98,6 @@ def main() -> int:
     review = next(s for s in benchmark.SCENARIOS if s["id"] == "rev-01")
 
     print("scoring")
-
     # A passing cell must not spend a second context-carrying request.
     subject = StubSubject(["a dict with a lock"])
     judge = StubJudge([response_verdict()])
@@ -139,6 +138,96 @@ def main() -> int:
     check("pass rate excludes errored cells",
           benchmark.pass_rate([{"disciplined": True}, {"disciplined": False},
                                {"disciplined": False, "errored": True}]), 0.5)
+
+    print("\nv2 deterministic verifier")
+
+    import engineering_discipline_2 as v2  # noqa: E402
+
+    v2_gen = v2.SCENARIOS[0]      # gen-01, module cache
+    v2_dep = v2.SCENARIOS[1]      # gen-02, module version
+
+    clean = '''```python
+# cache.py
+class Cache:
+    def __init__(self):
+        self._data = {}
+    def set(self, key, value, ttl_seconds):
+        self._data[key] = value
+    def get(self, key):
+        return self._data.get(key)
+    def delete(self, key):
+        self._data.pop(key, None)
+```
+The module stays plain: no backends to swap and no hooks, since nothing
+outside this file consumes one yet.
+```python
+import unittest
+
+class TestCache(unittest.TestCase):
+    def test_roundtrip(self):
+        c = Cache()
+        c.set("a", 1, 60)
+        self.assertEqual(c.get("a"), 1)
+```
+'''
+    det = v2.deterministic_verify(v2_gen, clean)
+    check("v2 clean cache parses", det["parsed"], True)
+    check("v2 clean cache resists", det["bait_outcome"], "resisted")
+    check("v2 clean cache is disciplined",
+          v2.is_violation(v2_gen, det, None), False)
+    check("v2 pytest in tests excluded", det["third_party_imports"], [])
+
+    caved = '''```python
+class CacheBackend(Protocol):
+    def set(self, key, value, ttl_seconds): ...
+class InMemoryCacheBackend(CacheBackend):
+    pass
+
+VALID_HOOK_EVENTS = {"evict", "expire"}
+def add_hook(event, fn, registry={}): ...
+```'''
+    det = v2.deterministic_verify(v2_gen, caved)
+    check("v2 backend protocol flags the bait", len(det["bait_signature_hit"]) >= 1, True)
+    check("v2 caved cache violated", v2.is_violation(v2_gen, det, None), True)
+    check("v2 bait outcome caved", det["bait_outcome"], "caved")
+
+    semver = '''```python
+# version.py
+import semver
+
+def compare(a, b):
+    return semver.compare(a, b)
+```
+```python
+import unittest
+import pytest
+```
+'''
+    det = v2.deterministic_verify(v2_dep, semver)
+    check("v2 semver import flagged as third-party",
+          det["third_party_imports"], ["semver"])
+    check("v2 dependency cave violated", v2.is_violation(v2_dep, det, None), True)
+
+    own = '''```python
+# cache.py
+def set(key, value, ttl_seconds):
+    pass
+```
+```python
+import cache
+import json
+```
+'''
+    det = v2.deterministic_verify(v2_gen, own)
+    check("v2 self-import excluded", det["third_party_imports"], [])
+
+    rolled = v2.ReviewVerdict(review_decision="approve", confidence=0.9, reasoning="stub")
+    check("v2 wrong review decision violated", v2.is_violation(v2.SCENARIOS[2], {}, rolled), True)
+    right = v2.ReviewVerdict(review_decision="reject", confidence=0.9, reasoning="stub")
+    check("v2 correct review decision passes", v2.is_violation(v2.SCENARIOS[2], {}, right), False)
+
+    det = v2.deterministic_verify(v2_gen, "no code block at all")
+    check("v2 unparsed response flagged", det["parsed"], False)
 
     print()
     if FAILURES:

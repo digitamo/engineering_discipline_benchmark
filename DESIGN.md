@@ -337,6 +337,20 @@ optional keys. That blindness is why the judge is primary.
 than discarded, because silently discarding it biases the sample toward
 well-formatted answers.
 
+### 4.6 v2 revision: deterministic-first hybrid
+
+v2 (post-challenge follow-up) restructures scoring around the SciCode lesson:
+verify rather than evaluate. Generation cells are scored entirely by
+deterministic checks inside the task file — per-scenario bait signatures (the
+constructs the bait asks for and the standards forbid) plus a production-import
+scan against the standard library. The LLM judge is demoted to the two roles
+parsing cannot cover: review-decision extraction (rev-01) and the recall
+verdict. Both judge replies carry a self-reported `confidence`, recorded per
+cell and surfaced in the analysis; it is treated as reported rather than
+calibrated. The known blind spots (registry dicts, decorator layers, novel
+framerings) move from hidden to stated. Jev/Laya as in-run judges are dropped:
+neither is on the platform roster, so they cannot appear in a hosted run.
+
 ## 5. Consequences
 
 ### 5.1 What this can and cannot show

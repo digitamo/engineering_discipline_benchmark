@@ -269,7 +269,7 @@ caveat.
 | **Using the structural measures instead of the judge** | the judge is 1% of a cell's cost, so this saves almost nothing; the measures are also blind to registry dicts and decorator hooks | worth doing for robustness, not for cost. Report them alongside the judge rather than replacing it |
 | **Run-to-run variance** | one hosted run so far, plus one local sweep; both agree that baseline and prose resist while 70% code caves | repeat a subset and report the flip rate at temperature zero |
 | **Paraphrase robustness** | one phrasing per scenario | paraphrase each scenario and check the result survives |
-| **Jev or Laya as the semantic judge** | both were the intended judges from the start | wire either in as `judge_llm`. The cross-family gap is closed by Claude Opus 5.5, but Jev and Laya were designed for this role and would replace a general-purpose model doing a specialist job |
+| **Jev or Laya as the semantic judge** | both were the intended judges from the start | dropped: v2 uses the deterministic-first hybrid instead. Neither is on the platform roster, so they cannot judge a hosted run; the verified hybrid covers every rubric item |
 
 ### The honest summary
 
@@ -285,6 +285,51 @@ completed on the platform with all 21 cells scored and the task is published.
 
 The commands are in Running, above. A push already scores one run; further
 models join with `kaggle b t run -m <model> --wait`.
+
+---
+
+## v2 follow-up: `engineering-discipline-2`
+
+The challenge window is closed; this is the post-competition continuation,
+driven by what v1 left unresolved: whether the 70% code result (`gen-01`
+caving) holds across model families, and how much of the effect is filler
+*content* rather than context *depth*.
+
+Task: [`engineering-discipline-2`](tasks/engineering_discipline_2.py), built on
+the same haystack dataset and standards. Differences from v1:
+
+| Change | Why |
+| :--- | :--- |
+| Deterministic-first hybrid scoring: generation cells verified from code structure (bait signatures, production-import scan); the LLM judge only extracts review decisions and recall, sending a `confidence` per verdict | SciCode's lesson: parseable behaviour should not be judged by a model. Unit-scoring removes family bias and the swallowed-None failure mode from the primary axis |
+| Reduced to `gen-01`, `gen-02`, `rev-01` | the three cells that produced signal in v1 |
+| No 0% baseline; fills at 40% and 70%, both fillers | every v1 baseline cell passed except one that later ran clean; depth contrast and prose-vs-code contrast are the measurable variables |
+| 12 cells per model, 6 models | multi-model window for cross-family comparison within budget |
+
+Roster and per-model cost (input $0.38/M, output $3.75/M):
+
+| Model | Window | Expected | Worst case |
+| :--- | ---: | ---: | ---: |
+| `gpt-oss-120b` | 131k | ~$0.72 | ~$1.15 |
+| `deepseek-r1-0528` | 131k | ~$0.72 | ~$1.15 |
+| `gemma-4-31b-it` | 131k | ~$0.72 | ~$1.15 |
+| `claude-sonnet-5-5-default` | 200k | ~$1.10 | ~$1.70 |
+| `qwen3-next-80b-a3b-instruct` | 262k | ~$1.44 | ~$2.20 |
+| `gpt-6-astra` | 1,050,000 | ~$2.80 | ~$3.20 |
+
+Run order is cheapest first; the 1M outlier runs last and only if the remaining
+balance covers it, since refused requests are free.
+
+```bash
+# bound the balance before spending anything, then run per model
+source scripts/kbench-env.sh
+kaggle b t run engineering-discipline-2 -m gpt-oss-120b --wait
+kaggle b t download engineering-discipline-2 -o ./runs
+python3 scripts/analyze.py runs/**/*.run.json
+```
+
+The v2 verifier runs offline in the scoring tests: every bait signature and
+dependency rule is exercised without a model, in `python3
+scripts/test_scoring.py`.
 
 ---
 

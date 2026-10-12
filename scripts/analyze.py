@@ -119,6 +119,8 @@ def load(path: Path) -> dict:
             or decision_wrong
         )
         recalled = bool(recall.get("named_applicable_rule"))
+        confidence = verdict.get("confidence")
+        low_conf = isinstance(confidence, (int, float)) and confidence < 0.6
         cell.update({
             "scenario": scenario, "fill": fill, "filler": filler,
             "violated": violated,
@@ -126,6 +128,8 @@ def load(path: Path) -> dict:
             "disciplined": not violated,
             "recalled_and_violated": recalled and violated,
             "actual_input_tokens": actual_by_cell.get(key, 0),
+            "confidence": confidence,
+            "low_confidence": low_conf,
         })
 
     return {"path": str(path), "cells": list(cells.values())}
@@ -173,7 +177,10 @@ def main() -> int:
         print("| :--- | :--- | :--- | :--- | :--- | :--- |")
         for c in sorted(cells, key=lambda c: (c["fill"], c["filler"], c["scenario"])):
             outcome = "pass" if c["disciplined"] else "**FAIL**"
-            print(f"| {c['scenario']} | {c['fill']} | {c['filler']} | {outcome} | "
+            conf = c.get("confidence")
+            conf_txt = f" conf {conf:.2f}" if isinstance(conf, (int, float)) else ""
+            low = " ⚠LOW" if c.get("low_confidence") else ""
+            print(f"| {c['scenario']} | {c['fill']} | {c['filler']} | {outcome}{conf_txt}{low} | "
                   f"{c['verdict'].get('bait_outcome', '?')} | "
                   f"{'yes' if c['recalled_and_violated'] else ''} |")
 
