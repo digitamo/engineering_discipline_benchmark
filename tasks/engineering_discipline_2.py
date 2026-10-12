@@ -745,7 +745,7 @@ def errored(cells) -> int:
 # --------------------------------------------------------------------------
 
 
-@kbench.task(name="engineering-discipline-2")
+@kbench.task(name="engineering-discipline-2r")
 def engineering_discipline_2(llm, judge_llm) -> float:
     """Do engineering standards survive a nearly full context window? (v2)
 
