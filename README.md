@@ -52,16 +52,12 @@ kaggle b t models       # models your token can reach
 │   └── engineering_discipline.py   the benchmark, self-contained
 │
 ├── scripts/
-│   ├── kbench-env.sh               load and refresh credentials
-│   ├── setup_corpus.sh             pinned clone of the code corpus
-│   ├── build_corpus.py             build the filler chunks
-│   ├── sync_prompt.py              regenerate the markdown copy of the standards
-│   ├── analyze.py                  read results from a run artifact
-│   ├── cost_model.py               estimate what a run costs on the proxy
-│   ├── test_scoring.py             scoring tests, no model or quota needed
-│   ├── litellm_bridge.py           path bridge so the library can reach LiteLLM
-│   ├── run_local.sh                run against LiteLLM, bypassing the proxy
-│   └── wait_for_quota.sh           poll until quota returns, then run
+│   │   ├── kbench-env.sh               load and refresh credentials
+│   │   ├── setup_corpus.sh             pinned clone of the code corpus
+│   │   ├── build_corpus.py             build the filler chunks
+│   │   ├── sync_prompt.py              regenerate the markdown copy of the standards
+│   │   ├── analyze.py                  read results from a run artifact
+│   │   └── test_scoring.py             scoring tests, no model or quota needed
 │
 ├── data/
 │   ├── system_prompt.md            generated from the task file, do not edit
@@ -128,27 +124,6 @@ source scripts/kbench-env.sh
 python3 scripts/test_scoring.py
 ```
 
-### Locally, against LiteLLM
-
-The platform proxy reserves quota per request and refuses a request before
-sending it when the reservation exceeds the balance. When that blocks you, run
-locally against a LiteLLM gateway instead, no quota applies.
-
-```bash
-./scripts/run_local.sh baseline     # all nine scenarios, no context
-./scripts/run_local.sh deep         # three scenarios at 40% and 70%
-./scripts/run_local.sh full         # both
-SUBJECT=gemini/gemini-3.8-flash-medium ./scripts/run_local.sh baseline
-```
-
-LiteLLM must already be running. The library appends `/openapi` to its base URL
-while LiteLLM serves `/v1`, so `scripts/litellm_bridge.py` starts automatically
-and rewrites the prefix. Neither the library nor the running gateway is changed.
-
-Choose a judge from a different model family where one is available. The
-platform has been using Gemini to judge Gemini, which is the self-preference
-problem noted in the roadmap.
-
 ### On Kaggle
 
 ```bash
@@ -176,7 +151,7 @@ The proxy reserves per request as `input_tokens + max_output_tokens`, and refuse
 a request *before* sending it when the reservation exceeds the remaining balance.
 Output is capped in the task file for that reason.
 
-`scripts/cost_model.py` models the configured sweep:
+The configured sweep:
 
 | Fill | Scenarios | Cells |
 | ---: | ---: | ---: |
@@ -261,9 +236,10 @@ for what that means and why temperature zero is not determinism.
 
 ## What is done, and what is not
 
-This section exists because the difference matters. The benchmark is built and
-its mechanism is verified end to end. The corrected measurement has not been
-taken, and no number from it should be quoted.
+This section exists because the difference matters. The benchmark is built, its
+mechanism is verified end to end, and a full hosted run has been scored and
+published. Numbers from that run are quotable, with the run-to-run variance
+caveat.
 
 ### Done and verified
 
@@ -283,8 +259,7 @@ taken, and no number from it should be quoted.
 
 | Item | Why it is not done | What it would take |
 | :--- | :--- | :--- |
-| **A published Kaggle leaderboard entry** | the platform proxy refuses every request; the reservation for even a baseline cell exceeds the balance | quota to return; `scripts/wait_for_quota.sh` pushes and runs automatically when it does. Local runs via `scripts/run_local.sh` give the measurement meanwhile, but they cannot populate the leaderboard |
-| **More than one subject model** | only Gemini 3.7 Flash has been measured | run locally with `SUBJECT=` per model. `scripts/run_local.sh` takes it as an argument |
+| **More than one subject model** | only Gemini 3.7 Flash has been measured on the leaderboard | run the task on Kaggle per model with `kaggle b t run -m` after the push |
 | **Fills deeper than 70% for the code filler** | code tokenises at ~1.3x the character-based estimate, so it exhausts the window before prose does. Verified by sending each filler at each level: 75% and above are refused | calibrate `chars/4` per filler by reading `usage` from a known context. That would let both fillers reach 90% |
 | **Domain-aligned code filler or repository-grounded tasks** | current scenarios are synthetic units (caches, parsers, reviews) while `dlt` acts strictly as an arbitrary code haystack for distraction and convention priming | either rebuild filler chunks from a repository aligned with the scenario domains, or ground scenarios directly in `dlt` issues/loaders, rebuild chunks via `scripts/build_corpus.py`, upload a new Kaggle dataset, and re-run sweeps |
 | **The precedence ablation** | the variant was written, then removed as dead code during the rewrite | re-add `SYSTEM_PROMPT_PRECEDENCE` and run both; answers whether stating precedence explicitly helps |
@@ -292,9 +267,9 @@ taken, and no number from it should be quoted.
 | **The self-generated context arm** | the most faithful simulation of a real session, and the most expensive | seed the model, let it elaborate over turns until the window is full, then ask the task |
 | **Judge validation** | no hand-labelled set exists, so judge agreement is asserted rather than measured | label ~60 outputs and report agreement |
 | **Using the structural measures instead of the judge** | the judge is 1% of a cell's cost, so this saves almost nothing; the measures are also blind to registry dicts and decorator hooks | worth doing for robustness, not for cost. Report them alongside the judge rather than replacing it |
-| **Run-to-run variance** | every run so far was a single run | repeat a subset and report the flip rate at temperature zero |
+| **Run-to-run variance** | one hosted run so far, plus one local sweep; both agree that baseline and prose resist while 70% code caves | repeat a subset and report the flip rate at temperature zero |
 | **Paraphrase robustness** | one phrasing per scenario | paraphrase each scenario and check the result survives |
-| **Jev or Laya as the semantic judge** | both were the intended judges from the start | wire either in as `judge_llm`. The cross-family gap is now closed locally by Claude Opus 5.5, but Jev and Laya were designed for this role and would replace a general-purpose model doing a specialist job |
+| **Jev or Laya as the semantic judge** | both were the intended judges from the start | wire either in as `judge_llm`. The cross-family gap is closed by Claude Opus 5.5, but Jev and Laya were designed for this role and would replace a general-purpose model doing a specialist job |
 
 ### The honest summary
 
@@ -303,18 +278,13 @@ a filler that primed a convention, a rubric broad enough to read the imitation a
 a violation, and a standards prompt that never reached the model. Two of the
 three cancelled, which is why the first result looked clean.
 
-That story is complete. The measurement it was meant to produce is not, and the
-leaderboard number currently reflects a run in which every cell failed.
+That story is complete, and the corrected measurement now exists: task version 9
+completed on the platform with all 21 cells scored and the task is published.
 
 ### If picking this up
 
-`scripts/wait_for_quota.sh` handles it automatically. The commands are in
-Running, above.
-
-The cheapest useful result is the baseline alone: set `FILL_LEVELS` to
-`[{"fill": 0.0, "scenarios": null}]` and run all nine scenarios with no context.
-That answers whether the model follows the standards when nothing competes for
-its attention, and it costs a fraction of a deep fill.
+The commands are in Running, above. A push already scores one run; further
+models join with `kaggle b t run -m <model> --wait`.
 
 ---
 

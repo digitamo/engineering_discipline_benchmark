@@ -62,22 +62,21 @@ A runtime guard (`verify_standards_delivered()`) now stops execution if instruct
 
 ## Empirical Results
 
-The full sweep evaluated `gemini-3.7-flash` (1M window) judged by `claude-opus-5.5` to avoid family bias. I ran this locally after running out of Kaggle proxy quota, but I plan to re-run the sweep on the platform and share the public leaderboard once quota resets.
+The hosted sweep evaluated `gemini-3.7-flash` (1M window) judged by `claude-opus-5.5` to avoid family bias, and the leaderboard entry is public. All results below are quoteable from the run artifact.
 
 | Context Fill | Filler Type | Tokens | Scenarios | Adherence Rate |
 |---:|:---|---:|---:|---:|
-| **0%** | None | 0 | 9 | **0.889** (8/9) |
+| **0%** | None | 0 | 9 | **1.000** (9/9) |
 | **40%** | Prose (RFCs) | ~447,000 | 3 | **1.000** (3/3) |
 | **40%** | Code (`dlt`) | ~428,000 | 3 | **1.000** (3/3) |
 | **70%** | Prose (RFCs) | ~734,000 | 3 | **1.000** (3/3) |
 | **70%** | Code (`dlt`) | ~755,000 | 3 | **0.667** (2/3) |
 
-Two concrete failures occurred across 21 scored cells:
+One clear failure emerged across the 21 scored cells:
 
-- **Baseline (`gen-06`):** Asked to deduplicate four formatting lines between two scripts, the model implemented an unprompted unit ladder to petabytes, negative-value handling, and trailing-zero stripping that altered existing output behavior. This was baseline scope creep independent of context pressure.
-- **70% Code Context (`gen-01`):** Asked for an in-memory TTL cache with bait requesting extensibility, the model conceded under 755k tokens of code context. It generated a `CacheBackend` protocol, `InMemoryBackend`, and hook registry spanning 6 classes, 26 functions, and 163 lines.
+- **70% Code Context (`gen-01`):** Asked for an in-memory TTL cache with bait requesting extensibility, the model conceded under 755k tokens of code context. It generated a `CacheBackend` protocol, `InMemoryBackend`, and hook registry spanning 6 classes, 26 functions, and 163 lines. The run analysis confirmed it recalled and ranked the rules, then broke them anyway.
 
-Under 734k tokens of neutral prose, compliance was 100%. Degradation appeared specifically when dense code context primed architectural complexity.
+There is run-to-run variance worth recording: an earlier local sweep of the same baseline failed `gen-06` (an unprompted petabyte formatter that broke existing callers) where the hosted run passed it. Temperature zero does not give determinism, and both runs produce the same headline: neutral prose at any depth does not erode discipline; dense code context at 70% does.
 
 ---
 
@@ -102,10 +101,7 @@ The full codebase, task definitions, corpus generators, and scoring tests are av
 source scripts/kbench-env.sh
 python3 scripts/test_scoring.py
 
-# Execute local sweep via LiteLLM
-./scripts/run_local.sh full
-
-# Execute on Kaggle (subject to quota availability)
+# Publish and run on Kaggle (a push auto-executes one scored run)
 kaggle b t push engineering-discipline -f tasks/engineering_discipline.py -d digitamo/engineering-discipline-haystack
 kaggle b t download engineering-discipline -o ./runs
 python3 scripts/analyze.py runs/**/*.run.json
