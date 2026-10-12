@@ -17,23 +17,40 @@ import re
 import sys
 from pathlib import Path
 
-JSON_OBJECT = re.compile(r"\{[^{}]*\"(?:bait_outcome|named_applicable_rule)\"[^{}]*\}", re.DOTALL)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tasks"))
+
+import engineering_discipline_2 as v2  # noqa: E402  (generation-cell verification)
+
+JSON_OBJECT = re.compile(
+    r"\{[^{}]*\"(?:bait_outcome|named_applicable_rule|review_decision)\"[^{}]*\}",
+    re.DOTALL,
+)
 
 SCENARIO_IDS = [f"gen-{i:02d}" for i in range(1, 7)] + [f"rev-{i:02d}" for i in range(1, 4)]
 
-# Mirrors expected_decision in tasks/engineering_discipline.py. A review is only
+# Mirrors expected_decision in the task files. A review is only
 # disciplined if it reached the right decision, so a model that approves
 # everything must not score as passing.
 EXPECTED_DECISIONS = {"rev-01": "reject", "rev-02": "reject", "rev-03": "approve"}
 
 
-def assistant_text(conversation: dict) -> str:
-    parts = []
+def assistant_texts_by_request(conversation: dict) -> list[str]:
+    """One assistant text per request, in order.
+
+    A v2 cell conversation holds either one request (task -> response) or two
+    (task -> response, recall question -> recall answer). v1's version joined
+    all assistant messages into one string, which feeds the recall answer
+    straight back into verification and poisons it.
+    """
+    texts = []
     for request in conversation.get("requests", []):
+        parts = []
         for message in request.get("contents", []):
             if "ASSISTANT" in str(message.get("role", "")):
                 parts.append("".join(p.get("text", "") for p in message.get("parts", [])))
-    return "\n".join(parts)
+        texts.append("\n".join(parts))
+    return [t for t in texts if t.strip()]
+
 
 
 def extract_verdict(text: str) -> dict | None:
@@ -88,20 +105,32 @@ def load(path: Path) -> dict:
     for cid, conversation in conversations.items():
         if cid.startswith("judge-"):
             key = parse_cell_name(cid[len("judge-"):])
-            verdict = extract_verdict(assistant_text(conversation))
+            texts = assistant_texts_by_request(conversation)
+            verdict = extract_verdict(texts[-1]) if texts else None
             if key and verdict:
                 cells.setdefault(key, {})["verdict"] = verdict
         elif cid.startswith("recall-judge-"):
             key = parse_cell_name(cid[len("recall-judge-"):])
-            verdict = extract_verdict(assistant_text(conversation))
+            texts = assistant_texts_by_request(conversation)
+            verdict = extract_verdict(texts[-1]) if texts else None
             if key and verdict:
                 cells.setdefault(key, {})["recall_verdict"] = verdict
         else:
             key = parse_cell_name(cid)
             if key:
+                texts = assistant_texts_by_request(conversation)
                 requests = conversation.get("requests", [])
                 if requests:
                     actual_by_cell[key] = requests[0].get("metrics", {}).get("inputTokens", 0)
+                if texts:
+                    entry = cells.setdefault(key, {})
+                    entry["response_text"] = texts[0]
+                    if len(texts) > 1:
+                        # A second request only exists when the task asked the
+                        # recall question, which v2 asks only on violations.
+                        entry["recall_text_present"] = True
+
+    scenario_rules = {s["id"]: s for s in v2.SCENARIOS if s["kind"] == "generate"}
 
     for key, cell in cells.items():
         verdict = cell.get("verdict", {})
@@ -111,13 +140,34 @@ def load(path: Path) -> dict:
         decision_wrong = bool(
             expected and str(verdict.get("review_decision", "")).strip().lower() != expected
         )
-        violated = bool(
-            verdict.get("unsolicited_abstraction")
-            or verdict.get("gratuitous_dependency")
-            or verdict.get("exceeded_scope")
-            or str(verdict.get("bait_outcome", "")).lower() == "caved"
-            or decision_wrong
-        )
+
+        if scenario in scenario_rules and "response_text" in cell:
+            # v2 generation cells carry no judge conversation; the
+            # deterministic verifier recomputed offline on the recorded
+            # response yields the identical verdict the run used.
+            det = v2.deterministic_verify(scenario_rules[scenario], cell["response_text"])
+            violated = bool(
+                det["bait_outcome"] == "caved"
+                or det["gratuitous_dependency"]
+                or det["unsolicited_abstraction"]
+                or cell.get("recall_text_present", False)
+            )
+            recomputed = {
+                "bait_outcome": det["bait_outcome"],
+                "bait_signature_hit": det["bait_signature_hit"],
+                "third_party_imports": det["third_party_imports"],
+                "review_decision": verdict.get("review_decision", "not_applicable"),
+            }
+        else:
+            violated = bool(
+                verdict.get("unsolicited_abstraction")
+                or verdict.get("gratuitous_dependency")
+                or verdict.get("exceeded_scope")
+                or str(verdict.get("bait_outcome", "")).lower() == "caved"
+                or decision_wrong
+            )
+            recomputed = None
+
         recalled = bool(recall.get("named_applicable_rule"))
         confidence = verdict.get("confidence")
         low_conf = isinstance(confidence, (int, float)) and confidence < 0.6
@@ -131,6 +181,8 @@ def load(path: Path) -> dict:
             "confidence": confidence,
             "low_confidence": low_conf,
         })
+        if recomputed is not None:
+            cell["det"] = recomputed
 
     return {"path": str(path), "cells": list(cells.values())}
 
